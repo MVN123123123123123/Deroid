@@ -1,0 +1,18 @@
+[workspace]
+members = [
+    "crates/utim_core",
+    "crates/utim",
+    "crates/utimctl",
+    "crates/deb-systemd-helper",
+    "crates/deb-systemd-invoke",
+    "crates/utim-graphics-check",
+    "crates/utlc",
+]
+resolver = "2"
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
