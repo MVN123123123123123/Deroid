@@ -12,8 +12,7 @@ use std::time::{Duration, Instant};
 
 use utim_core::compositor::desktop::{parse_desktop_entry, DesktopApp, DesktopCatalogue};
 use utim_core::compositor::gestures::{
-    cubic_bezier_ease_out, GestureAction, GestureConfig, GestureEngine, RawTouchEvent,
-    TouchPhase,
+    cubic_bezier_ease_out, GestureAction, GestureConfig, GestureEngine, RawTouchEvent, TouchPhase,
 };
 use utim_core::compositor::ime::{ImeAction, VirtualKeyboard};
 use utim_core::compositor::launcher::{HotseatDock, WorkspaceGrid};
@@ -55,26 +54,48 @@ fn test_milestone_3_1_wayland_protocols_and_wire_framing() {
 
     // 2. Validate Protocol Registry Coverage
     let reg = ProtocolRegistry::new();
-    assert!(reg.supports_mobile_protocols(), "Must support all mobile Wayland extensions");
+    assert!(
+        reg.supports_mobile_protocols(),
+        "Must support all mobile Wayland extensions"
+    );
     assert!(reg.find_by_interface(WaylandInterface::XdgWmBase).is_some());
-    assert!(reg.find_by_interface(WaylandInterface::ZwlrLayerShellV1).is_some());
-    assert!(reg.find_by_interface(WaylandInterface::ZwpLinuxDmabufV1).is_some());
-    assert!(reg.find_by_interface(WaylandInterface::WpPresentation).is_some());
-    assert!(reg.find_by_interface(WaylandInterface::WpViewporter).is_some());
-    assert!(reg.find_by_interface(WaylandInterface::ExtIdleNotifierV1).is_some());
-    assert!(reg.find_by_interface(WaylandInterface::ZwpTextInputV3).is_some());
-    assert!(reg.find_by_interface(WaylandInterface::ZwpInputMethodV2).is_some());
-    assert!(reg.find_by_interface(WaylandInterface::ZwpTabletManagerV2).is_some());
+    assert!(reg
+        .find_by_interface(WaylandInterface::ZwlrLayerShellV1)
+        .is_some());
+    assert!(reg
+        .find_by_interface(WaylandInterface::ZwpLinuxDmabufV1)
+        .is_some());
+    assert!(reg
+        .find_by_interface(WaylandInterface::WpPresentation)
+        .is_some());
+    assert!(reg
+        .find_by_interface(WaylandInterface::WpViewporter)
+        .is_some());
+    assert!(reg
+        .find_by_interface(WaylandInterface::ExtIdleNotifierV1)
+        .is_some());
+    assert!(reg
+        .find_by_interface(WaylandInterface::ZwpTextInputV3)
+        .is_some());
+    assert!(reg
+        .find_by_interface(WaylandInterface::ZwpInputMethodV2)
+        .is_some());
+    assert!(reg
+        .find_by_interface(WaylandInterface::ZwpTabletManagerV2)
+        .is_some());
 }
 
 #[test]
 fn test_milestone_3_1_hwc_multi_plane_presentation_and_performance() {
     let hwc = HwcComposer::new(HwcVersion::AidlComposer3);
-    let socket_path = std::path::PathBuf::from(format!("/tmp/utlc-test-{}.sock", std::process::id()));
+    let socket_path =
+        std::path::PathBuf::from(format!("/tmp/utlc-test-{}.sock", std::process::id()));
     let mut server = WaylandServer::new(&socket_path, 1080, 2400, 120.0, hwc);
 
     // Boot to first frame
-    let boot_dur = server.boot_to_first_frame().expect("Boot to first frame failed");
+    let boot_dur = server
+        .boot_to_first_frame()
+        .expect("Boot to first frame failed");
     assert!(
         boot_dur < Duration::from_millis(450),
         "Boot-to-launcher time must be < 450ms, got {:?}",
@@ -137,7 +158,8 @@ Categories=Development;IDE;
 Keywords=Code;Editor;Development;
 NoDisplay=false
 "#;
-    let app = parse_desktop_entry("antigravity-ide", desktop_content).expect("Failed to parse desktop");
+    let app =
+        parse_desktop_entry("antigravity-ide", desktop_content).expect("Failed to parse desktop");
     assert_eq!(app.id, "antigravity-ide");
     assert_eq!(app.name, "Antigravity IDE");
     assert_eq!(app.clean_exec(), "antigravity-ide");
@@ -146,13 +168,25 @@ NoDisplay=false
     // 4. Real-time Fuzzy Search (< 1ms query time)
     let mut catalogue = DesktopCatalogue::new();
     catalogue.add_app(app);
-    catalogue.add_app(DesktopApp::new("phone".into(), "Phone Dialer".into(), "dialer".into()));
-    catalogue.add_app(DesktopApp::new("firefox".into(), "Firefox Browser".into(), "firefox".into()));
+    catalogue.add_app(DesktopApp::new(
+        "phone".into(),
+        "Phone Dialer".into(),
+        "dialer".into(),
+    ));
+    catalogue.add_app(DesktopApp::new(
+        "firefox".into(),
+        "Firefox Browser".into(),
+        "firefox".into(),
+    ));
 
     let t_start = Instant::now();
     let matches = catalogue.search("anti");
     let t_dur = t_start.elapsed();
-    assert!(t_dur < Duration::from_millis(1), "Fuzzy search latency must be < 1ms, got {:?}", t_dur);
+    assert!(
+        t_dur < Duration::from_millis(1),
+        "Fuzzy search latency must be < 1ms, got {:?}",
+        t_dur
+    );
     assert_eq!(matches.len(), 1);
     assert_eq!(matches[0].0.id, "antigravity-ide");
 }
@@ -173,7 +207,11 @@ fn test_milestone_3_3_quickstep_gesture_navigation_and_recents() {
     let t_eval_start = Instant::now();
     let act_down = engine.process_touch(&touch_down);
     let eval_dur = t_eval_start.elapsed();
-    assert!(eval_dur < Duration::from_millis(8), "Input latency must be < 8ms, got {:?}", eval_dur);
+    assert!(
+        eval_dur < Duration::from_millis(8),
+        "Input latency must be < 8ms, got {:?}",
+        eval_dur
+    );
     assert_eq!(act_down, GestureAction::None);
 
     let touch_up = RawTouchEvent {
@@ -192,8 +230,26 @@ fn test_milestone_3_3_quickstep_gesture_navigation_and_recents() {
 
     // 2. Recents Carousel & Swipe-to-Kill Process Management
     let mut carousel = RecentsCarousel::new(1080.0, 2400.0);
-    carousel.add_card(RecentsCard::new("calc".into(), 5001, "Calculator".into(), "".into(), 1, None, 800.0, 1600.0));
-    carousel.add_card(RecentsCard::new("files".into(), 5002, "Files".into(), "".into(), 2, None, 800.0, 1600.0));
+    carousel.add_card(RecentsCard::new(
+        "calc".into(),
+        5001,
+        "Calculator".into(),
+        "".into(),
+        1,
+        None,
+        800.0,
+        1600.0,
+    ));
+    carousel.add_card(RecentsCard::new(
+        "files".into(),
+        5002,
+        "Files".into(),
+        "".into(),
+        2,
+        None,
+        800.0,
+        1600.0,
+    ));
     assert_eq!(carousel.cards.len(), 2);
 
     // Swipe upward on card 0
@@ -214,7 +270,10 @@ fn test_milestone_3_3_quickstep_gesture_navigation_and_recents() {
     split.enable(5001, 5002);
     assert!(split.is_active);
     assert_eq!(split.top_viewport(1080.0), (0.0, 0.0, 1080.0, 1200.0));
-    assert_eq!(split.bottom_viewport(1080.0, 2400.0), (0.0, 1200.0, 1080.0, 1200.0));
+    assert_eq!(
+        split.bottom_viewport(1080.0, 2400.0),
+        (0.0, 1200.0, 1080.0, 1200.0)
+    );
 }
 
 #[test]
@@ -249,7 +308,10 @@ fn test_milestone_3_4_systemui_status_bar_and_quick_settings() {
         "email".into(),
         "Meeting at 3PM".into(),
         "Discuss Universal Treble GSI roadmap.".into(),
-        vec![("open".into(), "Open".into()), ("dismiss".into(), "Dismiss".into())],
+        vec![
+            ("open".into(), "Open".into()),
+            ("dismiss".into(), "Dismiss".into()),
+        ],
     );
     assert_eq!(n_id, 1);
     assert_eq!(shade.notifications.len(), 1);
@@ -300,7 +362,13 @@ fn test_milestone_3_5_lock_screen_fingerprint_hal_and_ime() {
     assert_eq!(act_r, ImeAction::CommitString("R".into()));
 
     let act_bs = ime.handle_key_tap("BACKSPACE");
-    assert_eq!(act_bs, ImeAction::DeleteSurroundingText { before_length: 1, after_length: 0 });
+    assert_eq!(
+        act_bs,
+        ImeAction::DeleteSurroundingText {
+            before_length: 1,
+            after_length: 0
+        }
+    );
 
     let act_enter = ime.handle_key_tap("ENTER");
     assert_eq!(act_enter, ImeAction::SendKey(28));
@@ -330,7 +398,9 @@ fn test_milestone_3_6_power_governor_and_oom_synchronization() {
     let recents_pids = vec![2002, 2003];
     let inactive_pids = vec![2004, 2005];
 
-    assert!(power.on_app_switched(fg_pid, &recents_pids, &inactive_pids).is_ok());
+    assert!(power
+        .on_app_switched(fg_pid, &recents_pids, &inactive_pids)
+        .is_ok());
     assert_eq!(power.active_foreground_pid, Some(2001));
     assert_eq!(power.recents_pids, vec![2002, 2003]);
 }

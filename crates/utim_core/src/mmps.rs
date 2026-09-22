@@ -70,7 +70,10 @@ impl MemorySupervisor {
     pub fn read_psi(&self) -> io::Result<MemoryPressureMetrics> {
         let content = fs::read_to_string(&self.proc_pressure_path)?;
         parse_psi_output(&content).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "Failed to parse PSI memory content")
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Failed to parse PSI memory content",
+            )
         })
     }
 
@@ -168,7 +171,10 @@ full avg10=26.80 avg60=14.00 avg300=5.50 total=45678
         fs::write(&temp_psi, sample).unwrap();
 
         let mmps = MemorySupervisor::with_path(temp_psi.clone());
-        assert_eq!(mmps.evaluate_pressure_level(), MemoryPressureLevel::Critical);
+        assert_eq!(
+            mmps.evaluate_pressure_level(),
+            MemoryPressureLevel::Critical
+        );
 
         let _ = fs::remove_file(temp_psi);
     }

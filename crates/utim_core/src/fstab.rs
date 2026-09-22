@@ -100,7 +100,10 @@ odm                      /odm        erofs   ro                             wait
         assert_eq!(entries[0].fs_type, "ext4");
         assert!(entries[0].is_logical());
         assert!(entries[0].is_first_stage());
-        assert_eq!(entries[0].linux_mount_flags() & libc::MS_RDONLY, libc::MS_RDONLY);
+        assert_eq!(
+            entries[0].linux_mount_flags() & libc::MS_RDONLY,
+            libc::MS_RDONLY
+        );
 
         assert_eq!(entries[1].mount_point, "/vendor");
         assert_eq!(entries[2].mount_point, "/odm");

@@ -70,7 +70,8 @@ impl MobileScene {
         refresh_rate: f64,
         hwc_composer: HwcComposer,
     ) -> Self {
-        let vsync_cfg = VsyncConfig::new(refresh_rate).unwrap_or_else(|_| VsyncConfig::new(60.0).unwrap());
+        let vsync_cfg =
+            VsyncConfig::new(refresh_rate).unwrap_or_else(|_| VsyncConfig::new(60.0).unwrap());
         let vsync_validator = VsyncPresentationValidator::new(vsync_cfg);
 
         let mut scene = Self {
@@ -119,25 +120,39 @@ impl MobileScene {
 
         // Assign Z-orders
         if let Some(l) = self.layer_grid {
-            let _ = self.hwc.set_layer_z_order(self.display_id, l, plane_z_order::WALLPAPER_GRID);
+            let _ = self
+                .hwc
+                .set_layer_z_order(self.display_id, l, plane_z_order::WALLPAPER_GRID);
         }
         if let Some(l) = self.layer_dock {
-            let _ = self.hwc.set_layer_z_order(self.display_id, l, plane_z_order::HOTSEAT_DOCK);
+            let _ = self
+                .hwc
+                .set_layer_z_order(self.display_id, l, plane_z_order::HOTSEAT_DOCK);
         }
         if let Some(l) = self.layer_app {
-            let _ = self.hwc.set_layer_z_order(self.display_id, l, plane_z_order::APPLICATION_SURFACE);
+            let _ =
+                self.hwc
+                    .set_layer_z_order(self.display_id, l, plane_z_order::APPLICATION_SURFACE);
         }
         if let Some(l) = self.layer_status {
-            let _ = self.hwc.set_layer_z_order(self.display_id, l, plane_z_order::STATUS_BAR);
+            let _ = self
+                .hwc
+                .set_layer_z_order(self.display_id, l, plane_z_order::STATUS_BAR);
         }
         if let Some(l) = self.layer_shade {
-            let _ = self.hwc.set_layer_z_order(self.display_id, l, plane_z_order::SYSTEM_UI_SHADE);
+            let _ = self
+                .hwc
+                .set_layer_z_order(self.display_id, l, plane_z_order::SYSTEM_UI_SHADE);
         }
         if let Some(l) = self.layer_ime {
-            let _ = self.hwc.set_layer_z_order(self.display_id, l, plane_z_order::VIRTUAL_KEYBOARD);
+            let _ = self
+                .hwc
+                .set_layer_z_order(self.display_id, l, plane_z_order::VIRTUAL_KEYBOARD);
         }
         if let Some(l) = self.layer_lock {
-            let _ = self.hwc.set_layer_z_order(self.display_id, l, plane_z_order::LOCK_SCREEN);
+            let _ = self
+                .hwc
+                .set_layer_z_order(self.display_id, l, plane_z_order::LOCK_SCREEN);
         }
     }
 
@@ -169,7 +184,8 @@ impl MobileScene {
             GestureAction::BottomBarScrub { app_shift, .. } => {
                 if !self.recents.cards.is_empty() {
                     let new_idx = (self.recents.selected_index as i32 + app_shift)
-                        .clamp(0, self.recents.cards.len() as i32 - 1) as usize;
+                        .clamp(0, self.recents.cards.len() as i32 - 1)
+                        as usize;
                     self.recents.snap_to_index(new_idx);
                 }
             }
@@ -206,8 +222,12 @@ impl MobileScene {
 
         // 1. Grid / Wallpaper Layer
         if let Some(l) = self.layer_grid {
-            let _ = self.hwc.set_layer_display_frame(self.display_id, l, full_rect);
-            let _ = self.hwc.set_layer_composition_type(self.display_id, l, CompositionType::Device);
+            let _ = self
+                .hwc
+                .set_layer_display_frame(self.display_id, l, full_rect);
+            let _ =
+                self.hwc
+                    .set_layer_composition_type(self.display_id, l, CompositionType::Device);
             let _ = self.hwc.set_layer_buffer(self.display_id, l, 100, None);
         }
 
@@ -220,15 +240,21 @@ impl MobileScene {
                 right: w,
                 bottom: h - push_y,
             };
-            let _ = self.hwc.set_layer_display_frame(self.display_id, l, app_rect);
+            let _ = self
+                .hwc
+                .set_layer_display_frame(self.display_id, l, app_rect);
 
             let comp_type = match self.mode {
                 ShellMode::Application | ShellMode::SplitScreen => CompositionType::Device,
                 _ => CompositionType::Client,
             };
-            let _ = self.hwc.set_layer_composition_type(self.display_id, l, comp_type);
+            let _ = self
+                .hwc
+                .set_layer_composition_type(self.display_id, l, comp_type);
             if let Some(fd) = self.active_app_buffer_fd {
-                let _ = self.hwc.set_layer_buffer(self.display_id, l, fd as u64, None);
+                let _ = self
+                    .hwc
+                    .set_layer_buffer(self.display_id, l, fd as u64, None);
             }
         }
 
@@ -240,8 +266,12 @@ impl MobileScene {
                 right: w,
                 bottom: self.system_ui.status_bar.height as i32,
             };
-            let _ = self.hwc.set_layer_display_frame(self.display_id, l, status_rect);
-            let _ = self.hwc.set_layer_composition_type(self.display_id, l, CompositionType::Device);
+            let _ = self
+                .hwc
+                .set_layer_display_frame(self.display_id, l, status_rect);
+            let _ =
+                self.hwc
+                    .set_layer_composition_type(self.display_id, l, CompositionType::Device);
             let _ = self.hwc.set_layer_buffer(self.display_id, l, 200, None);
         }
 
@@ -249,7 +279,8 @@ impl MobileScene {
         let _ = self.hwc.set_client_target(self.display_id, 9999, None);
 
         // 5. Validate HWC composition
-        let (changed, _has_client) = self.hwc
+        let (changed, _has_client) = self
+            .hwc
             .validate_display(self.display_id)
             .map_err(|e| format!("HWC validation failed: {:?}", e))?;
 
@@ -261,14 +292,19 @@ impl MobileScene {
     }
 
     /// Present frame to display and verify tear-free VSYNC presentation
-    pub fn present_frame(&mut self, vsync_timestamp_ns: u64, present_timestamp_ns: u64) -> Result<(), String> {
+    pub fn present_frame(
+        &mut self,
+        vsync_timestamp_ns: u64,
+        present_timestamp_ns: u64,
+    ) -> Result<(), String> {
         // Validate tear-free timing
         self.vsync_validator
             .validate_frame_presentation(vsync_timestamp_ns, present_timestamp_ns)
             .map_err(|e| format!("VSYNC tear validation error: {:?}", e))?;
 
         // Present display via HWC
-        let _fences = self.hwc
+        let _fences = self
+            .hwc
             .present_display(self.display_id)
             .map_err(|e| format!("HWC presentation failed: {:?}", e))?;
 

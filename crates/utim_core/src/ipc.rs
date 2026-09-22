@@ -127,10 +127,15 @@ impl IpcResponse {
                 description,
                 details,
             } => {
-                let pid_str = pid.map(|p| p.to_string()).unwrap_or_else(|| "-1".to_string());
+                let pid_str = pid
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "-1".to_string());
                 let escaped_desc = description.replace('|', " ");
                 let escaped_details = details.replace('\n', "\\n");
-                format!("STATUS {}|{}|{}|{}|{}\n", name, state, pid_str, escaped_desc, escaped_details)
+                format!(
+                    "STATUS {}|{}|{}|{}|{}\n",
+                    name, state, pid_str, escaped_desc, escaped_details
+                )
             }
             IpcResponse::UnitList(units) => {
                 let mut out = String::from("UNITS_BEGIN\n");
@@ -196,7 +201,11 @@ impl IpcResponse {
                 }
                 let parts: Vec<&str> = item.split('|').collect();
                 if parts.len() >= 3 {
-                    list.push((parts[0].to_string(), parts[1].to_string(), parts[2].to_string()));
+                    list.push((
+                        parts[0].to_string(),
+                        parts[1].to_string(),
+                        parts[2].to_string(),
+                    ));
                 }
             }
             return Ok(Some(IpcResponse::UnitList(list)));
@@ -214,7 +223,10 @@ impl IpcResponse {
             }
         }
 
-        Ok(Some(IpcResponse::Err(format!("Unknown response: {}", trimmed))))
+        Ok(Some(IpcResponse::Err(format!(
+            "Unknown response: {}",
+            trimmed
+        ))))
     }
 }
 
@@ -225,8 +237,12 @@ pub fn send_ipc_request(socket_path: &Path, req: &IpcRequest) -> std::io::Result
     stream.flush()?;
 
     let mut reader = BufReader::new(stream);
-    IpcResponse::deserialize(&mut reader)?
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Connection closed by server"))
+    IpcResponse::deserialize(&mut reader)?.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "Connection closed by server",
+        )
+    })
 }
 
 #[cfg(test)]
@@ -241,7 +257,10 @@ mod tests {
 
         let req_oom = IpcRequest::SetOomScore(1234, -500);
         assert_eq!(req_oom.serialize(), "SET_OOM_SCORE 1234 -500\n");
-        assert_eq!(IpcRequest::deserialize("SET_OOM_SCORE 1234 -500"), Some(req_oom));
+        assert_eq!(
+            IpcRequest::deserialize("SET_OOM_SCORE 1234 -500"),
+            Some(req_oom)
+        );
     }
 
     #[test]

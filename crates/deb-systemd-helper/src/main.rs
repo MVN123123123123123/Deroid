@@ -67,7 +67,10 @@ fn main() {
     let units = &clean_args[1..];
 
     if units.is_empty() && action != "purge" {
-        eprintln!("deb-systemd-helper: error: {} requires at least one unit name", action);
+        eprintln!(
+            "deb-systemd-helper: error: {} requires at least one unit name",
+            action
+        );
         process::exit(1);
     }
 
@@ -127,17 +130,26 @@ fn main() {
     }
 }
 
-fn find_unit_path(root: &str, unit: &str) -> Option<PathBuf> {
+fn find_unit_path(root: &str, unit: &str) -> Option<(PathBuf, PathBuf)> {
     let candidate_dirs = [
         "etc/systemd/system",
         "usr/lib/systemd/system",
         "lib/systemd/system",
     ];
 
-    for dir in candidate_dirs {
-        let path = resolve_root_path(root, dir).join(unit);
-        if path.exists() {
-            return Some(path);
+    let names = if unit.contains('.') {
+        vec![unit.to_string()]
+    } else {
+        vec![format!("{}.service", unit), unit.to_string()]
+    };
+
+    for name in &names {
+        for dir in candidate_dirs {
+            let host_path = resolve_root_path(root, dir).join(name);
+            if host_path.exists() {
+                let target_path = Path::new("/").join(dir).join(name);
+                return Some((host_path, target_path));
+            }
         }
     }
     None
@@ -147,7 +159,7 @@ fn enable_unit(root: &str, unit: &str, no_enable: bool) {
     let enabled_dir = get_enabled_state_dir(root);
     let _ = fs::create_dir_all(&enabled_dir);
 
-    let Some(source_path) = find_unit_path(root, unit) else {
+    let Some((source_path, target_path)) = find_unit_path(root, unit) else {
         return;
     };
 
@@ -160,11 +172,28 @@ fn enable_unit(root: &str, unit: &str, no_enable: bool) {
 
         if !no_enable {
             for target in &parsed.install.wanted_by {
-                let target_wants = get_etc_systemd(root).join(format!("{}.wants", target));
+                let target_name = if target.contains('.') {
+                    target.clone()
+                } else {
+                    format!("{}.target", target)
+                };
+                let target_wants = get_etc_systemd(root).join(format!("{}.wants", target_name));
                 let _ = fs::create_dir_all(&target_wants);
                 let symlink_path = target_wants.join(unit);
                 let _ = fs::remove_file(&symlink_path);
-                let _ = std::os::unix::fs::symlink(&source_path, &symlink_path);
+                let _ = std::os::unix::fs::symlink(&target_path, &symlink_path);
+            }
+            for target in &parsed.install.required_by {
+                let target_name = if target.contains('.') {
+                    target.clone()
+                } else {
+                    format!("{}.target", target)
+                };
+                let target_req = get_etc_systemd(root).join(format!("{}.requires", target_name));
+                let _ = fs::create_dir_all(&target_req);
+                let symlink_path = target_req.join(unit);
+                let _ = fs::remove_file(&symlink_path);
+                let _ = std::os::unix::fs::symlink(&target_path, &symlink_path);
             }
         }
     }
@@ -175,10 +204,13 @@ fn disable_unit(root: &str, unit: &str) {
     if let Ok(entries) = fs::read_dir(&etc_systemd) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_dir() && path.extension().and_then(|s| s.to_str()) == Some("wants") {
-                let symlink = path.join(unit);
-                if symlink.exists() {
-                    let _ = fs::remove_file(&symlink);
+            if path.is_dir() {
+                let ext = path.extension().and_then(|s| s.to_str());
+                if ext == Some("wants") || ext == Some("requires") {
+                    let symlink = path.join(unit);
+                    if fs::symlink_metadata(&symlink).is_ok() {
+                        let _ = fs::remove_file(&symlink);
+                    }
                 }
             }
         }
@@ -194,11 +226,13 @@ fn is_unit_enabled(root: &str, unit: &str) -> bool {
     if let Ok(entries) = fs::read_dir(&etc_systemd) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_dir()
-                && path.extension().and_then(|s| s.to_str()) == Some("wants")
-                && path.join(unit).exists()
-            {
-                return true;
+            if path.is_dir() {
+                let ext = path.extension().and_then(|s| s.to_str());
+                if (ext == Some("wants") || ext == Some("requires"))
+                    && fs::symlink_metadata(path.join(unit)).is_ok()
+                {
+                    return true;
+                }
             }
         }
     }
@@ -259,4 +293,81 @@ fn print_usage() {
     eprintln!("  mask <unit>...");
     eprintln!("  unmask <unit>...");
     eprintln!("  purge <unit>...");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_deb_systemd_helper_chroot_relative_symlinks() {
+        let temp = std::env::temp_dir().join(format!("test_dsh_chroot_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp);
+        let service_dir = temp.join("usr/lib/systemd/system");
+        fs::create_dir_all(&service_dir).unwrap();
+        fs::write(
+            service_dir.join("test.service"),
+            "[Unit]\nDescription=Test\n\n[Install]\nWantedBy=multi-user.target\nRequiredBy=basic.target\n",
+        ).unwrap();
+
+        let root_str = temp.to_str().unwrap();
+        enable_unit(root_str, "test.service", false);
+
+        let wants_link = temp.join("etc/systemd/system/multi-user.target.wants/test.service");
+        assert!(
+            fs::symlink_metadata(&wants_link).is_ok(),
+            "wants symlink should exist"
+        );
+        let target = fs::read_link(&wants_link).unwrap();
+        assert_eq!(
+            target,
+            PathBuf::from("/usr/lib/systemd/system/test.service")
+        );
+
+        let req_link = temp.join("etc/systemd/system/basic.target.requires/test.service");
+        assert!(
+            fs::symlink_metadata(&req_link).is_ok(),
+            "requires symlink should exist"
+        );
+        let target_req = fs::read_link(&req_link).unwrap();
+        assert_eq!(
+            target_req,
+            PathBuf::from("/usr/lib/systemd/system/test.service")
+        );
+
+        assert!(is_unit_enabled(root_str, "test.service"));
+        assert!(was_unit_enabled(root_str, "test.service"));
+
+        disable_unit(root_str, "test.service");
+        assert!(!is_unit_enabled(root_str, "test.service"));
+        assert!(fs::symlink_metadata(&wants_link).is_err());
+        assert!(fs::symlink_metadata(&req_link).is_err());
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_deb_systemd_helper_bare_name_and_bare_target() {
+        let temp = std::env::temp_dir().join(format!("test_dsh_bare_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp);
+        let service_dir = temp.join("usr/lib/systemd/system");
+        fs::create_dir_all(&service_dir).unwrap();
+        fs::write(
+            service_dir.join("bare.service"),
+            "[Unit]\nDescription=Bare\n\n[Install]\nWantedBy=multi-user\n",
+        )
+        .unwrap();
+
+        let root_str = temp.to_str().unwrap();
+        // Invoke enable with "bare" instead of "bare.service"
+        enable_unit(root_str, "bare", false);
+
+        let wants_link = temp.join("etc/systemd/system/multi-user.target.wants/bare");
+        assert!(
+            fs::symlink_metadata(&wants_link).is_ok(),
+            "wants symlink should exist under normalized multi-user.target.wants"
+        );
+
+        let _ = fs::remove_dir_all(&temp);
+    }
 }

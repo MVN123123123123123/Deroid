@@ -23,7 +23,9 @@ pub use gestures::{
     TouchPhase,
 };
 pub use ime::{ImeAction, KeyboardLayout, VirtualKeyboard};
-pub use launcher::{AppDrawer, DrawerState, GridItem, HotseatDock, SpringConfig, SpringOscillator, WorkspaceGrid};
+pub use launcher::{
+    AppDrawer, DrawerState, GridItem, HotseatDock, SpringConfig, SpringOscillator, WorkspaceGrid,
+};
 pub use lockscreen::{FingerprintHalBridge, FingerprintResult, LockScreen, LockState, MediaWidget};
 pub use power_sync::{oom_roles, UtimPowerSync};
 pub use protocols::{
@@ -33,4 +35,6 @@ pub use protocols::{
 pub use recents::{KillProgress, RecentsCard, RecentsCarousel, SplitScreenConfig};
 pub use scene::{plane_z_order, MobileScene, ShellMode};
 pub use server::{CompositorMetrics, WaylandServer};
-pub use systemui::{CellularRat, NotificationCard, QuickTile, QuickTileKind, StatusBarState, SystemUiShade};
+pub use systemui::{
+    CellularRat, NotificationCard, QuickTile, QuickTileKind, StatusBarState, SystemUiShade,
+};

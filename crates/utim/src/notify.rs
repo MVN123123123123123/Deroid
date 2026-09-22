@@ -73,9 +73,10 @@ impl NotifyServer {
             msg.msg_iov = &mut iov;
             msg.msg_iovlen = 1;
             msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
-            msg.msg_controllen = cmsg_buf.len();
+            msg.msg_controllen = cmsg_buf.len() as _;
 
-            let ret = unsafe { libc::recvmsg(self.socket.as_raw_fd(), &mut msg, libc::MSG_DONTWAIT) };
+            let ret =
+                unsafe { libc::recvmsg(self.socket.as_raw_fd(), &mut msg, libc::MSG_DONTWAIT) };
             if ret < 0 {
                 let err = io::Error::last_os_error();
                 if err.kind() == io::ErrorKind::WouldBlock {
@@ -91,7 +92,9 @@ impl NotifyServer {
                 unsafe {
                     let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
                     while !cmsg.is_null() {
-                        if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_CREDENTIALS {
+                        if (*cmsg).cmsg_level == libc::SOL_SOCKET
+                            && (*cmsg).cmsg_type == libc::SCM_CREDENTIALS
+                        {
                             let ucred_ptr = libc::CMSG_DATA(cmsg) as *const libc::ucred;
                             let ucred = *ucred_ptr;
                             if ucred.pid > 0 {
@@ -113,7 +116,10 @@ impl NotifyServer {
     /// Read incoming datagram messages.
     #[allow(dead_code)]
     pub fn recv_messages(&self) -> Vec<NotifyMessage> {
-        self.recv_messages_with_sender().into_iter().map(|(m, _)| m).collect()
+        self.recv_messages_with_sender()
+            .into_iter()
+            .map(|(m, _)| m)
+            .collect()
     }
 }
 

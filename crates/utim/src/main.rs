@@ -42,7 +42,9 @@ fn main() {
     let early_start = Instant::now();
 
     if force_system && !test_mode {
-        println!("[UTIM] Mounting early pseudo-filesystems (/proc, /sys, /dev, /run, cgroup v2)...");
+        println!(
+            "[UTIM] Mounting early pseudo-filesystems (/proc, /sys, /dev, /run, cgroup v2)..."
+        );
         if let Err(e) = mount_early_filesystems() {
             eprintln!("[UTIM] Warning: Early mount error: {}", e);
         }
@@ -89,7 +91,10 @@ fn main() {
         ]
     };
 
-    println!("[UTIM] Loading systemd units from search paths: {:?}", default_paths);
+    println!(
+        "[UTIM] Loading systemd units from search paths: {:?}",
+        default_paths
+    );
     supervisor.load_systemd_units(&default_paths);
     println!("[UTIM] Total units loaded: {}", supervisor.dag.len());
 
@@ -97,7 +102,10 @@ fn main() {
     let cycles = supervisor.dag.detect_cycles();
     if !cycles.is_empty() {
         for cycle in cycles {
-            eprintln!("[UTIM] Warning: Dependency cycle detected in units: {:?}", cycle);
+            eprintln!(
+                "[UTIM] Warning: Dependency cycle detected in units: {:?}",
+                cycle
+            );
         }
     }
 
@@ -130,9 +138,19 @@ fn main() {
     register_epoll(epoll_fd, notify_server.as_raw_fd(), libc::EPOLLIN as u32);
     register_epoll(epoll_fd, control_server.as_raw_fd(), libc::EPOLLIN as u32);
 
+    let mut registered_sockets: std::collections::HashSet<RawFd> = std::collections::HashSet::new();
+    for fd in supervisor.sockets.all_fds() {
+        if registered_sockets.insert(fd) {
+            register_epoll(epoll_fd, fd, libc::EPOLLIN as u32);
+        }
+    }
+
     if test_mode {
         if let Some(target) = args.iter().find(|a| a.ends_with(".target")) {
-            println!("[UTIM] Test mode: Bootstrapping requested target: {}", target);
+            println!(
+                "[UTIM] Test mode: Bootstrapping requested target: {}",
+                target
+            );
             let _ = supervisor.start_unit(target);
         } else {
             println!("[UTIM] Test mode: Skipping target bootstrap.");
@@ -159,13 +177,33 @@ fn main() {
     println!("[UTIM] Bootstrapping target: {}", target);
     let _ = supervisor.start_unit(&target);
 
+    // Register any newly bound sockets from bootstrap
+    for fd in supervisor.sockets.all_fds() {
+        if registered_sockets.insert(fd) {
+            register_epoll(epoll_fd, fd, libc::EPOLLIN as u32);
+        }
+    }
+
     // Main event loop
     let mut events: [libc::epoll_event; MAX_EPOLL_EVENTS] = unsafe { std::mem::zeroed() };
     let mut last_psi_check = Instant::now();
 
+    let mut registered_socket_count = supervisor.sockets.count();
+
     println!("[UTIM] Entering permanent epoll event loop...");
 
     loop {
+        // Register any newly opened activation sockets only when new sockets exist
+        let current_count = supervisor.sockets.count();
+        if current_count != registered_socket_count {
+            registered_socket_count = current_count;
+            for fd in supervisor.sockets.all_fds() {
+                if registered_sockets.insert(fd) {
+                    register_epoll(epoll_fd, fd, libc::EPOLLIN as u32);
+                }
+            }
+        }
+
         let timeout_ms = 250; // 250ms event polling for timer checks and pending restarts
         let nfds = unsafe {
             libc::epoll_wait(
@@ -191,7 +229,8 @@ fn main() {
                                 }
                             }
                             libc::SIGTERM | libc::SIGINT | libc::SIGPWR => {
-                                supervisor.log_msg("Received shutdown signal. Syncing filesystems and powering off...");
+                                supervisor.log_msg("Received shutdown signal. Tearing down units, syncing filesystems and powering off...");
+                                supervisor.shutdown_all_units();
                                 unsafe {
                                     libc::sync();
                                     if !test_mode {
@@ -201,7 +240,8 @@ fn main() {
                                 return;
                             }
                             libc::SIGHUP => {
-                                supervisor.log_msg("Received SIGHUP, reloading unit definitions...");
+                                supervisor
+                                    .log_msg("Received SIGHUP, reloading unit definitions...");
                                 supervisor.load_systemd_units(&default_paths);
                             }
                             _ => {}
@@ -221,6 +261,15 @@ fn main() {
                     if let Ok(stream) = control_server.accept() {
                         handle_client_connection(&mut supervisor, stream, &default_paths);
                     }
+                } else if let Some(active_sock) = supervisor.sockets.find_by_fd(fd).cloned() {
+                    let svc_name = active_sock.service_name;
+                    if let Some(node) = supervisor.dag.get(&svc_name) {
+                        if node.state != UnitState::Active && node.state != UnitState::Activating {
+                            supervisor
+                                .log_msg(&format!("Socket activation triggered for {}", svc_name));
+                            let _ = supervisor.start_unit(&svc_name);
+                        }
+                    }
                 }
             }
         }
@@ -228,12 +277,17 @@ fn main() {
         // Process pending delayed restarts
         supervisor.process_pending_restarts();
 
+        // Process watchdog timer checks
+        supervisor.check_watchdogs();
+
         // Check MMPS memory pressure every 5 seconds
         if last_psi_check.elapsed() >= Duration::from_secs(5) {
             last_psi_check = Instant::now();
             let level = supervisor.mmps.evaluate_pressure_level();
             if level == MemoryPressureLevel::Critical {
-                supervisor.log_msg("CRITICAL Memory Pressure detected via PSI! Triggering background app reclaim.");
+                supervisor.log_msg(
+                    "CRITICAL Memory Pressure detected via PSI! Triggering background app reclaim.",
+                );
             }
         }
     }
@@ -276,13 +330,10 @@ fn handle_client_connection(
             Ok(_) => IpcResponse::Ok(format!("Stopped {}", unit)),
             Err(e) => IpcResponse::Err(e.to_string()),
         },
-        IpcRequest::Restart(unit) => {
-            let _ = supervisor.stop_unit(&unit);
-            match supervisor.start_unit(&unit) {
-                Ok(_) => IpcResponse::Ok(format!("Restarted {}", unit)),
-                Err(e) => IpcResponse::Err(e.to_string()),
-            }
-        }
+        IpcRequest::Restart(unit) => match supervisor.restart_unit(&unit) {
+            Ok(_) => IpcResponse::Ok(format!("Restarted {}", unit)),
+            Err(e) => IpcResponse::Err(e.to_string()),
+        },
         IpcRequest::Reload(unit) => match supervisor.reload_unit(&unit) {
             Ok(_) => IpcResponse::Ok(format!("Reloaded {}", unit)),
             Err(e) => IpcResponse::Err(e.to_string()),
@@ -372,6 +423,7 @@ fn handle_client_connection(
             supervisor.log_msg("System reboot requested via control socket");
             let resp = IpcResponse::Ok("Rebooting".to_string());
             let _ = write_response(&stream, &resp);
+            supervisor.shutdown_all_units();
             unsafe {
                 libc::sync();
                 libc::reboot(libc::RB_AUTOBOOT);
@@ -382,6 +434,7 @@ fn handle_client_connection(
             supervisor.log_msg("System poweroff requested via control socket");
             let resp = IpcResponse::Ok("Powering off".to_string());
             let _ = write_response(&stream, &resp);
+            supervisor.shutdown_all_units();
             unsafe {
                 libc::sync();
                 libc::reboot(libc::RB_POWER_OFF);

@@ -229,7 +229,8 @@ impl VsyncPresentationValidator {
         if self.last_present_ns > 0 {
             if present_timestamp_ns < self.last_present_ns {
                 let clamped_skew = ((present_timestamp_ns as i128) - (self.last_present_ns as i128))
-                    .clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+                    .clamp(i64::MIN as i128, i64::MAX as i128)
+                    as i64;
                 return Err(VsyncError::ScreenTearingDetected {
                     frame_seq: self.presented_frames + 1,
                     skew_ns: clamped_skew,
@@ -304,7 +305,9 @@ mod tests {
         assert_eq!(evt1.timestamp_ns, 1_000_000);
         assert_eq!(evt1.period_ns, 8_333_333);
 
-        let evt2 = ctrl.on_hardware_vsync(1_000_000 + 8_333_333).expect("Event 2");
+        let evt2 = ctrl
+            .on_hardware_vsync(1_000_000 + 8_333_333)
+            .expect("Event 2");
         assert_eq!(evt2.sequence, 2);
     }
 
@@ -359,10 +362,15 @@ mod tests {
         assert!(err_extreme.is_err());
 
         // Validate a good frame at 1s
-        validator.validate_frame_presentation(1_000_000_000, 1_000_010_000).unwrap();
+        validator
+            .validate_frame_presentation(1_000_000_000, 1_000_010_000)
+            .unwrap();
 
         // Second frame presented with timestamp LESS than previous (monotonicity violation)
         let err_backwards = validator.validate_frame_presentation(1_016_666_667, 900_000_000);
-        assert!(err_backwards.is_err(), "Out-of-order frame presentation must be rejected");
+        assert!(
+            err_backwards.is_err(),
+            "Out-of-order frame presentation must be rejected"
+        );
     }
 }

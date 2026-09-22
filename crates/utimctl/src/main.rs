@@ -13,7 +13,10 @@ fn main() {
 
     // Handle symlink invocations like /sbin/reboot, /sbin/poweroff, /sbin/halt
     if let Some(prog) = args.first() {
-        let prog_name = Path::new(prog).file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let prog_name = Path::new(prog)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
         match prog_name {
             "reboot" => {
                 run_simple_cmd(&socket_path, IpcRequest::Reboot);
@@ -179,7 +182,11 @@ fn run_simple_cmd(socket_path: &Path, req: IpcRequest) {
         }
         Ok(_) => process::exit(0),
         Err(e) => {
-            eprintln!("Failed to connect to UTIM daemon at {}: {}", socket_path.display(), e);
+            eprintln!(
+                "Failed to connect to UTIM daemon at {}: {}",
+                socket_path.display(),
+                e
+            );
             process::exit(1);
         }
     }
@@ -197,7 +204,9 @@ fn run_status_cmd(socket_path: &Path, unit: String) {
             let symbol = if state == "active" { "●" } else { "○" };
             println!("{} {} - {}", symbol, name, description);
             println!("     Loaded: loaded (/usr/lib/systemd/system/{})", name);
-            let pid_str = pid.map(|p| p.to_string()).unwrap_or_else(|| "none".to_string());
+            let pid_str = pid
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "none".to_string());
             println!("     Active: {} (PID: {})", state, pid_str);
             if !details.is_empty() {
                 println!("\n{}", details);
@@ -215,7 +224,11 @@ fn run_status_cmd(socket_path: &Path, unit: String) {
         }
         Ok(_) => process::exit(1),
         Err(e) => {
-            eprintln!("Failed to connect to UTIM daemon at {}: {}", socket_path.display(), e);
+            eprintln!(
+                "Failed to connect to UTIM daemon at {}: {}",
+                socket_path.display(),
+                e
+            );
             process::exit(1);
         }
     }
@@ -255,11 +268,13 @@ fn check_enabled_glob(unit: &str) -> bool {
     if let Ok(entries) = std::fs::read_dir(etc_systemd) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_dir()
-                && path.extension().and_then(|s| s.to_str()) == Some("wants")
-                && path.join(unit).exists()
-            {
-                return true;
+            if path.is_dir() {
+                let ext = path.extension().and_then(|s| s.to_str());
+                if (ext == Some("wants") || ext == Some("requires"))
+                    && std::fs::symlink_metadata(path.join(unit)).is_ok()
+                {
+                    return true;
+                }
             }
         }
     }
@@ -267,7 +282,7 @@ fn check_enabled_glob(unit: &str) -> bool {
 }
 
 fn run_enable_cmd(unit: &str) {
-    // Read unit file to discover WantedBy=
+    // Read unit file to discover WantedBy= and RequiredBy=
     let unit_paths = [
         format!("/etc/systemd/system/{}", unit),
         format!("/usr/lib/systemd/system/{}", unit),
@@ -291,9 +306,30 @@ fn run_enable_cmd(unit: &str) {
     if let Ok(content) = std::fs::read_to_string(&path) {
         let parsed = utim_core::unit::parse_unit(unit, &path, &content);
         for target in &parsed.install.wanted_by {
-            let target_wants = format!("/etc/systemd/system/{}.wants", target);
+            let target_name = if target.contains('.') {
+                target.clone()
+            } else {
+                format!("{}.target", target)
+            };
+            let target_wants = format!("/etc/systemd/system/{}.wants", target_name);
             let _ = std::fs::create_dir_all(&target_wants);
             let symlink_path = format!("{}/{}", target_wants, unit);
+            let _ = std::fs::remove_file(&symlink_path);
+            if let Err(e) = std::os::unix::fs::symlink(&path, &symlink_path) {
+                eprintln!("Failed to create symlink {}: {}", symlink_path, e);
+                process::exit(1);
+            }
+            println!("Created symlink {} -> {}.", symlink_path, path.display());
+        }
+        for target in &parsed.install.required_by {
+            let target_name = if target.contains('.') {
+                target.clone()
+            } else {
+                format!("{}.target", target)
+            };
+            let target_req = format!("/etc/systemd/system/{}.requires", target_name);
+            let _ = std::fs::create_dir_all(&target_req);
+            let symlink_path = format!("{}/{}", target_req, unit);
             let _ = std::fs::remove_file(&symlink_path);
             if let Err(e) = std::os::unix::fs::symlink(&path, &symlink_path) {
                 eprintln!("Failed to create symlink {}: {}", symlink_path, e);
@@ -310,11 +346,14 @@ fn run_disable_cmd(unit: &str) {
     if let Ok(entries) = std::fs::read_dir(etc_systemd) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_dir() && path.extension().and_then(|s| s.to_str()) == Some("wants") {
-                let symlink_path = path.join(unit);
-                if symlink_path.exists() {
-                    let _ = std::fs::remove_file(&symlink_path);
-                    println!("Removed {}.", symlink_path.display());
+            if path.is_dir() {
+                let ext = path.extension().and_then(|s| s.to_str());
+                if ext == Some("wants") || ext == Some("requires") {
+                    let symlink_path = path.join(unit);
+                    if std::fs::symlink_metadata(&symlink_path).is_ok() {
+                        let _ = std::fs::remove_file(&symlink_path);
+                        println!("Removed {}.", symlink_path.display());
+                    }
                 }
             }
         }
@@ -356,7 +395,11 @@ fn run_list_units(socket_path: &Path) {
         }
         Ok(_) => process::exit(1),
         Err(e) => {
-            eprintln!("Failed to connect to UTIM daemon at {}: {}", socket_path.display(), e);
+            eprintln!(
+                "Failed to connect to UTIM daemon at {}: {}",
+                socket_path.display(),
+                e
+            );
             process::exit(1);
         }
     }
@@ -378,7 +421,11 @@ fn run_analyze(socket_path: &Path) {
         }
         Ok(_) => process::exit(1),
         Err(e) => {
-            eprintln!("Failed to connect to UTIM daemon at {}: {}", socket_path.display(), e);
+            eprintln!(
+                "Failed to connect to UTIM daemon at {}: {}",
+                socket_path.display(),
+                e
+            );
             process::exit(1);
         }
     }

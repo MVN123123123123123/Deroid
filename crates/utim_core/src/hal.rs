@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HalInterfaceMode {
-    LegacyHidl,     // Android 8 - 11: /dev/hwbinder, hwservicemanager
-    ModernAidl,     // Android 12 - 16+: /dev/binder, servicemanager
+    LegacyHidl, // Android 8 - 11: /dev/hwbinder, hwservicemanager
+    ModernAidl, // Android 12 - 16+: /dev/binder, servicemanager
     Unknown,
 }
 
@@ -39,20 +39,44 @@ impl HalManager {
 
     /// Inspect VINTF manifest to determine if device uses HIDL or Stable AIDL.
     pub fn detect_interface_mode(&self) -> HalInterfaceMode {
-        let candidates = [
+        let mut candidates = vec![
             self.vendor_dir.join("etc/vintf/manifest.xml"),
             self.vendor_dir.join("manifest.xml"),
         ];
 
-        for manifest_path in &candidates {
-            if let Ok(content) = std::fs::read_to_string(manifest_path) {
-                if content.contains("format=\"aidl\"") || content.contains("<aidl>") {
-                    return HalInterfaceMode::ModernAidl;
-                }
-                if content.contains("format=\"hidl\"") || content.contains("<hidl>") {
-                    return HalInterfaceMode::LegacyHidl;
+        // Search VINTF fragment directory /vendor/etc/vintf/manifest/*.xml
+        let fragment_dir = self.vendor_dir.join("etc/vintf/manifest");
+        if let Ok(entries) = std::fs::read_dir(&fragment_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) == Some("xml") {
+                    candidates.push(path);
                 }
             }
+        }
+
+        let mut found_aidl = false;
+        let mut found_hidl = false;
+
+        for manifest_path in &candidates {
+            if let Ok(content) = std::fs::read_to_string(manifest_path) {
+                if content.contains("format=\"aidl\"")
+                    || content.contains("<aidl>")
+                    || content.contains("composer3")
+                {
+                    found_aidl = true;
+                }
+                if content.contains("format=\"hidl\"") || content.contains("<hidl>") {
+                    found_hidl = true;
+                }
+            }
+        }
+
+        if found_aidl {
+            return HalInterfaceMode::ModernAidl;
+        }
+        if found_hidl {
+            return HalInterfaceMode::LegacyHidl;
         }
 
         // Fallback: If /dev/binder exists and /dev/hwbinder does not, assume AIDL
@@ -70,39 +94,52 @@ impl HalManager {
             (
                 "android-hal-composer.service",
                 "Android Hardware Composer (HWC) Display HAL",
-                vec!["/vendor/bin/hw/android.hardware.graphics.composer@2.1-service",
-                     "/vendor/bin/hw/android.hardware.graphics.composer3-service"],
+                vec![
+                    "/vendor/bin/hw/android.hardware.graphics.composer@2.1-service",
+                    "/vendor/bin/hw/android.hardware.graphics.composer3-service",
+                ],
             ),
             (
                 "android-hal-audio.service",
                 "Android Audio Hardware Abstraction Layer",
-                vec!["/vendor/bin/hw/android.hardware.audio.service",
-                     "/vendor/bin/hw/android.hardware.audio.core-service"],
+                vec![
+                    "/vendor/bin/hw/android.hardware.audio.service",
+                    "/vendor/bin/hw/android.hardware.audio.core-service",
+                ],
             ),
             (
                 "android-hal-radio.service",
                 "Android Cellular Baseband Radio Interface Layer (rild)",
-                vec!["/vendor/bin/hw/rild",
-                     "/vendor/bin/hw/android.hardware.radio-service"],
+                vec![
+                    "/vendor/bin/hw/rild",
+                    "/vendor/bin/hw/android.hardware.radio-service",
+                ],
             ),
             (
                 "android-hal-camera.service",
                 "Android Camera Provider HAL3",
-                vec!["/vendor/bin/hw/android.hardware.camera.provider@2.4-service",
-                     "/vendor/bin/hw/android.hardware.camera.provider-service"],
+                vec![
+                    "/vendor/bin/hw/android.hardware.camera.provider@2.4-service",
+                    "/vendor/bin/hw/android.hardware.camera.provider-service",
+                ],
             ),
             (
                 "android-hal-sensors.service",
                 "Android Sensors Hardware Abstraction Layer",
-                vec!["/vendor/bin/hw/android.hardware.sensors@1.0-service",
-                     "/vendor/bin/hw/android.hardware.sensors-service"],
+                vec![
+                    "/vendor/bin/hw/android.hardware.sensors@1.0-service",
+                    "/vendor/bin/hw/android.hardware.sensors-service",
+                ],
             ),
         ];
 
         let mut units = Vec::new();
 
         for (name, desc, candidate_bins) in hal_defs {
-            let mut unit = SystemdUnit::new(name.to_string(), PathBuf::from(format!("/synthetic/{}", name)));
+            let mut unit = SystemdUnit::new(
+                name.to_string(),
+                PathBuf::from(format!("/synthetic/{}", name)),
+            );
             unit.unit.description = desc.to_string();
             unit.unit.default_dependencies = false;
 
@@ -152,12 +189,46 @@ mod tests {
         fs::write(vintf_dir.join("manifest.xml"), manifest).unwrap();
 
         let hal_mgr = HalManager::with_vendor(temp_dir.clone());
-        assert_eq!(hal_mgr.detect_interface_mode(), HalInterfaceMode::ModernAidl);
+        assert_eq!(
+            hal_mgr.detect_interface_mode(),
+            HalInterfaceMode::ModernAidl
+        );
 
         let units = hal_mgr.create_synthetic_units();
         assert_eq!(units.len(), 5);
         assert_eq!(units[0].name, "android-hal-composer.service");
-        assert_eq!(units[0].service.as_ref().unwrap().oom_score_adjust, Some(-700));
+        assert_eq!(
+            units[0].service.as_ref().unwrap().oom_score_adjust,
+            Some(-700)
+        );
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_vintf_fragment_directory_search() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("utim_test_vintf_frag_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        let fragment_dir = temp_dir.join("etc/vintf/manifest");
+        fs::create_dir_all(&fragment_dir).unwrap();
+
+        // Write fragment file hwc3.xml
+        let fragment_content = r#"
+<manifest version="5.0" type="device">
+    <hal format="aidl">
+        <name>android.hardware.graphics.composer3</name>
+        <fqname>IComposer/default</fqname>
+    </hal>
+</manifest>
+"#;
+        fs::write(fragment_dir.join("hwc3.xml"), fragment_content).unwrap();
+
+        let hal_mgr = HalManager::with_vendor(temp_dir.clone());
+        assert_eq!(
+            hal_mgr.detect_interface_mode(),
+            HalInterfaceMode::ModernAidl
+        );
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

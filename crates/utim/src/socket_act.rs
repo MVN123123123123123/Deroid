@@ -11,6 +11,7 @@ use utim_core::unit::SocketSection;
 
 pub const SD_LISTEN_FDS_START: i32 = 3;
 
+#[derive(Clone)]
 #[allow(dead_code)]
 pub struct ActiveSocket {
     pub name: String,
@@ -77,6 +78,11 @@ impl SocketActivationManager {
             .filter(|s| s.service_name == service_name)
             .map(|s| s.raw_fd)
             .collect()
+    }
+
+    #[allow(dead_code)]
+    pub fn count(&self) -> usize {
+        self.active_sockets.len()
     }
 
     #[allow(dead_code)]

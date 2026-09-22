@@ -20,9 +20,9 @@ use crate::graphics::composer::HwcComposer;
 pub struct CompositorMetrics {
     pub resident_memory_bytes: usize, // RSS bytes from /proc/self/statm
     pub boot_to_launcher_duration: Duration, // Cold boot startup to first presented frame
-    pub touch_processing_latency: Duration,  // Sub-8ms input guarantee
-    pub is_rss_within_target: bool,          // RSS < 15 MB
-    pub is_boot_within_target: bool,         // Boot < 0.45s
+    pub touch_processing_latency: Duration, // Sub-8ms input guarantee
+    pub is_rss_within_target: bool,   // RSS < 15 MB
+    pub is_boot_within_target: bool,  // Boot < 0.45s
 }
 
 /// Wayland Compositor Server
@@ -90,7 +90,11 @@ impl WaylandServer {
     /// Simulate or perform cold boot to first rendered frame
     pub fn boot_to_first_frame(&mut self) -> Result<Duration, String> {
         self.scene.prepare_frame()?;
-        let vsync = if self.last_vsync_ns == 0 { 1_000_000_000u64 } else { self.last_vsync_ns };
+        let vsync = if self.last_vsync_ns == 0 {
+            1_000_000_000u64
+        } else {
+            self.last_vsync_ns
+        };
         let present = vsync + 10_000;
         self.scene.present_frame(vsync, present)?;
         self.last_vsync_ns = vsync;
@@ -121,7 +125,9 @@ impl WaylandServer {
         let rss = self.measure_resident_memory();
         let boot_dur = match self.first_frame_presented_at {
             Some(t) => t.duration_since(self.start_time),
-            None => self.boot_to_first_frame().unwrap_or(Duration::from_millis(150)),
+            None => self
+                .boot_to_first_frame()
+                .unwrap_or(Duration::from_millis(150)),
         };
 
         // Measure input latency on synthetic touch

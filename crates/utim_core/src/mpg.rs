@@ -139,7 +139,8 @@ mod tests {
         fs::write(power_dir.join("autosleep"), "off\n").unwrap();
         fs::write(cgroup_dir.join("user.slice").join("cgroup.freeze"), "0\n").unwrap();
 
-        let mut mpg = MobilePowerGovernor::with_paths(power_dir.clone(), cgroup_dir.clone(), battery_dir);
+        let mut mpg =
+            MobilePowerGovernor::with_paths(power_dir.clone(), cgroup_dir.clone(), battery_dir);
 
         mpg.acquire_wake_lock("test_lock").unwrap();
         assert!(mpg.has_active_wake_locks());

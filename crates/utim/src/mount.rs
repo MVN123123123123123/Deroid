@@ -8,13 +8,35 @@ use utim_core::fstab::parse_fstab;
 
 pub fn mount_early_filesystems() -> io::Result<()> {
     // 1. Mount /proc
-    mount_fs("proc", "/proc", "proc", libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC, None)?;
+    mount_fs(
+        "proc",
+        "/proc",
+        "proc",
+        libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+        None,
+    )?;
 
     // 2. Mount /sys
-    mount_fs("sysfs", "/sys", "sysfs", libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC, None)?;
+    mount_fs(
+        "sysfs",
+        "/sys",
+        "sysfs",
+        libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+        None,
+    )?;
 
-    // 3. Mount /dev (devtmpfs)
-    mount_fs("devtmpfs", "/dev", "devtmpfs", libc::MS_NOSUID, Some("mode=0755"))?;
+    // 3. Mount /dev (devtmpfs with fallback to tmpfs for kernels with CONFIG_DEVTMPFS=n)
+    if mount_fs(
+        "devtmpfs",
+        "/dev",
+        "devtmpfs",
+        libc::MS_NOSUID,
+        Some("mode=0755"),
+    )
+    .is_err()
+    {
+        let _ = mount_fs("tmpfs", "/dev", "tmpfs", libc::MS_NOSUID, Some("mode=0755"));
+    }
 
     // Create standard dev subdirectories
     let _ = fs::create_dir_all("/dev/pts");
@@ -22,13 +44,31 @@ pub fn mount_early_filesystems() -> io::Result<()> {
     let _ = fs::create_dir_all("/dev/socket");
 
     // 4. Mount /dev/pts
-    mount_fs("devpts", "/dev/pts", "devpts", libc::MS_NOSUID | libc::MS_NOEXEC, Some("mode=0620,ptmxmode=0666"))?;
+    mount_fs(
+        "devpts",
+        "/dev/pts",
+        "devpts",
+        libc::MS_NOSUID | libc::MS_NOEXEC,
+        Some("mode=0620,ptmxmode=0666"),
+    )?;
 
     // 5. Mount /dev/shm
-    mount_fs("tmpfs", "/dev/shm", "tmpfs", libc::MS_NOSUID | libc::MS_NODEV, Some("mode=1777"))?;
+    mount_fs(
+        "tmpfs",
+        "/dev/shm",
+        "tmpfs",
+        libc::MS_NOSUID | libc::MS_NODEV,
+        Some("mode=1777"),
+    )?;
 
     // 6. Mount /run
-    mount_fs("tmpfs", "/run", "tmpfs", libc::MS_NOSUID | libc::MS_NODEV, Some("mode=0755"))?;
+    mount_fs(
+        "tmpfs",
+        "/run",
+        "tmpfs",
+        libc::MS_NOSUID | libc::MS_NODEV,
+        Some("mode=0755"),
+    )?;
 
     // Create systemd compatibility directory marker!
     // This allows Debian package maintainer scripts (dh_installsystemd / dpkg) to detect that systemd is active.
@@ -37,20 +77,85 @@ pub fn mount_early_filesystems() -> io::Result<()> {
 
     // 7. Mount cgroups v2
     let _ = fs::create_dir_all("/sys/fs/cgroup");
-    let _ = mount_fs("cgroup2", "/sys/fs/cgroup", "cgroup2", libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC, None);
+    let _ = mount_fs(
+        "cgroup2",
+        "/sys/fs/cgroup",
+        "cgroup2",
+        libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+        None,
+    );
     let _ = fs::create_dir_all("/sys/fs/cgroup/user.slice");
     let _ = fs::create_dir_all("/sys/fs/cgroup/system.slice");
 
+    // 8. Populate static /dev character nodes and standard symlinks
+    populate_static_dev_nodes();
+
+    // 9. Remount / read-write so userspace disk writes do not fail with EROFS
+    let c_root = CString::new("/").map_err(io::Error::other)?;
+    unsafe {
+        libc::mount(
+            std::ptr::null(),
+            c_root.as_ptr(),
+            std::ptr::null(),
+            libc::MS_REMOUNT,
+            std::ptr::null(),
+        );
+    }
+
     Ok(())
+}
+
+fn makedev(major: u32, minor: u32) -> libc::dev_t {
+    ((major as libc::dev_t & 0xfff) << 8)
+        | (minor as libc::dev_t & 0xff)
+        | (((major as libc::dev_t) & !0xfff) << 32)
+        | (((minor as libc::dev_t) & !0xff) << 12)
+}
+
+fn create_dev_node(path: &str, major: u32, minor: u32, mode: libc::mode_t) {
+    if fs::symlink_metadata(path).is_ok() {
+        return;
+    }
+    if let Ok(c_path) = CString::new(path) {
+        let dev = makedev(major, minor);
+        unsafe {
+            libc::mknod(c_path.as_ptr(), libc::S_IFCHR | mode, dev);
+        }
+    }
+}
+
+pub fn populate_static_dev_nodes() {
+    create_dev_node("/dev/null", 1, 3, 0o666);
+    create_dev_node("/dev/zero", 1, 5, 0o666);
+    create_dev_node("/dev/full", 1, 7, 0o666);
+    create_dev_node("/dev/random", 1, 8, 0o666);
+    create_dev_node("/dev/urandom", 1, 9, 0o666);
+    create_dev_node("/dev/console", 5, 1, 0o600);
+    create_dev_node("/dev/tty", 5, 0, 0o666);
+    create_dev_node("/dev/ptmx", 5, 2, 0o666);
+
+    let symlinks = [
+        ("/proc/self/fd", "/dev/fd"),
+        ("/proc/self/fd/0", "/dev/stdin"),
+        ("/proc/self/fd/1", "/dev/stdout"),
+        ("/proc/self/fd/2", "/dev/stderr"),
+    ];
+    for (src, dst) in symlinks {
+        if fs::symlink_metadata(dst).is_err() {
+            let _ = std::os::unix::fs::symlink(src, dst);
+        }
+    }
 }
 
 /// Parse vendor fstab and mount partitions (/vendor, /odm, /apex, /firmware, /dsp)
 pub fn mount_vendor_partitions() -> io::Result<()> {
     let candidate_fstabs = [
+        "/vendor/etc/fstab.ranchu",
         "/vendor/etc/fstab.default",
         "/vendor/etc/fstab.qcom",
         "/vendor/etc/fstab.mtk",
         "/odm/etc/fstab.default",
+        "/fstab.ranchu",
         "/fstab.default",
     ];
 
@@ -59,10 +164,35 @@ pub fn mount_vendor_partitions() -> io::Result<()> {
             let entries = parse_fstab(&content);
             for entry in entries {
                 let mnt = entry.mount_point.as_str();
-                if mnt == "/vendor" || mnt == "/odm" || mnt == "/firmware" || mnt == "/dsp" || mnt.starts_with("/apex") {
+                if mnt == "/vendor"
+                    || mnt == "/odm"
+                    || mnt == "/firmware"
+                    || mnt == "/dsp"
+                    || mnt.starts_with("/apex")
+                {
                     let _ = fs::create_dir_all(mnt);
                     let flags = entry.linux_mount_flags();
-                    let _ = mount_fs(&entry.src, mnt, &entry.fs_type, flags, None);
+
+                    let resolved_src = if Path::new(&entry.src).exists() {
+                        entry.src.clone()
+                    } else {
+                        let name = entry
+                            .src
+                            .trim_start_matches("/dev/block/mapper/")
+                            .trim_start_matches("/dev/block/by-name/")
+                            .trim_start_matches("/dev/block/bootdevice/by-name/");
+                        let mapper_path = format!("/dev/block/mapper/{}", name);
+                        let by_name_path = format!("/dev/block/by-name/{}", name);
+                        if Path::new(&mapper_path).exists() {
+                            mapper_path
+                        } else if Path::new(&by_name_path).exists() {
+                            by_name_path
+                        } else {
+                            entry.src.clone()
+                        }
+                    };
+
+                    let _ = mount_fs(&resolved_src, mnt, &entry.fs_type, flags, None);
                 }
             }
             break;
@@ -105,10 +235,12 @@ pub fn setup_binder_devnodes() -> io::Result<()> {
                         dev.name[i] = b as libc::c_char;
                     }
                     unsafe {
-                        libc::ioctl(fd, BINDER_CTL_ADD, &mut dev);
+                        libc::ioctl(fd, BINDER_CTL_ADD as _, &mut dev);
                     }
                 }
-                unsafe { libc::close(fd); }
+                unsafe {
+                    libc::close(fd);
+                }
             }
         }
 
@@ -143,7 +275,9 @@ fn mount_fs(
             c_target.as_ptr(),
             c_fstype.as_ptr(),
             flags,
-            c_data.as_ref().map_or(std::ptr::null(), |d| d.as_ptr() as *const libc::c_void),
+            c_data
+                .as_ref()
+                .map_or(std::ptr::null(), |d| d.as_ptr() as *const libc::c_void),
         )
     };
 

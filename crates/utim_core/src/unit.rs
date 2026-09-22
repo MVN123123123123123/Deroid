@@ -56,9 +56,9 @@ pub enum RestartPolicy {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecCommand {
-    pub ignore_failure: bool,  // Prefix '-'
-    pub privileged: bool,      // Prefix '+'
-    pub no_privileges: bool,   // Prefix '!'
+    pub ignore_failure: bool, // Prefix '-'
+    pub privileged: bool,     // Prefix '+'
+    pub no_privileges: bool,  // Prefix '!'
     pub binary: String,
     pub args: Vec<String>,
 }
@@ -437,9 +437,14 @@ pub fn parse_unit(name: &str, path: &Path, content: &str) -> SystemdUnit {
                 }
                 "ConditionPathExists" => unit.unit.condition_path_exists.push(val.to_string()),
                 "ConditionFileNotEmpty" => unit.unit.condition_file_not_empty.push(val.to_string()),
-                "ConditionDirectoryNotEmpty" => unit.unit.condition_directory_not_empty.push(val.to_string()),
+                "ConditionDirectoryNotEmpty" => unit
+                    .unit
+                    .condition_directory_not_empty
+                    .push(val.to_string()),
                 "DefaultDependencies" => {
-                    unit.unit.default_dependencies = val.eq_ignore_ascii_case("yes") || val == "1" || val.eq_ignore_ascii_case("true");
+                    unit.unit.default_dependencies = val.eq_ignore_ascii_case("yes")
+                        || val == "1"
+                        || val.eq_ignore_ascii_case("true");
                 }
                 _ => {}
             },
@@ -503,7 +508,8 @@ pub fn parse_unit(name: &str, path: &Path, content: &str) -> SystemdUnit {
                             }
                         }
                         "EnvironmentFile" => {
-                            let (optional, path_str) = if let Some(stripped) = val.strip_prefix('-') {
+                            let (optional, path_str) = if let Some(stripped) = val.strip_prefix('-')
+                            {
                                 (true, stripped.trim().to_string())
                             } else {
                                 (false, val.to_string())
@@ -686,7 +692,11 @@ pub fn expand_command_args(args: &[String], env: &HashMap<String, String>) -> Ve
         // Check if argument is a naked $VAR (word-splitting, drops if empty)
         if trimmed.starts_with('$') && !trimmed.starts_with("${") {
             let var_name = &trimmed[1..];
-            let val = env.get(var_name).cloned().or_else(|| std::env::var(var_name).ok()).unwrap_or_default();
+            let val = env
+                .get(var_name)
+                .cloned()
+                .or_else(|| std::env::var(var_name).ok())
+                .unwrap_or_default();
             for word in val.split_whitespace() {
                 expanded_args.push(word.to_string());
             }
@@ -728,7 +738,11 @@ WantedBy=multi-user.target
 Alias=sshd.service
 "#;
 
-        let unit = parse_unit("ssh.service", Path::new("/usr/lib/systemd/system/ssh.service"), content);
+        let unit = parse_unit(
+            "ssh.service",
+            Path::new("/usr/lib/systemd/system/ssh.service"),
+            content,
+        );
         assert_eq!(unit.name, "ssh.service");
         assert_eq!(unit.kind, UnitKind::Service);
         assert_eq!(unit.unit.description, "OpenBSD Secure Shell server");
@@ -791,7 +805,10 @@ Environment="DEBUG=1"
         env.insert("FOO".to_string(), "bar".to_string());
         env.insert("OPTS".to_string(), "-v -d".to_string());
 
-        assert_eq!(expand_env("cmd ${FOO} $OPTS end", &env), "cmd bar -v -d end");
+        assert_eq!(
+            expand_env("cmd ${FOO} $OPTS end", &env),
+            "cmd bar -v -d end"
+        );
     }
 
     #[test]
@@ -810,9 +827,6 @@ Environment="DEBUG=1"
 
         let expanded = expand_command_args(&raw_args, &env);
         // Empty opts dropped, multi-opts split into individual words, braced kept together
-        assert_eq!(
-            expanded,
-            vec!["-D", "-o", "Port=22", "-D", "hello world"]
-        );
+        assert_eq!(expanded, vec!["-D", "-o", "Port=22", "-D", "hello world"]);
     }
 }

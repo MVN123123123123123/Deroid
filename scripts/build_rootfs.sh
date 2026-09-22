@@ -47,6 +47,45 @@ if [[ "${DRY_RUN}" == "1" || "$(id -u)" != "0" ]]; then
     mkdir -p "${ROOTFS_DIR}/run/systemd/system"
     mkdir -p "${ROOTFS_DIR}/run/utim"
     mkdir -p "${ROOTFS_DIR}/var/lib/systemd/deb-systemd-helper-enabled"
+    mkdir -p "${ROOTFS_DIR}/proc" "${ROOTFS_DIR}/sys" "${ROOTFS_DIR}/dev"
+    mkdir -p "${ROOTFS_DIR}/lib" "${ROOTFS_DIR}/root" "${ROOTFS_DIR}/home" "${ROOTFS_DIR}/mnt"
+    rm -rf "${ROOTFS_DIR}/lib64"
+    ln -sfn "lib" "${ROOTFS_DIR}/lib64"
+
+    # Canonical systemd target definitions
+    cat << 'EOF' > "${ROOTFS_DIR}/usr/lib/systemd/system/basic.target"
+[Unit]
+Description=Basic System
+Documentation=man:systemd.special(7)
+EOF
+
+    cat << 'EOF' > "${ROOTFS_DIR}/usr/lib/systemd/system/multi-user.target"
+[Unit]
+Description=Multi-User System
+Documentation=man:systemd.special(7)
+Requires=basic.target
+Wants=basic.target
+After=basic.target
+EOF
+
+    cat << 'EOF' > "${ROOTFS_DIR}/usr/lib/systemd/system/graphical.target"
+[Unit]
+Description=Graphical Interface
+Documentation=man:systemd.special(7)
+Requires=multi-user.target
+Wants=multi-user.target
+After=multi-user.target
+EOF
+
+    ln -sfn "graphical.target" "${ROOTFS_DIR}/usr/lib/systemd/system/default.target"
+
+    # Copy essential aarch64 glibc libraries if cross-toolchain is available on host
+    if [[ -d "/usr/aarch64-linux-gnu/lib" ]]; then
+        echo "[*] Populating aarch64 glibc runtime into rootfs..."
+        cp -a /usr/aarch64-linux-gnu/lib/ld-linux-aarch64.so.1 "${ROOTFS_DIR}/lib/" || true
+        cp -a /usr/aarch64-linux-gnu/lib/libc.so.6 "${ROOTFS_DIR}/lib/" || true
+        cp -a /usr/aarch64-linux-gnu/lib/libgcc_s.so.1 "${ROOTFS_DIR}/lib/" || true
+    fi
 
     # Configure Debian Sid sources.list
     cat << 'EOF' > "${ROOTFS_DIR}/etc/apt/sources.list"
@@ -64,10 +103,13 @@ EOF
     echo "[*] Installing UTIM binaries, systemd shims, graphics check tool, and UTLC compositor..."
     cp "${WORKSPACE_ROOT}/target/aarch64-unknown-linux-gnu/release/utim" "${ROOTFS_DIR}/usr/bin/utim"
     ln -sf "/usr/bin/utim" "${ROOTFS_DIR}/sbin/init"
+    ln -sf "/usr/bin/utim" "${ROOTFS_DIR}/init"
 
     cp "${WORKSPACE_ROOT}/target/aarch64-unknown-linux-gnu/release/utimctl" "${ROOTFS_DIR}/usr/bin/utimctl"
     ln -sf "/usr/bin/utimctl" "${ROOTFS_DIR}/usr/bin/systemctl"
-    ln -sf "/usr/bin/systemctl" "${ROOTFS_DIR}/bin/systemctl"
+    if [[ ! -L "${ROOTFS_DIR}/bin" ]] || [[ "$(readlink "${ROOTFS_DIR}/bin")" != *"usr/bin"* && "$(readlink "${ROOTFS_DIR}/bin")" != "usr/bin" ]]; then
+        ln -sf "/usr/bin/utimctl" "${ROOTFS_DIR}/bin/systemctl"
+    fi
 
     cp "${WORKSPACE_ROOT}/target/aarch64-unknown-linux-gnu/release/deb-systemd-helper" "${ROOTFS_DIR}/usr/bin/deb-systemd-helper"
     cp "${WORKSPACE_ROOT}/target/aarch64-unknown-linux-gnu/release/deb-systemd-invoke" "${ROOTFS_DIR}/usr/bin/deb-systemd-invoke"
@@ -113,22 +155,53 @@ EOF
 echo "[*] Installing UTIM binaries, systemd shims, and graphics check tool..."
 cp "${WORKSPACE_ROOT}/target/aarch64-unknown-linux-gnu/release/utim" "${ROOTFS_DIR}/usr/bin/utim"
 ln -sf "/usr/bin/utim" "${ROOTFS_DIR}/sbin/init"
+ln -sf "/usr/bin/utim" "${ROOTFS_DIR}/init"
 
-cp "${WORKSPACE_ROOT}/target/aarch64-unknown-linux-gnu/release/utimctl" "${ROOTFS_DIR}/usr/bin/utimctl"
-ln -sf "/usr/bin/utimctl" "${ROOTFS_DIR}/usr/bin/systemctl"
-ln -sf "/usr/bin/systemctl" "${ROOTFS_DIR}/bin/systemctl"
+    cp "${WORKSPACE_ROOT}/target/aarch64-unknown-linux-gnu/release/utimctl" "${ROOTFS_DIR}/usr/bin/utimctl"
+    ln -sf "/usr/bin/utimctl" "${ROOTFS_DIR}/usr/bin/systemctl"
+    if [[ ! -L "${ROOTFS_DIR}/bin" ]] || [[ "$(readlink "${ROOTFS_DIR}/bin")" != *"usr/bin"* && "$(readlink "${ROOTFS_DIR}/bin")" != "usr/bin" ]]; then
+        ln -sf "/usr/bin/utimctl" "${ROOTFS_DIR}/bin/systemctl"
+    fi
 
-cp "${WORKSPACE_ROOT}/target/aarch64-unknown-linux-gnu/release/deb-systemd-helper" "${ROOTFS_DIR}/usr/bin/deb-systemd-helper"
-cp "${WORKSPACE_ROOT}/target/aarch64-unknown-linux-gnu/release/deb-systemd-invoke" "${ROOTFS_DIR}/usr/bin/deb-systemd-invoke"
-cp "${WORKSPACE_ROOT}/target/aarch64-unknown-linux-gnu/release/utim-graphics-check" "${ROOTFS_DIR}/usr/bin/utim-graphics-check"
-cp "${WORKSPACE_ROOT}/target/aarch64-unknown-linux-gnu/release/utlc" "${ROOTFS_DIR}/usr/bin/utlc"
+    cp "${WORKSPACE_ROOT}/target/aarch64-unknown-linux-gnu/release/deb-systemd-helper" "${ROOTFS_DIR}/usr/bin/deb-systemd-helper"
+    cp "${WORKSPACE_ROOT}/target/aarch64-unknown-linux-gnu/release/deb-systemd-invoke" "${ROOTFS_DIR}/usr/bin/deb-systemd-invoke"
+    cp "${WORKSPACE_ROOT}/target/aarch64-unknown-linux-gnu/release/utim-graphics-check" "${ROOTFS_DIR}/usr/bin/utim-graphics-check"
+    cp "${WORKSPACE_ROOT}/target/aarch64-unknown-linux-gnu/release/utlc" "${ROOTFS_DIR}/usr/bin/utlc"
 
-mkdir -p "${ROOTFS_DIR}/usr/lib/systemd/system"
-mkdir -p "${ROOTFS_DIR}/etc/systemd/system/graphical.target.wants"
-if [[ -f "${WORKSPACE_ROOT}/utlc.service" ]]; then
-    cp "${WORKSPACE_ROOT}/utlc.service" "${ROOTFS_DIR}/usr/lib/systemd/system/utlc.service"
-    ln -sf "/usr/lib/systemd/system/utlc.service" "${ROOTFS_DIR}/etc/systemd/system/graphical.target.wants/utlc.service"
-fi
+    mkdir -p "${ROOTFS_DIR}/usr/lib/systemd/system"
+    mkdir -p "${ROOTFS_DIR}/etc/systemd/system/graphical.target.wants"
+
+    # Canonical systemd target definitions
+    cat << 'EOF' > "${ROOTFS_DIR}/usr/lib/systemd/system/basic.target"
+[Unit]
+Description=Basic System
+Documentation=man:systemd.special(7)
+EOF
+
+    cat << 'EOF' > "${ROOTFS_DIR}/usr/lib/systemd/system/multi-user.target"
+[Unit]
+Description=Multi-User System
+Documentation=man:systemd.special(7)
+Requires=basic.target
+Wants=basic.target
+After=basic.target
+EOF
+
+    cat << 'EOF' > "${ROOTFS_DIR}/usr/lib/systemd/system/graphical.target"
+[Unit]
+Description=Graphical Interface
+Documentation=man:systemd.special(7)
+Requires=multi-user.target
+Wants=multi-user.target
+After=multi-user.target
+EOF
+
+    ln -sfn "graphical.target" "${ROOTFS_DIR}/usr/lib/systemd/system/default.target"
+
+    if [[ -f "${WORKSPACE_ROOT}/utlc.service" ]]; then
+        cp "${WORKSPACE_ROOT}/utlc.service" "${ROOTFS_DIR}/usr/lib/systemd/system/utlc.service"
+        ln -sf "/usr/lib/systemd/system/utlc.service" "${ROOTFS_DIR}/etc/systemd/system/graphical.target.wants/utlc.service"
+    fi
 
 mkdir -p "${ROOTFS_DIR}/run/systemd/system"
 mkdir -p "${ROOTFS_DIR}/run/utim"

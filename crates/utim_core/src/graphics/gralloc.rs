@@ -100,7 +100,7 @@ pub mod usage {
 
     // Vendor Compression flags
     pub const QCOM_USAGE_UBWC: u64 = 0x10000000; // Qualcomm Universal Bandwidth Compression
-    pub const ARM_USAGE_AFBC: u64 = 0x20000000;  // ARM Frame Buffer Compression
+    pub const ARM_USAGE_AFBC: u64 = 0x20000000; // ARM Frame Buffer Compression
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -230,7 +230,9 @@ pub enum GrallocError {
 impl fmt::Display for GrallocError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            GrallocError::UnsupportedFormat(fmt) => write!(f, "Unsupported pixel format: 0x{:x}", fmt),
+            GrallocError::UnsupportedFormat(fmt) => {
+                write!(f, "Unsupported pixel format: 0x{:x}", fmt)
+            }
             GrallocError::UnsupportedUsage(u) => write!(f, "Unsupported usage flags: 0x{:x}", u),
             GrallocError::AllocationFailed(s) => write!(f, "Gralloc allocation failed: {}", s),
             GrallocError::BufferNotFound(id) => write!(f, "Buffer handle {} not found", id),
@@ -559,7 +561,9 @@ impl GrallocManager {
         stride_pixels: Option<u32>,
     ) -> Result<DmaBufBuffer, GrallocError> {
         if raw_fd < 0 {
-            return Err(GrallocError::AllocationFailed("Invalid DMA-BUF descriptor".into()));
+            return Err(GrallocError::AllocationFailed(
+                "Invalid DMA-BUF descriptor".into(),
+            ));
         }
         if width == 0 || height == 0 || width > 16384 || height > 16384 {
             return Err(GrallocError::InvalidDimensions(width, height));
@@ -581,9 +585,8 @@ impl GrallocManager {
 
         let bpp = format.bytes_per_pixel();
         let stride_alignment = if is_ubwc { 64 } else { 32 };
-        let calc_stride_pixels = stride_pixels.unwrap_or_else(|| {
-            (width + stride_alignment - 1) & !(stride_alignment - 1)
-        });
+        let calc_stride_pixels = stride_pixels
+            .unwrap_or_else(|| (width + stride_alignment - 1) & !(stride_alignment - 1));
         let byte_stride = calc_stride_pixels * (bpp as u32);
         let slice_alignment = if is_ubwc { 32 } else { 16 };
         let slice_height = (height + slice_alignment - 1) & !(slice_alignment - 1);
@@ -730,7 +733,10 @@ mod tests {
         assert_eq!(buf.planes.len(), 2); // Y plane + UV plane
         assert_eq!(buf.planes[0].offset, 0);
         assert_eq!(buf.planes[1].offset, buf.planes[0].size_bytes as u64);
-        assert_eq!(buf.total_size_bytes, buf.planes[0].size_bytes + buf.planes[1].size_bytes);
+        assert_eq!(
+            buf.total_size_bytes,
+            buf.planes[0].size_bytes + buf.planes[1].size_bytes
+        );
     }
 
     #[test]
@@ -772,14 +778,20 @@ mod tests {
         let fd2 = buf2.fd.unwrap();
 
         // The file descriptors MUST be distinct numbers (duplicated via F_DUPFD_CLOEXEC)
-        assert_ne!(fd1, fd2, "Cloning DmaBufBuffer must produce an independent, duplicated fd");
+        assert_ne!(
+            fd1, fd2,
+            "Cloning DmaBufBuffer must produce an independent, duplicated fd"
+        );
 
         // Dropping buf2 closes fd2, but fd1 MUST remain valid!
         drop(buf2);
 
         // Verify fd1 is still open and valid
         let flags = unsafe { libc::fcntl(fd1, libc::F_GETFD) };
-        assert!(flags >= 0, "Original fd1 must remain open after dropping cloned buf2");
+        assert!(
+            flags >= 0,
+            "Original fd1 must remain open after dropping cloned buf2"
+        );
     }
 
     #[test]
@@ -813,13 +825,24 @@ mod tests {
 
         // Import the exported DMA-BUF fd
         let imported = mgr
-            .import_dmabuf(exported_fd, 256, 256, PixelFormat::Rgba8888, usage::HW_RENDER, None)
+            .import_dmabuf(
+                exported_fd,
+                256,
+                256,
+                PixelFormat::Rgba8888,
+                usage::HW_RENDER,
+                None,
+            )
             .expect("Import");
 
         assert_eq!(imported.width, 256);
         assert_eq!(imported.height, 256);
         assert!(imported.fd.is_some());
-        assert_ne!(imported.fd.unwrap(), exported_fd, "Import must duplicate descriptor");
+        assert_ne!(
+            imported.fd.unwrap(),
+            exported_fd,
+            "Import must duplicate descriptor"
+        );
 
         // Close exported_fd
         unsafe { libc::close(exported_fd) };
@@ -846,24 +869,14 @@ mod tests {
         );
 
         // UBWC on unsupported format (YV12)
-        let err_yv12_ubwc = mgr.allocate(
-            1920,
-            1080,
-            PixelFormat::Yv12,
-            usage::QCOM_USAGE_UBWC,
-        );
+        let err_yv12_ubwc = mgr.allocate(1920, 1080, PixelFormat::Yv12, usage::QCOM_USAGE_UBWC);
         assert_eq!(
             err_yv12_ubwc.unwrap_err(),
             GrallocError::UnsupportedUsage(usage::QCOM_USAGE_UBWC)
         );
 
         // AFBC on unsupported format (NV12)
-        let err_nv12_afbc = mgr.allocate(
-            1920,
-            1080,
-            PixelFormat::Nv12,
-            usage::ARM_USAGE_AFBC,
-        );
+        let err_nv12_afbc = mgr.allocate(1920, 1080, PixelFormat::Nv12, usage::ARM_USAGE_AFBC);
         assert_eq!(
             err_nv12_afbc.unwrap_err(),
             GrallocError::UnsupportedUsage(usage::ARM_USAGE_AFBC)

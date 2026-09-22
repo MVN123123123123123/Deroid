@@ -104,7 +104,11 @@ impl GpuDetector {
         let mali_node = self.dev_root.join("mali0");
         let mali_alt = self.dev_root.join("mali");
         if mali_node.exists() || mali_alt.exists() {
-            let active_node = if mali_node.exists() { mali_node } else { mali_alt };
+            let active_node = if mali_node.exists() {
+                mali_node
+            } else {
+                mali_alt
+            };
             let vendor_egl = self.vendor_root.join("lib64/egl/libEGL_mali.so");
             return GpuDeviceInfo {
                 architecture: GpuArchitecture::ArmMali,
@@ -141,7 +145,10 @@ impl GpuDetector {
                         device_node: Some("/dev/kgsl-3d0".into()),
                         driver_path: Some(entry.path().to_string_lossy().to_string()),
                     };
-                } else if name.contains("xclipse") || name.contains("exynos") || name.contains("samsung") {
+                } else if name.contains("xclipse")
+                    || name.contains("exynos")
+                    || name.contains("samsung")
+                {
                     return GpuDeviceInfo {
                         architecture: GpuArchitecture::SamsungExynos,
                         pipeline: GpuPipeline::HybrisEgl,
@@ -233,8 +240,12 @@ impl GpuDetector {
 
     /// Format environment variables as shell export lines or systemd environment format.
     pub fn format_env_file(&self, info: &GpuDeviceInfo) -> String {
-        let mut output = String::from("# Universal Treble Linux - Auto-generated GPU Pipeline Config\n");
-        output.push_str(&format!("# Detected Architecture: {}\n", info.architecture.name()));
+        let mut output =
+            String::from("# Universal Treble Linux - Auto-generated GPU Pipeline Config\n");
+        output.push_str(&format!(
+            "# Detected Architecture: {}\n",
+            info.architecture.name()
+        ));
         output.push_str(&format!("# Active Pipeline: {}\n", info.pipeline.name()));
         if let Some(chip) = &info.chip_model {
             output.push_str(&format!("# Chip Model: {}\n", chip));
@@ -314,7 +325,10 @@ mod tests {
         assert_eq!(info.pipeline, GpuPipeline::HybrisEgl);
 
         let env = detector.generate_environment_vars(&info);
-        assert_eq!(env.get("EGL_PLATFORM").map(|s| s.as_str()), Some("hwcomposer"));
+        assert_eq!(
+            env.get("EGL_PLATFORM").map(|s| s.as_str()),
+            Some("hwcomposer")
+        );
         assert!(env.get("LD_LIBRARY_PATH").unwrap().contains("libhybris"));
 
         let _ = fs::remove_dir_all(&temp_dir);
@@ -340,8 +354,14 @@ mod tests {
         assert!(!info.architecture.is_hardware_accelerated());
 
         let env = detector.generate_environment_vars(&info);
-        assert_eq!(env.get("LIBGL_ALWAYS_SOFTWARE").map(|s| s.as_str()), Some("1"));
-        assert_eq!(env.get("GALLIUM_DRIVER").map(|s| s.as_str()), Some("llvmpipe"));
+        assert_eq!(
+            env.get("LIBGL_ALWAYS_SOFTWARE").map(|s| s.as_str()),
+            Some("1")
+        );
+        assert_eq!(
+            env.get("GALLIUM_DRIVER").map(|s| s.as_str()),
+            Some("llvmpipe")
+        );
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

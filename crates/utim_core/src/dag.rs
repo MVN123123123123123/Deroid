@@ -112,15 +112,21 @@ impl UnitDag {
                 self.stack.push(v.to_string());
                 self.on_stack.insert(v.to_string());
 
-                let mut neighbors = Vec::new();
+                let mut neighbors_set = HashSet::new();
                 if let Some(node) = self.dag.nodes.get(v) {
-                    // Outgoing ordering edges: If A is After B, B comes before A (B -> A)
                     for after in &node.unit.unit.after {
                         if self.dag.nodes.contains_key(after) {
-                            neighbors.push(after.clone());
+                            neighbors_set.insert(after.clone());
                         }
                     }
                 }
+                for (other_name, other_node) in &self.dag.nodes {
+                    if other_node.unit.unit.before.contains(&v.to_string()) {
+                        neighbors_set.insert(other_name.clone());
+                    }
+                }
+                let mut neighbors: Vec<String> = neighbors_set.into_iter().collect();
+                neighbors.sort();
 
                 for w in &neighbors {
                     if !self.indices.contains_key(w) {
@@ -217,18 +223,20 @@ impl UnitDag {
             adj.insert(u.clone(), Vec::new());
         }
 
+        let mut edges: HashSet<(String, String)> = HashSet::new();
+
         for u in &needed {
             if let Some(node) = self.nodes.get(u) {
-                // u must run after 'after'
+                // u must run after 'after': edge after -> u
                 for after in &node.unit.unit.after {
-                    if needed.contains(after) {
+                    if needed.contains(after) && edges.insert((after.clone(), u.clone())) {
                         adj.get_mut(after).unwrap().push(u.clone());
                         *in_degree.get_mut(u).unwrap() += 1;
                     }
                 }
-                // u must run before 'before'
+                // u must run before 'before': edge u -> before
                 for before in &node.unit.unit.before {
-                    if needed.contains(before) {
+                    if needed.contains(before) && edges.insert((u.clone(), before.clone())) {
                         adj.get_mut(u).unwrap().push(before.clone());
                         *in_degree.get_mut(before).unwrap() += 1;
                     }
@@ -237,10 +245,15 @@ impl UnitDag {
         }
 
         let mut ready: VecDeque<String> = VecDeque::new();
+        let mut ready_nodes: Vec<String> = Vec::new();
         for (u, &deg) in &in_degree {
             if deg == 0 {
-                ready.push_back(u.clone());
+                ready_nodes.push(u.clone());
             }
+        }
+        ready_nodes.sort();
+        for u in ready_nodes {
+            ready.push_back(u);
         }
 
         let mut sorted = Vec::new();
@@ -267,7 +280,7 @@ impl UnitDag {
         sorted
     }
 
-    /// Check which units in `Inactive` have all their `After` dependencies satisfied.
+    /// Check which units in `Inactive` have all their `After` and `Before` dependencies satisfied.
     pub fn ready_to_spawn(&self, pending: &[String]) -> Vec<String> {
         let mut spawnable = Vec::new();
         for name in pending {
@@ -281,14 +294,36 @@ impl UnitDag {
                     if let Some(dep_node) = self.nodes.get(after) {
                         // Targets and oneshots count as satisfied if Active or Inactive (if succeeded)
                         dep_node.state == UnitState::Active
-                            || (dep_node.unit.kind == UnitKind::Target && dep_node.state == UnitState::Active)
+                            || (dep_node.unit.kind == UnitKind::Target
+                                && dep_node.state == UnitState::Active)
                     } else {
                         // Unloaded optional dependency treated as satisfied
                         true
                     }
                 });
 
-                if all_after_satisfied {
+                if !all_after_satisfied {
+                    continue;
+                }
+
+                // Check that no pending unit has declared Before=name and is not yet satisfied
+                let all_before_satisfied = self.nodes.iter().all(|(other_name, other_node)| {
+                    if other_name == name {
+                        return true;
+                    }
+                    if other_node.unit.unit.before.contains(name) {
+                        if pending.contains(other_name) {
+                            other_node.state == UnitState::Active
+                        } else {
+                            other_node.state == UnitState::Active
+                                || other_node.state == UnitState::Inactive
+                        }
+                    } else {
+                        true
+                    }
+                });
+
+                if all_before_satisfied {
                     spawnable.push(name.clone());
                 }
             }
@@ -347,9 +382,21 @@ mod tests {
     fn test_dag_cycle_detection() {
         let mut dag = UnitDag::new();
 
-        let a = parse_unit("a.service", Path::new("/a.service"), "[Unit]\nAfter=b.service\n");
-        let b = parse_unit("b.service", Path::new("/b.service"), "[Unit]\nAfter=c.service\n");
-        let c = parse_unit("c.service", Path::new("/c.service"), "[Unit]\nAfter=a.service\n");
+        let a = parse_unit(
+            "a.service",
+            Path::new("/a.service"),
+            "[Unit]\nAfter=b.service\n",
+        );
+        let b = parse_unit(
+            "b.service",
+            Path::new("/b.service"),
+            "[Unit]\nAfter=c.service\n",
+        );
+        let c = parse_unit(
+            "c.service",
+            Path::new("/c.service"),
+            "[Unit]\nAfter=a.service\n",
+        );
 
         dag.insert(a);
         dag.insert(b);
@@ -358,5 +405,69 @@ mod tests {
         let cycles = dag.detect_cycles();
         assert_eq!(cycles.len(), 1);
         assert_eq!(cycles[0].len(), 3);
+    }
+
+    #[test]
+    fn test_dag_before_ordering_and_deduplication() {
+        let mut dag = UnitDag::new();
+
+        // Symmetrically declared Before and After:
+        // A declares Before=B, and B declares After=A.
+        // Edge must be deduplicated so in_degree of B is 1, not 2.
+        let a = parse_unit(
+            "a.service",
+            Path::new("/a.service"),
+            "[Unit]\nBefore=b.service\n",
+        );
+        let b = parse_unit(
+            "b.service",
+            Path::new("/b.service"),
+            "[Unit]\nAfter=a.service\nBefore=c.service\n",
+        );
+        let c = parse_unit(
+            "c.service",
+            Path::new("/c.service"),
+            "[Unit]\nAfter=b.service\n",
+        );
+
+        dag.insert(a);
+        dag.insert(b);
+        dag.insert(c);
+
+        let queue = dag.resolve_start_queue("c.service");
+        assert_eq!(queue, vec!["a.service", "b.service", "c.service"]);
+
+        // Verify ready_to_spawn respects Before=
+        let spawnable_init = dag.ready_to_spawn(&queue);
+        // a.service can spawn, but b.service cannot spawn because a.service is not active yet!
+        assert_eq!(spawnable_init, vec!["a.service"]);
+
+        // Mark a active
+        dag.set_state("a.service", UnitState::Active);
+        let spawnable_step1 = dag.ready_to_spawn(&queue);
+        assert_eq!(spawnable_step1, vec!["b.service"]);
+
+        // Mark b active
+        dag.set_state("b.service", UnitState::Active);
+        let spawnable_step2 = dag.ready_to_spawn(&queue);
+        assert_eq!(spawnable_step2, vec!["c.service"]);
+
+        // Verify cycle detection with Before=
+        let mut cycle_dag = UnitDag::new();
+        let u1 = parse_unit(
+            "u1.service",
+            Path::new("/u1.service"),
+            "[Unit]\nBefore=u2.service\n",
+        );
+        let u2 = parse_unit(
+            "u2.service",
+            Path::new("/u2.service"),
+            "[Unit]\nBefore=u1.service\n",
+        );
+        cycle_dag.insert(u1);
+        cycle_dag.insert(u2);
+        let cycles = cycle_dag.detect_cycles();
+        assert_eq!(cycles.len(), 1);
+        assert_eq!(cycles[0].len(), 2);
     }
 }

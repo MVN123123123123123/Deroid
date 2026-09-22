@@ -26,7 +26,7 @@ pub struct RecentsCard {
     pub dmabuf_fd: Option<i32>,
     pub width: f32,
     pub height: f32,
-    pub y_offset: f32,    // Drag offset during vertical swipe-to-kill
+    pub y_offset: f32, // Drag offset during vertical swipe-to-kill
     pub kill_state: KillProgress,
     pub is_dismissable: bool,
 }
@@ -128,11 +128,14 @@ impl RecentsCarousel {
             display_height,
             cards: Vec::new(),
             selected_index: 0,
-            scroll_spring: SpringOscillator::new(0.0, SpringConfig {
-                stiffness: 200.0,
-                damping: 22.0,
-                mass: 1.0,
-            }),
+            scroll_spring: SpringOscillator::new(
+                0.0,
+                SpringConfig {
+                    stiffness: 200.0,
+                    damping: 22.0,
+                    mass: 1.0,
+                },
+            ),
             split_screen: SplitScreenConfig::new(display_height),
             card_width,
             card_height,
@@ -285,8 +288,26 @@ mod tests {
     #[test]
     fn test_recents_carousel_add_and_snap() {
         let mut carousel = RecentsCarousel::new(1080.0, 2400.0);
-        let card1 = RecentsCard::new("term".into(), 1001, "Term".into(), "".into(), 1, None, 800.0, 1600.0);
-        let card2 = RecentsCard::new("web".into(), 1002, "Web".into(), "".into(), 2, None, 800.0, 1600.0);
+        let card1 = RecentsCard::new(
+            "term".into(),
+            1001,
+            "Term".into(),
+            "".into(),
+            1,
+            None,
+            800.0,
+            1600.0,
+        );
+        let card2 = RecentsCard::new(
+            "web".into(),
+            1002,
+            "Web".into(),
+            "".into(),
+            2,
+            None,
+            800.0,
+            1600.0,
+        );
 
         carousel.add_card(card1);
         carousel.add_card(card2);
@@ -305,7 +326,16 @@ mod tests {
     #[test]
     fn test_swipe_to_kill_lifecycle() {
         let mut carousel = RecentsCarousel::new(1080.0, 2400.0);
-        let card = RecentsCard::new("calc".into(), 2002, "Calc".into(), "".into(), 3, None, 800.0, 1600.0);
+        let card = RecentsCard::new(
+            "calc".into(),
+            2002,
+            "Calc".into(),
+            "".into(),
+            3,
+            None,
+            800.0,
+            1600.0,
+        );
         carousel.add_card(card);
 
         // Simulate swipe up by -200px
@@ -339,8 +369,26 @@ mod tests {
     #[test]
     fn test_clear_all_action() {
         let mut carousel = RecentsCarousel::new(1080.0, 2400.0);
-        carousel.add_card(RecentsCard::new("c1".into(), 1, "C1".into(), "".into(), 1, None, 800.0, 1600.0));
-        carousel.add_card(RecentsCard::new("c2".into(), 2, "C2".into(), "".into(), 2, None, 800.0, 1600.0));
+        carousel.add_card(RecentsCard::new(
+            "c1".into(),
+            1,
+            "C1".into(),
+            "".into(),
+            1,
+            None,
+            800.0,
+            1600.0,
+        ));
+        carousel.add_card(RecentsCard::new(
+            "c2".into(),
+            2,
+            "C2".into(),
+            "".into(),
+            2,
+            None,
+            800.0,
+            1600.0,
+        ));
 
         let pids = carousel.clear_all();
         assert_eq!(pids.len(), 2);

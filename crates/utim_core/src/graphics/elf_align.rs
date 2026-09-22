@@ -97,9 +97,14 @@ impl std::fmt::Display for ElfAlignError {
 impl std::error::Error for ElfAlignError {}
 
 /// Parse and validate ELF segment alignment from an in-memory byte slice.
-pub fn inspect_elf_bytes(bytes: &[u8], path: Option<&str>) -> Result<ElfAlignmentReport, ElfAlignError> {
+pub fn inspect_elf_bytes(
+    bytes: &[u8],
+    path: Option<&str>,
+) -> Result<ElfAlignmentReport, ElfAlignError> {
     if bytes.len() < 64 {
-        return Err(ElfAlignError::InvalidHeader("File is too small for ELF64 header".into()));
+        return Err(ElfAlignError::InvalidHeader(
+            "File is too small for ELF64 header".into(),
+        ));
     }
 
     // Verify ELF magic: 0x7F, 'E', 'L', 'F'
@@ -115,12 +120,13 @@ pub fn inspect_elf_bytes(bytes: &[u8], path: Option<&str>) -> Result<ElfAlignmen
     // EI_DATA: 1 = Little-endian
     let is_little_endian = bytes[5] == 1;
     if !is_little_endian {
-        return Err(ElfAlignError::InvalidHeader("Only little-endian ELF is supported".into()));
+        return Err(ElfAlignError::InvalidHeader(
+            "Only little-endian ELF is supported".into(),
+        ));
     }
 
-    let read_u16 = |offset: usize| -> u16 {
-        u16::from_le_bytes([bytes[offset], bytes[offset + 1]])
-    };
+    let read_u16 =
+        |offset: usize| -> u16 { u16::from_le_bytes([bytes[offset], bytes[offset + 1]]) };
 
     let read_u32 = |offset: usize| -> u32 {
         u32::from_le_bytes([
@@ -294,7 +300,11 @@ mod tests {
             let p_type = PT_LOAD;
             let p_flags = 5u32; // R-X
             let p_offset = (i as u64) * align;
-            let base_vaddr = if align > 1 { (0x400000 / align) * align } else { 0x400000 };
+            let base_vaddr = if align > 1 {
+                (0x400000 / align) * align
+            } else {
+                0x400000
+            };
             let p_vaddr = base_vaddr + (i as u64) * align;
             let p_paddr = p_vaddr;
             let p_filesz = 0x1000u64;
@@ -354,14 +364,20 @@ mod tests {
         // Alignment is >= 64KB (65537) but NOT a power of two!
         let mock_elf = create_mock_elf64(&[65537]);
         let report = inspect_elf_bytes(&mock_elf, None).expect("Parsed ELF");
-        assert!(!report.is_64k_compatible, "Non-power-of-two alignment must not be compatible");
+        assert!(
+            !report.is_64k_compatible,
+            "Non-power-of-two alignment must not be compatible"
+        );
     }
 
     #[test]
     fn test_elf_align_no_load_segments() {
         let mock_elf = create_mock_elf64(&[]);
         let report = inspect_elf_bytes(&mock_elf, None).expect("Parsed ELF");
-        assert!(!report.is_64k_compatible, "ELF without PT_LOAD must not be compatible");
+        assert!(
+            !report.is_64k_compatible,
+            "ELF without PT_LOAD must not be compatible"
+        );
         assert_eq!(report.load_segments.len(), 0);
     }
 

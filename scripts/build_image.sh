@@ -39,10 +39,10 @@ fi
 if command -v img2simg >/dev/null 2>&1; then
     echo "[*] Converting raw ext4 image to Android sparse format (img2simg)..."
     img2simg "${REL_RAW_IMG}" "${REL_OUTPUT_IMG}"
-    rm -f "${REL_RAW_IMG}"
+    echo "[*] Retained raw image at ${REL_RAW_IMG} for QEMU / direct boot."
 else
     echo "[*] Renaming raw image to target..."
-    mv "${REL_RAW_IMG}" "${REL_OUTPUT_IMG}"
+    cp "${REL_RAW_IMG}" "${REL_OUTPUT_IMG}"
 fi
 
 echo "[+] Successfully created Universal Treble Linux GSI image: ${REL_OUTPUT_IMG}"

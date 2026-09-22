@@ -2,7 +2,6 @@
 //! Implements paged grid layout, spring-physics horizontal scrolling,
 //! persistent bottom dock, and smooth drawer transitions.
 
-
 /// Spring physics parameters for smooth workspace grid and recents scrolling
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SpringConfig {
@@ -75,10 +74,10 @@ pub struct GridItem {
 
 /// Paged Home Workspace Grid
 pub struct WorkspaceGrid {
-    pub cols: usize,        // e.g. 4
-    pub rows: usize,        // e.g. 5
-    pub num_pages: usize,   // e.g. 3
-    pub page_width: f32,    // Display width in pixels
+    pub cols: usize,      // e.g. 4
+    pub rows: usize,      // e.g. 5
+    pub num_pages: usize, // e.g. 3
+    pub page_width: f32,  // Display width in pixels
     pub current_page: usize,
     pub scroll_spring: SpringOscillator,
     pub items: Vec<GridItem>,
@@ -102,7 +101,11 @@ impl WorkspaceGrid {
             return false;
         }
         // Check slot collision
-        if self.items.iter().any(|i| i.page == page && i.col == col && i.row == row) {
+        if self
+            .items
+            .iter()
+            .any(|i| i.page == page && i.col == col && i.row == row)
+        {
             return false;
         }
         self.items.push(GridItem {
@@ -248,11 +251,14 @@ impl AppDrawer {
         Self {
             state: DrawerState::Closed,
             search_query: String::new(),
-            spring: SpringOscillator::new(0.0, SpringConfig {
-                stiffness: 220.0,
-                damping: 20.0,
-                mass: 1.0,
-            }),
+            spring: SpringOscillator::new(
+                0.0,
+                SpringConfig {
+                    stiffness: 220.0,
+                    damping: 20.0,
+                    mass: 1.0,
+                },
+            ),
         }
     }
 

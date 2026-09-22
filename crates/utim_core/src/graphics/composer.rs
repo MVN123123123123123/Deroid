@@ -117,7 +117,8 @@ pub struct DisplayConfig {
 
 impl DisplayConfig {
     pub fn standard_mobile(display_id: u32, width: u32, height: u32, refresh_rate_hz: f64) -> Self {
-        let vsync = VsyncConfig::new(refresh_rate_hz).unwrap_or_else(|_| VsyncConfig::for_rate_60hz());
+        let vsync =
+            VsyncConfig::new(refresh_rate_hz).unwrap_or_else(|_| VsyncConfig::for_rate_60hz());
         Self {
             display_id,
             width,
@@ -232,7 +233,10 @@ impl fmt::Display for HwcError {
             HwcError::UnsupportedBlendMode(b) => write!(f, "Unsupported blend mode: {}", b),
             HwcError::ValidationFailed(s) => write!(f, "HWC display validation failed: {}", s),
             HwcError::PresentationFailed(s) => write!(f, "HWC presentation failed: {}", s),
-            HwcError::NoClientTarget => write!(f, "Client composition required but no ClientTarget buffer set"),
+            HwcError::NoClientTarget => write!(
+                f,
+                "Client composition required but no ClientTarget buffer set"
+            ),
         }
     }
 }
@@ -272,7 +276,8 @@ impl HwcComposer {
     pub fn detect_version_from_manifest(manifest_content: Option<&str>) -> HwcVersion {
         if let Some(content) = manifest_content {
             if content.contains("android.hardware.graphics.composer3")
-                || (content.contains("android.hardware.graphics.composer") && content.contains("aidl"))
+                || (content.contains("android.hardware.graphics.composer")
+                    && content.contains("aidl"))
             {
                 return HwcVersion::AidlComposer3;
             }
@@ -377,7 +382,12 @@ impl HwcComposer {
         Ok(())
     }
 
-    pub fn set_layer_z_order(&mut self, display_id: u32, layer_id: u64, z_order: u32) -> Result<(), HwcError> {
+    pub fn set_layer_z_order(
+        &mut self,
+        display_id: u32,
+        layer_id: u64,
+        z_order: u32,
+    ) -> Result<(), HwcError> {
         let layer = self.get_layer_mut(display_id, layer_id)?;
         layer.z_order = z_order;
         self.validated.insert(display_id, false);
@@ -429,7 +439,10 @@ impl HwcComposer {
         if !self.displays.contains_key(&display_id) {
             return Err(HwcError::DisplayNotFound(display_id));
         }
-        if let Some((_, Some(old_fence))) = self.client_targets.insert(display_id, (buffer_handle, acquire_fence)) {
+        if let Some((_, Some(old_fence))) = self
+            .client_targets
+            .insert(display_id, (buffer_handle, acquire_fence))
+        {
             if old_fence >= 0 {
                 unsafe { libc::close(old_fence) };
             }
@@ -543,10 +556,7 @@ impl HwcComposer {
     /// Present display to screen:
     /// Validates readiness, generates simulated or real presentation fence,
     /// consumes acquire fences, and issues release fences per layer.
-    pub fn present_display(
-        &mut self,
-        display_id: u32,
-    ) -> Result<PresentFences, HwcError> {
+    pub fn present_display(&mut self, display_id: u32) -> Result<PresentFences, HwcError> {
         let is_val = self.validated.get(&display_id).copied().unwrap_or(false);
         if !is_val {
             return Err(HwcError::ValidationFailed(
@@ -682,8 +692,10 @@ mod tests {
         hwc.set_layer_z_order(0, l1, 1).unwrap();
         hwc.set_layer_z_order(0, l2, 2).unwrap();
 
-        hwc.set_layer_composition_type(0, l1, CompositionType::Device).unwrap();
-        hwc.set_layer_composition_type(0, l2, CompositionType::Device).unwrap();
+        hwc.set_layer_composition_type(0, l1, CompositionType::Device)
+            .unwrap();
+        hwc.set_layer_composition_type(0, l2, CompositionType::Device)
+            .unwrap();
 
         hwc.set_layer_buffer(0, l1, 101, None).unwrap();
         hwc.set_layer_buffer(0, l2, 102, None).unwrap();
@@ -712,9 +724,12 @@ mod tests {
         hwc.set_layer_z_order(0, l2, 2).unwrap();
         hwc.set_layer_z_order(0, l3, 3).unwrap();
 
-        hwc.set_layer_composition_type(0, l1, CompositionType::Device).unwrap();
-        hwc.set_layer_composition_type(0, l2, CompositionType::Device).unwrap();
-        hwc.set_layer_composition_type(0, l3, CompositionType::Device).unwrap();
+        hwc.set_layer_composition_type(0, l1, CompositionType::Device)
+            .unwrap();
+        hwc.set_layer_composition_type(0, l2, CompositionType::Device)
+            .unwrap();
+        hwc.set_layer_composition_type(0, l3, CompositionType::Device)
+            .unwrap();
 
         let (changed, has_client) = hwc.validate_display(0).expect("Validate");
         // Because ClientTarget consumes 1 hardware plane, only 2-1=1 layer can be Device.
@@ -723,7 +738,10 @@ mod tests {
         assert!(has_client);
 
         // Attempt present without ClientTarget must fail
-        assert_eq!(hwc.present_display(0).unwrap_err(), HwcError::NoClientTarget);
+        assert_eq!(
+            hwc.present_display(0).unwrap_err(),
+            HwcError::NoClientTarget
+        );
 
         // Supply ClientTarget
         hwc.set_client_target(0, 999, None).unwrap();
@@ -734,18 +752,37 @@ mod tests {
 
     fn make_test_fence_pair() -> (i32, i32) {
         let mut sv = [0i32; 2];
-        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0, sv.as_mut_ptr()) };
+        let rc = unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+                0,
+                sv.as_mut_ptr(),
+            )
+        };
         assert_eq!(rc, 0, "socketpair creation failed");
         (sv[0], sv[1])
     }
 
     fn assert_fence_closed_via_peer(peer_fd: i32, msg: &str) {
         let byte = [1u8; 1];
-        let ret = unsafe { libc::send(peer_fd, byte.as_ptr() as *const libc::c_void, 1, libc::MSG_NOSIGNAL) };
+        let ret = unsafe {
+            libc::send(
+                peer_fd,
+                byte.as_ptr() as *const libc::c_void,
+                1,
+                libc::MSG_NOSIGNAL,
+            )
+        };
         let errno = std::io::Error::last_os_error().raw_os_error();
         unsafe { libc::close(peer_fd) };
         assert_eq!(ret, -1, "{}: send should fail on closed peer", msg);
-        assert_eq!(errno, Some(libc::EPIPE), "{}: expected EPIPE when peer is closed", msg);
+        assert_eq!(
+            errno,
+            Some(libc::EPIPE),
+            "{}: expected EPIPE when peer is closed",
+            msg
+        );
     }
 
     #[test]
@@ -764,7 +801,10 @@ mod tests {
         let _ = hwc.present_display(0).unwrap();
 
         // Verify that fence_fd was closed by present_display without racing on fd reuse
-        assert_fence_closed_via_peer(peer_fd, "Acquire fence fd should have been closed by present_display");
+        assert_fence_closed_via_peer(
+            peer_fd,
+            "Acquire fence fd should have been closed by present_display",
+        );
     }
 
     #[test]
@@ -782,9 +822,12 @@ mod tests {
         hwc.set_layer_z_order(0, l_dev1, 1).unwrap();
         hwc.set_layer_z_order(0, l_dev2, 2).unwrap();
 
-        hwc.set_layer_composition_type(0, l_cursor, CompositionType::Cursor).unwrap();
-        hwc.set_layer_composition_type(0, l_dev1, CompositionType::Device).unwrap();
-        hwc.set_layer_composition_type(0, l_dev2, CompositionType::Device).unwrap();
+        hwc.set_layer_composition_type(0, l_cursor, CompositionType::Cursor)
+            .unwrap();
+        hwc.set_layer_composition_type(0, l_dev1, CompositionType::Device)
+            .unwrap();
+        hwc.set_layer_composition_type(0, l_dev2, CompositionType::Device)
+            .unwrap();
 
         let (changed, has_client) = hwc.validate_display(0).expect("Validate display");
         // 3 non-client layers on 2-plane display -> requires client composition!
@@ -808,17 +851,24 @@ mod tests {
 
         let l1 = hwc.create_layer(0).unwrap();
         let l2 = hwc.create_layer(0).unwrap();
-        hwc.set_layer_composition_type(0, l1, CompositionType::Device).unwrap();
-        hwc.set_layer_composition_type(0, l2, CompositionType::Device).unwrap();
+        hwc.set_layer_composition_type(0, l1, CompositionType::Device)
+            .unwrap();
+        hwc.set_layer_composition_type(0, l2, CompositionType::Device)
+            .unwrap();
         hwc.validate_display(0).unwrap();
 
         let (target_fence, target_peer) = make_test_fence_pair();
         hwc.set_client_target(0, 777, Some(target_fence)).unwrap();
 
-        let _ = hwc.present_display(0).expect("Present with client target fence");
+        let _ = hwc
+            .present_display(0)
+            .expect("Present with client target fence");
 
         // Verify target_fence was consumed and closed
-        assert_fence_closed_via_peer(target_peer, "ClientTarget acquire fence must be closed on presentation");
+        assert_fence_closed_via_peer(
+            target_peer,
+            "ClientTarget acquire fence must be closed on presentation",
+        );
     }
 
     #[test]

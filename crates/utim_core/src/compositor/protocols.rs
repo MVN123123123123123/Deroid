@@ -3,7 +3,6 @@
 //! conforming to xdg-shell, wlr-layer-shell, linux-dmabuf, presentation-time, wp-viewporter,
 //! ext-idle-notify, text-input-v3, and zwp-tablet-v2.
 
-
 pub const WAYLAND_VERSION_MAJOR: u32 = 1;
 pub const WAYLAND_VERSION_MINOR: u32 = 22;
 
@@ -316,7 +315,7 @@ pub mod drm_formats {
     pub const DRM_FORMAT_XRGB8888: u32 = 0x34325258; // 'XR24'
     pub const DRM_FORMAT_ARGB8888: u32 = 0x34325241; // 'AR24'
     pub const DRM_FORMAT_RGBA8888: u32 = 0x34324152; // 'RA24'
-    pub const DRM_FORMAT_NV12: u32 = 0x3231564e;     // 'NV12'
+    pub const DRM_FORMAT_NV12: u32 = 0x3231564e; // 'NV12'
 }
 
 /// Protocol Global advertisement registry
@@ -441,11 +440,23 @@ mod tests {
         let reg = ProtocolRegistry::new();
         assert!(reg.supports_mobile_protocols());
         assert!(reg.find_by_interface(WaylandInterface::XdgWmBase).is_some());
-        assert!(reg.find_by_interface(WaylandInterface::ZwlrLayerShellV1).is_some());
-        assert!(reg.find_by_interface(WaylandInterface::ZwpLinuxDmabufV1).is_some());
-        assert!(reg.find_by_interface(WaylandInterface::WpPresentation).is_some());
-        assert!(reg.find_by_interface(WaylandInterface::WpViewporter).is_some());
-        assert!(reg.find_by_interface(WaylandInterface::ExtIdleNotifierV1).is_some());
-        assert!(reg.find_by_interface(WaylandInterface::ZwpTextInputV3).is_some());
+        assert!(reg
+            .find_by_interface(WaylandInterface::ZwlrLayerShellV1)
+            .is_some());
+        assert!(reg
+            .find_by_interface(WaylandInterface::ZwpLinuxDmabufV1)
+            .is_some());
+        assert!(reg
+            .find_by_interface(WaylandInterface::WpPresentation)
+            .is_some());
+        assert!(reg
+            .find_by_interface(WaylandInterface::WpViewporter)
+            .is_some());
+        assert!(reg
+            .find_by_interface(WaylandInterface::ExtIdleNotifierV1)
+            .is_some());
+        assert!(reg
+            .find_by_interface(WaylandInterface::ZwpTextInputV3)
+            .is_some());
     }
 }

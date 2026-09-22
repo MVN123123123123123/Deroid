@@ -363,9 +363,21 @@ NoDisplay=true
     #[test]
     fn test_catalogue_search_ranking() {
         let mut cat = DesktopCatalogue::new();
-        cat.add_app(DesktopApp::new("phone".into(), "Phone".into(), "dialer".into()));
-        cat.add_app(DesktopApp::new("photos".into(), "Photos".into(), "photos".into()));
-        cat.add_app(DesktopApp::new("term".into(), "Terminal".into(), "term".into()));
+        cat.add_app(DesktopApp::new(
+            "phone".into(),
+            "Phone".into(),
+            "dialer".into(),
+        ));
+        cat.add_app(DesktopApp::new(
+            "photos".into(),
+            "Photos".into(),
+            "photos".into(),
+        ));
+        cat.add_app(DesktopApp::new(
+            "term".into(),
+            "Terminal".into(),
+            "term".into(),
+        ));
 
         let res = cat.search("ph");
         assert_eq!(res.len(), 2);

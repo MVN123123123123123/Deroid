@@ -9,7 +9,8 @@ fn main() {
     // If /run/systemd/system does not exist, systemd / UTIM is not running as PID 1
     // (e.g. during chroot bootstrap, container build, or offline installation).
     // All service actions must exit cleanly with 0.
-    let run_systemd_dir = env::var("DEB_SYSTEMD_SYSTEM_DIR").unwrap_or_else(|_| "/run/systemd/system".to_string());
+    let run_systemd_dir =
+        env::var("DEB_SYSTEMD_SYSTEM_DIR").unwrap_or_else(|_| "/run/systemd/system".to_string());
     if !Path::new(&run_systemd_dir).exists() {
         process::exit(0);
     }
@@ -88,7 +89,10 @@ fn main() {
             process::exit(code);
         }
         Err(e) => {
-            eprintln!("deb-systemd-invoke: failed to execute {}: {}", systemctl_bin, e);
+            eprintln!(
+                "deb-systemd-invoke: failed to execute {}: {}",
+                systemctl_bin, e
+            );
             // In chroot or package installation without active init, exit cleanly with 0
             process::exit(0);
         }
@@ -101,7 +105,11 @@ fn is_action_forbidden_by_policy(service: &str, action: &str) -> bool {
         return false;
     }
 
-    match Command::new(policy_script).arg(service).arg(action).status() {
+    match Command::new(policy_script)
+        .arg(service)
+        .arg(action)
+        .status()
+    {
         Ok(status) => {
             match status.code() {
                 Some(0) | Some(104) => false, // 0 = allowed, 104 = fallback allowed

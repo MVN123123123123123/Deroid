@@ -41,9 +41,12 @@ Description=Service with \
 ExecStart=/bin/echo \
           "hello world" \
           --flag=1
-"#
+"#,
     );
-    assert!(continuation_unit.unit.description.contains("long multi-line"));
+    assert!(continuation_unit
+        .unit
+        .description
+        .contains("long multi-line"));
     let svc = continuation_unit.service.unwrap();
     assert_eq!(svc.exec_start.len(), 1);
     assert_eq!(svc.exec_start[0].binary, "/bin/echo");
@@ -75,12 +78,16 @@ fn test_env_expansion_edge_cases() {
     assert_eq!(expand_env("eat ${A} and $B", &env), "eat apple and banana");
     assert_eq!(expand_env("cost is $100", &env), "cost is "); // $100 parsed as variable name starting with 100
     assert_eq!(expand_env("unclosed ${A without brace", &env), "unclosed ");
-    assert_eq!(expand_env("no variables at all", &env), "no variables at all");
+    assert_eq!(
+        expand_env("no variables at all", &env),
+        "no variables at all"
+    );
 }
 
 #[test]
 fn test_word_parsing_quotes_and_escapes() {
-    let words = parse_words(r#"/usr/bin/cmd "arg with spaces" 'single quotes' escaped\ space normal"#);
+    let words =
+        parse_words(r#"/usr/bin/cmd "arg with spaces" 'single quotes' escaped\ space normal"#);
     assert_eq!(
         words,
         vec![
@@ -98,14 +105,34 @@ fn test_dag_self_loop_and_complex_cycles() {
     let mut dag = UnitDag::new();
 
     // Self loop: A -> A
-    let self_loop = parse_unit("self.service", Path::new("/self.service"), "[Unit]\nAfter=self.service\n");
+    let self_loop = parse_unit(
+        "self.service",
+        Path::new("/self.service"),
+        "[Unit]\nAfter=self.service\n",
+    );
     dag.insert(self_loop);
 
     // 4-cycle: 1 -> 2 -> 3 -> 4 -> 1
-    let u1 = parse_unit("1.service", Path::new("/1.service"), "[Unit]\nAfter=2.service\n");
-    let u2 = parse_unit("2.service", Path::new("/2.service"), "[Unit]\nAfter=3.service\n");
-    let u3 = parse_unit("3.service", Path::new("/3.service"), "[Unit]\nAfter=4.service\n");
-    let u4 = parse_unit("4.service", Path::new("/4.service"), "[Unit]\nAfter=1.service\n");
+    let u1 = parse_unit(
+        "1.service",
+        Path::new("/1.service"),
+        "[Unit]\nAfter=2.service\n",
+    );
+    let u2 = parse_unit(
+        "2.service",
+        Path::new("/2.service"),
+        "[Unit]\nAfter=3.service\n",
+    );
+    let u3 = parse_unit(
+        "3.service",
+        Path::new("/3.service"),
+        "[Unit]\nAfter=4.service\n",
+    );
+    let u4 = parse_unit(
+        "4.service",
+        Path::new("/4.service"),
+        "[Unit]\nAfter=1.service\n",
+    );
 
     dag.insert(u1);
     dag.insert(u2);
@@ -114,7 +141,9 @@ fn test_dag_self_loop_and_complex_cycles() {
 
     let cycles = dag.detect_cycles();
     assert_eq!(cycles.len(), 2); // self-loop cycle AND 4-node cycle
-    assert!(cycles.iter().any(|c| c.len() == 1 && c[0] == "self.service"));
+    assert!(cycles
+        .iter()
+        .any(|c| c.len() == 1 && c[0] == "self.service"));
     assert!(cycles.iter().any(|c| c.len() == 4));
 
     // resolve_start_queue must break cycles and not hang or crash
@@ -207,11 +236,23 @@ fn test_ipc_parser_edge_cases() {
     assert_eq!(IpcRequest::deserialize("SET_OOM_SCORE 123"), None);
 
     // Valid
-    assert_eq!(IpcRequest::deserialize("DAEMON_RELOAD"), Some(IpcRequest::DaemonReload));
-    assert_eq!(IpcRequest::deserialize("LIST_UNITS"), Some(IpcRequest::ListUnits));
-    assert_eq!(IpcRequest::deserialize("ANALYZE_TIME"), Some(IpcRequest::AnalyzeTime));
+    assert_eq!(
+        IpcRequest::deserialize("DAEMON_RELOAD"),
+        Some(IpcRequest::DaemonReload)
+    );
+    assert_eq!(
+        IpcRequest::deserialize("LIST_UNITS"),
+        Some(IpcRequest::ListUnits)
+    );
+    assert_eq!(
+        IpcRequest::deserialize("ANALYZE_TIME"),
+        Some(IpcRequest::AnalyzeTime)
+    );
     assert_eq!(IpcRequest::deserialize("REBOOT"), Some(IpcRequest::Reboot));
-    assert_eq!(IpcRequest::deserialize("POWEROFF"), Some(IpcRequest::Poweroff));
+    assert_eq!(
+        IpcRequest::deserialize("POWEROFF"),
+        Some(IpcRequest::Poweroff)
+    );
     assert_eq!(IpcRequest::Reboot.serialize(), "REBOOT\n");
     assert_eq!(IpcRequest::Poweroff.serialize(), "POWEROFF\n");
 }
@@ -263,7 +304,12 @@ fn test_expand_command_args_systemd_compliance() {
     assert_eq!(expanded, vec!["-v", "--debug", "arg1"]);
 
     // Naked $EMPTY and $UNSET should be completely omitted from the arg list
-    let raw = vec!["$EMPTY".to_string(), "$UNSET".to_string(), "$WHITESPACE".to_string(), "keep".to_string()];
+    let raw = vec![
+        "$EMPTY".to_string(),
+        "$UNSET".to_string(),
+        "$WHITESPACE".to_string(),
+        "keep".to_string(),
+    ];
     let expanded = expand_command_args(&raw, &env);
     assert_eq!(expanded, vec!["keep"]);
 

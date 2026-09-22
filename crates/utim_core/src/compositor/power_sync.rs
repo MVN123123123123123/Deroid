@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::ipc::{send_ipc_request, DEFAULT_CONTROL_SOCKET, IpcRequest, IpcResponse};
+use crate::ipc::{send_ipc_request, IpcRequest, IpcResponse, DEFAULT_CONTROL_SOCKET};
 
 /// Dynamic OOM score roles defined in Universal Treble GSI blueprint
 pub mod oom_roles {

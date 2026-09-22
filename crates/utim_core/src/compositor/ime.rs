@@ -16,7 +16,10 @@ pub enum KeyboardLayout {
 pub enum ImeAction {
     None,
     CommitString(String),
-    DeleteSurroundingText { before_length: u32, after_length: u32 },
+    DeleteSurroundingText {
+        before_length: u32,
+        after_length: u32,
+    },
     SendKey(u32), // Linux evdev keycode e.g. KEY_ENTER (28)
 }
 
@@ -44,11 +47,14 @@ impl VirtualKeyboard {
             is_shift_active: false,
             is_caps_lock: false,
             is_active: false,
-            slide_spring: SpringOscillator::new(0.0, SpringConfig {
-                stiffness: 260.0,
-                damping: 26.0,
-                mass: 1.0,
-            }),
+            slide_spring: SpringOscillator::new(
+                0.0,
+                SpringConfig {
+                    stiffness: 260.0,
+                    damping: 26.0,
+                    mass: 1.0,
+                },
+            ),
             last_haptic_trigger: false,
         }
     }

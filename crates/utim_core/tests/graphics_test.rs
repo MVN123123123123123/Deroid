@@ -10,7 +10,9 @@ use utim_core::graphics::composer::{
 };
 use utim_core::graphics::elf_align::{inspect_elf_file, REQUIRED_PAGE_ALIGNMENT};
 use utim_core::graphics::gpu::{GpuArchitecture, GpuDetector, GpuPipeline};
-use utim_core::graphics::gralloc::{usage, GrallocError, GrallocManager, GrallocVersion, PixelFormat};
+use utim_core::graphics::gralloc::{
+    usage, GrallocError, GrallocManager, GrallocVersion, PixelFormat,
+};
 use utim_core::graphics::vsync::{
     VsyncConfig, VsyncController, VsyncPresentationValidator, STANDARD_REFRESH_RATES,
 };
@@ -44,19 +46,29 @@ fn test_hwc_aidl_composer3_full_pipeline() {
     // Set geometry
     let full_screen = Rect::new(0, 0, 1080, 2400);
     let bar_rect = Rect::new(0, 0, 1080, 80);
-    hwc.set_layer_display_frame(display_id, wallpaper, full_screen).unwrap();
-    hwc.set_layer_display_frame(display_id, app_content, full_screen).unwrap();
-    hwc.set_layer_display_frame(display_id, ui_shell, full_screen).unwrap();
-    hwc.set_layer_display_frame(display_id, status_bar, bar_rect).unwrap();
+    hwc.set_layer_display_frame(display_id, wallpaper, full_screen)
+        .unwrap();
+    hwc.set_layer_display_frame(display_id, app_content, full_screen)
+        .unwrap();
+    hwc.set_layer_display_frame(display_id, ui_shell, full_screen)
+        .unwrap();
+    hwc.set_layer_display_frame(display_id, status_bar, bar_rect)
+        .unwrap();
 
     // Set buffers and composition types
-    for (i, &l) in [wallpaper, app_content, ui_shell, status_bar].iter().enumerate() {
-        hwc.set_layer_composition_type(display_id, l, CompositionType::Device).unwrap();
-        hwc.set_layer_buffer(display_id, l, 2000 + (i as u64), None).unwrap();
+    for (i, &l) in [wallpaper, app_content, ui_shell, status_bar]
+        .iter()
+        .enumerate()
+    {
+        hwc.set_layer_composition_type(display_id, l, CompositionType::Device)
+            .unwrap();
+        hwc.set_layer_buffer(display_id, l, 2000 + (i as u64), None)
+            .unwrap();
     }
 
     // Set transform on app_content (Rotate90)
-    hwc.set_layer_transform(display_id, app_content, Transform::Rotate90).unwrap();
+    hwc.set_layer_transform(display_id, app_content, Transform::Rotate90)
+        .unwrap();
 
     // Validate display: 4 layers fit in standard 4 overlay planes
     let (changed, has_client) = hwc.validate_display(display_id).unwrap();
@@ -83,7 +95,8 @@ fn test_hwc_plane_overflow_and_client_target_fallback() {
     for i in 0..6 {
         let l = hwc.create_layer(0).unwrap();
         hwc.set_layer_z_order(0, l, i as u32).unwrap();
-        hwc.set_layer_composition_type(0, l, CompositionType::Device).unwrap();
+        hwc.set_layer_composition_type(0, l, CompositionType::Device)
+            .unwrap();
         hwc.set_layer_buffer(0, l, 3000 + (i as u64), None).unwrap();
         layers.push(l);
     }
@@ -111,7 +124,12 @@ fn test_gralloc_linear_and_compressed_allocations() {
 
     // 1. RGBA_8888 Linear
     let buf_rgba = gralloc
-        .allocate(1080, 2340, PixelFormat::Rgba8888, usage::HW_RENDER | usage::HW_COMPOSER)
+        .allocate(
+            1080,
+            2340,
+            PixelFormat::Rgba8888,
+            usage::HW_RENDER | usage::HW_COMPOSER,
+        )
         .expect("Allocate RGBA_8888");
     assert_eq!(buf_rgba.planes.len(), 1);
     assert_eq!(buf_rgba.byte_stride, buf_rgba.stride_pixels * 4);
@@ -174,7 +192,14 @@ fn test_gralloc_linear_and_compressed_allocations() {
     assert!(exported_fd >= 0);
 
     let imported_buf = gralloc
-        .import_dmabuf(exported_fd, 1080, 2340, PixelFormat::Rgba8888, usage::HW_RENDER, None)
+        .import_dmabuf(
+            exported_fd,
+            1080,
+            2340,
+            PixelFormat::Rgba8888,
+            usage::HW_RENDER,
+            None,
+        )
         .expect("Import DMA-BUF");
     assert!(imported_buf.fd.is_some());
     assert_ne!(imported_buf.fd.unwrap(), exported_fd);
@@ -200,9 +225,13 @@ fn test_gralloc_linear_and_compressed_allocations() {
         .is_err());
 
     // 7. Invalid dimensions
-    let err = gralloc.allocate(0, 1080, PixelFormat::Rgba8888, 0).unwrap_err();
+    let err = gralloc
+        .allocate(0, 1080, PixelFormat::Rgba8888, 0)
+        .unwrap_err();
     assert_eq!(err, GrallocError::InvalidDimensions(0, 1080));
-    assert!(gralloc.allocate(25000, 1080, PixelFormat::Rgba8888, 0).is_err());
+    assert!(gralloc
+        .allocate(25000, 1080, PixelFormat::Rgba8888, 0)
+        .is_err());
 }
 
 #[test]
@@ -320,7 +349,11 @@ fn test_gpu_detection_and_environment_profiles() {
 
 #[test]
 fn test_elf_alignment_real_release_binaries() {
-    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
     let release_dir = workspace_root.join("target/aarch64-unknown-linux-gnu/release");
 
     let binaries = [
@@ -344,7 +377,9 @@ fn test_elf_alignment_real_release_binaries() {
             assert!(
                 report.min_load_align >= REQUIRED_PAGE_ALIGNMENT,
                 "Binary {} alignment 0x{:x} < 0x{:x}",
-                bin_name, report.min_load_align, REQUIRED_PAGE_ALIGNMENT
+                bin_name,
+                report.min_load_align,
+                REQUIRED_PAGE_ALIGNMENT
             );
         }
     }

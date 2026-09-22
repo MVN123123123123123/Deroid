@@ -36,7 +36,11 @@ Environment="PIPEWIRE_DEBUG=2" "XDG_RUNTIME_DIR=/run/user/1000"
 WantedBy=default.target
 "#;
 
-    let unit = parse_unit("pipewire.service", Path::new("/etc/systemd/system/pipewire.service"), complex_unit);
+    let unit = parse_unit(
+        "pipewire.service",
+        Path::new("/etc/systemd/system/pipewire.service"),
+        complex_unit,
+    );
     assert_eq!(unit.name, "pipewire.service");
     assert_eq!(unit.unit.after, vec!["android-hal-audio.service"]);
     assert_eq!(unit.unit.requires, vec!["android-hal-audio.service"]);
@@ -47,7 +51,10 @@ WantedBy=default.target
     assert_eq!(svc.restart_sec, Duration::from_millis(500));
     assert_eq!(svc.limit_memlock, Some(67108864));
     assert_eq!(svc.oom_score_adjust, Some(-800));
-    assert_eq!(svc.environment.get("PIPEWIRE_DEBUG").map(|s| s.as_str()), Some("2"));
+    assert_eq!(
+        svc.environment.get("PIPEWIRE_DEBUG").map(|s| s.as_str()),
+        Some("2")
+    );
 
     assert_eq!(svc.exec_start_pre.len(), 1);
     assert!(svc.exec_start_pre[0].ignore_failure);
@@ -55,7 +62,10 @@ WantedBy=default.target
 
     assert_eq!(svc.exec_start.len(), 1);
     assert_eq!(svc.exec_start[0].binary, "/usr/bin/pipewire");
-    assert_eq!(svc.exec_start[0].args, vec!["-c", "/etc/pipewire/pipewire.conf"]);
+    assert_eq!(
+        svc.exec_start[0].args,
+        vec!["-c", "/etc/pipewire/pipewire.conf"]
+    );
 
     assert_eq!(unit.install.wanted_by, vec!["default.target"]);
 }
@@ -87,9 +97,15 @@ fn test_dag_scheduler_ordering_and_dependency() {
     let queue = dag.resolve_start_queue("wireplumber.service");
     assert_eq!(queue.len(), 3);
 
-    let idx_hal = queue.iter().position(|x| x == "android-hal-audio.service").unwrap();
+    let idx_hal = queue
+        .iter()
+        .position(|x| x == "android-hal-audio.service")
+        .unwrap();
     let idx_pw = queue.iter().position(|x| x == "pipewire.service").unwrap();
-    let idx_wp = queue.iter().position(|x| x == "wireplumber.service").unwrap();
+    let idx_wp = queue
+        .iter()
+        .position(|x| x == "wireplumber.service")
+        .unwrap();
 
     assert!(idx_hal < idx_pw);
     assert!(idx_pw < idx_wp);
@@ -113,7 +129,8 @@ fn test_mpg_and_mmps_integration() {
     fs::write(power_dir.join("autosleep"), "off\n").unwrap();
     fs::write(cgroup_dir.join("user.slice").join("cgroup.freeze"), "0\n").unwrap();
 
-    let mut mpg = MobilePowerGovernor::with_paths(power_dir.clone(), cgroup_dir.clone(), battery_dir);
+    let mut mpg =
+        MobilePowerGovernor::with_paths(power_dir.clone(), cgroup_dir.clone(), battery_dir);
 
     // Screen off event: freeze background applications
     mpg.set_cgroup_freeze("user.slice", true).unwrap();
@@ -122,13 +139,19 @@ fn test_mpg_and_mmps_integration() {
     // Music playback: PipeWire holds partial wakelock
     mpg.acquire_wake_lock("pipewire-playback").unwrap();
     assert!(mpg.has_active_wake_locks());
-    assert_eq!(fs::read_to_string(power_dir.join("wake_lock")).unwrap(), "pipewire-playback");
+    assert_eq!(
+        fs::read_to_string(power_dir.join("wake_lock")).unwrap(),
+        "pipewire-playback"
+    );
 
     // Music stopped: wakelock released -> allow deep autosleep
     mpg.release_wake_lock("pipewire-playback").unwrap();
     assert!(!mpg.has_active_wake_locks());
     mpg.configure_autosleep(true).unwrap();
-    assert_eq!(fs::read_to_string(power_dir.join("autosleep")).unwrap(), "mem\n");
+    assert_eq!(
+        fs::read_to_string(power_dir.join("autosleep")).unwrap(),
+        "mem\n"
+    );
 
     // Screen on event: unfreeze user apps in < 150us
     mpg.set_cgroup_freeze("user.slice", false).unwrap();
@@ -142,7 +165,10 @@ fn test_mpg_and_mmps_integration() {
     ).unwrap();
 
     let mmps = MemorySupervisor::with_path(psi_file);
-    assert_eq!(mmps.evaluate_pressure_level(), utim_core::mmps::MemoryPressureLevel::Critical);
+    assert_eq!(
+        mmps.evaluate_pressure_level(),
+        utim_core::mmps::MemoryPressureLevel::Critical
+    );
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
@@ -185,7 +211,10 @@ fn test_ipc_roundtrip_server_client() {
     stream.flush().unwrap();
 
     let client_resp = client_handle.join().unwrap().unwrap();
-    assert_eq!(client_resp, IpcResponse::Ok("Started sshd.service".to_string()));
+    assert_eq!(
+        client_resp,
+        IpcResponse::Ok("Started sshd.service".to_string())
+    );
 
     let _ = fs::remove_file(&temp_sock);
 }
@@ -226,7 +255,12 @@ WantedBy=multi-user.target
 
     // 1. Enable unit with --root
     let status = std::process::Command::new(&dsh_bin)
-        .args(["--root", chroot.to_str().unwrap(), "enable", "test-helper.service"])
+        .args([
+            "--root",
+            chroot.to_str().unwrap(),
+            "enable",
+            "test-helper.service",
+        ])
         .status()
         .expect("Failed to execute deb-systemd-helper");
     assert!(status.success(), "enable should succeed");
@@ -236,19 +270,30 @@ WantedBy=multi-user.target
     assert!(symlink.exists(), "wants symlink should exist");
 
     // Verify state file created in var/lib/systemd/deb-systemd-helper-enabled/
-    let state_file = chroot.join("var/lib/systemd/deb-systemd-helper-enabled/test-helper.service.dsh-also");
+    let state_file =
+        chroot.join("var/lib/systemd/deb-systemd-helper-enabled/test-helper.service.dsh-also");
     assert!(state_file.exists(), "dsh-also state file should exist");
 
     // 2. is-enabled returns 0 (enabled)
     let status = std::process::Command::new(&dsh_bin)
-        .args(["--root", chroot.to_str().unwrap(), "is-enabled", "test-helper.service"])
+        .args([
+            "--root",
+            chroot.to_str().unwrap(),
+            "is-enabled",
+            "test-helper.service",
+        ])
         .status()
         .expect("Failed to execute is-enabled");
     assert!(status.success(), "is-enabled should exit 0 when enabled");
 
     // 3. Disable unit
     let status = std::process::Command::new(&dsh_bin)
-        .args(["--root", chroot.to_str().unwrap(), "disable", "test-helper.service"])
+        .args([
+            "--root",
+            chroot.to_str().unwrap(),
+            "disable",
+            "test-helper.service",
+        ])
         .status()
         .expect("Failed to execute disable");
     assert!(status.success(), "disable should succeed");
@@ -257,24 +302,46 @@ WantedBy=multi-user.target
 
     // 4. is-enabled returns 1 (disabled)
     let status = std::process::Command::new(&dsh_bin)
-        .args(["--root", chroot.to_str().unwrap(), "is-enabled", "test-helper.service"])
+        .args([
+            "--root",
+            chroot.to_str().unwrap(),
+            "is-enabled",
+            "test-helper.service",
+        ])
         .status()
         .expect("Failed to execute is-enabled on disabled unit");
-    assert_eq!(status.code(), Some(1), "is-enabled should exit 1 when disabled");
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "is-enabled should exit 1 when disabled"
+    );
 
     // 5. Mask unit
     let status = std::process::Command::new(&dsh_bin)
-        .args(["--root", chroot.to_str().unwrap(), "mask", "test-helper.service"])
+        .args([
+            "--root",
+            chroot.to_str().unwrap(),
+            "mask",
+            "test-helper.service",
+        ])
         .status()
         .expect("Failed to execute mask");
     assert!(status.success(), "mask should succeed");
     let mask_symlink = chroot.join("etc/systemd/system/test-helper.service");
     assert!(mask_symlink.is_symlink());
-    assert_eq!(fs::read_link(&mask_symlink).unwrap(), Path::new("/dev/null"));
+    assert_eq!(
+        fs::read_link(&mask_symlink).unwrap(),
+        Path::new("/dev/null")
+    );
 
     // 6. Unmask unit
     let status = std::process::Command::new(&dsh_bin)
-        .args(["--root", chroot.to_str().unwrap(), "unmask", "test-helper.service"])
+        .args([
+            "--root",
+            chroot.to_str().unwrap(),
+            "unmask",
+            "test-helper.service",
+        ])
         .status()
         .expect("Failed to execute unmask");
     assert!(status.success(), "unmask should succeed");
@@ -282,12 +349,21 @@ WantedBy=multi-user.target
 
     // 7. Test --no-enable flag
     let status = std::process::Command::new(&dsh_bin)
-        .args(["--root", chroot.to_str().unwrap(), "--no-enable", "enable", "test-helper.service"])
+        .args([
+            "--root",
+            chroot.to_str().unwrap(),
+            "--no-enable",
+            "enable",
+            "test-helper.service",
+        ])
         .status()
         .expect("Failed to execute enable with --no-enable");
     assert!(status.success(), "--no-enable enable should succeed");
     assert!(state_file.exists(), "state file should exist");
-    assert!(!symlink.exists(), "wants symlink should NOT exist when --no-enable is set");
+    assert!(
+        !symlink.exists(),
+        "wants symlink should NOT exist when --no-enable is set"
+    );
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
@@ -303,12 +379,17 @@ fn test_deb_systemd_invoke_cli() {
         .args(["start", "ssh.service"])
         .status()
         .expect("Failed to execute deb-systemd-invoke");
-    assert_eq!(status.code(), Some(0), "deb-systemd-invoke must exit 0 in offline chroot environment");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "deb-systemd-invoke must exit 0 in offline chroot environment"
+    );
 }
 
 #[test]
 fn test_reboot_and_poweroff_ipc_handling() {
-    let temp_sock = std::env::temp_dir().join(format!("utim_ipc_rb_test_{}.sock", std::process::id()));
+    let temp_sock =
+        std::env::temp_dir().join(format!("utim_ipc_rb_test_{}.sock", std::process::id()));
     let _ = fs::remove_file(&temp_sock);
 
     let listener = UnixListener::bind(&temp_sock).unwrap();
@@ -335,7 +416,13 @@ fn test_reboot_and_poweroff_ipc_handling() {
     let mut line1 = String::new();
     reader1.read_line(&mut line1).unwrap();
     assert_eq!(IpcRequest::deserialize(&line1).unwrap(), IpcRequest::Reboot);
-    stream1.write_all(IpcResponse::Ok("Rebooting system...".to_string()).serialize().as_bytes()).unwrap();
+    stream1
+        .write_all(
+            IpcResponse::Ok("Rebooting system...".to_string())
+                .serialize()
+                .as_bytes(),
+        )
+        .unwrap();
     stream1.flush().unwrap();
 
     // Server responds to Poweroff
@@ -351,13 +438,28 @@ fn test_reboot_and_poweroff_ipc_handling() {
     let mut reader2 = BufReader::new(stream2.try_clone().unwrap());
     let mut line2 = String::new();
     reader2.read_line(&mut line2).unwrap();
-    assert_eq!(IpcRequest::deserialize(&line2).unwrap(), IpcRequest::Poweroff);
-    stream2.write_all(IpcResponse::Ok("Powering off system...".to_string()).serialize().as_bytes()).unwrap();
+    assert_eq!(
+        IpcRequest::deserialize(&line2).unwrap(),
+        IpcRequest::Poweroff
+    );
+    stream2
+        .write_all(
+            IpcResponse::Ok("Powering off system...".to_string())
+                .serialize()
+                .as_bytes(),
+        )
+        .unwrap();
     stream2.flush().unwrap();
 
     let (resp_reboot, resp_poweroff) = client_handle.join().unwrap();
-    assert_eq!(resp_reboot.unwrap(), IpcResponse::Ok("Rebooting system...".to_string()));
-    assert_eq!(resp_poweroff.unwrap(), IpcResponse::Ok("Powering off system...".to_string()));
+    assert_eq!(
+        resp_reboot.unwrap(),
+        IpcResponse::Ok("Rebooting system...".to_string())
+    );
+    assert_eq!(
+        resp_poweroff.unwrap(),
+        IpcResponse::Ok("Powering off system...".to_string())
+    );
 
     let _ = fs::remove_file(&temp_sock);
 }
@@ -367,12 +469,23 @@ fn test_dag_ready_to_spawn_state_isolation() {
     use utim_core::dag::UnitState;
 
     let mut dag = UnitDag::new();
-    let unit1 = parse_unit("service1.service", Path::new("/service1.service"), "[Unit]\nDescription=S1\n");
-    let unit2 = parse_unit("service2.service", Path::new("/service2.service"), "[Unit]\nDescription=S2\n");
+    let unit1 = parse_unit(
+        "service1.service",
+        Path::new("/service1.service"),
+        "[Unit]\nDescription=S1\n",
+    );
+    let unit2 = parse_unit(
+        "service2.service",
+        Path::new("/service2.service"),
+        "[Unit]\nDescription=S2\n",
+    );
     dag.insert(unit1);
     dag.insert(unit2);
 
-    let queue = vec!["service1.service".to_string(), "service2.service".to_string()];
+    let queue = vec![
+        "service1.service".to_string(),
+        "service2.service".to_string(),
+    ];
 
     // Initially both are Inactive, so ready_to_spawn returns both
     let ready = dag.ready_to_spawn(&queue);

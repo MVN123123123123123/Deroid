@@ -11,7 +11,9 @@ use std::process;
 use std::time::{Duration, Instant};
 
 use utim_core::compositor::desktop::{DesktopApp, DesktopCatalogue};
-use utim_core::compositor::gestures::{GestureAction, GestureConfig, GestureEngine, RawTouchEvent, TouchPhase};
+use utim_core::compositor::gestures::{
+    GestureAction, GestureConfig, GestureEngine, RawTouchEvent, TouchPhase,
+};
 use utim_core::compositor::ime::{ImeAction, VirtualKeyboard};
 use utim_core::compositor::lockscreen::LockScreen;
 use utim_core::compositor::power_sync::UtimPowerSync;
@@ -101,11 +103,30 @@ fn run_daemon() {
     println!("[+] Initializing UTLC (Universal Treble Launcher & Compositor)...");
     println!("[*] Single-process unified mobile compositor starting up...");
 
-    // Detect HWC version from manifest
-    let manifest_content = fs::read_to_string("/vendor/etc/vintf/manifest.xml")
-        .or_else(|_| fs::read_to_string("/vendor/manifest.xml"))
-        .ok();
-    let hwc_version = HwcComposer::detect_version_from_manifest(manifest_content.as_deref());
+    // Detect HWC version from monolithic manifest and VINTF fragments
+    let mut manifest_content = String::new();
+    if let Ok(c) = fs::read_to_string("/vendor/etc/vintf/manifest.xml") {
+        manifest_content.push_str(&c);
+    }
+    if let Ok(c) = fs::read_to_string("/vendor/manifest.xml") {
+        manifest_content.push_str(&c);
+    }
+    if let Ok(entries) = fs::read_dir("/vendor/etc/vintf/manifest") {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) == Some("xml") {
+                if let Ok(c) = fs::read_to_string(&path) {
+                    manifest_content.push_str(&c);
+                }
+            }
+        }
+    }
+    let manifest_opt = if manifest_content.is_empty() {
+        None
+    } else {
+        Some(manifest_content.as_str())
+    };
+    let hwc_version = HwcComposer::detect_version_from_manifest(manifest_opt);
     println!("[*] Initializing Hardware Composer: {:?}", hwc_version);
     let hwc = HwcComposer::new(hwc_version);
 
@@ -116,9 +137,16 @@ fn run_daemon() {
     server.power_sync.configure_self_oom_score();
 
     if let Err(e) = server.bind_socket() {
-        eprintln!("[-] Failed to bind Wayland socket at {}: {}", socket_path.display(), e);
+        eprintln!(
+            "[-] Failed to bind Wayland socket at {}: {}",
+            socket_path.display(),
+            e
+        );
     } else {
-        println!("[+] Bound Wayland display socket at {}", socket_path.display());
+        println!(
+            "[+] Bound Wayland display socket at {}",
+            socket_path.display()
+        );
     }
 
     match server.boot_to_first_frame() {
@@ -135,14 +163,176 @@ fn run_daemon() {
     }
 
     // Signal systemd/UTIM via sd_notify if NOTIFY_SOCKET is present
-    if let Ok(notify_socket) = env::var("NOTIFY_SOCKET") {
-        use std::os::unix::net::UnixDatagram;
-        if let Ok(sock) = UnixDatagram::unbound() {
-            let _ = sock.send_to(b"READY=1\nSTATUS=UTLC Mobile Shell Active\n", notify_socket);
+    let notify_socket = env::var("NOTIFY_SOCKET").ok();
+    let notify_dgram = if notify_socket.is_some() {
+        std::os::unix::net::UnixDatagram::unbound().ok()
+    } else {
+        None
+    };
+    if let (Some(ref dgram), Some(ref sock_path)) = (&notify_dgram, &notify_socket) {
+        let _ = dgram.send_to(b"READY=1\nSTATUS=UTLC Mobile Shell Active\n", sock_path);
+    }
+
+    // Set up signal handling via signalfd for persistent daemon mode
+    let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::sigemptyset(&mut mask);
+        libc::sigaddset(&mut mask, libc::SIGTERM);
+        libc::sigaddset(&mut mask, libc::SIGINT);
+        libc::sigprocmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut());
+    }
+    let sig_fd = unsafe { libc::signalfd(-1, &mask, libc::SFD_NONBLOCK | libc::SFD_CLOEXEC) };
+
+    let epoll_fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+    if epoll_fd >= 0 && sig_fd >= 0 {
+        let mut sig_ev = libc::epoll_event {
+            events: libc::EPOLLIN as u32,
+            u64: sig_fd as u64,
+        };
+        unsafe {
+            libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, sig_fd, &mut sig_ev);
         }
     }
 
-    println!("[+] UTLC daemon running successfully.");
+    use std::os::unix::io::AsRawFd;
+    if let Some(ref listener) = server.listener {
+        let listen_fd = listener.as_raw_fd();
+        if epoll_fd >= 0 {
+            let mut listen_ev = libc::epoll_event {
+                events: libc::EPOLLIN as u32,
+                u64: listen_fd as u64,
+            };
+            unsafe {
+                libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, listen_fd, &mut listen_ev);
+            }
+        }
+    }
+
+    let watchdog_usec = env::var("WATCHDOG_USEC")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok());
+    let watchdog_interval = watchdog_usec
+        .map(|us| Duration::from_micros(us / 2))
+        .unwrap_or(Duration::from_secs(5));
+    let mut last_watchdog_ping = Instant::now();
+
+    let mut running = true;
+    let mut last_frame = Instant::now();
+    let frame_interval = Duration::from_millis(16);
+
+    println!("[+] UTLC daemon running successfully in persistent event loop.");
+
+    while running {
+        let timeout_ms = 16;
+        let mut events: [libc::epoll_event; 16] = unsafe { std::mem::zeroed() };
+        let nfds = if epoll_fd >= 0 {
+            unsafe { libc::epoll_wait(epoll_fd, events.as_mut_ptr(), 16, timeout_ms) }
+        } else {
+            std::thread::sleep(Duration::from_millis(16));
+            0
+        };
+
+        if nfds > 0 {
+            for ev in events.iter().take(nfds as usize) {
+                let fd = ev.u64 as libc::c_int;
+                if fd == sig_fd {
+                    println!("[*] UTLC received termination signal, shutting down...");
+                    running = false;
+                    break;
+                } else if server
+                    .listener
+                    .as_ref()
+                    .is_some_and(|l| l.as_raw_fd() == fd)
+                {
+                    if let Some(ref listener) = server.listener {
+                        while let Ok((client_stream, _)) = listener.accept() {
+                            let _ = client_stream.set_nonblocking(true);
+                            if epoll_fd >= 0 {
+                                let c_fd = client_stream.as_raw_fd();
+                                let mut client_ev = libc::epoll_event {
+                                    events: (libc::EPOLLIN | libc::EPOLLHUP | libc::EPOLLERR)
+                                        as u32,
+                                    u64: c_fd as u64,
+                                };
+                                unsafe {
+                                    libc::epoll_ctl(
+                                        epoll_fd,
+                                        libc::EPOLL_CTL_ADD,
+                                        c_fd,
+                                        &mut client_ev,
+                                    );
+                                }
+                            }
+                            server.client_streams.push(client_stream);
+                        }
+                    }
+                } else {
+                    // Servicing connected client stream events (read/drain or close)
+                    use std::io::Read;
+                    let mut buf = [0u8; 1024];
+                    let mut closed = false;
+                    let mut stream_idx = None;
+                    for (idx, stream) in server.client_streams.iter_mut().enumerate() {
+                        if stream.as_raw_fd() == fd {
+                            stream_idx = Some(idx);
+                            if (ev.events & (libc::EPOLLHUP | libc::EPOLLERR) as u32) != 0 {
+                                closed = true;
+                            } else {
+                                match stream.read(&mut buf) {
+                                    Ok(0) => closed = true,
+                                    Ok(_) => {}
+                                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                                    Err(_) => closed = true,
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    if closed {
+                        if let Some(idx) = stream_idx {
+                            if epoll_fd >= 0 {
+                                unsafe {
+                                    libc::epoll_ctl(
+                                        epoll_fd,
+                                        libc::EPOLL_CTL_DEL,
+                                        fd,
+                                        std::ptr::null_mut(),
+                                    );
+                                }
+                            }
+                            server.client_streams.swap_remove(idx);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Vsync frame presentation step
+        if last_frame.elapsed() >= frame_interval {
+            let dt = last_frame.elapsed().as_secs_f32();
+            last_frame = Instant::now();
+            let _ = server.step_frame(dt);
+        }
+
+        // Watchdog periodic ping
+        if last_watchdog_ping.elapsed() >= watchdog_interval {
+            last_watchdog_ping = Instant::now();
+            if let (Some(ref dgram), Some(ref sock_path)) = (&notify_dgram, &notify_socket) {
+                let _ = dgram.send_to(b"WATCHDOG=1\n", sock_path);
+            }
+        }
+    }
+
+    if epoll_fd >= 0 {
+        unsafe {
+            libc::close(epoll_fd);
+        }
+    }
+    if sig_fd >= 0 {
+        unsafe {
+            libc::close(sig_fd);
+        }
+    }
 }
 
 fn check_protocols(json: bool) -> bool {
@@ -150,15 +340,50 @@ fn check_protocols(json: bool) -> bool {
     let supported = reg.supports_mobile_protocols();
 
     let protocols = [
-        ("xdg_wm_base", reg.find_by_interface(WaylandInterface::XdgWmBase).is_some()),
-        ("zwlr_layer_shell_v1", reg.find_by_interface(WaylandInterface::ZwlrLayerShellV1).is_some()),
-        ("zwp_linux_dmabuf_v1", reg.find_by_interface(WaylandInterface::ZwpLinuxDmabufV1).is_some()),
-        ("wp_presentation", reg.find_by_interface(WaylandInterface::WpPresentation).is_some()),
-        ("wp_viewporter", reg.find_by_interface(WaylandInterface::WpViewporter).is_some()),
-        ("ext_idle_notifier_v1", reg.find_by_interface(WaylandInterface::ExtIdleNotifierV1).is_some()),
-        ("zwp_text_input_v3", reg.find_by_interface(WaylandInterface::ZwpTextInputV3).is_some()),
-        ("zwp_input_method_v2", reg.find_by_interface(WaylandInterface::ZwpInputMethodV2).is_some()),
-        ("zwp_tablet_manager_v2", reg.find_by_interface(WaylandInterface::ZwpTabletManagerV2).is_some()),
+        (
+            "xdg_wm_base",
+            reg.find_by_interface(WaylandInterface::XdgWmBase).is_some(),
+        ),
+        (
+            "zwlr_layer_shell_v1",
+            reg.find_by_interface(WaylandInterface::ZwlrLayerShellV1)
+                .is_some(),
+        ),
+        (
+            "zwp_linux_dmabuf_v1",
+            reg.find_by_interface(WaylandInterface::ZwpLinuxDmabufV1)
+                .is_some(),
+        ),
+        (
+            "wp_presentation",
+            reg.find_by_interface(WaylandInterface::WpPresentation)
+                .is_some(),
+        ),
+        (
+            "wp_viewporter",
+            reg.find_by_interface(WaylandInterface::WpViewporter)
+                .is_some(),
+        ),
+        (
+            "ext_idle_notifier_v1",
+            reg.find_by_interface(WaylandInterface::ExtIdleNotifierV1)
+                .is_some(),
+        ),
+        (
+            "zwp_text_input_v3",
+            reg.find_by_interface(WaylandInterface::ZwpTextInputV3)
+                .is_some(),
+        ),
+        (
+            "zwp_input_method_v2",
+            reg.find_by_interface(WaylandInterface::ZwpInputMethodV2)
+                .is_some(),
+        ),
+        (
+            "zwp_tablet_manager_v2",
+            reg.find_by_interface(WaylandInterface::ZwpTabletManagerV2)
+                .is_some(),
+        ),
     ];
 
     if json {
@@ -166,16 +391,27 @@ fn check_protocols(json: bool) -> bool {
         for (name, ok) in &protocols {
             parts.push(format!(r#""{}":{}"#, name, ok));
         }
-        println!(r#"{{"all_supported":{},"protocols":{{{}}}}}"#, supported, parts.join(","));
+        println!(
+            r#"{{"all_supported":{},"protocols":{{{}}}}}"#,
+            supported,
+            parts.join(",")
+        );
     } else {
         println!("============================================================");
         println!(" UTLC WAYLAND PROTOCOL ENGINE VERIFICATION");
         println!("============================================================");
         for (name, ok) in &protocols {
-            println!("  [{}] Protocol: {:<25} (Active)", if *ok { "PASS" } else { "FAIL" }, name);
+            println!(
+                "  [{}] Protocol: {:<25} (Active)",
+                if *ok { "PASS" } else { "FAIL" },
+                name
+            );
         }
         println!("------------------------------------------------------------");
-        println!(" All Mobile Protocols Verified: {}", if supported { "YES" } else { "NO" });
+        println!(
+            " All Mobile Protocols Verified: {}",
+            if supported { "YES" } else { "NO" }
+        );
         println!("============================================================");
     }
 
@@ -198,7 +434,11 @@ fn run_benchmarks(json: bool) -> bool {
     if catalogue.apps().is_empty() {
         // Add sample apps if no system desktop files found
         for i in 0..100 {
-            catalogue.add_app(DesktopApp::new(format!("app_{}", i), format!("Application {}", i), format!("exec_{}", i)));
+            catalogue.add_app(DesktopApp::new(
+                format!("app_{}", i),
+                format!("Application {}", i),
+                format!("exec_{}", i),
+            ));
         }
     }
 
@@ -207,7 +447,10 @@ fn run_benchmarks(json: bool) -> bool {
     let search_latency = search_start.elapsed();
     let search_ms = search_latency.as_secs_f64() * 1000.0;
 
-    let passed = metrics.is_rss_within_target && metrics.is_boot_within_target && touch_ms < 8.0 && search_ms < 1.0;
+    let passed = metrics.is_rss_within_target
+        && metrics.is_boot_within_target
+        && touch_ms < 8.0
+        && search_ms < 1.0;
 
     if json {
         println!(
@@ -229,12 +472,20 @@ fn run_benchmarks(json: bool) -> bool {
         println!(
             "[*] Resident Set Size (RSS):       {:.2} MB (Target: < 15 MB) -> {}",
             rss_mb,
-            if metrics.is_rss_within_target { "PASS" } else { "FAIL" }
+            if metrics.is_rss_within_target {
+                "PASS"
+            } else {
+                "FAIL"
+            }
         );
         println!(
             "[*] Boot-to-Launcher Time:        {:.2} ms (Target: < 450 ms) -> {}",
             boot_ms,
-            if metrics.is_boot_within_target { "PASS" } else { "FAIL" }
+            if metrics.is_boot_within_target {
+                "PASS"
+            } else {
+                "FAIL"
+            }
         );
         println!(
             "[*] Touch Gesture Input Latency:  {:.4} ms (Target: < 8.0 ms) -> {}",
@@ -247,7 +498,14 @@ fn run_benchmarks(json: bool) -> bool {
             if search_ms < 1.0 { "PASS" } else { "FAIL" }
         );
         println!("------------------------------------------------------------");
-        println!(" Overall Performance Verification: {}", if passed { "ALL TARGETS MET" } else { "TARGET REGRESSION" });
+        println!(
+            " Overall Performance Verification: {}",
+            if passed {
+                "ALL TARGETS MET"
+            } else {
+                "TARGET REGRESSION"
+            }
+        );
         println!("============================================================");
     }
 
@@ -259,31 +517,66 @@ fn test_gestures(json: bool) -> bool {
     let t0 = Instant::now();
 
     // 1. Home gesture
-    engine.process_touch(&RawTouchEvent { touch_id: 1, phase: TouchPhase::Down, x: 540.0, y: 2380.0, timestamp: t0 });
+    engine.process_touch(&RawTouchEvent {
+        touch_id: 1,
+        phase: TouchPhase::Down,
+        x: 540.0,
+        y: 2380.0,
+        timestamp: t0,
+    });
     let home_act = engine.process_touch(&RawTouchEvent {
-        touch_id: 1, phase: TouchPhase::Up, x: 540.0, y: 2200.0, timestamp: t0 + Duration::from_millis(80),
+        touch_id: 1,
+        phase: TouchPhase::Up,
+        x: 540.0,
+        y: 2200.0,
+        timestamp: t0 + Duration::from_millis(80),
     });
     let home_ok = matches!(home_act, GestureAction::Home { progress, .. } if progress >= 1.0);
 
     // 2. Recents gesture (hold > 180ms)
-    engine.process_touch(&RawTouchEvent { touch_id: 2, phase: TouchPhase::Down, x: 540.0, y: 2380.0, timestamp: t0 });
-    let recents_act = engine.process_touch(&RawTouchEvent {
-        touch_id: 2, phase: TouchPhase::Move, x: 540.0, y: 2200.0, timestamp: t0 + Duration::from_millis(200),
+    engine.process_touch(&RawTouchEvent {
+        touch_id: 2,
+        phase: TouchPhase::Down,
+        x: 540.0,
+        y: 2380.0,
+        timestamp: t0,
     });
-    let recents_ok = matches!(recents_act, GestureAction::Recents { trigger_haptic, .. } if trigger_haptic);
+    let recents_act = engine.process_touch(&RawTouchEvent {
+        touch_id: 2,
+        phase: TouchPhase::Move,
+        x: 540.0,
+        y: 2200.0,
+        timestamp: t0 + Duration::from_millis(200),
+    });
+    let recents_ok =
+        matches!(recents_act, GestureAction::Recents { trigger_haptic, .. } if trigger_haptic);
 
     // 3. Back gesture (edge swipe)
-    engine.process_touch(&RawTouchEvent { touch_id: 3, phase: TouchPhase::Down, x: 10.0, y: 1200.0, timestamp: t0 });
+    engine.process_touch(&RawTouchEvent {
+        touch_id: 3,
+        phase: TouchPhase::Down,
+        x: 10.0,
+        y: 1200.0,
+        timestamp: t0,
+    });
     let back_act = engine.process_touch(&RawTouchEvent {
-        touch_id: 3, phase: TouchPhase::Up, x: 60.0, y: 1200.0, timestamp: t0 + Duration::from_millis(100),
+        touch_id: 3,
+        phase: TouchPhase::Up,
+        x: 60.0,
+        y: 1200.0,
+        timestamp: t0 + Duration::from_millis(100),
     });
     let back_ok = matches!(back_act, GestureAction::Back { injected, .. } if injected);
 
     let all_ok = home_ok && recents_ok && back_ok;
     if json {
-        println!(r#"{{"home_ok":{},"recents_ok":{},"back_ok":{},"all_passed":{}}}"#, home_ok, recents_ok, back_ok, all_ok);
+        println!(
+            r#"{{"home_ok":{},"recents_ok":{},"back_ok":{},"all_passed":{}}}"#,
+            home_ok, recents_ok, back_ok, all_ok
+        );
     } else {
-        println!("[*] QuickStep Gestures: Home={}, Recents={}, Back={} -> {}",
+        println!(
+            "[*] QuickStep Gestures: Home={}, Recents={}, Back={} -> {}",
             if home_ok { "PASS" } else { "FAIL" },
             if recents_ok { "PASS" } else { "FAIL" },
             if back_ok { "PASS" } else { "FAIL" },
@@ -295,9 +588,21 @@ fn test_gestures(json: bool) -> bool {
 
 fn test_desktop(json: bool) -> bool {
     let mut catalogue = DesktopCatalogue::new();
-    catalogue.add_app(DesktopApp::new("phone".into(), "Phone Dialer".into(), "dialer".into()));
-    catalogue.add_app(DesktopApp::new("chatty".into(), "Messaging".into(), "chatty".into()));
-    catalogue.add_app(DesktopApp::new("firefox".into(), "Firefox Web Browser".into(), "firefox".into()));
+    catalogue.add_app(DesktopApp::new(
+        "phone".into(),
+        "Phone Dialer".into(),
+        "dialer".into(),
+    ));
+    catalogue.add_app(DesktopApp::new(
+        "chatty".into(),
+        "Messaging".into(),
+        "chatty".into(),
+    ));
+    catalogue.add_app(DesktopApp::new(
+        "firefox".into(),
+        "Firefox Web Browser".into(),
+        "firefox".into(),
+    ));
 
     let results = catalogue.search("fox");
     let ok = results.len() == 1 && results[0].0.id == "firefox";
@@ -305,7 +610,10 @@ fn test_desktop(json: bool) -> bool {
     if json {
         println!(r#"{{"desktop_search_ok":{}}}"#, ok);
     } else {
-        println!("[*] Desktop Parsing & Search: {}", if ok { "PASSED" } else { "FAILED" });
+        println!(
+            "[*] Desktop Parsing & Search: {}",
+            if ok { "PASSED" } else { "FAILED" }
+        );
     }
     ok
 }
@@ -313,14 +621,27 @@ fn test_desktop(json: bool) -> bool {
 fn test_systemui(json: bool) -> bool {
     let mut shade = SystemUiShade::new(1080.0, 2400.0);
     let torch_ok = shade.toggle_tile(QuickTileKind::Torch);
-    let notif_id = shade.notify("App".into(), 0, "icon".into(), "Summary".into(), "Body".into(), vec![]);
+    let notif_id = shade.notify(
+        "App".into(),
+        0,
+        "icon".into(),
+        "Summary".into(),
+        "Body".into(),
+        vec![],
+    );
     let notif_ok = notif_id > 0 && shade.notifications.len() == 1;
 
     let all_ok = torch_ok && notif_ok;
     if json {
-        println!(r#"{{"torch_toggle_ok":{},"notification_ok":{},"all_passed":{}}}"#, torch_ok, notif_ok, all_ok);
+        println!(
+            r#"{{"torch_toggle_ok":{},"notification_ok":{},"all_passed":{}}}"#,
+            torch_ok, notif_ok, all_ok
+        );
     } else {
-        println!("[*] SystemUI Status & Shade: {}", if all_ok { "PASSED" } else { "FAILED" });
+        println!(
+            "[*] SystemUI Status & Shade: {}",
+            if all_ok { "PASSED" } else { "FAILED" }
+        );
     }
     all_ok
 }
@@ -328,12 +649,19 @@ fn test_systemui(json: bool) -> bool {
 fn test_lockscreen(json: bool) -> bool {
     let mut lockscreen = LockScreen::new(Some("1234"));
     let fp_ok = lockscreen.on_fingerprint_touch(1);
-    let auth_ok = !lockscreen.is_locked() && lockscreen.biometric_bridge.last_auth_duration < Duration::from_millis(300);
+    let auth_ok = !lockscreen.is_locked()
+        && lockscreen.biometric_bridge.last_auth_duration < Duration::from_millis(300);
 
     if json {
-        println!(r#"{{"fingerprint_unlock_ok":{},"sub_300ms":{}}}"#, fp_ok, auth_ok);
+        println!(
+            r#"{{"fingerprint_unlock_ok":{},"sub_300ms":{}}}"#,
+            fp_ok, auth_ok
+        );
     } else {
-        println!("[*] Lock Screen & Fingerprint HAL Bridge (< 300ms): {}", if auth_ok { "PASSED" } else { "FAILED" });
+        println!(
+            "[*] Lock Screen & Fingerprint HAL Bridge (< 300ms): {}",
+            if auth_ok { "PASSED" } else { "FAILED" }
+        );
     }
     auth_ok
 }
@@ -350,9 +678,15 @@ fn test_ime(json: bool) -> bool {
 
     let all_ok = push_ok && key_ok;
     if json {
-        println!(r#"{{"ime_viewport_push_ok":{},"ime_key_ok":{},"all_passed":{}}}"#, push_ok, key_ok, all_ok);
+        println!(
+            r#"{{"ime_viewport_push_ok":{},"ime_key_ok":{},"all_passed":{}}}"#,
+            push_ok, key_ok, all_ok
+        );
     } else {
-        println!("[*] Virtual Keyboard IME & Viewport Push: {}", if all_ok { "PASSED" } else { "FAILED" });
+        println!(
+            "[*] Virtual Keyboard IME & Viewport Push: {}",
+            if all_ok { "PASSED" } else { "FAILED" }
+        );
     }
     all_ok
 }
@@ -365,9 +699,15 @@ fn test_power_sync(json: bool) -> bool {
 
     let all_ok = sleep_ok && wake_ok && oom_ok;
     if json {
-        println!(r#"{{"sleep_ok":{},"wake_ok":{},"oom_ok":{},"all_passed":{}}}"#, sleep_ok, wake_ok, oom_ok, all_ok);
+        println!(
+            r#"{{"sleep_ok":{},"wake_ok":{},"oom_ok":{},"all_passed":{}}}"#,
+            sleep_ok, wake_ok, oom_ok, all_ok
+        );
     } else {
-        println!("[*] UTIM Power & OOM Synchronization: {}", if all_ok { "PASSED" } else { "FAILED" });
+        println!(
+            "[*] UTIM Power & OOM Synchronization: {}",
+            if all_ok { "PASSED" } else { "FAILED" }
+        );
     }
     all_ok
 }
@@ -382,7 +722,8 @@ fn run_all_checks(json: bool) -> bool {
     let ime_ok = test_ime(false);
     let pwr_ok = test_power_sync(false);
 
-    let passed = proto_ok && bench_ok && gesture_ok && desk_ok && sys_ok && lock_ok && ime_ok && pwr_ok;
+    let passed =
+        proto_ok && bench_ok && gesture_ok && desk_ok && sys_ok && lock_ok && ime_ok && pwr_ok;
 
     if json {
         println!(

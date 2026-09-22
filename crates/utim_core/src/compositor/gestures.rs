@@ -101,13 +101,13 @@ enum GestureState {
 /// Gesture Engine Configuration
 #[derive(Debug, Clone, PartialEq)]
 pub struct GestureConfig {
-    pub bottom_nav_height: f32, // default 48.0 px
-    pub edge_zone_width: f32,   // default 48.0 px
-    pub top_bar_height: f32,    // default 48.0 px
-    pub home_threshold_y: f32,  // default 60.0 px
+    pub bottom_nav_height: f32,      // default 48.0 px
+    pub edge_zone_width: f32,        // default 48.0 px
+    pub top_bar_height: f32,         // default 48.0 px
+    pub home_threshold_y: f32,       // default 60.0 px
     pub recents_hold_time: Duration, // default 180 ms
-    pub back_threshold_x: f32,  // default 40.0 px
-    pub scrub_threshold_x: f32, // default 80.0 px
+    pub back_threshold_x: f32,       // default 40.0 px
+    pub scrub_threshold_x: f32,      // default 80.0 px
 }
 
 impl Default for GestureConfig {
@@ -274,9 +274,7 @@ impl GestureEngine {
                     }
 
                     GestureState::TrackingTop {
-                        start_y,
-                        current_y,
-                        ..
+                        start_y, current_y, ..
                     } => {
                         *current_y = event.y;
                         let dy = event.y - *start_y; // positive downward
@@ -306,7 +304,9 @@ impl GestureEngine {
                                 progress: 1.0,
                                 trigger_haptic: false,
                             }
-                        } else if dy >= self.config.home_threshold_y && elapsed < self.config.recents_hold_time {
+                        } else if dy >= self.config.home_threshold_y
+                            && elapsed < self.config.recents_hold_time
+                        {
                             // Quick swipe up -> Home
                             GestureAction::Home {
                                 progress: 1.0,
@@ -324,11 +324,7 @@ impl GestureEngine {
                         }
                     }
 
-                    GestureState::TrackingEdge {
-                        side,
-                        start_x,
-                        ..
-                    } => {
+                    GestureState::TrackingEdge { side, start_x, .. } => {
                         let dx = match side {
                             EdgeSide::Left => event.x - *start_x,
                             EdgeSide::Right => *start_x - event.x,
@@ -347,10 +343,7 @@ impl GestureEngine {
                         }
                     }
 
-                    GestureState::TrackingTop {
-                        start_y,
-                        ..
-                    } => {
+                    GestureState::TrackingTop { start_y, .. } => {
                         let dy = event.y - *start_y;
                         if dy >= 50.0 {
                             GestureAction::NotificationShade { progress: 1.0 }

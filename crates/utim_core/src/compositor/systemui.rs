@@ -40,7 +40,7 @@ pub struct StatusBarState {
     pub is_charging: bool,
     pub cellular_bars: u8, // 0 to 4
     pub cellular_rat: CellularRat,
-    pub wifi_bars: u8,     // 0 to 3
+    pub wifi_bars: u8, // 0 to 3
     pub wifi_ssid: Option<String>,
     pub notification_count: usize,
 }
@@ -127,25 +127,60 @@ pub struct SystemUiShade {
 impl SystemUiShade {
     pub fn new(display_width: f32, display_height: f32) -> Self {
         let tiles = vec![
-            QuickTile { kind: QuickTileKind::Wifi, is_active: true, subtitle: "Connected".into() },
-            QuickTile { kind: QuickTileKind::MobileData, is_active: true, subtitle: "5G Active".into() },
-            QuickTile { kind: QuickTileKind::Bluetooth, is_active: false, subtitle: "Off".into() },
-            QuickTile { kind: QuickTileKind::Torch, is_active: false, subtitle: "Off".into() },
-            QuickTile { kind: QuickTileKind::AutoRotate, is_active: true, subtitle: "On".into() },
-            QuickTile { kind: QuickTileKind::AirplaneMode, is_active: false, subtitle: "Off".into() },
-            QuickTile { kind: QuickTileKind::BatterySaver, is_active: false, subtitle: "Off".into() },
-            QuickTile { kind: QuickTileKind::Hotspot, is_active: false, subtitle: "Off".into() },
+            QuickTile {
+                kind: QuickTileKind::Wifi,
+                is_active: true,
+                subtitle: "Connected".into(),
+            },
+            QuickTile {
+                kind: QuickTileKind::MobileData,
+                is_active: true,
+                subtitle: "5G Active".into(),
+            },
+            QuickTile {
+                kind: QuickTileKind::Bluetooth,
+                is_active: false,
+                subtitle: "Off".into(),
+            },
+            QuickTile {
+                kind: QuickTileKind::Torch,
+                is_active: false,
+                subtitle: "Off".into(),
+            },
+            QuickTile {
+                kind: QuickTileKind::AutoRotate,
+                is_active: true,
+                subtitle: "On".into(),
+            },
+            QuickTile {
+                kind: QuickTileKind::AirplaneMode,
+                is_active: false,
+                subtitle: "Off".into(),
+            },
+            QuickTile {
+                kind: QuickTileKind::BatterySaver,
+                is_active: false,
+                subtitle: "Off".into(),
+            },
+            QuickTile {
+                kind: QuickTileKind::Hotspot,
+                is_active: false,
+                subtitle: "Off".into(),
+            },
         ];
 
         Self {
             display_width,
             display_height,
             status_bar: StatusBarState::default(),
-            pull_spring: SpringOscillator::new(0.0, SpringConfig {
-                stiffness: 240.0,
-                damping: 24.0,
-                mass: 1.0,
-            }),
+            pull_spring: SpringOscillator::new(
+                0.0,
+                SpringConfig {
+                    stiffness: 240.0,
+                    damping: 24.0,
+                    mass: 1.0,
+                },
+            ),
             tiles,
             brightness_percent: 75,
             volume_percent: 60,
@@ -179,7 +214,11 @@ impl SystemUiShade {
         let mut found = false;
         if let Some(tile) = self.tiles.iter_mut().find(|t| t.kind == kind) {
             tile.is_active = !tile.is_active;
-            tile.subtitle = if tile.is_active { "On".into() } else { "Off".into() };
+            tile.subtitle = if tile.is_active {
+                "On".into()
+            } else {
+                "Off".into()
+            };
             activated = tile.is_active;
             found = true;
         }
@@ -317,7 +356,11 @@ mod tests {
 
         let torch_state = shade.toggle_tile(QuickTileKind::Torch);
         assert!(torch_state);
-        let torch_tile = shade.tiles.iter().find(|t| t.kind == QuickTileKind::Torch).unwrap();
+        let torch_tile = shade
+            .tiles
+            .iter()
+            .find(|t| t.kind == QuickTileKind::Torch)
+            .unwrap();
         assert!(torch_tile.is_active);
 
         shade.set_brightness(90);

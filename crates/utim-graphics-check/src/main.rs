@@ -7,15 +7,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process;
 
-use utim_core::graphics::composer::{
-    CompositionType, DisplayConfig, HwcComposer,
-};
+use utim_core::graphics::composer::{CompositionType, DisplayConfig, HwcComposer};
 use utim_core::graphics::elf_align::inspect_elf_file;
 use utim_core::graphics::gpu::GpuDetector;
 use utim_core::graphics::gralloc::{usage, GrallocManager, PixelFormat};
-use utim_core::graphics::vsync::{
-    VsyncConfig, VsyncPresentationValidator, STANDARD_REFRESH_RATES,
-};
+use utim_core::graphics::vsync::{VsyncConfig, VsyncPresentationValidator, STANDARD_REFRESH_RATES};
 use utim_core::hal::HalManager;
 
 fn main() {
@@ -28,14 +24,21 @@ fn main() {
     }
 
     if let Some(pos) = args.iter().position(|a| a == "--generate-env") {
-        let out_path = args.get(pos + 1).cloned().unwrap_or_else(|| "/run/utim/graphics.env".to_string());
+        let out_path = args
+            .get(pos + 1)
+            .cloned()
+            .unwrap_or_else(|| "/run/utim/graphics.env".to_string());
         generate_env_file(&out_path);
         process::exit(0);
     }
 
     if let Some(pos) = args.iter().position(|a| a == "--check-elf") {
         let mut targets: Vec<String> = if pos + 1 < args.len() {
-            args[pos + 1..].iter().filter(|s| !s.starts_with("--")).cloned().collect()
+            args[pos + 1..]
+                .iter()
+                .filter(|s| !s.starts_with("--"))
+                .cloned()
+                .collect()
         } else {
             Vec::new()
         };
@@ -77,7 +80,10 @@ fn generate_env_file(path: &str) {
         process::exit(1);
     }
 
-    println!("[+] Successfully wrote GPU environment configuration to {}", path);
+    println!(
+        "[+] Successfully wrote GPU environment configuration to {}",
+        path
+    );
 }
 
 fn check_elf_alignment(targets: &[String], json: bool) -> bool {
@@ -98,14 +104,21 @@ fn check_elf_alignment(targets: &[String], json: bool) -> bool {
                 if json {
                     println!(
                         r#"{{"file":"{}","is_64k_compatible":{},"min_align":{},"load_segments":{}}}"#,
-                        target, report.is_64k_compatible, report.min_load_align, report.load_segments.len()
+                        target,
+                        report.is_64k_compatible,
+                        report.min_load_align,
+                        report.load_segments.len()
                     );
                 } else {
                     println!(
                         "[*] ELF Alignment: {} -> min_align=0x{:x} ({})",
                         target,
                         report.min_load_align,
-                        if report.is_64k_compatible { "PASS (>=64KB)" } else { "FAIL (<64KB)" }
+                        if report.is_64k_compatible {
+                            "PASS (>=64KB)"
+                        } else {
+                            "FAIL (<64KB)"
+                        }
                     );
                     for seg in &report.load_segments {
                         println!(
@@ -113,7 +126,11 @@ fn check_elf_alignment(targets: &[String], json: bool) -> bool {
                             seg.index,
                             seg.vaddr,
                             seg.align,
-                            if seg.is_aligned_64k { "64K OK" } else { "INSUFFICIENT" }
+                            if seg.is_aligned_64k {
+                                "64K OK"
+                            } else {
+                                "INSUFFICIENT"
+                            }
                         );
                     }
                 }
@@ -153,9 +170,12 @@ fn run_full_diagnostics(json: bool) -> bool {
     hwc.set_layer_z_order(0, l1, 1).unwrap();
     hwc.set_layer_z_order(0, l2, 2).unwrap();
     hwc.set_layer_z_order(0, l3, 3).unwrap();
-    hwc.set_layer_composition_type(0, l1, CompositionType::Device).unwrap();
-    hwc.set_layer_composition_type(0, l2, CompositionType::Device).unwrap();
-    hwc.set_layer_composition_type(0, l3, CompositionType::Device).unwrap();
+    hwc.set_layer_composition_type(0, l1, CompositionType::Device)
+        .unwrap();
+    hwc.set_layer_composition_type(0, l2, CompositionType::Device)
+        .unwrap();
+    hwc.set_layer_composition_type(0, l3, CompositionType::Device)
+        .unwrap();
     hwc.set_layer_buffer(0, l1, 1001, None).unwrap();
     hwc.set_layer_buffer(0, l2, 1002, None).unwrap();
     hwc.set_layer_buffer(0, l3, 1003, None).unwrap();
@@ -170,7 +190,12 @@ fn run_full_diagnostics(json: bool) -> bool {
     let gralloc_version = GrallocManager::detect_version(manifest_content.as_deref());
     let mut gralloc = GrallocManager::new(gralloc_version);
 
-    let buf_linear = gralloc.allocate(1080, 2400, PixelFormat::Rgba8888, usage::HW_RENDER | usage::HW_COMPOSER);
+    let buf_linear = gralloc.allocate(
+        1080,
+        2400,
+        PixelFormat::Rgba8888,
+        usage::HW_RENDER | usage::HW_COMPOSER,
+    );
     let buf_ubwc = gralloc.allocate(
         1080,
         2400,
@@ -179,9 +204,18 @@ fn run_full_diagnostics(json: bool) -> bool {
     );
     let dmabuf_export = buf_linear.as_ref().map(|b| gralloc.export_dmabuf(b));
     let dmabuf_import = if let Ok(Ok(fd)) = &dmabuf_export {
-        gralloc.import_dmabuf(*fd, 1080, 2400, PixelFormat::Rgba8888, usage::HW_RENDER, None)
+        gralloc.import_dmabuf(
+            *fd,
+            1080,
+            2400,
+            PixelFormat::Rgba8888,
+            usage::HW_RENDER,
+            None,
+        )
     } else {
-        Err(utim_core::graphics::GrallocError::AllocationFailed("Export failed".into()))
+        Err(utim_core::graphics::GrallocError::AllocationFailed(
+            "Export failed".into(),
+        ))
     };
     if let Ok(Ok(fd)) = dmabuf_export {
         unsafe { libc::close(fd) };
@@ -202,7 +236,10 @@ fn run_full_diagnostics(json: bool) -> bool {
 
         for _ in 0..60 {
             let sim_present = sim_vsync + 10_000; // 10 us delay
-            if validator.validate_frame_presentation(sim_vsync, sim_present).is_err() {
+            if validator
+                .validate_frame_presentation(sim_vsync, sim_present)
+                .is_err()
+            {
                 rate_ok = false;
                 break;
             }
@@ -225,7 +262,10 @@ fn run_full_diagnostics(json: bool) -> bool {
     // 5. Binary 64KB ELF Alignment Check on own binary
     let current_exe = env::current_exe().unwrap_or_else(|_| PathBuf::from("/proc/self/exe"));
     let elf_report = inspect_elf_file(&current_exe).ok();
-    let elf_ok = elf_report.as_ref().map(|r| r.is_64k_compatible).unwrap_or(false);
+    let elf_ok = elf_report
+        .as_ref()
+        .map(|r| r.is_64k_compatible)
+        .unwrap_or(false);
     if !elf_ok {
         // If running in development debug mode on non-aarch64 x86_64 host, note that host elf might have 4k align
         // but cross-compiled aarch64 binary must have 64k.
@@ -272,13 +312,14 @@ fn run_full_diagnostics(json: bool) -> bool {
             if hwc_ok { "PASSED" } else { "FAILED" }
         );
 
-        println!(
-            "[*] 2. Gralloc & DMA-BUF Allocator: {:?}",
-            gralloc_version
-        );
+        println!("[*] 2. Gralloc & DMA-BUF Allocator: {:?}", gralloc_version);
         println!(
             "       Linear RGBA_8888 Allocation: {}",
-            if buf_linear.is_ok() { "PASSED" } else { "FAILED" }
+            if buf_linear.is_ok() {
+                "PASSED"
+            } else {
+                "FAILED"
+            }
         );
         println!(
             "       Qualcomm UBWC Compressed Allocation: {}",
