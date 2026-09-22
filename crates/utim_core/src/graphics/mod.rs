@@ -3,6 +3,7 @@
 //! DMA-BUF zero-copy negotiation, hardware VSYNC presentation, and GPU pipeline management.
 
 pub mod composer;
+pub mod drm_kms;
 pub mod elf_align;
 pub mod gpu;
 pub mod gralloc;
@@ -12,6 +13,7 @@ pub use composer::{
     CompositionType, DisplayConfig, HwcComposer, HwcError, HwcLayer, HwcVersion, PresentFences,
     Rect, Transform,
 };
+pub use drm_kms::DrmKmsDevice;
 pub use elf_align::{
     inspect_elf_bytes, inspect_elf_file, verify_64k_alignment, ElfAlignmentReport,
 };

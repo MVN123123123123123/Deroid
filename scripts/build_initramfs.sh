@@ -17,15 +17,19 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 OUTPUT_INITRAMFS="${1:-${WORKSPACE_ROOT}/dist/initramfs.cpio.gz}"
+if [[ "${OUTPUT_INITRAMFS}" != /* ]]; then
+    OUTPUT_INITRAMFS="${PWD}/${OUTPUT_INITRAMFS}"
+fi
 RAMDISK_BUILD_DIR="${WORKSPACE_ROOT}/build/initramfs"
 ANDROID_RAMDISK="/opt/android-sdk/system-images/android-34/google_apis/arm64-v8a/ramdisk.img"
+ANDROID_VENDOR="/opt/android-sdk/system-images/android-34/google_apis/arm64-v8a/vendor.img"
 
 echo "============================================================"
 echo " Building Universal Treble Linux Initramfs for Android GKI"
 echo " Target Output: ${OUTPUT_INITRAMFS}"
 echo "============================================================"
 
-mkdir -p "${WORKSPACE_ROOT}/dist"
+mkdir -p "${WORKSPACE_ROOT}/dist/modules"
 rm -rf "${RAMDISK_BUILD_DIR}"
 mkdir -p "${RAMDISK_BUILD_DIR}"/{bin,dev,proc,sys,lib/modules,sysroot}
 
@@ -63,12 +67,22 @@ while pos < len(data):
     if pos % 4 != 0:
         pos += (4 - (pos % 4))
 ' "${ANDROID_RAMDISK}" "${RAMDISK_BUILD_DIR}"
-else
-    echo "[!] Warning: Android ramdisk.img not found at ${ANDROID_RAMDISK}."
-    echo "[*] Looking for existing modules in dist or build..."
-    if [[ -d "${WORKSPACE_ROOT}/dist/modules" ]]; then
-        cp -a "${WORKSPACE_ROOT}/dist/modules/"*.ko "${RAMDISK_BUILD_DIR}/lib/modules/"
-    fi
+fi
+
+# 1b. Extract GPU & Display kernel modules from Android vendor partition
+if [[ -f "${ANDROID_VENDOR}" ]]; then
+    echo "[*] Extracting GPU and DRM kernel modules from ${ANDROID_VENDOR}..."
+    7z e -y "${ANDROID_VENDOR}" \
+        lib/modules/virtio-gpu.ko \
+        lib/modules/drm_dma_helper.ko \
+        lib/modules/virtio_input.ko \
+        "-o${RAMDISK_BUILD_DIR}/lib/modules" >/dev/null 2>&1 || true
+fi
+
+# Cache extracted modules and populate fallbacks
+cp -a "${RAMDISK_BUILD_DIR}/lib/modules/"*.ko "${WORKSPACE_ROOT}/dist/modules/" 2>/dev/null || true
+if [[ -d "${WORKSPACE_ROOT}/dist/modules" ]]; then
+    cp -a "${WORKSPACE_ROOT}/dist/modules/"*.ko "${RAMDISK_BUILD_DIR}/lib/modules/" 2>/dev/null || true
 fi
 
 # 2. Compile static early init executable
@@ -129,6 +143,12 @@ int main(int argc, char *argv[]) {
     load_module("/lib/modules/virtio_blk.ko");
     load_module("/lib/modules/virtio_console.ko");
     load_module("/lib/modules/virtio-rng.ko");
+
+    // Load DRM KMS & input drivers for graphical display
+    load_module("/lib/modules/virtio_dma_buf.ko");
+    load_module("/lib/modules/drm_dma_helper.ko");
+    load_module("/lib/modules/virtio-gpu.ko");
+    load_module("/lib/modules/virtio_input.ko");
 
     // Parse root= and init= from kernel cmdline
     char root_dev[128] = "/dev/vda";

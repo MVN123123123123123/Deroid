@@ -21,6 +21,7 @@ use utim_core::compositor::protocols::{ProtocolRegistry, WaylandInterface};
 use utim_core::compositor::server::WaylandServer;
 use utim_core::compositor::systemui::{QuickTileKind, SystemUiShade};
 use utim_core::graphics::composer::{HwcComposer, HwcVersion};
+use utim_core::graphics::DrmKmsDevice;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -162,6 +163,42 @@ fn run_daemon() {
         }
     }
 
+    // Try to open Direct Rendering Manager (DRM KMS) hardware scanout device
+    let mut drm_display = match DrmKmsDevice::open_card("/dev/dri/card0") {
+        Ok(dev) => {
+            println!(
+                "[+] Successfully initialized hardware DRM KMS display ({}x{})",
+                dev.width, dev.height
+            );
+            Some(dev)
+        }
+        Err(e) => {
+            println!(
+                "[*] Hardware DRM KMS /dev/dri/card0 not available ({}), operating in headless Wayland mode",
+                e
+            );
+            None
+        }
+    };
+
+    let get_current_time = || -> String {
+        let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+        unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts) };
+        let total_secs = ts.tv_sec;
+        let hours = (total_secs / 3600) % 24;
+        let mins = (total_secs / 60) % 60;
+        format!("{:02}:{:02}", hours, mins)
+    };
+
+    if let Some(ref mut drm) = drm_display {
+        let t_str = get_current_time();
+        drm.render_mobile_ui(
+            &t_str,
+            server.scene.mode == utim_core::compositor::scene::ShellMode::LockScreen,
+        );
+        drm.flush();
+    }
+
     // Signal systemd/UTIM via sd_notify if NOTIFY_SOCKET is present
     let notify_socket = env::var("NOTIFY_SOCKET").ok();
     let notify_dgram = if notify_socket.is_some() {
@@ -216,6 +253,40 @@ fn run_daemon() {
         .unwrap_or(Duration::from_secs(5));
     let mut last_watchdog_ping = Instant::now();
 
+    // Listen on input event devices (/dev/input/event*)
+    let mut input_fds = Vec::new();
+    if let Ok(entries) = fs::read_dir("/dev/input") {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map_or(false, |n| n.starts_with("event"))
+            {
+                if let Ok(c_path) = std::ffi::CString::new(path.to_string_lossy().as_bytes()) {
+                    let fd = unsafe {
+                        libc::open(
+                            c_path.as_ptr(),
+                            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                        )
+                    };
+                    if fd >= 0 {
+                        if epoll_fd >= 0 {
+                            let mut in_ev = libc::epoll_event {
+                                events: libc::EPOLLIN as u32,
+                                u64: fd as u64,
+                            };
+                            unsafe {
+                                libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, fd, &mut in_ev);
+                            }
+                        }
+                        input_fds.push(fd);
+                    }
+                }
+            }
+        }
+    }
+
     let mut running = true;
     let mut last_frame = Instant::now();
     let frame_interval = Duration::from_millis(16);
@@ -266,6 +337,19 @@ fn run_daemon() {
                             server.client_streams.push(client_stream);
                         }
                     }
+                } else if input_fds.contains(&fd) {
+                    // Drain and handle user input events (touch, mouse, keyboard)
+                    let mut ev_buf = [0u8; 64];
+                    while unsafe {
+                        libc::read(fd, ev_buf.as_mut_ptr() as *mut libc::c_void, ev_buf.len())
+                    } > 0
+                    {
+                        if server.scene.lockscreen.is_locked() {
+                            server.scene.lockscreen.unlock();
+                            server.scene.mode =
+                                utim_core::compositor::scene::ShellMode::Launcher;
+                        }
+                    }
                 } else {
                     // Servicing connected client stream events (read/drain or close)
                     use std::io::Read;
@@ -312,6 +396,23 @@ fn run_daemon() {
             let dt = last_frame.elapsed().as_secs_f32();
             last_frame = Instant::now();
             let _ = server.step_frame(dt);
+
+            if let Some(ref mut drm) = drm_display {
+                let t_str = get_current_time();
+                drm.render_mobile_ui(
+                    &t_str,
+                    server.scene.mode == utim_core::compositor::scene::ShellMode::LockScreen,
+                );
+                drm.flush();
+            }
+        }
+
+        // Auto-transition to Launcher home screen after initial boot presentation
+        if server.scene.lockscreen.is_locked()
+            && server.start_time.elapsed() >= Duration::from_secs(2)
+        {
+            server.scene.lockscreen.unlock();
+            server.scene.mode = utim_core::compositor::scene::ShellMode::Launcher;
         }
 
         // Watchdog periodic ping
@@ -320,6 +421,12 @@ fn run_daemon() {
             if let (Some(ref dgram), Some(ref sock_path)) = (&notify_dgram, &notify_socket) {
                 let _ = dgram.send_to(b"WATCHDOG=1\n", sock_path);
             }
+        }
+    }
+
+    for fd in input_fds {
+        unsafe {
+            libc::close(fd);
         }
     }
 

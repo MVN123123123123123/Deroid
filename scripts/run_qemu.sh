@@ -80,9 +80,14 @@ if [[ ! -f "${DRIVE_PATH}" ]]; then
     "${SCRIPT_DIR}/build_image.sh"
 fi
 
-DISPLAY_OPTS="-nographic"
+DISPLAY_OPTS=("-nographic")
 if [[ "${GRAPHIC_MODE}" == "1" ]]; then
-    DISPLAY_OPTS=""
+    DISPLAY_OPTS=(
+        -device "virtio-gpu-pci,xres=1080,yres=2400"
+        -device "virtio-keyboard-pci"
+        -device "virtio-tablet-pci"
+        -display "gtk,gl=off,zoom-to-fit=on"
+    )
 fi
 
 QEMU_CMD=(
@@ -95,7 +100,7 @@ QEMU_CMD=(
     -initrd "${INITRD_PATH}"
     -drive "file=${DRIVE_PATH},if=virtio,format=raw"
     -append "console=ttyAMA0 root=/dev/vda rw init=/init loglevel=7 printk.devkmsg=on"
-    ${DISPLAY_OPTS}
+    "${DISPLAY_OPTS[@]}"
 )
 
 if [[ "${TEST_MODE}" == "1" ]]; then

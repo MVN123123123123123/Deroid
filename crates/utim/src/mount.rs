@@ -134,6 +134,19 @@ pub fn populate_static_dev_nodes() {
     create_dev_node("/dev/tty", 5, 0, 0o666);
     create_dev_node("/dev/ptmx", 5, 2, 0o666);
 
+    // Direct Rendering Manager (DRM) and Framebuffer nodes
+    let _ = fs::create_dir_all("/dev/dri");
+    create_dev_node("/dev/dri/card0", 226, 0, 0o666);
+    create_dev_node("/dev/dri/renderD128", 226, 128, 0o666);
+    create_dev_node("/dev/fb0", 29, 0, 0o666);
+
+    // Input event devices (virtio-input, keyboard, touchscreen/tablet)
+    let _ = fs::create_dir_all("/dev/input");
+    for i in 0..8 {
+        create_dev_node(&format!("/dev/input/event{}", i), 13, 64 + i, 0o666);
+    }
+    create_dev_node("/dev/input/mice", 13, 63, 0o666);
+
     let symlinks = [
         ("/proc/self/fd", "/dev/fd"),
         ("/proc/self/fd/0", "/dev/stdin"),
