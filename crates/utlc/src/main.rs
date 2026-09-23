@@ -15,13 +15,16 @@ use utim_core::compositor::gestures::{
     GestureAction, GestureConfig, GestureEngine, RawTouchEvent, TouchPhase,
 };
 use utim_core::compositor::ime::{ImeAction, VirtualKeyboard};
+use utim_core::compositor::input::{
+    InputDispatchResult, InputDispatcher, LinuxInputEvent, KEY_BACKSPACE, KEY_ENTER, KEY_ESC,
+};
 use utim_core::compositor::lockscreen::LockScreen;
 use utim_core::compositor::power_sync::UtimPowerSync;
 use utim_core::compositor::protocols::{ProtocolRegistry, WaylandInterface};
 use utim_core::compositor::server::WaylandServer;
 use utim_core::compositor::systemui::{QuickTileKind, SystemUiShade};
 use utim_core::graphics::composer::{HwcComposer, HwcVersion};
-use utim_core::graphics::DrmKmsDevice;
+use utim_core::graphics::{DrmInteractiveState, DrmKmsDevice};
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -181,19 +184,12 @@ fn run_daemon() {
         }
     };
 
-    let get_current_time = || -> String {
-        let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
-        unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts) };
-        let total_secs = ts.tv_sec;
-        let hours = (total_secs / 3600) % 24;
-        let mins = (total_secs / 60) % 60;
-        format!("{:02}:{:02}", hours, mins)
-    };
+    let mut time_buf = [0u8; 5];
 
     if let Some(ref mut drm) = drm_display {
-        let t_str = get_current_time();
+        let t_str = format_current_time(&mut time_buf);
         drm.render_mobile_ui(
-            &t_str,
+            t_str,
             server.scene.mode == utim_core::compositor::scene::ShellMode::LockScreen,
         );
         drm.flush();
@@ -255,13 +251,14 @@ fn run_daemon() {
 
     // Listen on input event devices (/dev/input/event*)
     let mut input_fds = Vec::new();
+    let mut opened_paths: Vec<std::path::PathBuf> = Vec::new();
     if let Ok(entries) = fs::read_dir("/dev/input") {
         for entry in entries.flatten() {
             let path = entry.path();
             if path
                 .file_name()
                 .and_then(|n| n.to_str())
-                .map_or(false, |n| n.starts_with("event"))
+                .is_some_and(|n| n.starts_with("event"))
             {
                 if let Ok(c_path) = std::ffi::CString::new(path.to_string_lossy().as_bytes()) {
                     let fd = unsafe {
@@ -281,11 +278,25 @@ fn run_daemon() {
                             }
                         }
                         input_fds.push(fd);
+                        opened_paths.push(path);
                     }
                 }
             }
         }
     }
+
+    // State machine for interactive shell
+    let mut dispatcher = InputDispatcher::new(server.scene.width as f32, server.scene.height as f32);
+    let mut gesture_engine = GestureEngine::new(server.scene.width as f32, server.scene.height as f32, GestureConfig::default());
+    let mut search_query = String::with_capacity(64);
+    let mut search_active = false;
+    let mut active_app: Option<String> = None;
+    let mut terminal_lines: Vec<String> = Vec::with_capacity(32);
+    let mut terminal_input = String::with_capacity(64);
+    let mut quick_tiles_active = [true, true, true, false, true, false, false, false];
+    let mut cursor_pos: Option<(usize, usize)> = None;
+    let mut is_touching = false;
+    let mut last_input_rescan = Instant::now();
 
     let mut running = true;
     let mut last_frame = Instant::now();
@@ -338,16 +349,297 @@ fn run_daemon() {
                         }
                     }
                 } else if input_fds.contains(&fd) {
-                    // Drain and handle user input events (touch, mouse, keyboard)
-                    let mut ev_buf = [0u8; 64];
-                    while unsafe {
+                    // Drain and decode Linux evdev events (virtio-tablet, virtio-keyboard, virtio-mouse)
+                    let mut ev_buf = [0u8; 24 * 16];
+                    let n = unsafe {
                         libc::read(fd, ev_buf.as_mut_ptr() as *mut libc::c_void, ev_buf.len())
-                    } > 0
-                    {
-                        if server.scene.lockscreen.is_locked() {
-                            server.scene.lockscreen.unlock();
-                            server.scene.mode =
-                                utim_core::compositor::scene::ShellMode::Launcher;
+                    };
+                    if n > 0 {
+                        let total_bytes = n as usize;
+                        let mut offset = 0;
+                        while offset + LinuxInputEvent::SIZE <= total_bytes {
+                            if let Some(ev) = LinuxInputEvent::from_raw_bytes(&ev_buf[offset..offset + LinuxInputEvent::SIZE]) {
+                                let res = dispatcher.process_event(&ev);
+                                cursor_pos = Some((dispatcher.cursor_x as usize, dispatcher.cursor_y as usize));
+                                is_touching = dispatcher.is_touch_down;
+
+                                if server.scene.lockscreen.is_locked() {
+                                    match res {
+                                        InputDispatchResult::Touch(ref t) if t.phase == TouchPhase::Down => {
+                                            server.scene.lockscreen.unlock();
+                                            server.scene.mode = utim_core::compositor::scene::ShellMode::Launcher;
+                                        }
+                                        InputDispatchResult::Tap { .. } => {
+                                            server.scene.lockscreen.unlock();
+                                            server.scene.mode = utim_core::compositor::scene::ShellMode::Launcher;
+                                        }
+                                        InputDispatchResult::KeyPress { pressed: true, .. } => {
+                                            server.scene.lockscreen.unlock();
+                                            server.scene.mode = utim_core::compositor::scene::ShellMode::Launcher;
+                                        }
+                                        _ => {}
+                                    }
+                                } else {
+                                    match res {
+                                        InputDispatchResult::Touch(raw_touch) => {
+                                            let gesture_act = gesture_engine.process_touch(&raw_touch);
+                                            match gesture_act {
+                                                GestureAction::Home { progress, .. } if progress >= 1.0 => {
+                                                    active_app = None;
+                                                    server.scene.system_ui.close();
+                                                    search_active = false;
+                                                    server.scene.keyboard.deactivate();
+                                                    server.scene.mode = utim_core::compositor::scene::ShellMode::Launcher;
+                                                }
+                                                GestureAction::NotificationShade { progress } => {
+                                                    if progress > 0.35 {
+                                                        server.scene.system_ui.open();
+                                                        server.scene.keyboard.deactivate();
+                                                    }
+                                                }
+                                                GestureAction::Back { injected, .. } if injected => {
+                                                    if server.scene.system_ui.is_open() {
+                                                        server.scene.system_ui.close();
+                                                    } else if server.scene.keyboard.is_active {
+                                                        server.scene.keyboard.deactivate();
+                                                        search_active = false;
+                                                    } else if active_app.is_some() {
+                                                        active_app = None;
+                                                        server.scene.keyboard.deactivate();
+                                                        search_active = false;
+                                                    }
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                        InputDispatchResult::Tap { x, y } => {
+                                            let w = server.scene.width as f32;
+                                            let h = server.scene.height as f32;
+                                            let kb_h = 420.0;
+                                            let kb_y = h - kb_h - 20.0;
+
+                                            if server.scene.system_ui.is_open() {
+                                                if y < 44.0 || y > 580.0 {
+                                                    server.scene.system_ui.close();
+                                                } else if (155.0..=450.0).contains(&y) {
+                                                    let col = if x < (w / 2.0) { 0 } else { 1 };
+                                                    let row = ((y - 155.0) / 84.0) as usize;
+                                                    if row < 4 {
+                                                        let idx = row * 2 + col;
+                                                        quick_tiles_active[idx] = !quick_tiles_active[idx];
+                                                    }
+                                                }
+                                            } else if server.scene.keyboard.is_active && y >= kb_y && y <= (h - 20.0) {
+                                                // Virtual Keyboard key tap
+                                                let kb_w = w - 24.0;
+                                                let kb_x = 12.0;
+
+                                                let row1 = ["Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P"];
+                                                let row2 = ["A", "S", "D", "F", "G", "H", "J", "K", "L"];
+                                                let row3 = ["Z", "X", "C", "V", "B", "N", "M"];
+
+                                                let r1_y = kb_y + 25.0;
+                                                let r2_y = r1_y + 65.0 + 12.0;
+                                                let r3_y = r2_y + 65.0 + 12.0;
+                                                let r4_y = r3_y + 65.0 + 12.0;
+
+                                                if y >= r1_y && y < r1_y + 65.0 {
+                                                    let r1_key_w = (kb_w - 30.0) / 10.0;
+                                                    let idx = ((x - kb_x - 15.0) / r1_key_w).clamp(0.0, 9.0) as usize;
+                                                    if let Some(ch) = row1[idx].chars().next() {
+                                                        if active_app.as_deref() == Some("Terminal") {
+                                                            terminal_input.push(ch.to_ascii_lowercase());
+                                                        } else if search_active {
+                                                            search_query.push(ch.to_ascii_lowercase());
+                                                        }
+                                                    }
+                                                } else if y >= r2_y && y < r2_y + 65.0 {
+                                                    let r2_key_w = (kb_w - 60.0) / 9.0;
+                                                    let idx = ((x - kb_x - 30.0) / r2_key_w).clamp(0.0, 8.0) as usize;
+                                                    if let Some(ch) = row2[idx].chars().next() {
+                                                        if active_app.as_deref() == Some("Terminal") {
+                                                            terminal_input.push(ch.to_ascii_lowercase());
+                                                        } else if search_active {
+                                                            search_query.push(ch.to_ascii_lowercase());
+                                                        }
+                                                    }
+                                                } else if y >= r3_y && y < r3_y + 65.0 {
+                                                    let special_w = 95.0;
+                                                    let mid_w = (kb_w - 30.0 - special_w * 2.0) / 7.0;
+                                                    if x > kb_x + 15.0 + special_w + 7.0 * mid_w {
+                                                        // Backspace
+                                                        if active_app.as_deref() == Some("Terminal") {
+                                                            terminal_input.pop();
+                                                        } else if search_active {
+                                                            search_query.pop();
+                                                        }
+                                                    } else if x >= kb_x + 15.0 + special_w {
+                                                        let idx = ((x - kb_x - 15.0 - special_w) / mid_w).clamp(0.0, 6.0) as usize;
+                                                        if let Some(ch) = row3[idx].chars().next() {
+                                                            if active_app.as_deref() == Some("Terminal") {
+                                                                terminal_input.push(ch.to_ascii_lowercase());
+                                                            } else if search_active {
+                                                                search_query.push(ch.to_ascii_lowercase());
+                                                            }
+                                                        }
+                                                    }
+                                                } else if y >= r4_y && y < r4_y + 65.0 {
+                                                    let sym_w = 120.0;
+                                                    let enter_w = 140.0;
+                                                    let space_x = kb_x + 15.0 + sym_w;
+                                                    let enter_x = kb_w - enter_w;
+
+                                                    if x <= kb_x + 15.0 + sym_w {
+                                                        // "Hide" key tapped -> dismiss virtual keyboard
+                                                        server.scene.keyboard.deactivate();
+                                                    } else if x >= enter_x {
+                                                        if active_app.as_deref() == Some("Terminal") {
+                                                            let exited = execute_terminal_command(&mut terminal_lines, &mut terminal_input, &mut active_app);
+                                                            if exited {
+                                                                server.scene.keyboard.deactivate();
+                                                                search_active = false;
+                                                            }
+                                                        } else {
+                                                            search_active = false;
+                                                            server.scene.keyboard.deactivate();
+                                                        }
+                                                    } else if x >= space_x {
+                                                        if active_app.as_deref() == Some("Terminal") {
+                                                            terminal_input.push(' ');
+                                                        } else if search_active {
+                                                            search_query.push(' ');
+                                                        }
+                                                    }
+                                                }
+                                            } else if server.scene.keyboard.is_active {
+                                                // Tapped outside keyboard while keyboard was active -> dismiss keyboard
+                                                server.scene.keyboard.deactivate();
+                                                search_active = false;
+                                                // If tapped on app top buttons or nav pill, also handle app exit
+                                                if active_app.is_some()
+                                                    && (((20.0..=130.0).contains(&x) && (48.0..=110.0).contains(&y))
+                                                        || (x >= (w - 90.0) && (48.0..=110.0).contains(&y))
+                                                        || (y >= (h - 40.0)))
+                                                {
+                                                    active_app = None;
+                                                }
+                                            } else if active_app.is_some() {
+                                                // An app is open and keyboard is not active
+                                                if ((20.0..=130.0).contains(&x) && (48.0..=110.0).contains(&y))
+                                                    || (x >= (w - 90.0) && (48.0..=110.0).contains(&y))
+                                                    || (y >= (h - 40.0))
+                                                {
+                                                    active_app = None;
+                                                    server.scene.keyboard.deactivate();
+                                                    search_active = false;
+                                                } else if active_app.as_deref() == Some("Terminal") {
+                                                    // Tapping inside terminal brings keyboard back up
+                                                    server.scene.keyboard.activate();
+                                                }
+                                            } else {
+                                                // Home screen hit testing
+                                                if y <= 50.0 {
+                                                    // Tap status bar -> toggle Quick Settings shade
+                                                    server.scene.system_ui.toggle();
+                                                } else if (32.0..=(w - 32.0)).contains(&x) && (235.0..=295.0).contains(&y) {
+                                                    // Tap search pill -> activate search & virtual keyboard
+                                                    search_active = true;
+                                                    server.scene.keyboard.activate();
+                                                } else if (325.0..=325.0 + 3.0 * 115.0).contains(&y) {
+                                                    // App grid icons
+                                                    let col_width = w / 4.0;
+                                                    let col = (x / col_width).clamp(0.0, 3.0) as usize;
+                                                    let row = ((y - 325.0) / 115.0).clamp(0.0, 2.0) as usize;
+                                                    let idx = row * 4 + col;
+                                                    let app_names = [
+                                                        "Phone", "Messages", "Browser", "Camera",
+                                                        "Gallery", "Settings", "Files", "Music",
+                                                        "Terminal", "Treble OS", "Contacts", "Clock",
+                                                    ];
+                                                    let app_to_launch = app_names[idx];
+                                                    active_app = Some(app_to_launch.to_string());
+                                                    if app_to_launch == "Terminal" {
+                                                        server.scene.keyboard.activate();
+                                                    } else {
+                                                        server.scene.keyboard.deactivate();
+                                                        search_active = false;
+                                                    }
+                                                } else if y >= (h - 150.0) && y <= (h - 35.0) {
+                                                    // Hotseat dock icons
+                                                    let dock_col_w = (w - 40.0) / 5.0;
+                                                    let dock_col = ((x - 20.0) / dock_col_w).clamp(0.0, 4.0) as usize;
+                                                    let dock_apps = ["Phone", "Messages", "Apps", "Browser", "Camera"];
+                                                    let app = dock_apps[dock_col];
+                                                    if app == "Apps" {
+                                                        search_active = true;
+                                                        server.scene.keyboard.activate();
+                                                    } else {
+                                                        active_app = Some(app.to_string());
+                                                        if app == "Terminal" {
+                                                            server.scene.keyboard.activate();
+                                                        } else {
+                                                            server.scene.keyboard.deactivate();
+                                                            search_active = false;
+                                                        }
+                                                    }
+                                                } else if y >= (h - 30.0) {
+                                                    // Navigation pill
+                                                    active_app = None;
+                                                    search_active = false;
+                                                    server.scene.keyboard.deactivate();
+                                                    server.scene.system_ui.close();
+                                                }
+                                            }
+                                        }
+                                        InputDispatchResult::KeyPress { code, ch, pressed, repeat } => {
+                                            if pressed {
+                                                if code == KEY_ESC {
+                                                    if server.scene.keyboard.is_active {
+                                                        server.scene.keyboard.deactivate();
+                                                        search_active = false;
+                                                    } else if active_app.is_some() {
+                                                        active_app = None;
+                                                        server.scene.keyboard.deactivate();
+                                                        search_active = false;
+                                                    } else if server.scene.system_ui.is_open() {
+                                                        server.scene.system_ui.close();
+                                                    }
+                                                } else if code == KEY_BACKSPACE {
+                                                    if active_app.as_deref() == Some("Terminal") {
+                                                        terminal_input.pop();
+                                                    } else if search_active {
+                                                        search_query.pop();
+                                                    }
+                                                } else if code == KEY_ENTER && !repeat {
+                                                    if active_app.as_deref() == Some("Terminal") {
+                                                        let exited = execute_terminal_command(&mut terminal_lines, &mut terminal_input, &mut active_app);
+                                                        if exited {
+                                                            server.scene.keyboard.deactivate();
+                                                            search_active = false;
+                                                        }
+                                                    } else if search_active {
+                                                        search_active = false;
+                                                        server.scene.keyboard.deactivate();
+                                                    }
+                                                } else if let Some(c) = ch {
+                                                    if !repeat {
+                                                        if active_app.as_deref() == Some("Terminal") {
+                                                            if terminal_input.len() < 60 {
+                                                                terminal_input.push(c);
+                                                            }
+                                                        } else if search_active && search_query.len() < 40 {
+                                                            search_query.push(c);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        InputDispatchResult::PointerMove { .. } => {}
+                                        InputDispatchResult::None => {}
+                                    }
+                                }
+                            }
+                            offset += LinuxInputEvent::SIZE;
                         }
                     }
                 } else {
@@ -391,6 +683,46 @@ fn run_daemon() {
             }
         }
 
+        // Periodic check for newly registered input event devices
+        if last_input_rescan.elapsed() >= Duration::from_secs(1) {
+            last_input_rescan = Instant::now();
+            if let Ok(entries) = fs::read_dir("/dev/input") {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("event"))
+                    {
+                        if opened_paths.contains(&path) {
+                            continue;
+                        }
+                        if let Ok(c_path) = std::ffi::CString::new(path.to_string_lossy().as_bytes()) {
+                            let fd = unsafe {
+                                libc::open(
+                                    c_path.as_ptr(),
+                                    libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                                )
+                            };
+                            if fd >= 0 {
+                                if epoll_fd >= 0 {
+                                    let mut in_ev = libc::epoll_event {
+                                        events: libc::EPOLLIN as u32,
+                                        u64: fd as u64,
+                                    };
+                                    unsafe {
+                                        libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, fd, &mut in_ev);
+                                    }
+                                }
+                                input_fds.push(fd);
+                                opened_paths.push(path);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Vsync frame presentation step
         if last_frame.elapsed() >= frame_interval {
             let dt = last_frame.elapsed().as_secs_f32();
@@ -398,11 +730,22 @@ fn run_daemon() {
             let _ = server.step_frame(dt);
 
             if let Some(ref mut drm) = drm_display {
-                let t_str = get_current_time();
-                drm.render_mobile_ui(
-                    &t_str,
-                    server.scene.mode == utim_core::compositor::scene::ShellMode::LockScreen,
-                );
+                let t_str = format_current_time(&mut time_buf);
+                let drm_state = DrmInteractiveState {
+                    time_str: t_str,
+                    is_locked: server.scene.mode == utim_core::compositor::scene::ShellMode::LockScreen,
+                    cursor_pos,
+                    is_touching,
+                    search_query: &search_query,
+                    search_active,
+                    keyboard_active: server.scene.keyboard.is_active,
+                    shade_open: server.scene.system_ui.is_open(),
+                    quick_tiles_active,
+                    active_app: active_app.as_deref(),
+                    terminal_lines: &terminal_lines,
+                    terminal_input: &terminal_input,
+                };
+                drm.render_interactive_ui(&drm_state);
                 drm.flush();
             }
         }
@@ -440,6 +783,63 @@ fn run_daemon() {
             libc::close(sig_fd);
         }
     }
+}
+
+fn format_current_time(buf: &mut [u8; 5]) -> &str {
+    let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+    unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts) };
+    let total_secs = ts.tv_sec;
+    let hours = ((total_secs / 3600) % 24) as u8;
+    let mins = ((total_secs / 60) % 60) as u8;
+    buf[0] = b'0' + (hours / 10);
+    buf[1] = b'0' + (hours % 10);
+    buf[2] = b':';
+    buf[3] = b'0' + (mins / 10);
+    buf[4] = b'0' + (mins % 10);
+    unsafe { std::str::from_utf8_unchecked(buf) }
+}
+
+fn execute_terminal_command(
+    terminal_lines: &mut Vec<String>,
+    terminal_input: &mut String,
+    active_app: &mut Option<String>,
+) -> bool {
+    let cmd = terminal_input.trim().to_string();
+    terminal_lines.push(format!("root@treble-gsi:~# {}", cmd));
+    let mut exited = false;
+    match cmd.as_str() {
+        "uname" | "uname -a" => {
+            terminal_lines.push("Linux treble-gsi 6.1.23-android14-4-00257 aarch64 GNU/Linux".into());
+        }
+        "uptime" => {
+            terminal_lines.push(" 20:48:00 up 12 min, 1 user, load avg: 0.04, 0.02, 0.00".into());
+        }
+        "whoami" => {
+            terminal_lines.push("root".into());
+        }
+        "ls" | "ls -la" => {
+            terminal_lines.push("bin  dev  etc  init  lib  proc  run  sbin  sys  usr  var".into());
+        }
+        "clear" => {
+            terminal_lines.clear();
+        }
+        "help" => {
+            terminal_lines.push("Commands: uname, uptime, whoami, ls, date, clear, exit".into());
+        }
+        "exit" => {
+            *active_app = None;
+            exited = true;
+        }
+        "" => {}
+        other => {
+            terminal_lines.push(format!("bash: {}: command not found", other));
+        }
+    }
+    terminal_input.clear();
+    if terminal_lines.len() > 14 {
+        terminal_lines.drain(0..terminal_lines.len() - 14);
+    }
+    exited
 }
 
 fn check_protocols(json: bool) -> bool {
@@ -840,4 +1240,93 @@ fn run_all_checks(json: bool) -> bool {
     }
 
     passed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_terminal_command_execution() {
+        let mut lines = Vec::new();
+        let mut input = "uname -a".to_string();
+        let mut app = Some("Terminal".to_string());
+
+        execute_terminal_command(&mut lines, &mut input, &mut app);
+        assert!(input.is_empty());
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "root@treble-gsi:~# uname -a");
+        assert!(lines[1].contains("Linux treble-gsi"));
+
+        input = "exit".to_string();
+        execute_terminal_command(&mut lines, &mut input, &mut app);
+        assert!(app.is_none());
+    }
+
+    #[test]
+    fn test_input_tap_detection() {
+        let mut dispatcher = InputDispatcher::new(1080.0, 2400.0);
+
+        // Move to Search Pill (540, 260)
+        let ev_x = LinuxInputEvent {
+            time_sec: 0,
+            time_usec: 0,
+            type_: utim_core::compositor::input::EV_ABS,
+            code: utim_core::compositor::input::ABS_X,
+            value: 16383, // center = 540
+        };
+        let ev_y = LinuxInputEvent {
+            time_sec: 0,
+            time_usec: 0,
+            type_: utim_core::compositor::input::EV_ABS,
+            code: utim_core::compositor::input::ABS_Y,
+            value: 3550, // 3550/32767 * 2400 ~= 260
+        };
+        let ev_syn = LinuxInputEvent {
+            time_sec: 0,
+            time_usec: 0,
+            type_: utim_core::compositor::input::EV_SYN,
+            code: utim_core::compositor::input::SYN_REPORT,
+            value: 0,
+        };
+        dispatcher.process_event(&ev_x);
+        dispatcher.process_event(&ev_y);
+        dispatcher.process_event(&ev_syn);
+
+        // Down & Up
+        let ev_down = LinuxInputEvent {
+            time_sec: 0,
+            time_usec: 0,
+            type_: utim_core::compositor::input::EV_KEY,
+            code: utim_core::compositor::input::BTN_LEFT,
+            value: 1,
+        };
+        dispatcher.process_event(&ev_down);
+
+        let ev_up = LinuxInputEvent {
+            time_sec: 0,
+            time_usec: 0,
+            type_: utim_core::compositor::input::EV_KEY,
+            code: utim_core::compositor::input::BTN_LEFT,
+            value: 0,
+        };
+        let res = dispatcher.process_event(&ev_up);
+        match res {
+            InputDispatchResult::Tap { x, y } => {
+                assert!((x - 540.0).abs() < 2.0);
+                assert!((y - 260.0).abs() < 5.0);
+            }
+            other => panic!("Expected Tap, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_format_current_time_zero_alloc() {
+        let mut buf = [0u8; 5];
+        let t_str = format_current_time(&mut buf);
+        assert_eq!(t_str.len(), 5);
+        assert_eq!(&t_str[2..3], ":");
+        assert!(t_str[..2].chars().all(|c| c.is_ascii_digit()));
+        assert!(t_str[3..].chars().all(|c| c.is_ascii_digit()));
+    }
 }

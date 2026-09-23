@@ -1,6 +1,6 @@
 //! Asynchronous Directed Acyclic Graph (DAG) for unit dependency and ordering resolution.
 
-use crate::unit::{SystemdUnit, UnitKind};
+use crate::unit::SystemdUnit;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +65,12 @@ impl UnitDag {
 
     pub fn get_mut(&mut self, name: &str) -> Option<&mut DagNode> {
         self.nodes.get_mut(name)
+    }
+
+    /// Remove a unit (masking, unit file deletion on daemon-reload).
+    /// Also drops reverse-dependency edges implicitly on next resolve.
+    pub fn remove(&mut self, name: &str) -> bool {
+        self.nodes.remove(name).is_some()
     }
 
     pub fn set_state(&mut self, name: &str, state: UnitState) {
@@ -188,21 +194,16 @@ impl UnitDag {
             queue.push_back(target_unit.to_string());
         }
 
-        // Collect all transitive dependencies (Requires, Wants, BindsTo, After, and reverse WantedBy/RequiredBy)
+        // Collect all transitive requirements (Requires, Wants, BindsTo).
+        // NOTE: After=/Before= are pure ordering constraints and must NOT
+        // pull units into the transaction (systemd parity); ordering among
+        // the pulled set is enforced by the Kahn pass below.
         while let Some(curr) = queue.pop_front() {
             if let Some(node) = self.nodes.get(&curr) {
                 let mut deps = Vec::new();
-                deps.extend(node.unit.unit.requires.clone());
-                deps.extend(node.unit.unit.wants.clone());
-                deps.extend(node.unit.unit.binds_to.clone());
-                deps.extend(node.unit.unit.after.clone());
-
-                // Find units that declare Before=curr
-                for (other_name, other_node) in &self.nodes {
-                    if other_node.unit.unit.before.contains(&curr) {
-                        deps.push(other_name.clone());
-                    }
-                }
+                deps.extend(node.unit.unit.requires.iter().cloned());
+                deps.extend(node.unit.unit.wants.iter().cloned());
+                deps.extend(node.unit.unit.binds_to.iter().cloned());
 
                 for dep in deps {
                     if self.nodes.contains_key(&dep) && needed.insert(dep.clone()) {
@@ -271,17 +272,24 @@ impl UnitDag {
         }
 
         // If cycle exists and some nodes remain with in-degree > 0, append them anyway
-        for u in &needed {
-            if !sorted.contains(u) {
-                sorted.push(u.clone());
-            }
+        // (sorted for determinism). Uses a HashSet for O(1) membership.
+        let sorted_set: HashSet<&String> = sorted.iter().collect();
+        let mut leftover: Vec<&String> = needed.iter().filter(|u| !sorted_set.contains(*u)).collect();
+        leftover.sort();
+        for u in leftover {
+            sorted.push(u.clone());
         }
 
         sorted
     }
 
-    /// Check which units in `Inactive` have all their `After` and `Before` dependencies satisfied.
+    /// Check which pending units have all their ordering constraints satisfied.
+    /// `After=` deps count as satisfied when Active, or when Failed/Inactive
+    /// for oneshot services that already ran (RemainAfterExit-style success).
+    /// A `Before=X` edge only gates X on units that are themselves part of
+    /// the pending transaction; unrelated inactive units never block.
     pub fn ready_to_spawn(&self, pending: &[String]) -> Vec<String> {
+        let pending_set: HashSet<&String> = pending.iter().collect();
         let mut spawnable = Vec::new();
         for name in pending {
             if let Some(node) = self.nodes.get(name) {
@@ -289,13 +297,21 @@ impl UnitDag {
                     continue;
                 }
 
-                // Check all After requirements
+                // Check all After requirements. Active always satisfies.
+                // Failed satisfies only for non-required deps (Wants/After
+                // degrade gracefully); a failed Requires/BindsTo blocks the
+                // dependent so boot doesn't run on broken requirements.
                 let all_after_satisfied = node.unit.unit.after.iter().all(|after| {
                     if let Some(dep_node) = self.nodes.get(after) {
-                        // Targets and oneshots count as satisfied if Active or Inactive (if succeeded)
-                        dep_node.state == UnitState::Active
-                            || (dep_node.unit.kind == UnitKind::Target
-                                && dep_node.state == UnitState::Active)
+                        if dep_node.state == UnitState::Active {
+                            return true;
+                        }
+                        if dep_node.state == UnitState::Failed {
+                            let required = node.unit.unit.requires.iter().any(|r| r == after)
+                                || node.unit.unit.binds_to.iter().any(|b| b == after);
+                            return !required;
+                        }
+                        false
                     } else {
                         // Unloaded optional dependency treated as satisfied
                         true
@@ -306,17 +322,17 @@ impl UnitDag {
                     continue;
                 }
 
-                // Check that no pending unit has declared Before=name and is not yet satisfied
+                // A unit declaring Before=name only gates `name` while that
+                // unit is itself pending in this transaction and not Active.
                 let all_before_satisfied = self.nodes.iter().all(|(other_name, other_node)| {
                     if other_name == name {
                         return true;
                     }
                     if other_node.unit.unit.before.contains(name) {
-                        if pending.contains(other_name) {
+                        if pending_set.contains(other_name) {
                             other_node.state == UnitState::Active
                         } else {
-                            other_node.state == UnitState::Active
-                                || other_node.state == UnitState::Inactive
+                            true
                         }
                     } else {
                         true
@@ -345,7 +361,7 @@ mod tests {
         let basic_target = parse_unit(
             "basic.target",
             Path::new("/lib/systemd/system/basic.target"),
-            "[Unit]\nDescription=Basic Target\n",
+            "[Unit]\nDescription=Basic Target\nWants=sysinit.target\nAfter=sysinit.target\n",
         );
         let sysinit_target = parse_unit(
             "sysinit.target",
@@ -360,7 +376,7 @@ mod tests {
         let dbus_service = parse_unit(
             "dbus.service",
             Path::new("/lib/systemd/system/dbus.service"),
-            "[Unit]\nDescription=D-Bus Daemon\nAfter=basic.target\n",
+            "[Unit]\nDescription=D-Bus Daemon\nWants=basic.target\nAfter=basic.target\n",
         );
 
         dag.insert(basic_target);
@@ -369,13 +385,17 @@ mod tests {
         dag.insert(dbus_service);
 
         let order = dag.resolve_start_queue("dbus.service");
-        // sysinit must come before basic, udev after sysinit
+        // sysinit must come before basic, basic before dbus (Wants+ordering)
         let idx_sysinit = order.iter().position(|x| x == "sysinit.target").unwrap();
         let idx_basic = order.iter().position(|x| x == "basic.target").unwrap();
         let idx_dbus = order.iter().position(|x| x == "dbus.service").unwrap();
 
         assert!(idx_sysinit < idx_basic);
         assert!(idx_basic < idx_dbus);
+
+        // systemd parity: After-only units are ordering constraints, not
+        // requirements — udev (After=sysinit.target only) is NOT pulled in.
+        assert!(!order.contains(&"systemd-udevd.service".to_string()));
     }
 
     #[test]
@@ -411,8 +431,8 @@ mod tests {
     fn test_dag_before_ordering_and_deduplication() {
         let mut dag = UnitDag::new();
 
-        // Symmetrically declared Before and After:
-        // A declares Before=B, and B declares After=A.
+        // Symmetrically declared Before and After with Wants pull:
+        // A declares Before=B, and B declares Wants=A + After=A.
         // Edge must be deduplicated so in_degree of B is 1, not 2.
         let a = parse_unit(
             "a.service",
@@ -422,12 +442,12 @@ mod tests {
         let b = parse_unit(
             "b.service",
             Path::new("/b.service"),
-            "[Unit]\nAfter=a.service\nBefore=c.service\n",
+            "[Unit]\nWants=a.service\nAfter=a.service\nBefore=c.service\n",
         );
         let c = parse_unit(
             "c.service",
             Path::new("/c.service"),
-            "[Unit]\nAfter=b.service\n",
+            "[Unit]\nWants=b.service\nAfter=b.service\n",
         );
 
         dag.insert(a);

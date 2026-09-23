@@ -203,6 +203,14 @@ impl SystemUiShade {
         self.pull_spring.target = 0.0;
     }
 
+    pub fn toggle(&mut self) {
+        if self.is_open() {
+            self.close();
+        } else {
+            self.open();
+        }
+    }
+
     pub fn set_pull_progress(&mut self, progress: f32) {
         let clamped = progress.clamp(0.0, 1.0);
         self.pull_spring.current = clamped;

@@ -7,6 +7,10 @@ use std::path::Path;
 
 pub const DEFAULT_CONTROL_SOCKET: &str = "/run/utim/control.sock";
 
+/// Hardening bounds for the client-side response parser.
+pub const MAX_IPC_LINE_BYTES: u64 = 65_536;
+pub const MAX_IPC_UNITS: usize = 8192;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IpcRequest {
     Start(String),
@@ -62,22 +66,32 @@ impl IpcRequest {
             None => (trimmed, ""),
         };
 
+        // Unit-taking commands require a non-empty argument; accepting an
+        // empty name would address the wrong unit or panic downstream.
+        let unit_arg = |a: &str| {
+            if a.is_empty() {
+                None
+            } else {
+                Some(a.to_string())
+            }
+        };
+
         match cmd {
-            "START" => Some(IpcRequest::Start(args.to_string())),
-            "STOP" => Some(IpcRequest::Stop(args.to_string())),
-            "RESTART" => Some(IpcRequest::Restart(args.to_string())),
-            "RELOAD" => Some(IpcRequest::Reload(args.to_string())),
-            "STATUS" => Some(IpcRequest::Status(args.to_string())),
+            "START" => Some(IpcRequest::Start(unit_arg(args)?)),
+            "STOP" => Some(IpcRequest::Stop(unit_arg(args)?)),
+            "RESTART" => Some(IpcRequest::Restart(unit_arg(args)?)),
+            "RELOAD" => Some(IpcRequest::Reload(unit_arg(args)?)),
+            "STATUS" => Some(IpcRequest::Status(unit_arg(args)?)),
             "LIST_UNITS" => Some(IpcRequest::ListUnits),
             "DAEMON_RELOAD" => Some(IpcRequest::DaemonReload),
-            "ENABLE" => Some(IpcRequest::Enable(args.to_string())),
-            "DISABLE" => Some(IpcRequest::Disable(args.to_string())),
-            "IS_ACTIVE" => Some(IpcRequest::IsActive(args.to_string())),
-            "IS_ENABLED" => Some(IpcRequest::IsEnabled(args.to_string())),
-            "FREEZE_CGROUP" => Some(IpcRequest::FreezeCgroup(args.to_string())),
-            "UNFREEZE_CGROUP" => Some(IpcRequest::UnfreezeCgroup(args.to_string())),
-            "ACQUIRE_WAKELOCK" => Some(IpcRequest::AcquireWakeLock(args.to_string())),
-            "RELEASE_WAKELOCK" => Some(IpcRequest::ReleaseWakeLock(args.to_string())),
+            "ENABLE" => Some(IpcRequest::Enable(unit_arg(args)?)),
+            "DISABLE" => Some(IpcRequest::Disable(unit_arg(args)?)),
+            "IS_ACTIVE" => Some(IpcRequest::IsActive(unit_arg(args)?)),
+            "IS_ENABLED" => Some(IpcRequest::IsEnabled(unit_arg(args)?)),
+            "FREEZE_CGROUP" => Some(IpcRequest::FreezeCgroup(unit_arg(args)?)),
+            "UNFREEZE_CGROUP" => Some(IpcRequest::UnfreezeCgroup(unit_arg(args)?)),
+            "ACQUIRE_WAKELOCK" => Some(IpcRequest::AcquireWakeLock(unit_arg(args)?)),
+            "RELEASE_WAKELOCK" => Some(IpcRequest::ReleaseWakeLock(unit_arg(args)?)),
             "SET_OOM_SCORE" => {
                 let parts: Vec<&str> = args.split_whitespace().collect();
                 if parts.len() >= 2 {
@@ -157,8 +171,16 @@ impl IpcResponse {
 
     pub fn deserialize<R: BufRead>(reader: &mut R) -> std::io::Result<Option<Self>> {
         let mut line = String::new();
-        if reader.read_line(&mut line)? == 0 {
+        // Bound each response line: a malicious/compromised daemon cannot
+        // force unbounded client memory growth.
+        let mut limited = reader.take(MAX_IPC_LINE_BYTES);
+        let n = limited.read_line(&mut line)?;
+        drop(limited);
+        if n == 0 {
             return Ok(None);
+        }
+        if n as u64 >= MAX_IPC_LINE_BYTES && !line.ends_with('\n') {
+            return Ok(Some(IpcResponse::Err("Response line too long".to_string())));
         }
 
         let trimmed = line.trim();
@@ -191,8 +213,14 @@ impl IpcResponse {
         } else if trimmed == "UNITS_BEGIN" {
             let mut list = Vec::new();
             loop {
+                if list.len() >= MAX_IPC_UNITS {
+                    break;
+                }
                 line.clear();
-                if reader.read_line(&mut line)? == 0 {
+                let mut limited = reader.take(MAX_IPC_LINE_BYTES);
+                let n = limited.read_line(&mut line)?;
+                drop(limited);
+                if n == 0 {
                     break;
                 }
                 let item = line.trim();
@@ -212,14 +240,17 @@ impl IpcResponse {
         } else if let Some(rest) = trimmed.strip_prefix("TIME ") {
             let parts: Vec<&str> = rest.split_whitespace().collect();
             if parts.len() >= 3 {
-                let k = parts[0].parse().unwrap_or(0.0);
-                let i = parts[1].parse().unwrap_or(0.0);
-                let t = parts[2].parse().unwrap_or(0.0);
-                return Ok(Some(IpcResponse::Time {
-                    kernel_sec: k,
-                    init_sec: i,
-                    total_sec: t,
-                }));
+                if let (Ok(k), Ok(i), Ok(t)) = (
+                    parts[0].parse::<f64>(),
+                    parts[1].parse::<f64>(),
+                    parts[2].parse::<f64>(),
+                ) {
+                    return Ok(Some(IpcResponse::Time {
+                        kernel_sec: k,
+                        init_sec: i,
+                        total_sec: t,
+                    }));
+                }
             }
         }
 
@@ -231,8 +262,11 @@ impl IpcResponse {
 }
 
 /// Send a request to UTIM and receive the response.
+/// Read/write timeouts keep a hung daemon from blocking the CLI forever.
 pub fn send_ipc_request(socket_path: &Path, req: &IpcRequest) -> std::io::Result<IpcResponse> {
-    let mut stream = UnixStream::connect(socket_path)?;
+    let stream = UnixStream::connect(socket_path)?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+    stream.set_write_timeout(Some(std::time::Duration::from_secs(10)))?;
     stream.write_all(req.serialize().as_bytes())?;
     stream.flush()?;
 

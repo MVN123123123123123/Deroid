@@ -154,6 +154,8 @@ pub struct DrmKmsDevice {
     pub size: usize,
     mmap_ptr: *mut u32,
     pub mode: DrmModeModeInfo,
+    frame_cache_hash: u64,
+    frame_cache_valid: bool,
 }
 
 impl DrmKmsDevice {
@@ -211,21 +213,24 @@ impl DrmKmsDevice {
             modes[0]
         } else {
             // Fallback synthesis for virtual displays (QEMU virtio-gpu)
-            let mut m = DrmModeModeInfo::default();
-            m.clock = 74250;
-            m.hdisplay = 1080;
-            m.hsync_start = 1120;
-            m.hsync_end = 1140;
-            m.htotal = 1200;
-            m.vdisplay = 2400;
-            m.vsync_start = 2410;
-            m.vsync_end = 2420;
-            m.vtotal = 2450;
-            m.vrefresh = 60;
-            m.mode_type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED;
+            let mut name = [0u8; 32];
             let name_bytes = b"1080x2400\0";
-            m.name[..name_bytes.len()].copy_from_slice(name_bytes);
-            m
+            name[..name_bytes.len()].copy_from_slice(name_bytes);
+            DrmModeModeInfo {
+                clock: 74250,
+                hdisplay: 1080,
+                hsync_start: 1120,
+                hsync_end: 1140,
+                htotal: 1200,
+                vdisplay: 2400,
+                vsync_start: 2410,
+                vsync_end: 2420,
+                vtotal: 2450,
+                vrefresh: 60,
+                mode_type: DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED,
+                name,
+                ..Default::default()
+            }
         };
 
         let width = selected_mode.hdisplay as u32;
@@ -274,7 +279,15 @@ impl DrmKmsDevice {
         };
         let ret = unsafe { libc::ioctl(fd, DRM_IOCTL_MODE_MAP_DUMB, &mut map_dumb) };
         if ret < 0 {
-            return Err(io::Error::last_os_error());
+            let err = io::Error::last_os_error();
+            let mut destroy = DrmModeDestroyDumb {
+                handle: create_dumb.handle,
+            };
+            unsafe {
+                libc::ioctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &mut destroy);
+                libc::ioctl(fd, DRM_IOCTL_MODE_RMFB, &mut fb_cmd.fb_id);
+            }
+            return Err(err);
         }
 
         let mmap_res = unsafe {
@@ -288,7 +301,15 @@ impl DrmKmsDevice {
             )
         };
         if mmap_res == libc::MAP_FAILED {
-            return Err(io::Error::last_os_error());
+            let err = io::Error::last_os_error();
+            let mut destroy = DrmModeDestroyDumb {
+                handle: create_dumb.handle,
+            };
+            unsafe {
+                libc::ioctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &mut destroy);
+                libc::ioctl(fd, DRM_IOCTL_MODE_RMFB, &mut fb_cmd.fb_id);
+            }
+            return Err(err);
         }
         let mmap_ptr = mmap_res as *mut u32;
 
@@ -320,6 +341,8 @@ impl DrmKmsDevice {
             size: create_dumb.size as usize,
             mmap_ptr,
             mode: selected_mode,
+            frame_cache_hash: 0,
+            frame_cache_valid: false,
         })
     }
 
@@ -343,9 +366,65 @@ impl DrmKmsDevice {
             libc::ioctl(self.file.as_raw_fd(), DRM_IOCTL_MODE_DIRTYFB, &mut dirty);
         }
     }
+}
 
-    /// Render the entire Universal Treble Mobile Launcher and SystemUI shell
+#[derive(Debug, Clone)]
+pub struct DrmInteractiveState<'a> {
+    pub time_str: &'a str,
+    pub is_locked: bool,
+    pub cursor_pos: Option<(usize, usize)>,
+    pub is_touching: bool,
+    pub search_query: &'a str,
+    pub search_active: bool,
+    pub keyboard_active: bool,
+    pub shade_open: bool,
+    pub quick_tiles_active: [bool; 8],
+    pub active_app: Option<&'a str>,
+    pub terminal_lines: &'a [String],
+    pub terminal_input: &'a str,
+}
+
+impl<'a> Default for DrmInteractiveState<'a> {
+    fn default() -> Self {
+        Self {
+            time_str: "12:00",
+            is_locked: false,
+            cursor_pos: None,
+            is_touching: false,
+            search_query: "",
+            search_active: false,
+            keyboard_active: false,
+            shade_open: false,
+            quick_tiles_active: [true, true, true, false, true, false, false, false],
+            active_app: None,
+            terminal_lines: &[],
+            terminal_input: "",
+        }
+    }
+}
+
+impl DrmKmsDevice {
+    /// Backward-compatible wrapper for static rendering
     pub fn render_mobile_ui(&mut self, time_str: &str, is_locked: bool) {
+        let state = DrmInteractiveState {
+            time_str,
+            is_locked,
+            ..Default::default()
+        };
+        self.render_interactive_ui(&state);
+    }
+
+    /// Render the Universal Treble Mobile Launcher, SystemUI, or active App with live interactivity.
+    /// Skips the full software redraw when the visible state hash is unchanged
+    /// (damage-tracking fast path: saves ~2.6M px/frame on idle screens).
+    pub fn render_interactive_ui(&mut self, state: &DrmInteractiveState) {
+        let hash = interactive_state_hash(state);
+        if self.frame_cache_valid && hash == self.frame_cache_hash {
+            return;
+        }
+        self.frame_cache_hash = hash;
+        self.frame_cache_valid = true;
+
         let w = self.width as usize;
         let h = self.height as usize;
         let stride = (self.pitch / 4) as usize;
@@ -371,19 +450,23 @@ impl DrmKmsDevice {
 
         // 2. SystemUI Status Bar (Y: 0 .. 44)
         draw_rect(buf, stride, w, h, 0, 0, w, 44, 0x22000000);
-        draw_text(buf, stride, w, h, 24, 14, time_str, 0xFFFFFFFF, 2);
+        draw_text(buf, stride, w, h, 24, 14, state.time_str, 0xFFFFFFFF, 2);
 
         // Status Icons (Right side of status bar)
         let icon_right = w - 24;
         draw_battery(buf, stride, w, h, icon_right - 40, 14, 98);
-        draw_wifi(buf, stride, w, h, icon_right - 80, 14);
-        draw_text(buf, stride, w, h, icon_right - 125, 14, "5G", 0xFFFFFFFF, 2);
+        if state.quick_tiles_active[0] {
+            draw_wifi(buf, stride, w, h, icon_right - 80, 14);
+        }
+        let rat_label = if state.quick_tiles_active[1] { "5G" } else { "OFF" };
+        let rat_color = if state.quick_tiles_active[1] { 0xFFFFFFFF } else { 0xFF888888 };
+        draw_text(buf, stride, w, h, icon_right - 135, 14, rat_label, rat_color, 2);
 
-        if is_locked {
+        if state.is_locked {
             // Lock Screen UI
             let center_x = w / 2;
             let center_y = h / 3;
-            draw_text_centered(buf, stride, w, h, center_x, center_y, time_str, 0xFFFFFFFF, 6);
+            draw_text_centered(buf, stride, w, h, center_x, center_y, state.time_str, 0xFFFFFFFF, 6);
             draw_text_centered(
                 buf,
                 stride,
@@ -402,145 +485,364 @@ impl DrmKmsDevice {
                 h,
                 center_x,
                 h - 180,
-                "Swipe up to unlock",
+                "Click or Swipe up to unlock",
                 0xFF8899A6,
                 2,
             );
             draw_padlock(buf, stride, w, h, center_x, center_y - 80);
-            return;
-        }
+        } else if state.shade_open {
+            // 3. Full-Screen Quick Settings & Notification Shade
+            draw_rect(buf, stride, w, h, 0, 44, w, h - 44, 0xDD080D1A);
+            
+            // Header clock & date
+            draw_text(buf, stride, w, h, 36, 65, state.time_str, 0xFFFFFFFF, 4);
+            draw_text(buf, stride, w, h, 36, 115, "Tue, Sep 22 | Universal Treble GSI", 0xFF94A3B8, 2);
 
-        // 3. Digital Clock & Date Widget on Home Screen
-        let widget_y = 120;
-        draw_text_centered(buf, stride, w, h, w / 2, widget_y, time_str, 0xFFFFFFFF, 5);
-        draw_text_centered(
-            buf,
-            stride,
-            w,
-            h,
-            w / 2,
-            widget_y + 65,
-            "Tue, Sep 22  |  28 C Sunny",
-            0xFF88A0C0,
-            2,
-        );
+            // Quick Settings Tiles (2 columns x 4 rows)
+            let tile_names = [
+                "Wi-Fi",
+                "Mobile Data",
+                "Bluetooth",
+                "Flashlight",
+                "Auto-rotate",
+                "Airplane mode",
+                "Battery Saver",
+                "Hotspot",
+            ];
+            let tile_w = (w - 72 - 20) / 2;
+            let tile_h = 70;
+            let tile_start_y = 155;
 
-        // 4. Google / Treble Search Pill Widget
-        let search_y = widget_y + 115;
-        let search_w = w - 64;
-        let search_x = 32;
-        draw_rounded_rect(
-            buf,
-            stride,
-            w,
-            h,
-            search_x,
-            search_y,
-            search_w,
-            56,
-            28,
-            0x2A3345,
-        );
-        draw_text(buf, stride, w, h, search_x + 20, search_y + 16, "G", 0x4285F4, 3);
-        draw_text(
-            buf,
-            stride,
-            w,
-            h,
-            search_x + 55,
-            search_y + 18,
-            "Search apps, web...",
-            0x8A99AD,
-            2,
-        );
-        draw_text(buf, stride, w, h, search_x + search_w - 36, search_y + 16, "*", 0xEA4335, 3);
+            for (idx, name) in tile_names.iter().enumerate() {
+                let col = idx % 2;
+                let row = idx / 2;
+                let tx = 36 + col * (tile_w + 20);
+                let ty = tile_start_y + row * (tile_h + 14);
 
-        // 5. App Grid Icons (4 columns x 3 rows)
-        let grid_top = search_y + 90;
-        let cols = 4;
-        let col_width = w / cols;
-        let icon_size = 64;
+                let is_active = state.quick_tiles_active[idx];
+                let bg_color = if is_active { 0xFF2563EB } else { 0xFF1E293B };
+                let text_color = if is_active { 0xFFFFFFFF } else { 0xFF94A3B8 };
+                let status_str = if is_active { "ON" } else { "OFF" };
 
-        let apps = [
-            ("Phone", 0x10B981, "P"),
-            ("Messages", 0x3B82F6, "M"),
-            ("Browser", 0x06B6D4, "B"),
-            ("Camera", 0xF43F5E, "C"),
-            ("Gallery", 0x8B5CF6, "G"),
-            ("Settings", 0x64748B, "S"),
-            ("Files", 0xF59E0B, "F"),
-            ("Music", 0xD946EF, "M"),
-            ("Terminal", 0x1E293B, ">"),
-            ("Treble OS", 0x6366F1, "U"),
-            ("Contacts", 0x14B8A6, "C"),
-            ("Clock", 0xEF4444, "T"),
-        ];
+                draw_rounded_rect(buf, stride, w, h, tx, ty, tile_w, tile_h, 16, bg_color);
+                draw_text(buf, stride, w, h, tx + 18, ty + 18, name, text_color, 2);
+                draw_text(buf, stride, w, h, tx + 18, ty + 42, status_str, if is_active { 0xFF93C5FD } else { 0xFF64748B }, 1);
+            }
 
-        for (idx, (name, color, glyph)) in apps.iter().enumerate() {
-            let row = idx / cols;
-            let col = idx % cols;
-            let cx = col * col_width + col_width / 2;
-            let cy = grid_top + row * 115;
+            // Brightness Slider Bar
+            let slider_y = tile_start_y + 4 * (tile_h + 14) + 10;
+            let slider_w = w - 72;
+            draw_rounded_rect(buf, stride, w, h, 36, slider_y, slider_w, 42, 21, 0xFF1E293B);
+            let fill_w = (slider_w * 78) / 100;
+            draw_rounded_rect(buf, stride, w, h, 36, slider_y, fill_w, 42, 21, 0xFF38BDF8);
+            draw_text(buf, stride, w, h, 54, slider_y + 14, "* Brightness: 78%", 0xFF082F49, 2);
 
-            let ix = cx.saturating_sub(icon_size / 2);
-            let iy = cy.saturating_sub(icon_size / 2);
-            draw_rounded_rect(buf, stride, w, h, ix, iy, icon_size, icon_size, 16, *color);
-            draw_text_centered(buf, stride, w, h, cx, cy - 10, glyph, 0xFFFFFFFF, 3);
-            draw_text_centered(buf, stride, w, h, cx, cy + 42, name, 0xFFE2E8F0, 1);
-        }
+            // Notifications List Section
+            let notif_y = slider_y + 65;
+            draw_text(buf, stride, w, h, 36, notif_y, "NOTIFICATIONS", 0xFF64748B, 2);
 
-        // 6. Persistent Hotseat Dock at Bottom
-        let dock_h = 100;
-        let dock_y = h - dock_h - 40;
-        let dock_w = w - 40;
-        let dock_x = 20;
+            // Notification Card 1
+            draw_rounded_rect(buf, stride, w, h, 36, notif_y + 26, w - 72, 85, 18, 0xFF1E293B);
+            draw_text(buf, stride, w, h, 56, notif_y + 40, "UTIM PID 1 & UTLC Wayland", 0xFFF8FAFC, 2);
+            draw_text(buf, stride, w, h, 56, notif_y + 68, "Interactive mobile compositor active with < 8ms input response", 0xFF94A3B8, 1);
 
-        draw_rounded_rect(
-            buf,
-            stride,
-            w,
-            h,
-            dock_x,
-            dock_y,
-            dock_w,
-            dock_h,
-            32,
-            0x182236,
-        );
+            // Notification Card 2
+            draw_rounded_rect(buf, stride, w, h, 36, notif_y + 125, w - 72, 85, 18, 0xFF1E293B);
+            draw_text(buf, stride, w, h, 56, notif_y + 139, "Direct DRM KMS Scanout", 0xFFF8FAFC, 2);
+            draw_text(buf, stride, w, h, 56, notif_y + 167, "1080x2400 @ 120Hz native scanout via /dev/dri/card0", 0xFF94A3B8, 1);
 
-        let dock_apps = [
-            ("Phone", 0x10B981, "P"),
-            ("Messages", 0x3B82F6, "M"),
-            ("Apps", 0x475569, ":"),
-            ("Browser", 0x06B6D4, "B"),
-            ("Camera", 0xF43F5E, "C"),
-        ];
+            // Pull handle at bottom
+            let handle_y = h - 60;
+            draw_rounded_rect(buf, stride, w, h, (w - 140) / 2, handle_y, 140, 6, 3, 0xFF64748B);
+            draw_text_centered(buf, stride, w, h, w / 2, handle_y - 25, "Tap to close", 0xFF94A3B8, 1);
+        } else if let Some(app_name) = state.active_app {
+            // 4. Active Application Window View
+            // Top App Bar
+            let bar_h = 56;
+            let bar_y = 48;
+            draw_rounded_rect(buf, stride, w, h, 16, bar_y, w - 32, bar_h, 16, 0xFF1E293B);
 
-        let dock_col_w = dock_w / dock_apps.len();
-        for (i, (_name, color, glyph)) in dock_apps.iter().enumerate() {
-            let cx = dock_x + i * dock_col_w + dock_col_w / 2;
-            let cy = dock_y + dock_h / 2;
-            let d_size = 54;
-            draw_rounded_rect(
+            // Back button
+            draw_rounded_rect(buf, stride, w, h, 26, bar_y + 8, 95, 40, 10, 0xFF334155);
+            draw_text(buf, stride, w, h, 38, bar_y + 18, "< Back", 0xFFF8FAFC, 2);
+
+            // App title
+            draw_text_centered(buf, stride, w, h, w / 2, bar_y + 18, app_name, 0xFFFFFFFF, 2);
+
+            // Close button
+            draw_rounded_rect(buf, stride, w, h, w - 85, bar_y + 8, 60, 40, 10, 0xFFEF4444);
+            draw_text(buf, stride, w, h, w - 63, bar_y + 18, "X", 0xFFFFFFFF, 2);
+
+            // App Content Container
+            let content_y = bar_y + bar_h + 12;
+            let content_h = if state.keyboard_active {
+                h - content_y - 450
+            } else {
+                h - content_y - 50
+            };
+            draw_rounded_rect(buf, stride, w, h, 16, content_y, w - 32, content_h, 18, 0xFF0A0E17);
+
+            if app_name == "Terminal" {
+                // Interactive Linux Shell Terminal Window
+                let mut line_y = content_y + 24;
+                draw_text(buf, stride, w, h, 36, line_y, "Universal Treble Linux 1.0 (Debian Sid ARM64)", 0xFF38BDF8, 2);
+                line_y += 26;
+                draw_text(buf, stride, w, h, 36, line_y, "Linux 6.1.23-android14-4-00257 (Android GKI)", 0xFF94A3B8, 1);
+                line_y += 20;
+                draw_text(buf, stride, w, h, 36, line_y, "UTIM PID 1 init | UTLC Wayland Compositor", 0xFF94A3B8, 1);
+                line_y += 26;
+                draw_text(buf, stride, w, h, 36, line_y, "Type below or with physical keyboard (help, uname, ls, date)", 0xFF64748B, 1);
+                line_y += 34;
+
+                // Past terminal command lines
+                for line in state.terminal_lines {
+                    if line_y + 24 < content_y + content_h - 40 {
+                        draw_text(buf, stride, w, h, 36, line_y, line, 0xFFE2E8F0, 1);
+                        line_y += 20;
+                    }
+                }
+
+                // Active prompt line with typed characters and blinking cursor
+                if line_y + 24 < content_y + content_h {
+                    draw_text(buf, stride, w, h, 36, line_y, "root@treble-gsi:~# ", 0xFF10B981, 1);
+                    let prompt_w = 19 * 6;
+                    draw_text(buf, stride, w, h, 36 + prompt_w, line_y, state.terminal_input, 0xFFFFFFFF, 1);
+                    let cursor_x = 36 + prompt_w + state.terminal_input.len() * 6;
+                    draw_rect(buf, stride, w, h, cursor_x, line_y, 6, 12, 0xFF10B981);
+                }
+            } else if app_name == "Settings" {
+                // Interactive Mobile Settings Page
+                let mut card_y = content_y + 24;
+                let cards = [
+                    ("Network & Internet", "Wi-Fi, Mobile, Hotspot, VPN"),
+                    ("Connected Devices", "Bluetooth, Android HAL bridge"),
+                    ("Display & Graphics", "1080x2400 @ 120Hz Direct DRM KMS"),
+                    ("Sound & Multimedia", "PipeWire spa-droid Audio"),
+                    ("Storage", "4.00 GB ext4 System GSI Image"),
+                    ("Battery", "98% - Mobile Power Governor active"),
+                    ("About Phone", "Universal Treble Linux (Android 14 GKI)"),
+                ];
+                for (title, desc) in cards {
+                    if card_y + 70 < content_y + content_h {
+                        draw_rounded_rect(buf, stride, w, h, 32, card_y, w - 64, 60, 12, 0xFF1E293B);
+                        draw_text(buf, stride, w, h, 48, card_y + 12, title, 0xFFF8FAFC, 2);
+                        draw_text(buf, stride, w, h, 48, card_y + 36, desc, 0xFF94A3B8, 1);
+                        card_y += 72;
+                    }
+                }
+            } else {
+                // Generic Modern Mobile App Screen
+                draw_text_centered(buf, stride, w, h, w / 2, content_y + 80, app_name, 0xFF38BDF8, 4);
+                draw_text_centered(buf, stride, w, h, w / 2, content_y + 130, "Universal Treble Linux Mobile Application", 0xFF94A3B8, 2);
+                draw_rounded_rect(buf, stride, w, h, (w - 200) / 2, content_y + 180, 200, 50, 14, 0xFF3B82F6);
+                draw_text_centered(buf, stride, w, h, w / 2, content_y + 195, "Action Ready", 0xFFFFFFFF, 2);
+            }
+
+            // Bottom Navigation Pill
+            let nav_y = h - 20;
+            let nav_w = 140;
+            let nav_x = (w - nav_w) / 2;
+            draw_rounded_rect(buf, stride, w, h, nav_x, nav_y, nav_w, 5, 2, 0xFFFFFFFF);
+        } else {
+            // 5. Digital Clock & Date Widget on Home Screen
+            let widget_y = 120;
+            draw_text_centered(buf, stride, w, h, w / 2, widget_y, state.time_str, 0xFFFFFFFF, 5);
+            draw_text_centered(
                 buf,
                 stride,
                 w,
                 h,
-                cx.saturating_sub(d_size / 2),
-                cy.saturating_sub(d_size / 2),
-                d_size,
-                d_size,
-                16,
-                *color,
+                w / 2,
+                widget_y + 65,
+                "Tue, Sep 22  |  28 C Sunny",
+                0xFF88A0C0,
+                2,
             );
-            draw_text_centered(buf, stride, w, h, cx, cy - 8, glyph, 0xFFFFFFFF, 2);
+
+            // 6. Google / Treble Search Pill Widget
+            let search_y = widget_y + 115;
+            let search_w = w - 64;
+            let search_x = 32;
+            let pill_bg = if state.search_active { 0xFF334155 } else { 0xFF2A3345 };
+            let pill_border = if state.search_active { 0xFF38BDF8 } else { 0xFF475569 };
+            draw_rounded_rect(buf, stride, w, h, search_x - 2, search_y - 2, search_w + 4, 60, 30, pill_border);
+            draw_rounded_rect(buf, stride, w, h, search_x, search_y, search_w, 56, 28, pill_bg);
+            draw_text(buf, stride, w, h, search_x + 20, search_y + 16, "G", 0xFF4285F4, 3);
+
+            if state.search_active {
+                let disp_query = if state.search_query.is_empty() {
+                    "Type to search..."
+                } else {
+                    state.search_query
+                };
+                let q_color = if state.search_query.is_empty() { 0xFF94A3B8 } else { 0xFFFFFFFF };
+                draw_text(buf, stride, w, h, search_x + 55, search_y + 18, disp_query, q_color, 2);
+                let cur_x = search_x + 55 + (if state.search_query.is_empty() { 0 } else { state.search_query.len() * 12 });
+                draw_rect(buf, stride, w, h, cur_x, search_y + 16, 2, 24, 0xFF38BDF8);
+            } else {
+                draw_text(buf, stride, w, h, search_x + 55, search_y + 18, "Search apps, web...", 0xFF8A99AD, 2);
+                draw_text(buf, stride, w, h, search_x + search_w - 36, search_y + 16, "*", 0xFFEA4335, 3);
+            }
+
+            // 7. App Grid Icons (4 columns x 3 rows)
+            let grid_top = search_y + 90;
+            let cols = 4;
+            let col_width = w / cols;
+            let icon_size = 64;
+
+            let apps = [
+                ("Phone", 0xFF10B981, "P"),
+                ("Messages", 0xFF3B82F6, "M"),
+                ("Browser", 0xFF06B6D4, "B"),
+                ("Camera", 0xFFF43F5E, "C"),
+                ("Gallery", 0xFF8B5CF6, "G"),
+                ("Settings", 0xFF64748B, "S"),
+                ("Files", 0xFFF59E0B, "F"),
+                ("Music", 0xFFD946EF, "M"),
+                ("Terminal", 0xFF1E293B, ">"),
+                ("Treble OS", 0xFF6366F1, "U"),
+                ("Contacts", 0xFF14B8A6, "C"),
+                ("Clock", 0xFFEF4444, "T"),
+            ];
+
+            for (idx, (name, color, glyph)) in apps.iter().enumerate() {
+                let row = idx / cols;
+                let col = idx % cols;
+                let cx = col * col_width + col_width / 2;
+                let cy = grid_top + row * 115;
+
+                let ix = cx.saturating_sub(icon_size / 2);
+                let iy = cy.saturating_sub(icon_size / 2);
+                draw_rounded_rect(buf, stride, w, h, ix, iy, icon_size, icon_size, 16, *color);
+                draw_text_centered(buf, stride, w, h, cx, cy - 10, glyph, 0xFFFFFFFF, 3);
+                draw_text_centered(buf, stride, w, h, cx, cy + 42, name, 0xFFE2E8F0, 1);
+            }
+
+            // 8. Persistent Hotseat Dock at Bottom
+            let dock_h = 100;
+            let dock_y = h - dock_h - 40;
+            let dock_w = w - 40;
+            let dock_x = 20;
+
+            draw_rounded_rect(buf, stride, w, h, dock_x, dock_y, dock_w, dock_h, 32, 0xFF182236);
+
+            let dock_apps = [
+                ("Phone", 0xFF10B981, "P"),
+                ("Messages", 0xFF3B82F6, "M"),
+                ("Apps", 0xFF475569, ":"),
+                ("Browser", 0xFF06B6D4, "B"),
+                ("Camera", 0xFFF43F5E, "C"),
+            ];
+
+            let dock_col_w = dock_w / dock_apps.len();
+            for (i, (_name, color, glyph)) in dock_apps.iter().enumerate() {
+                let cx = dock_x + i * dock_col_w + dock_col_w / 2;
+                let cy = dock_y + dock_h / 2;
+                let d_size = 54;
+                draw_rounded_rect(
+                    buf,
+                    stride,
+                    w,
+                    h,
+                    cx.saturating_sub(d_size / 2),
+                    cy.saturating_sub(d_size / 2),
+                    d_size,
+                    d_size,
+                    16,
+                    *color,
+                );
+                draw_text_centered(buf, stride, w, h, cx, cy - 8, glyph, 0xFFFFFFFF, 2);
+            }
+
+            // 9. Gesture Navigation Bar (Pill at bottom)
+            let nav_y = h - 20;
+            let nav_w = 140;
+            let nav_x = (w - nav_w) / 2;
+            draw_rounded_rect(buf, stride, w, h, nav_x, nav_y, nav_w, 5, 2, 0xFFFFFFFF);
         }
 
-        // 7. Gesture Navigation Bar (Pill at bottom)
-        let nav_y = h - 20;
-        let nav_w = 140;
-        let nav_x = (w - nav_w) / 2;
-        draw_rounded_rect(buf, stride, w, h, nav_x, nav_y, nav_w, 5, 2, 0xFFFFFFFF);
+        // 10. Virtual Keyboard (Gboard Style) when active
+        if state.keyboard_active && !state.is_locked && !state.shade_open {
+            let kb_h = 420;
+            let kb_y = h - kb_h - 20;
+            let kb_w = w - 24;
+            let kb_x = 12;
+
+            draw_rounded_rect(buf, stride, w, h, kb_x, kb_y, kb_w, kb_h, 24, 0xF0111827);
+            draw_rect(buf, stride, w, h, kb_x + 10, kb_y + 1, kb_w - 20, 2, 0xFF334155);
+
+            // Row 1: Q W E R T Y U I O P (10 keys)
+            let row1 = ["Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P"];
+            let r1_key_w = (kb_w - 30) / 10;
+            let key_h = 65;
+            let r1_y = kb_y + 25;
+            for (i, k) in row1.iter().enumerate() {
+                let kx = kb_x + 15 + i * r1_key_w;
+                draw_rounded_rect(buf, stride, w, h, kx + 2, r1_y, r1_key_w - 4, key_h, 10, 0xFF334155);
+                draw_text_centered(buf, stride, w, h, kx + r1_key_w / 2, r1_y + 18, k, 0xFFFFFFFF, 3);
+            }
+
+            // Row 2: A S D F G H J K L (9 keys)
+            let row2 = ["A", "S", "D", "F", "G", "H", "J", "K", "L"];
+            let r2_key_w = (kb_w - 60) / 9;
+            let r2_y = r1_y + key_h + 12;
+            let r2_offset = kb_x + 30;
+            for (i, k) in row2.iter().enumerate() {
+                let kx = r2_offset + i * r2_key_w;
+                draw_rounded_rect(buf, stride, w, h, kx + 2, r2_y, r2_key_w - 4, key_h, 10, 0xFF334155);
+                draw_text_centered(buf, stride, w, h, kx + r2_key_w / 2, r2_y + 18, k, 0xFFFFFFFF, 3);
+            }
+
+            // Row 3: [SHIFT] Z X C V B N M [DEL]
+            let r3_y = r2_y + key_h + 12;
+            let special_w = 95;
+            let mid_w = (kb_w - 30 - special_w * 2) / 7;
+            // Shift
+            draw_rounded_rect(buf, stride, w, h, kb_x + 15, r3_y, special_w - 4, key_h, 10, 0xFF1E293B);
+            draw_text_centered(buf, stride, w, h, kb_x + 15 + special_w / 2, r3_y + 22, "^", 0xFFFFFFFF, 3);
+
+            let row3 = ["Z", "X", "C", "V", "B", "N", "M"];
+            for (i, k) in row3.iter().enumerate() {
+                let kx = kb_x + 15 + special_w + i * mid_w;
+                draw_rounded_rect(buf, stride, w, h, kx + 2, r3_y, mid_w - 4, key_h, 10, 0xFF334155);
+                draw_text_centered(buf, stride, w, h, kx + mid_w / 2, r3_y + 18, k, 0xFFFFFFFF, 3);
+            }
+
+            // Backspace / Del
+            let del_x = kb_x + 15 + special_w + 7 * mid_w;
+            draw_rounded_rect(buf, stride, w, h, del_x + 2, r3_y, special_w - 4, key_h, 10, 0xFF1E293B);
+            draw_text_centered(buf, stride, w, h, del_x + special_w / 2, r3_y + 22, "<-", 0xFFFFFFFF, 2);
+
+            // Row 4: [?123] [SPACE] [ENTER]
+            let r4_y = r3_y + key_h + 12;
+            let sym_w = 120;
+            let enter_w = 140;
+            let space_w = kb_w - 30 - sym_w - enter_w;
+
+            draw_rounded_rect(buf, stride, w, h, kb_x + 15, r4_y, sym_w - 4, key_h, 10, 0xFF1E293B);
+            draw_text_centered(buf, stride, w, h, kb_x + 15 + sym_w / 2, r4_y + 22, "Hide", 0xFF94A3B8, 2);
+
+            let space_x = kb_x + 15 + sym_w;
+            draw_rounded_rect(buf, stride, w, h, space_x + 2, r4_y, space_w - 4, key_h, 10, 0xFF334155);
+            draw_text_centered(buf, stride, w, h, space_x + space_w / 2, r4_y + 22, "English", 0xFF94A3B8, 2);
+
+            let enter_x = space_x + space_w;
+            draw_rounded_rect(buf, stride, w, h, enter_x + 2, r4_y, enter_w - 4, key_h, 10, 0xFF3B82F6);
+            draw_text_centered(buf, stride, w, h, enter_x + enter_w / 2, r4_y + 22, "Enter", 0xFFFFFFFF, 2);
+        }
+
+        // 11. Interactive Touch Ripple / Cursor Pointer
+        if let Some((cx, cy)) = state.cursor_pos {
+            if state.is_touching {
+                // Vibrant glowing ripple when touching or clicking
+                draw_glow_circle(buf, stride, w, h, cx, cy, 26, 0x00, 0xE5, 0xFF, 50);
+                draw_rounded_rect(buf, stride, w, h, cx.saturating_sub(8), cy.saturating_sub(8), 16, 16, 8, 0xFFFFFFFF);
+            } else {
+                // Sleek, modern subtle pointer dot for cursor hovering
+                draw_rounded_rect(buf, stride, w, h, cx.saturating_sub(5), cy.saturating_sub(5), 10, 10, 5, 0xAAFFFFFF);
+                draw_rounded_rect(buf, stride, w, h, cx.saturating_sub(2), cy.saturating_sub(2), 4, 4, 2, 0xFF00E5FF);
+            }
+        }
     }
 }
 
@@ -553,8 +855,9 @@ impl Drop for DrmKmsDevice {
         }
         if self.fb_id > 0 {
             let fd = self.file.as_raw_fd();
+            let mut fb_id = self.fb_id;
             unsafe {
-                libc::ioctl(fd, DRM_IOCTL_MODE_RMFB, self.fb_id);
+                libc::ioctl(fd, DRM_IOCTL_MODE_RMFB, &mut fb_id);
             }
         }
         if self.dumb_handle > 0 {
@@ -571,7 +874,67 @@ impl Drop for DrmKmsDevice {
 
 // --- Zero-Allocation Graphics Primitives ---
 
+/// FNV-1a hash over the visible interactive state for the render-skip fast path.
+fn interactive_state_hash(state: &DrmInteractiveState) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut h = FNV_OFFSET;
+    let mut mix = |b: u8| {
+        h ^= b as u64;
+        h = h.wrapping_mul(FNV_PRIME);
+    };
+    for b in state.time_str.bytes() {
+        mix(b);
+    }
+    mix(state.is_locked as u8);
+    mix(state.is_touching as u8);
+    mix(state.search_active as u8);
+    mix(state.keyboard_active as u8);
+    mix(state.shade_open as u8);
+    match state.cursor_pos {
+        Some((x, y)) => {
+            for b in x.to_ne_bytes() {
+                mix(b);
+            }
+            for b in y.to_ne_bytes() {
+                mix(b);
+            }
+        }
+        None => mix(0xFF),
+    }
+    for b in state.search_query.bytes() {
+        mix(b);
+    }
+    for (i, t) in state.quick_tiles_active.iter().enumerate() {
+        if *t {
+            mix(i as u8);
+        }
+    }
+    match state.active_app {
+        Some(a) => {
+            mix(1);
+            for b in a.bytes() {
+                mix(b);
+            }
+        }
+        None => mix(0),
+    }
+    for b in state.terminal_input.bytes() {
+        mix(b);
+    }
+    for b in state.terminal_lines.len().to_ne_bytes() {
+        mix(b);
+    }
+    if let Some(last) = state.terminal_lines.last() {
+        for b in last.bytes() {
+            mix(b);
+        }
+    }
+    h
+}
+
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn draw_rect(
     buf: &mut [u32],
     stride: usize,
@@ -594,6 +957,7 @@ fn draw_rect(
 }
 
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn draw_rounded_rect(
     buf: &mut [u32],
     stride: usize,
@@ -606,6 +970,9 @@ fn draw_rounded_rect(
     radius: usize,
     color: u32,
 ) {
+    // Clamp radius to half of the smallest dimension: prevents usize
+    // underflow in `x + rw - radius` for small widgets (nav pill, dots).
+    let radius = radius.min(rw / 2).min(rh / 2);
     let r2 = (radius * radius) as i32;
     let x_end = (x + rw).min(w);
     let y_end = (y + rh).min(h);
@@ -637,6 +1004,7 @@ fn draw_rounded_rect(
 }
 
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn draw_glow_circle(
     buf: &mut [u32],
     stride: usize,
@@ -713,11 +1081,20 @@ static FONT_5X7: [[u8; 5]; 96] = {
     table[24] = [0x36, 0x49, 0x49, 0x49, 0x36]; // 8
     table[25] = [0x06, 0x49, 0x49, 0x29, 0x1e]; // 9
     table[26] = [0x00, 0x36, 0x36, 0x00, 0x00]; // :
-    table[12] = [0x00, 0x50, 0x30, 0x00, 0x00]; // ,
-    table[14] = [0x00, 0x60, 0x60, 0x00, 0x00]; // .
-    table[13] = [0x08, 0x08, 0x08, 0x08, 0x08]; // -
-    table[15] = [0x20, 0x10, 0x08, 0x04, 0x02]; // /
-    table[10] = [0x14, 0x08, 0x3e, 0x08, 0x14]; // *
+    table[27] = [0x00, 0x56, 0x36, 0x00, 0x00]; // ;
+    table[1] = [0x00, 0x41, 0x7f, 0x41, 0x00]; // !
+    table[2] = [0x00, 0x07, 0x00, 0x07, 0x00]; // "
+    table[3] = [0x28, 0x7f, 0x28, 0x7f, 0x28]; // #
+    table[4] = [0x24, 0x2a, 0x7f, 0x2a, 0x12]; // $
+    table[6] = [0x32, 0x49, 0x59, 0x25, 0x26]; // &
+    table[7] = [0x00, 0x05, 0x03, 0x00, 0x00]; // '
+    table[8] = [0x00, 0x1c, 0x22, 0x41, 0x00]; // (
+    table[9] = [0x00, 0x41, 0x22, 0x1c, 0x00]; // )
+    table[11] = [0x08, 0x08, 0x3e, 0x08, 0x08]; // +
+    table[28] = [0x08, 0x14, 0x22, 0x41, 0x00]; // <
+    table[29] = [0x14, 0x14, 0x14, 0x14, 0x14]; // =
+    table[31] = [0x02, 0x01, 0x51, 0x09, 0x06]; // ?
+    table[32] = [0x32, 0x49, 0x79, 0x41, 0x3e]; // @
     table[5] = [0x23, 0x13, 0x08, 0x64, 0x62];  // %
     table[30] = [0x00, 0x41, 0x22, 0x14, 0x08]; // >
     table[63] = [0x00, 0x41, 0x00, 0x41, 0x00]; // |
@@ -776,6 +1153,7 @@ static FONT_5X7: [[u8; 5]; 96] = {
     table
 };
 
+#[allow(clippy::too_many_arguments)]
 fn draw_text(
     buf: &mut [u32],
     stride: usize,
@@ -788,10 +1166,9 @@ fn draw_text(
     scale: usize,
 ) {
     for b in text.bytes() {
-        if b >= 32 && b < 128 {
+        if (32..128).contains(&b) {
             let glyph = &FONT_5X7[(b - 32) as usize];
-            for col in 0..5 {
-                let col_bits = glyph[col];
+            for (col, &col_bits) in glyph.iter().enumerate() {
                 for row in 0..7 {
                     if (col_bits & (1 << row)) != 0 {
                         let px = x + col * scale;
@@ -805,6 +1182,7 @@ fn draw_text(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_text_centered(
     buf: &mut [u32],
     stride: usize,

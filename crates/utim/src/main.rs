@@ -86,6 +86,7 @@ fn main() {
     } else {
         vec![
             PathBuf::from("/etc/systemd/system"),
+            PathBuf::from("/run/systemd/system"),
             PathBuf::from("/usr/lib/systemd/system"),
             PathBuf::from("/lib/systemd/system"),
         ]
@@ -187,6 +188,7 @@ fn main() {
     // Main event loop
     let mut events: [libc::epoll_event; MAX_EPOLL_EVENTS] = unsafe { std::mem::zeroed() };
     let mut last_psi_check = Instant::now();
+    let mut psi_frozen = false;
 
     let mut registered_socket_count = supervisor.sockets.count();
 
@@ -204,7 +206,7 @@ fn main() {
             }
         }
 
-        let timeout_ms = 250; // 250ms event polling for timer checks and pending restarts
+        let timeout_ms = supervisor.next_deadline_ms(&last_psi_check);
         let nfds = unsafe {
             libc::epoll_wait(
                 epoll_fd,
@@ -243,6 +245,25 @@ fn main() {
                                 supervisor
                                     .log_msg("Received SIGHUP, reloading unit definitions...");
                                 supervisor.load_systemd_units(&default_paths);
+                                // Prune activation sockets of removed units
+                                // and stop tracking them in epoll.
+                                let live: std::collections::HashSet<String> = supervisor
+                                    .dag
+                                    .all_nodes()
+                                    .keys()
+                                    .cloned()
+                                    .collect();
+                                for fd in supervisor.sockets.prune_removed_units(&live) {
+                                    registered_sockets.remove(&fd);
+                                    unsafe {
+                                        libc::epoll_ctl(
+                                            epoll_fd,
+                                            libc::EPOLL_CTL_DEL,
+                                            fd,
+                                            std::ptr::null_mut(),
+                                        );
+                                    }
+                                }
                             }
                             _ => {}
                         }
@@ -258,8 +279,24 @@ fn main() {
                         supervisor.handle_notify_message(&msg, pid);
                     }
                 } else if fd == control_server.as_raw_fd() {
-                    if let Ok(stream) = control_server.accept() {
-                        handle_client_connection(&mut supervisor, stream, &default_paths);
+                    match control_server.accept_with_cred() {
+                        Ok((stream, cred)) => {
+                            handle_client_connection(
+                                &mut supervisor,
+                                stream,
+                                &default_paths,
+                                cred.uid,
+                            );
+                        }
+                        Err(e) => {
+                            let kind = e.kind();
+                            if kind != std::io::ErrorKind::WouldBlock {
+                                supervisor.log_msg(&format!(
+                                    "Control accept error: {}",
+                                    e
+                                ));
+                            }
+                        }
                     }
                 } else if let Some(active_sock) = supervisor.sockets.find_by_fd(fd).cloned() {
                     let svc_name = active_sock.service_name;
@@ -277,17 +314,32 @@ fn main() {
         // Process pending delayed restarts
         supervisor.process_pending_restarts();
 
+        // Escalate stops that ignored SIGTERM to SIGKILL
+        supervisor.process_stop_timeouts();
+
         // Process watchdog timer checks
         supervisor.check_watchdogs();
 
-        // Check MMPS memory pressure every 5 seconds
+        // Check MMPS memory pressure every 5 seconds. On Critical, freeze
+        // the background slice to stop CPU burn; unfreeze as soon as
+        // pressure subsides so the phone never wedges frozen.
         if last_psi_check.elapsed() >= Duration::from_secs(5) {
             last_psi_check = Instant::now();
             let level = supervisor.mmps.evaluate_pressure_level();
-            if level == MemoryPressureLevel::Critical {
+            if level == MemoryPressureLevel::Critical && !psi_frozen {
                 supervisor.log_msg(
-                    "CRITICAL Memory Pressure detected via PSI! Triggering background app reclaim.",
+                    "CRITICAL Memory Pressure via PSI: freezing user.slice until pressure subsides.",
                 );
+                match supervisor.mpg.set_cgroup_freeze("user.slice", true) {
+                    Ok(_) => psi_frozen = true,
+                    Err(e) => supervisor.log_msg(&format!("PSI reclaim: freeze failed: {}", e)),
+                }
+            } else if level != MemoryPressureLevel::Critical && psi_frozen {
+                supervisor.log_msg("Memory pressure relieved: unfreezing user.slice.");
+                match supervisor.mpg.set_cgroup_freeze("user.slice", false) {
+                    Ok(_) => psi_frozen = false,
+                    Err(e) => supervisor.log_msg(&format!("PSI relief: unfreeze failed: {}", e)),
+                }
             }
         }
     }

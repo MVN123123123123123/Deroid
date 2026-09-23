@@ -31,8 +31,11 @@ pub struct Supervisor {
     pub restart_queue: HashSet<String>,
     pub pending_units: HashSet<String>,
     pub last_watchdogs: HashMap<String, Instant>,
+    pub watchdog_aborted: HashSet<String>,
     pub boot_start_time: Instant,
     pub early_init_duration: Duration,
+    pub stopping_since: HashMap<String, Instant>,
+    pub stop_timeout: Duration,
 }
 
 impl Supervisor {
@@ -49,8 +52,11 @@ impl Supervisor {
             restart_queue: HashSet::new(),
             pending_units: HashSet::new(),
             last_watchdogs: HashMap::new(),
+            watchdog_aborted: HashSet::new(),
             boot_start_time: Instant::now(),
             early_init_duration: Duration::ZERO,
+            stopping_since: HashMap::new(),
+            stop_timeout: Duration::from_secs(5),
         }
     }
 
@@ -60,41 +66,46 @@ impl Supervisor {
         let mut masked_units: HashSet<String> = HashSet::new();
         let mut loaded_units_in_pass: HashSet<String> = HashSet::new();
 
-        // Pass 1: Load unit files respecting priority and detecting /dev/null masks
+        // Pass 1: Load unit files respecting priority and detecting /dev/null masks.
+        // Entries are sorted for deterministic load order across boots.
         for dir in search_paths {
             if let Ok(entries) = fs::read_dir(dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
+                let mut paths: Vec<PathBuf> = entries
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| {
+                        p.extension().and_then(|s| s.to_str()).is_some_and(|ext| {
+                            matches!(ext, "service" | "target" | "socket" | "timer" | "mount")
+                        })
+                    })
+                    .collect();
+                paths.sort();
+                for path in paths {
                     let name = path
                         .file_name()
                         .and_then(|n| n.to_str())
                         .unwrap_or("")
                         .to_string();
-                    if name.ends_with(".service")
-                        || name.ends_with(".target")
-                        || name.ends_with(".socket")
-                    {
-                        // Check if masked via /dev/null symlink
-                        if let Ok(dest) = fs::read_link(&path) {
-                            if dest == Path::new("/dev/null") {
-                                masked_units.insert(name.clone());
-                                continue;
-                            }
-                        }
-
-                        if masked_units.contains(&name) {
+                    // Check if masked via /dev/null symlink
+                    if let Ok(dest) = fs::read_link(&path) {
+                        if dest == Path::new("/dev/null") {
+                            masked_units.insert(name.clone());
                             continue;
                         }
+                    }
 
-                        // Only insert if not already loaded from a higher priority directory in this pass
-                        if loaded_units_in_pass.insert(name.clone()) && path.is_file() {
-                            if let Ok(content) = fs::read_to_string(&path) {
-                                let parsed = utim_core::unit::parse_unit(&name, &path, &content);
-                                if let Some(existing_node) = self.dag.get_mut(&name) {
-                                    existing_node.unit = parsed;
-                                } else {
-                                    self.dag.insert(parsed);
-                                }
+                    if masked_units.contains(&name) {
+                        continue;
+                    }
+
+                    // Only insert if not already loaded from a higher priority directory in this pass
+                    if loaded_units_in_pass.insert(name.clone()) && path.is_file() {
+                        if let Ok(content) = fs::read_to_string(&path) {
+                            let parsed = utim_core::unit::parse_unit(&name, &path, &content);
+                            if let Some(existing_node) = self.dag.get_mut(&name) {
+                                existing_node.unit = parsed;
+                            } else {
+                                self.dag.insert(parsed);
                             }
                         }
                     }
@@ -168,6 +179,13 @@ impl Supervisor {
             if self.dag.get(&synthetic.name).is_none() && !masked_units.contains(&synthetic.name) {
                 self.dag.insert(synthetic);
             }
+        }
+
+        // Evict units that are now masked (e.g. masked after a previous
+        // load via daemon-reload) so masked units can never start.
+        for masked in &masked_units {
+            self.dag.remove(masked);
+            self.pending_units.remove(masked);
         }
     }
 
@@ -377,8 +395,16 @@ impl Supervisor {
         // Socket activation file descriptors
         let socket_fds = self.sockets.sockets_for_service(unit_name);
 
+        // Failure-report pipe for Simple and Exec types: child writes errno
+        // pre-execve (or on execve failure); parent distinguishes "failed to
+        // start" from "started then exited". Forking/Notify/Oneshot keep the
+        // legacy fire-and-observe semantics.
+        let report_failures = matches!(
+            svc.service_type,
+            ServiceType::Simple | ServiceType::Exec
+        );
         let mut exec_pipe = [-1; 2];
-        if svc.service_type == ServiceType::Exec {
+        if report_failures {
             unsafe {
                 if libc::pipe2(exec_pipe.as_mut_ptr(), libc::O_CLOEXEC) != 0 {
                     return Err(io::Error::last_os_error());
@@ -393,8 +419,20 @@ impl Supervisor {
 
         if pid == 0 {
             // Child process
-            if svc.service_type == ServiceType::Exec {
+            if report_failures {
                 unsafe { libc::close(exec_pipe[0]) };
+            }
+
+            // Close every inherited FD except the failure pipe write-end and
+            // the socket-activation FDs (dup2'ed below). Without this the
+            // child leaks the control/notify listeners, epoll and signalfd
+            // into every service.
+            {
+                let mut keep = socket_fds.clone();
+                if report_failures {
+                    keep.push(exec_pipe[1]);
+                }
+                close_fds_except(&keep);
             }
 
             // Unblock signals
@@ -407,39 +445,66 @@ impl Supervisor {
 
             // Change working directory if specified
             if let Some(ref cwd) = svc.working_directory {
-                let c_cwd = CString::new(cwd.as_str()).unwrap();
-                unsafe { libc::chdir(c_cwd.as_ptr()) };
+                match CString::new(cwd.as_str()) {
+                    Ok(c_cwd) => unsafe {
+                        if libc::chdir(c_cwd.as_ptr()) != 0 {
+                            libc::_exit(126);
+                        }
+                    },
+                    Err(_) => unsafe { libc::_exit(126) },
+                }
             }
 
-            // Drop privileges if user / group specified
+            // Fail-closed privilege drop: any configured user/group that
+            // cannot be resolved or applied aborts the child instead of
+            // silently running as root.
+            let mut priv_fail = false;
             if let Some(ref group_name) = svc.group {
-                let c_grp = CString::new(group_name.as_str()).unwrap();
+                let c_grp = match CString::new(group_name.as_str()) {
+                    Ok(c) => c,
+                    Err(_) => unsafe { libc::_exit(126) },
+                };
                 let gr = unsafe { libc::getgrnam(c_grp.as_ptr()) };
                 if !gr.is_null() {
-                    unsafe {
-                        libc::setgid((*gr).gr_gid);
+                    if unsafe { libc::setgid((*gr).gr_gid) } != 0 {
+                        priv_fail = true;
                     }
                 } else if let Ok(gid) = group_name.parse::<u32>() {
-                    unsafe {
-                        libc::setgid(gid);
+                    if unsafe { libc::setgid(gid) } != 0 {
+                        priv_fail = true;
                     }
+                } else {
+                    priv_fail = true;
                 }
             }
             if let Some(ref user_name) = svc.user {
-                let c_usr = CString::new(user_name.as_str()).unwrap();
+                let c_usr = match CString::new(user_name.as_str()) {
+                    Ok(c) => c,
+                    Err(_) => unsafe { libc::_exit(126) },
+                };
                 let pw = unsafe { libc::getpwnam(c_usr.as_ptr()) };
                 if !pw.is_null() {
                     unsafe {
-                        if svc.group.is_none() {
-                            libc::setgid((*pw).pw_gid);
+                        if svc.group.is_none() && libc::setgid((*pw).pw_gid) != 0 {
+                            priv_fail = true;
                         }
-                        libc::setuid((*pw).pw_uid);
+                        if libc::initgroups(c_usr.as_ptr(), (*pw).pw_gid) != 0 {
+                            priv_fail = true;
+                        }
+                        if libc::setuid((*pw).pw_uid) != 0 {
+                            priv_fail = true;
+                        }
                     }
                 } else if let Ok(uid) = user_name.parse::<u32>() {
-                    unsafe {
-                        libc::setuid(uid);
+                    if unsafe { libc::setuid(uid) } != 0 {
+                        priv_fail = true;
                     }
+                } else {
+                    priv_fail = true;
                 }
+            }
+            if priv_fail {
+                unsafe { libc::_exit(126) };
             }
 
             // Apply resource limits
@@ -449,6 +514,20 @@ impl Supervisor {
                     rlim_max: nofile,
                 };
                 unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rlim) };
+            }
+            if let Some(memlock) = svc.limit_memlock {
+                let rlim = libc::rlimit {
+                    rlim_cur: memlock,
+                    rlim_max: memlock,
+                };
+                unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &rlim) };
+            }
+            if let Some(nproc) = svc.limit_nproc {
+                let rlim = libc::rlimit {
+                    rlim_cur: nproc,
+                    rlim_max: nproc,
+                };
+                unsafe { libc::setrlimit(libc::RLIMIT_NPROC, &rlim) };
             }
 
             // Apply OOM score adjust
@@ -480,12 +559,20 @@ impl Supervisor {
                 }
             }
 
-            // Build CString args with systemd-compliant argument expansion
+            // Build CString args with systemd-compliant argument expansion.
+            // Any NUL byte in the unit file is a hard start failure, not a panic.
             let resolved_bin = resolve_binary(&cmd.binary).unwrap_or_else(|| cmd.binary.clone());
             let mut c_args = Vec::new();
-            c_args.push(CString::new(resolved_bin.as_str()).unwrap());
+            let bin_cstr = match CString::new(resolved_bin.as_str()) {
+                Ok(c) => c,
+                Err(_) => unsafe { libc::_exit(126) },
+            };
+            c_args.push(bin_cstr);
             for arg in expand_command_args(&cmd.args, &child_env_map) {
-                c_args.push(CString::new(arg).unwrap());
+                match CString::new(arg) {
+                    Ok(c) => c_args.push(c),
+                    Err(_) => unsafe { libc::_exit(126) },
+                }
             }
             let mut arg_ptrs: Vec<*const libc::c_char> =
                 c_args.iter().map(|s| s.as_ptr()).collect();
@@ -494,7 +581,10 @@ impl Supervisor {
             // Build CString env
             let mut c_envs = Vec::new();
             for (k, v) in child_env_map {
-                c_envs.push(CString::new(format!("{}={}", k, v)).unwrap());
+                match CString::new(format!("{}={}", k, v)) {
+                    Ok(c) => c_envs.push(c),
+                    Err(_) => unsafe { libc::_exit(126) },
+                }
             }
             let mut env_ptrs: Vec<*const libc::c_char> =
                 c_envs.iter().map(|s| s.as_ptr()).collect();
@@ -503,7 +593,7 @@ impl Supervisor {
             unsafe {
                 libc::execve(c_args[0].as_ptr(), arg_ptrs.as_ptr(), env_ptrs.as_ptr());
                 // If execve fails, write errno to pipe so parent knows it failed
-                if svc.service_type == ServiceType::Exec {
+                if report_failures {
                     let err = *libc::__errno_location();
                     libc::write(
                         exec_pipe[1],
@@ -518,7 +608,7 @@ impl Supervisor {
 
         // Parent process
         let mut exec_succeeded = false;
-        if svc.service_type == ServiceType::Exec {
+        if report_failures {
             unsafe {
                 libc::close(exec_pipe[1]);
                 let mut err_code: libc::c_int = 0;
@@ -550,11 +640,7 @@ impl Supervisor {
         }
 
         let initial_state = match svc.service_type {
-            ServiceType::Simple => {
-                self.pending_units.remove(unit_name);
-                UnitState::Active
-            }
-            ServiceType::Exec => {
+            ServiceType::Simple | ServiceType::Exec => {
                 self.pending_units.remove(unit_name);
                 if exec_succeeded {
                     UnitState::Active
@@ -600,15 +686,19 @@ impl Supervisor {
                 libc::kill(pid, libc::SIGTERM);
             }
             self.dag.set_state(unit_name, UnitState::Deactivating);
+            self.stopping_since
+                .insert(unit_name.to_string(), Instant::now());
             self.log_msg(&format!(
                 "Stopping {}: Sent SIGTERM to PID {}",
                 unit_name, pid
             ));
         } else {
             self.dag.set_state(unit_name, UnitState::Inactive);
+            self.stopping_since.remove(unit_name);
         }
 
         self.last_watchdogs.remove(unit_name);
+        self.watchdog_aborted.remove(unit_name);
         Ok(())
     }
 
@@ -687,6 +777,7 @@ impl Supervisor {
         if let Some(ref name) = unit_name {
             if msg.watchdog {
                 self.last_watchdogs.insert(name.clone(), Instant::now());
+                self.watchdog_aborted.remove(name);
             }
             if msg.ready {
                 self.dag.set_state(name, UnitState::Active);
@@ -734,6 +825,7 @@ impl Supervisor {
 
                 // Always clear watchdog and clear PID (unless re-adopted below)
                 self.last_watchdogs.remove(&unit_name);
+                self.watchdog_aborted.remove(&unit_name);
                 self.dag.set_pid(&unit_name, None);
 
                 // Explicit stop check: if unit was deactivating, transition directly to Inactive
@@ -741,6 +833,7 @@ impl Supervisor {
                 if let Some(node) = self.dag.get(&unit_name) {
                     if node.state == UnitState::Deactivating {
                         self.pending_units.remove(&unit_name);
+                        self.stopping_since.remove(&unit_name);
                         if self.restart_queue.remove(&unit_name) {
                             self.log_msg(&format!(
                                 "Unit {} stopped, executing queued restart",
@@ -802,8 +895,15 @@ impl Supervisor {
                             unit_name, new_pid
                         ));
                     } else {
-                        self.dag.set_state(&unit_name, UnitState::Active);
+                        // No PID file entry: the daemon double-forked without
+                        // leaving an identity. Do NOT fabricate Active; the
+                        // exit will be reaped as a start failure below.
+                        self.dag.set_state(&unit_name, UnitState::Failed);
                         self.pending_units.remove(&unit_name);
+                        self.log_msg(&format!(
+                            "Forking service {} exited without a PID file entry; marking Failed",
+                            unit_name
+                        ));
                     }
 
                     if let Some(node) = self.dag.get(&unit_name) {
@@ -888,7 +988,49 @@ impl Supervisor {
         }
     }
 
+    /// Escalate stops that ignored SIGTERM: after `stop_timeout`, SIGKILL.
+    /// Called once per event-loop iteration (event-driven, no extra wakeups).
+    pub fn process_stop_timeouts(&mut self) {
+        let now = Instant::now();
+        let mut escalate = Vec::new();
+        for (name, since) in &self.stopping_since {
+            if let Some(node) = self.dag.get(name) {
+                if node.state == UnitState::Deactivating
+                    && now.duration_since(*since) >= self.stop_timeout
+                {
+                    escalate.push((name.clone(), node.pid));
+                }
+            }
+        }
+        for (name, pid) in escalate {
+            // Refresh the deadline so a SIGKILL-ignoring (D-state) process
+            // is logged once per interval rather than every iteration.
+            self.stopping_since.insert(name.clone(), now);
+            if let Some(p) = pid {
+                self.log_msg(&format!(
+                    "Unit {} (PID {}) ignored SIGTERM; sending SIGKILL",
+                    name, p
+                ));
+                unsafe {
+                    libc::kill(p, libc::SIGKILL);
+                }
+            } else {
+                self.stopping_since.remove(&name);
+                self.dag.set_state(&name, UnitState::Inactive);
+            }
+        }
+        // Drop tracking for units that left Deactivating by another path.
+        self.stopping_since
+            .retain(|name, _| match self.dag.get(name) {
+                Some(n) => n.state == UnitState::Deactivating,
+                None => false,
+            });
+    }
+
     /// Check watchdog timers for active services and restart any that timed out.
+    /// First timeout sends SIGABRT (core dump for diagnostics); a second
+    /// consecutive timeout escalates to SIGKILL. A fresh WATCHDOG=1 ping
+    /// clears the escalation (see `handle_notify_message`).
     pub fn check_watchdogs(&mut self) {
         let now = Instant::now();
         let mut expired = Vec::new();
@@ -906,14 +1048,31 @@ impl Supervisor {
             }
         }
         for (name, pid) in expired {
-            self.log_msg(&format!(
-                "Watchdog timeout for service {}! Terminating and restarting...",
-                name
-            ));
-            self.last_watchdogs.remove(&name);
-            if let Some(p) = pid {
-                unsafe {
-                    libc::kill(p, libc::SIGABRT);
+            let already_aborted = self.watchdog_aborted.contains(&name);
+            if already_aborted {
+                self.log_msg(&format!(
+                    "Watchdog timeout for service {} persists; sending SIGKILL...",
+                    name
+                ));
+                self.last_watchdogs.remove(&name);
+                self.watchdog_aborted.remove(&name);
+                if let Some(p) = pid {
+                    unsafe {
+                        libc::kill(p, libc::SIGKILL);
+                    }
+                }
+            } else {
+                self.log_msg(&format!(
+                    "Watchdog timeout for service {}! Sending SIGABRT...",
+                    name
+                ));
+                // Grant one more interval before SIGKILL escalation.
+                self.last_watchdogs.insert(name.clone(), now);
+                self.watchdog_aborted.insert(name.clone());
+                if let Some(p) = pid {
+                    unsafe {
+                        libc::kill(p, libc::SIGABRT);
+                    }
                 }
             }
         }
@@ -971,8 +1130,36 @@ impl Supervisor {
     }
 }
 
-fn resolve_binary(binary: &str) -> Option<String> {
-    if binary.starts_with('/') {
+/// Close all open file descriptors >= 3 except those in `keep`.
+/// Called in the fork child before execve so services never inherit the
+/// supervisor's epoll/signalfd/listeners. Uses /proc/self/fd when available
+/// with an _SC_OPEN_MAX fallback (no allocation on failure paths of note).
+fn close_fds_except(keep: &[i32]) {
+    let mut fds: Vec<i32> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir("/proc/self/fd") {
+        for entry in entries.flatten() {
+            if let Some(n) = entry.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) {
+                if n >= 3 && !keep.contains(&n) {
+                    fds.push(n);
+                }
+            }
+        }
+        // The read_dir itself holds an fd; closing it via drop happens after.
+        for fd in fds {
+            unsafe { libc::close(fd) };
+        }
+    } else {
+        let max = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+        let max = if max > 0 { max } else { 1024 };
+        for fd in 3..max {
+            if !keep.contains(&fd) {
+                unsafe { libc::close(fd as i32) };
+            }
+        }
+    }
+}
+
+fn resolve_binary(binary: &str) -> Option<String> {    if binary.starts_with('/') {
         return Some(binary.to_string());
     }
     let default_path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
@@ -1003,7 +1190,14 @@ fn run_command_sync(
     }
 
     match command.status() {
-        Ok(status) => Ok(status.code().unwrap_or(0)),
+        Ok(status) => {
+            // A signal death is NOT success: surface it as failure so
+            // ExecStartPre with `!ignore_failure` correctly fails the unit.
+            match status.code() {
+                Some(code) => Ok(code),
+                None => Ok(128),
+            }
+        }
         Err(e) => {
             if cmd.ignore_failure {
                 Ok(0)

@@ -129,6 +129,7 @@ pub fn parse_notify_payload(payload: &str) -> Option<NotifyMessage> {
     let mut watchdog = false;
     let mut mainpid = None;
     let mut errno = None;
+    let mut recognized = false;
 
     for line in payload.lines() {
         let trimmed = line.trim();
@@ -138,14 +139,35 @@ pub fn parse_notify_payload(payload: &str) -> Option<NotifyMessage> {
 
         if let Some((k, v)) = trimmed.split_once('=') {
             match k {
-                "READY" => ready = v == "1",
-                "STATUS" => status = Some(v.to_string()),
-                "WATCHDOG" => watchdog = v == "1",
-                "MAINPID" => mainpid = v.parse::<i32>().ok(),
-                "ERRNO" => errno = v.parse::<i32>().ok(),
+                "READY" => {
+                    ready = v == "1";
+                    recognized = true;
+                }
+                "STATUS" => {
+                    status = Some(v.to_string());
+                    recognized = true;
+                }
+                "WATCHDOG" => {
+                    watchdog = v == "1";
+                    recognized = true;
+                }
+                "MAINPID" => {
+                    mainpid = v.parse::<i32>().ok();
+                    recognized = true;
+                }
+                "ERRNO" => {
+                    errno = v.parse::<i32>().ok();
+                    recognized = true;
+                }
                 _ => {}
             }
         }
+    }
+
+    // Garbage datagrams (no sd_notify key at all) are rejected so random
+    // writes to the world-writable socket can't spoof service state.
+    if !recognized {
+        return None;
     }
 
     Some(NotifyMessage {

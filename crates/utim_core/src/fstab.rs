@@ -22,9 +22,12 @@ impl FstabEntry {
                 "noatime" => flags |= libc::MS_NOATIME,
                 "nodiratime" => flags |= libc::MS_NODIRATIME,
                 "relatime" => flags |= libc::MS_RELATIME,
+                "strictatime" => flags |= libc::MS_STRICTATIME,
+                "dirsync" => flags |= libc::MS_DIRSYNC,
                 "sync" => flags |= libc::MS_SYNCHRONOUS,
                 "remount" => flags |= libc::MS_REMOUNT,
                 "bind" => flags |= libc::MS_BIND,
+                "rw" => {}
                 _ => {}
             }
         }
@@ -39,6 +42,31 @@ impl FstabEntry {
     /// Check if this entry should be mounted in first stage / early boot.
     pub fn is_first_stage(&self) -> bool {
         self.fs_mgr_flags.iter().any(|f| f == "first_stage_mount")
+    }
+
+    /// Owned mount(2) `data` string with fs-specific options (uid=,
+    /// shortname=, barrier=, ...). Bare MS_* keywords are consumed by
+    /// [`FstabEntry::linux_mount_flags`]; everything else is forwarded.
+    /// Returns None when there is nothing to forward.
+    pub fn mount_data_owned(&self) -> Option<String> {
+        static KNOWN: &[&str] = &[
+            "ro", "rw", "nosuid", "nodev", "noexec", "noatime", "nodiratime", "relatime",
+            "strictatime", "sync", "dirsync", "remount", "bind",
+        ];
+        let extra: Vec<&str> = self
+            .mnt_flags
+            .iter()
+            .filter(|flag| {
+                let bare = flag.split_once('=').map(|(k, _)| k).unwrap_or(flag.as_str());
+                !KNOWN.contains(&bare) && !flag.is_empty()
+            })
+            .map(|s| s.as_str())
+            .collect();
+        if extra.is_empty() {
+            None
+        } else {
+            Some(extra.join(","))
+        }
     }
 }
 

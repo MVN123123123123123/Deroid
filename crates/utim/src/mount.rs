@@ -7,23 +7,35 @@ use std::path::Path;
 use utim_core::fstab::parse_fstab;
 
 pub fn mount_early_filesystems() -> io::Result<()> {
+    // Best-effort: every mount is attempted even if an earlier one failed,
+    // so a missing /proc never skips cgroup v2 or /run on odd kernels.
+    // The first error is remembered and returned at the end.
+    let mut first_err: Option<io::Error> = None;
+    let mut attempt = |r: io::Result<()>| {
+        if let Err(e) = r {
+            if first_err.is_none() {
+                first_err = Some(e);
+            }
+        }
+    };
+
     // 1. Mount /proc
-    mount_fs(
+    attempt(mount_fs(
         "proc",
         "/proc",
         "proc",
         libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
         None,
-    )?;
+    ));;
 
     // 2. Mount /sys
-    mount_fs(
+    attempt(mount_fs(
         "sysfs",
         "/sys",
         "sysfs",
         libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
         None,
-    )?;
+    ));;
 
     // 3. Mount /dev (devtmpfs with fallback to tmpfs for kernels with CONFIG_DEVTMPFS=n)
     if mount_fs(
@@ -44,31 +56,31 @@ pub fn mount_early_filesystems() -> io::Result<()> {
     let _ = fs::create_dir_all("/dev/socket");
 
     // 4. Mount /dev/pts
-    mount_fs(
+    attempt(mount_fs(
         "devpts",
         "/dev/pts",
         "devpts",
         libc::MS_NOSUID | libc::MS_NOEXEC,
         Some("mode=0620,ptmxmode=0666"),
-    )?;
+    ));
 
     // 5. Mount /dev/shm
-    mount_fs(
+    attempt(mount_fs(
         "tmpfs",
         "/dev/shm",
         "tmpfs",
         libc::MS_NOSUID | libc::MS_NODEV,
         Some("mode=1777"),
-    )?;
+    ));
 
     // 6. Mount /run
-    mount_fs(
+    attempt(mount_fs(
         "tmpfs",
         "/run",
         "tmpfs",
         libc::MS_NOSUID | libc::MS_NODEV,
         Some("mode=0755"),
-    )?;
+    ));;
 
     // Create systemd compatibility directory marker!
     // This allows Debian package maintainer scripts (dh_installsystemd / dpkg) to detect that systemd is active.
@@ -90,18 +102,30 @@ pub fn mount_early_filesystems() -> io::Result<()> {
     // 8. Populate static /dev character nodes and standard symlinks
     populate_static_dev_nodes();
 
-    // 9. Remount / read-write so userspace disk writes do not fail with EROFS
+    // 9. Remount / read-write so userspace disk writes do not fail with EROFS.
+    // A bare MS_REMOUNT with NULL source/fstype is a kernel no-op; pass an
+    // explicit "rw" remount and surface the error instead of ignoring it.
     let c_root = CString::new("/").map_err(io::Error::other)?;
-    unsafe {
+    let c_data = CString::new("rw").map_err(io::Error::other)?;
+    let ret = unsafe {
         libc::mount(
-            std::ptr::null(),
+            c_root.as_ptr(),
             c_root.as_ptr(),
             std::ptr::null(),
             libc::MS_REMOUNT,
-            std::ptr::null(),
-        );
+            c_data.as_ptr() as *const libc::c_void,
+        )
+    };
+    if ret != 0 {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EBUSY) && first_err.is_none() {
+            first_err = Some(err);
+        }
     }
 
+    if let Some(e) = first_err {
+        return Err(e);
+    }
     Ok(())
 }
 
@@ -134,18 +158,19 @@ pub fn populate_static_dev_nodes() {
     create_dev_node("/dev/tty", 5, 0, 0o666);
     create_dev_node("/dev/ptmx", 5, 2, 0o666);
 
-    // Direct Rendering Manager (DRM) and Framebuffer nodes
+    // Direct Rendering Manager (DRM) and Framebuffer nodes: 0660 like udev
+    // (root:video). World-writable GPU nodes let any app modeset the display.
     let _ = fs::create_dir_all("/dev/dri");
-    create_dev_node("/dev/dri/card0", 226, 0, 0o666);
-    create_dev_node("/dev/dri/renderD128", 226, 128, 0o666);
-    create_dev_node("/dev/fb0", 29, 0, 0o666);
+    create_dev_node("/dev/dri/card0", 226, 0, 0o660);
+    create_dev_node("/dev/dri/renderD128", 226, 128, 0o660);
+    create_dev_node("/dev/fb0", 29, 0, 0o660);
 
     // Input event devices (virtio-input, keyboard, touchscreen/tablet)
     let _ = fs::create_dir_all("/dev/input");
     for i in 0..8 {
-        create_dev_node(&format!("/dev/input/event{}", i), 13, 64 + i, 0o666);
+        create_dev_node(&format!("/dev/input/event{}", i), 13, 64 + i, 0o660);
     }
-    create_dev_node("/dev/input/mice", 13, 63, 0o666);
+    create_dev_node("/dev/input/mice", 13, 63, 0o660);
 
     let symlinks = [
         ("/proc/self/fd", "/dev/fd"),
@@ -173,43 +198,59 @@ pub fn mount_vendor_partitions() -> io::Result<()> {
     ];
 
     for fstab_path in &candidate_fstabs {
-        if let Ok(content) = fs::read_to_string(fstab_path) {
-            let entries = parse_fstab(&content);
-            for entry in entries {
-                let mnt = entry.mount_point.as_str();
-                if mnt == "/vendor"
-                    || mnt == "/odm"
-                    || mnt == "/firmware"
-                    || mnt == "/dsp"
-                    || mnt.starts_with("/apex")
-                {
-                    let _ = fs::create_dir_all(mnt);
-                    let flags = entry.linux_mount_flags();
-
-                    let resolved_src = if Path::new(&entry.src).exists() {
-                        entry.src.clone()
-                    } else {
-                        let name = entry
-                            .src
-                            .trim_start_matches("/dev/block/mapper/")
-                            .trim_start_matches("/dev/block/by-name/")
-                            .trim_start_matches("/dev/block/bootdevice/by-name/");
-                        let mapper_path = format!("/dev/block/mapper/{}", name);
-                        let by_name_path = format!("/dev/block/by-name/{}", name);
-                        if Path::new(&mapper_path).exists() {
-                            mapper_path
-                        } else if Path::new(&by_name_path).exists() {
-                            by_name_path
-                        } else {
-                            entry.src.clone()
-                        }
-                    };
-
-                    let _ = mount_fs(&resolved_src, mnt, &entry.fs_type, flags, None);
-                }
-            }
-            break;
+        let Ok(content) = fs::read_to_string(fstab_path) else {
+            continue;
+        };
+        let entries = parse_fstab(&content);
+        if entries.is_empty() {
+            // An empty fstab must not shadow later candidates.
+            continue;
         }
+        for entry in entries {
+            let mnt = entry.mount_point.as_str();
+            if mnt == "/vendor"
+                || mnt == "/odm"
+                || mnt == "/product"
+                || mnt == "/system_ext"
+                || mnt == "/vendor_dlkm"
+                || mnt == "/odm_dlkm"
+                || mnt == "/firmware"
+                || mnt == "/dsp"
+                || mnt.starts_with("/apex")
+            {
+                let _ = fs::create_dir_all(mnt);
+                let flags = entry.linux_mount_flags();
+
+                let resolved_src = if Path::new(&entry.src).exists() {
+                    entry.src.clone()
+                } else {
+                    let name = entry
+                        .src
+                        .trim_start_matches("/dev/block/mapper/")
+                        .trim_start_matches("/dev/block/by-name/")
+                        .trim_start_matches("/dev/block/bootdevice/by-name/");
+                    let mapper_path = format!("/dev/block/mapper/{}", name);
+                    let by_name_path = format!("/dev/block/by-name/{}", name);
+                    if Path::new(&mapper_path).exists() {
+                        mapper_path
+                    } else if Path::new(&by_name_path).exists() {
+                        by_name_path
+                    } else {
+                        entry.src.clone()
+                    }
+                };
+
+                let data_owned = entry.mount_data_owned();
+                let _ = mount_fs(
+                    &resolved_src,
+                    mnt,
+                    &entry.fs_type,
+                    flags,
+                    data_owned.as_deref(),
+                );
+            }
+        }
+        break;
     }
 
     Ok(())

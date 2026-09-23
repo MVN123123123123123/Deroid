@@ -86,6 +86,7 @@ if [[ "${GRAPHIC_MODE}" == "1" ]]; then
         -device "virtio-gpu-pci,xres=1080,yres=2400"
         -device "virtio-keyboard-pci"
         -device "virtio-tablet-pci"
+        -device "virtio-mouse-pci"
         -display "gtk,gl=off,zoom-to-fit=on"
     )
 fi

@@ -8,6 +8,7 @@
 pub mod desktop;
 pub mod gestures;
 pub mod ime;
+pub mod input;
 pub mod launcher;
 pub mod lockscreen;
 pub mod power_sync;
@@ -23,6 +24,7 @@ pub use gestures::{
     TouchPhase,
 };
 pub use ime::{ImeAction, KeyboardLayout, VirtualKeyboard};
+pub use input::{InputDispatchResult, InputDispatcher, LinuxInputEvent};
 pub use launcher::{
     AppDrawer, DrawerState, GridItem, HotseatDock, SpringConfig, SpringOscillator, WorkspaceGrid,
 };

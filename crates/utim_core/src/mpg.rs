@@ -67,6 +67,11 @@ impl MobilePowerGovernor {
         !self.active_wake_locks.is_empty()
     }
 
+    /// Check if a specific wake lock is currently held.
+    pub fn is_wake_lock_active(&self, name: &str) -> bool {
+        self.active_wake_locks.contains(name)
+    }
+
     pub fn active_wake_locks(&self) -> &HashSet<String> {
         &self.active_wake_locks
     }

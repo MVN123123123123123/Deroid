@@ -77,14 +77,26 @@ impl<const N: usize> ByteRingBuffer<N> {
     }
 
     /// Read all available bytes into a String (for status/logs).
+    /// Decodes as UTF-8 lossily so multi-byte log output is preserved
+    /// instead of being mangled one byte per char.
     pub fn to_string_lossy(&self) -> String {
-        let mut s = String::with_capacity(self.count);
+        let mut tmp = [0u8; 512];
+        let mut out = String::with_capacity(self.count.min(512));
         let mut idx = self.head;
-        for _ in 0..self.count {
-            s.push(self.buf[idx] as char);
-            idx = (idx + 1) % N;
+        let mut remaining = self.count;
+        while remaining > 0 {
+            let chunk = remaining.min(tmp.len());
+            for i in 0..chunk {
+                tmp[i] = self.buf[idx];
+                idx += 1;
+                if idx == N {
+                    idx = 0;
+                }
+            }
+            out.push_str(&String::from_utf8_lossy(&tmp[..chunk]));
+            remaining -= chunk;
         }
-        s
+        out
     }
 
     /// Clear the ring buffer.

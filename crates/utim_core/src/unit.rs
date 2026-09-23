@@ -326,31 +326,87 @@ pub fn parse_words(s: &str) -> Vec<String> {
     words
 }
 
-/// Parse a time duration from systemd format (e.g., "5s", "100ms", "2min", "1h", or "10").
+/// Parse a time duration from systemd format.
+/// Supports us/µs, ms, s/sec, min, h, d/day, w/week, bare seconds and
+/// fractional values ("1.5s"). "infinity"/"inf" map to Duration::MAX
+/// (never-expires); "0"/"no"/"" map to ZERO. Unparseable input is ZERO.
 pub fn parse_duration(s: &str) -> Duration {
     let trimmed = s.trim();
-    if trimmed.is_empty() || trimmed == "0" || trimmed == "no" || trimmed == "infinity" {
+    if trimmed.is_empty() || trimmed == "0" || trimmed == "no" {
         return Duration::ZERO;
     }
+    if trimmed == "infinity" || trimmed == "inf" {
+        return Duration::MAX;
+    }
 
+    // Longest suffixes first so "ms"/"min" win over a bare trailing 's'/'m'.
     if let Some(val) = trimmed.strip_suffix("ms") {
-        if let Ok(v) = val.trim().parse::<u64>() {
-            return Duration::from_millis(v);
+        if let Ok(v) = val.trim().parse::<f64>() {
+            if v >= 0.0 {
+                return Duration::from_secs_f64(v / 1000.0);
+            }
         }
-    } else if let Some(val) = trimmed.strip_suffix('s') {
-        if let Ok(v) = val.trim().parse::<u64>() {
-            return Duration::from_secs(v);
+    } else if let Some(val) = trimmed
+        .strip_suffix("us")
+        .or_else(|| trimmed.strip_suffix("µs"))
+        .or_else(|| trimmed.strip_suffix("μs"))
+    {
+        if let Ok(v) = val.trim().parse::<f64>() {
+            if v >= 0.0 {
+                return Duration::from_secs_f64(v / 1_000_000.0);
+            }
         }
     } else if let Some(val) = trimmed.strip_suffix("min") {
-        if let Ok(v) = val.trim().parse::<u64>() {
-            return Duration::from_secs(v * 60);
+        if let Ok(v) = val.trim().parse::<f64>() {
+            if v >= 0.0 {
+                return Duration::from_secs_f64(v * 60.0);
+            }
+        }
+        // "min" must precede the week/day arms only in suffix length; the
+        // bare 's' arm below would claim trailing-"s" plurals ("weeks"),
+        // so weeks/days are matched before 's'.
+    } else if let Some(val) = trimmed
+        .strip_suffix("weeks")
+        .or_else(|| trimmed.strip_suffix("week"))
+        .or_else(|| trimmed.strip_suffix('w'))
+    {
+        if let Ok(v) = val.trim().parse::<f64>() {
+            if v >= 0.0 {
+                return Duration::from_secs_f64(v * 7.0 * 86400.0);
+            }
+        }
+    } else if let Some(val) = trimmed
+        .strip_suffix("days")
+        .or_else(|| trimmed.strip_suffix("day"))
+        .or_else(|| trimmed.strip_suffix('d'))
+    {
+        if let Ok(v) = val.trim().parse::<f64>() {
+            if v >= 0.0 {
+                return Duration::from_secs_f64(v * 86400.0);
+            }
+        }
+    } else if let Some(val) = trimmed
+        .strip_suffix("seconds")
+        .or_else(|| trimmed.strip_suffix("second"))
+        .or_else(|| trimmed.strip_suffix("secs"))
+        .or_else(|| trimmed.strip_suffix("sec"))
+        .or_else(|| trimmed.strip_suffix('s'))
+    {
+        if let Ok(v) = val.trim().parse::<f64>() {
+            if v >= 0.0 {
+                return Duration::from_secs_f64(v);
+            }
         }
     } else if let Some(val) = trimmed.strip_suffix('h') {
-        if let Ok(v) = val.trim().parse::<u64>() {
-            return Duration::from_secs(v * 3600);
+        if let Ok(v) = val.trim().parse::<f64>() {
+            if v >= 0.0 {
+                return Duration::from_secs_f64(v * 3600.0);
+            }
         }
-    } else if let Ok(v) = trimmed.parse::<u64>() {
-        return Duration::from_secs(v);
+    } else if let Ok(v) = trimmed.parse::<f64>() {
+        if v >= 0.0 {
+            return Duration::from_secs_f64(v);
+        }
     }
 
     Duration::ZERO
@@ -582,7 +638,35 @@ pub fn parse_unit(name: &str, path: &Path, content: &str) -> SystemdUnit {
     unit
 }
 
+/// Does a drop-in file explicitly set `key` inside `[section]`?
+/// Used to distinguish "not mentioned" from "reset to default" (e.g.
+/// `Restart=no`, or bare `ExecStart=` which clears the command list).
+fn dropin_has_key(dropin_content: &str, section: &str, key: &str) -> bool {
+    let mut current = String::new();
+    for line in dropin_content.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') || t.starts_with(';') {
+            continue;
+        }
+        if t.starts_with('[') && t.ends_with(']') {
+            current = t[1..t.len() - 1].to_string();
+            continue;
+        }
+        if current == section {
+            if let Some((k, _)) = t.split_once('=') {
+                if k.trim() == key {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Apply drop-in configurations (`<unit>.d/*.conf`) on top of an existing unit.
+/// Follows systemd reset semantics: a bare `ExecStart=` / `ExecStop=` clears
+/// the inherited list, and explicit `Restart=no` / `RestartSec=` override
+/// even when they equal the built-in defaults.
 pub fn apply_dropin(unit: &mut SystemdUnit, dropin_content: &str) {
     let dummy_path = PathBuf::from("dropin.conf");
     let dropin_unit = parse_unit(&unit.name, &dummy_path, dropin_content);
@@ -591,46 +675,137 @@ pub fn apply_dropin(unit: &mut SystemdUnit, dropin_content: &str) {
     if !dropin_unit.unit.description.is_empty() {
         unit.unit.description = dropin_unit.unit.description;
     }
+    if !dropin_unit.unit.documentation.is_empty() {
+        unit.unit.documentation = dropin_unit.unit.documentation;
+    }
     unit.unit.requires.extend(dropin_unit.unit.requires);
     unit.unit.wants.extend(dropin_unit.unit.wants);
     unit.unit.binds_to.extend(dropin_unit.unit.binds_to);
     unit.unit.conflicts.extend(dropin_unit.unit.conflicts);
     unit.unit.after.extend(dropin_unit.unit.after);
     unit.unit.before.extend(dropin_unit.unit.before);
+    unit.unit
+        .condition_path_exists
+        .extend(dropin_unit.unit.condition_path_exists);
+    unit.unit
+        .condition_file_not_empty
+        .extend(dropin_unit.unit.condition_file_not_empty);
+    unit.unit
+        .condition_directory_not_empty
+        .extend(dropin_unit.unit.condition_directory_not_empty);
+    if dropin_has_key(dropin_content, "Unit", "DefaultDependencies") {
+        unit.unit.default_dependencies = dropin_unit.unit.default_dependencies;
+    }
 
     // Merge Service section
     if let (Some(ref mut target), Some(source)) = (&mut unit.service, dropin_unit.service) {
-        if !source.exec_start.is_empty() {
+        if dropin_has_key(dropin_content, "Service", "Type") {
+            target.service_type = source.service_type;
+        }
+        if dropin_has_key(dropin_content, "Service", "ExecStart") {
             target.exec_start = source.exec_start;
         }
-        target.exec_start_pre.extend(source.exec_start_pre);
-        target.exec_start_post.extend(source.exec_start_post);
-        if !source.exec_stop.is_empty() {
+        if dropin_has_key(dropin_content, "Service", "ExecStartPre") {
+            target.exec_start_pre = source.exec_start_pre;
+        } else {
+            target.exec_start_pre.extend(source.exec_start_pre);
+        }
+        if dropin_has_key(dropin_content, "Service", "ExecStartPost") {
+            target.exec_start_post = source.exec_start_post;
+        } else {
+            target.exec_start_post.extend(source.exec_start_post);
+        }
+        if dropin_has_key(dropin_content, "Service", "ExecStop") {
+            target.exec_stop = source.exec_stop;
+        } else if !source.exec_stop.is_empty() {
             target.exec_stop = source.exec_stop;
         }
-        if source.restart != RestartPolicy::No {
+        if dropin_has_key(dropin_content, "Service", "ExecReload") {
+            target.exec_reload = source.exec_reload;
+        } else {
+            target.exec_reload.extend(source.exec_reload);
+        }
+        if dropin_has_key(dropin_content, "Service", "Restart") {
             target.restart = source.restart;
         }
-        if source.restart_sec != Duration::from_millis(100) {
+        if dropin_has_key(dropin_content, "Service", "RestartSec") {
             target.restart_sec = source.restart_sec;
         }
         for (k, v) in source.environment {
             target.environment.insert(k, v);
         }
         target.environment_files.extend(source.environment_files);
-        if source.working_directory.is_some() {
+        if dropin_has_key(dropin_content, "Service", "WorkingDirectory") {
             target.working_directory = source.working_directory;
         }
-        if source.user.is_some() {
+        if dropin_has_key(dropin_content, "Service", "User") {
             target.user = source.user;
         }
-        if source.group.is_some() {
+        if dropin_has_key(dropin_content, "Service", "Group") {
             target.group = source.group;
         }
-        if source.oom_score_adjust.is_some() {
+        if !source.supplementary_groups.is_empty() {
+            target.supplementary_groups = source.supplementary_groups;
+        }
+        if dropin_has_key(dropin_content, "Service", "StandardOutput") {
+            target.standard_output = source.standard_output;
+        }
+        if dropin_has_key(dropin_content, "Service", "StandardError") {
+            target.standard_error = source.standard_error;
+        }
+        if dropin_has_key(dropin_content, "Service", "LimitNOFILE") {
+            target.limit_nofile = source.limit_nofile;
+        }
+        if dropin_has_key(dropin_content, "Service", "LimitMEMLOCK") {
+            target.limit_memlock = source.limit_memlock;
+        }
+        if dropin_has_key(dropin_content, "Service", "LimitNPROC") {
+            target.limit_nproc = source.limit_nproc;
+        }
+        if dropin_has_key(dropin_content, "Service", "OOMScoreAdjust") {
             target.oom_score_adjust = source.oom_score_adjust;
         }
+        if dropin_has_key(dropin_content, "Service", "WatchdogSec") {
+            target.watchdog_sec = source.watchdog_sec;
+        }
+        if dropin_has_key(dropin_content, "Service", "PIDFile") {
+            target.pid_file = source.pid_file;
+        }
+        if dropin_has_key(dropin_content, "Service", "BusName") {
+            target.bus_name = source.bus_name;
+        }
     }
+
+    // Merge Socket section
+    if let (Some(ref mut target), Some(source)) = (&mut unit.socket, dropin_unit.socket) {
+        if !source.listen_stream.is_empty() {
+            target.listen_stream = source.listen_stream;
+        }
+        if !source.listen_datagram.is_empty() {
+            target.listen_datagram = source.listen_datagram;
+        }
+        if dropin_has_key(dropin_content, "Socket", "SocketMode") {
+            target.socket_mode = source.socket_mode;
+        }
+        if dropin_has_key(dropin_content, "Socket", "SocketUser") {
+            target.socket_user = source.socket_user;
+        }
+        if dropin_has_key(dropin_content, "Socket", "SocketGroup") {
+            target.socket_group = source.socket_group;
+        }
+        if dropin_has_key(dropin_content, "Socket", "Service") {
+            target.service = source.service;
+        }
+    }
+
+    // Merge Install section (additive)
+    unit.install.wanted_by.extend(dropin_unit.install.wanted_by);
+    unit
+        .install
+        .required_by
+        .extend(dropin_unit.install.required_by);
+    unit.install.also.extend(dropin_unit.install.also);
+    unit.install.alias.extend(dropin_unit.install.alias);
 }
 
 /// Expand environment variables in string like `${VAR}` or `$VAR`.
@@ -643,11 +818,21 @@ pub fn expand_env(input: &str, env: &HashMap<String, String>) -> String {
             if chars.peek() == Some(&'{') {
                 chars.next(); // consume '{'
                 let mut var_name = String::new();
+                let mut closed = false;
                 for inner in chars.by_ref() {
                     if inner == '}' {
+                        closed = true;
                         break;
                     }
                     var_name.push(inner);
+                }
+                if !closed {
+                    // Unclosed `${VAR`: preserve literally instead of
+                    // silently dropping the remainder of the line.
+                    result.push('$');
+                    result.push('{');
+                    result.push_str(&var_name);
+                    continue;
                 }
                 if let Some(val) = env.get(&var_name) {
                     result.push_str(val);
@@ -680,6 +865,7 @@ pub fn expand_env(input: &str, env: &HashMap<String, String>) -> String {
 
 /// Expand command arguments conforming to systemd syntax:
 /// - Arguments with `$VAR` (no curly braces) are word-split on whitespace; empty values yield 0 arguments.
+///   A path suffix after the variable name is preserved (`$DIR/sub`).
 /// - Arguments with `${VAR}` (curly braces) are substituted in-place without word-splitting.
 pub fn expand_command_args(args: &[String], env: &HashMap<String, String>) -> Vec<String> {
     let mut expanded_args = Vec::new();
@@ -689,16 +875,51 @@ pub fn expand_command_args(args: &[String], env: &HashMap<String, String>) -> Ve
             continue;
         }
 
-        // Check if argument is a naked $VAR (word-splitting, drops if empty)
+        // Naked $VAR (word-splitting, drops if empty). The variable name is
+        // the longest [A-Za-z0-9_] prefix; any suffix is re-attached to each
+        // expanded word (or once, when the value is empty and no split occurs).
         if trimmed.starts_with('$') && !trimmed.starts_with("${") {
-            let var_name = &trimmed[1..];
+            let name_end = trimmed[1..]
+                .char_indices()
+                .find(|(_, c)| !(c.is_alphanumeric() || *c == '_'))
+                .map(|(i, _)| 1 + i)
+                .unwrap_or(trimmed.len());
+            let var_name = &trimmed[1..name_end];
+            let suffix = &trimmed[name_end..];
+            if var_name.is_empty() {
+                let expanded = expand_env(trimmed, env);
+                if !expanded.is_empty() {
+                    expanded_args.push(expanded);
+                }
+                continue;
+            }
             let val = env
                 .get(var_name)
                 .cloned()
                 .or_else(|| std::env::var(var_name).ok())
                 .unwrap_or_default();
-            for word in val.split_whitespace() {
-                expanded_args.push(word.to_string());
+            if val.is_empty() && suffix.is_empty() {
+                continue;
+            }
+            let words: Vec<&str> = val.split_whitespace().collect();
+            if words.is_empty() {
+                // Empty value with a suffix (e.g. `$EMPTY/sub`) yields the
+                // suffix alone rather than dropping the argument.
+                if !suffix.is_empty() {
+                    expanded_args.push(suffix.to_string());
+                }
+            } else if suffix.is_empty() {
+                for word in words {
+                    expanded_args.push(word.to_string());
+                }
+            } else {
+                // Suffix re-attached per word is ambiguous; attach to the
+                // last word (matches shell `$VAR/sub` intuition for single
+                // values, stays deterministic for lists).
+                for word in &words[..words.len() - 1] {
+                    expanded_args.push(word.to_string());
+                }
+                expanded_args.push(format!("{}{}", words[words.len() - 1], suffix));
             }
         } else {
             let expanded = expand_env(trimmed, env);

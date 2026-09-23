@@ -42,7 +42,8 @@ impl SignalHandler {
 
     /// Read pending signals from signalfd.
     pub fn read_signals(&self) -> Vec<libc::signalfd_siginfo> {
-        let mut signals = Vec::new();
+        // Small pre-reserve: the hot path delivers 1-2 signals per wakeup.
+        let mut signals = Vec::with_capacity(4);
         let mut info: libc::signalfd_siginfo = unsafe { mem::zeroed() };
         let size = mem::size_of::<libc::signalfd_siginfo>();
 
