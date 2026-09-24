@@ -26,7 +26,7 @@ pub fn mount_early_filesystems() -> io::Result<()> {
         "proc",
         libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
         None,
-    ));;
+    ));
 
     // 2. Mount /sys
     attempt(mount_fs(
@@ -35,7 +35,7 @@ pub fn mount_early_filesystems() -> io::Result<()> {
         "sysfs",
         libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
         None,
-    ));;
+    ));
 
     // 3. Mount /dev (devtmpfs with fallback to tmpfs for kernels with CONFIG_DEVTMPFS=n)
     if mount_fs(
@@ -80,7 +80,7 @@ pub fn mount_early_filesystems() -> io::Result<()> {
         "tmpfs",
         libc::MS_NOSUID | libc::MS_NODEV,
         Some("mode=0755"),
-    ));;
+    ));
 
     // Create systemd compatibility directory marker!
     // This allows Debian package maintainer scripts (dh_installsystemd / dpkg) to detect that systemd is active.
@@ -98,6 +98,7 @@ pub fn mount_early_filesystems() -> io::Result<()> {
     );
     let _ = fs::create_dir_all("/sys/fs/cgroup/user.slice");
     let _ = fs::create_dir_all("/sys/fs/cgroup/system.slice");
+    let _ = fs::write("/sys/fs/cgroup/cgroup.subtree_control", b"+cpu +memory +io +pids\n");
 
     // 8. Populate static /dev character nodes and standard symlinks
     populate_static_dev_nodes();
@@ -185,6 +186,35 @@ pub fn populate_static_dev_nodes() {
     }
 }
 
+pub fn place_in_cgroup(pid: libc::pid_t) {
+    let system_slice = "/sys/fs/cgroup/system.slice/cgroup.procs";
+    let root_cgroup = "/sys/fs/cgroup/cgroup.procs";
+    if Path::new(system_slice).exists() {
+        let _ = fs::write(system_slice, format!("{}\n", pid));
+    } else if Path::new(root_cgroup).exists() {
+        let _ = fs::write(root_cgroup, format!("{}\n", pid));
+    }
+}
+
+fn get_slot_suffix() -> Option<String> {
+    if let Ok(cmdline) = fs::read_to_string("/proc/cmdline") {
+        for arg in cmdline.split_whitespace() {
+            if let Some(val) = arg.strip_prefix("androidboot.slot_suffix=") {
+                return Some(val.to_string());
+            }
+            if let Some(val) = arg.strip_prefix("androidboot.slot=") {
+                let s = val.trim();
+                return Some(if s.starts_with('_') {
+                    s.to_string()
+                } else {
+                    format!("_{}", s)
+                });
+            }
+        }
+    }
+    None
+}
+
 /// Parse vendor fstab and mount partitions (/vendor, /odm, /apex, /firmware, /dsp)
 pub fn mount_vendor_partitions() -> io::Result<()> {
     let candidate_fstabs = [
@@ -197,6 +227,9 @@ pub fn mount_vendor_partitions() -> io::Result<()> {
         "/fstab.default",
     ];
 
+    let slot_suffix = get_slot_suffix();
+    let mut mounted_targets = std::collections::HashSet::new();
+
     for fstab_path in &candidate_fstabs {
         let Ok(content) = fs::read_to_string(fstab_path) else {
             continue;
@@ -208,6 +241,9 @@ pub fn mount_vendor_partitions() -> io::Result<()> {
         }
         for entry in entries {
             let mnt = entry.mount_point.as_str();
+            if mounted_targets.contains(mnt) {
+                continue;
+            }
             if mnt == "/vendor"
                 || mnt == "/odm"
                 || mnt == "/product"
@@ -221,36 +257,50 @@ pub fn mount_vendor_partitions() -> io::Result<()> {
                 let _ = fs::create_dir_all(mnt);
                 let flags = entry.linux_mount_flags();
 
-                let resolved_src = if Path::new(&entry.src).exists() {
-                    entry.src.clone()
-                } else {
-                    let name = entry
-                        .src
-                        .trim_start_matches("/dev/block/mapper/")
-                        .trim_start_matches("/dev/block/by-name/")
-                        .trim_start_matches("/dev/block/bootdevice/by-name/");
-                    let mapper_path = format!("/dev/block/mapper/{}", name);
-                    let by_name_path = format!("/dev/block/by-name/{}", name);
-                    if Path::new(&mapper_path).exists() {
-                        mapper_path
-                    } else if Path::new(&by_name_path).exists() {
-                        by_name_path
+                let base_name = entry
+                    .src
+                    .trim_start_matches("/dev/block/mapper/")
+                    .trim_start_matches("/dev/block/by-name/")
+                    .trim_start_matches("/dev/block/bootdevice/by-name/");
+
+                let mut candidates = Vec::new();
+                if Path::new(&entry.src).exists() {
+                    candidates.push(entry.src.clone());
+                }
+                if let Some(ref suffix) = slot_suffix {
+                    let suffixed = if base_name.ends_with(suffix) {
+                        base_name.to_string()
                     } else {
-                        entry.src.clone()
-                    }
-                };
+                        format!("{}{}", base_name, suffix)
+                    };
+                    candidates.push(format!("/dev/block/mapper/{}", suffixed));
+                    candidates.push(format!("/dev/block/by-name/{}", suffixed));
+                    candidates.push(format!("/dev/block/bootdevice/by-name/{}", suffixed));
+                }
+                candidates.push(format!("/dev/block/mapper/{}", base_name));
+                candidates.push(format!("/dev/block/by-name/{}", base_name));
+                candidates.push(format!("/dev/block/bootdevice/by-name/{}", base_name));
+                candidates.push(entry.src.clone());
+
+                let resolved_src = candidates
+                    .into_iter()
+                    .find(|p| Path::new(p).exists())
+                    .unwrap_or_else(|| entry.src.clone());
 
                 let data_owned = entry.mount_data_owned();
-                let _ = mount_fs(
+                if mount_fs(
                     &resolved_src,
                     mnt,
                     &entry.fs_type,
                     flags,
                     data_owned.as_deref(),
-                );
+                )
+                .is_ok()
+                {
+                    mounted_targets.insert(entry.mount_point.clone());
+                }
             }
         }
-        break;
     }
 
     Ok(())
@@ -298,12 +348,32 @@ pub fn setup_binder_devnodes() -> io::Result<()> {
             }
         }
 
-        // Symlink binderfs nodes to /dev
+        // Symlink binderfs nodes to /dev and chmod 0666
         for node in &["binder", "vndbinder", "hwbinder"] {
             let src = format!("{}/{}", binderfs_dir, node);
             let dst = format!("/dev/{}", node);
+            if let Ok(c_src) = CString::new(src.as_str()) {
+                unsafe {
+                    libc::chmod(c_src.as_ptr(), 0o666);
+                }
+            }
             if Path::new(&src).exists() && !Path::new(&dst).exists() {
                 let _ = std::os::unix::fs::symlink(&src, &dst);
+            }
+            if let Ok(c_dst) = CString::new(dst.as_str()) {
+                unsafe {
+                    libc::chmod(c_dst.as_ptr(), 0o666);
+                }
+            }
+        }
+    }
+
+    // Also ensure any existing /dev/binder* nodes have 0o666 permissions
+    for node in &["binder", "vndbinder", "hwbinder"] {
+        let dst = format!("/dev/{}", node);
+        if let Ok(c_dst) = CString::new(dst.as_str()) {
+            unsafe {
+                libc::chmod(c_dst.as_ptr(), 0o666);
             }
         }
     }

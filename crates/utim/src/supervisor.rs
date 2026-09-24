@@ -419,6 +419,7 @@ impl Supervisor {
 
         if pid == 0 {
             // Child process
+            crate::mount::place_in_cgroup(0);
             if report_failures {
                 unsafe { libc::close(exec_pipe[0]) };
             }
@@ -459,24 +460,9 @@ impl Supervisor {
             // cannot be resolved or applied aborts the child instead of
             // silently running as root.
             let mut priv_fail = false;
-            if let Some(ref group_name) = svc.group {
-                let c_grp = match CString::new(group_name.as_str()) {
-                    Ok(c) => c,
-                    Err(_) => unsafe { libc::_exit(126) },
-                };
-                let gr = unsafe { libc::getgrnam(c_grp.as_ptr()) };
-                if !gr.is_null() {
-                    if unsafe { libc::setgid((*gr).gr_gid) } != 0 {
-                        priv_fail = true;
-                    }
-                } else if let Ok(gid) = group_name.parse::<u32>() {
-                    if unsafe { libc::setgid(gid) } != 0 {
-                        priv_fail = true;
-                    }
-                } else {
-                    priv_fail = true;
-                }
-            }
+            let mut target_uid: Option<libc::uid_t> = None;
+            let mut target_gid: Option<libc::gid_t> = None;
+
             if let Some(ref user_name) = svc.user {
                 let c_usr = match CString::new(user_name.as_str()) {
                     Ok(c) => c,
@@ -485,24 +471,83 @@ impl Supervisor {
                 let pw = unsafe { libc::getpwnam(c_usr.as_ptr()) };
                 if !pw.is_null() {
                     unsafe {
-                        if svc.group.is_none() && libc::setgid((*pw).pw_gid) != 0 {
-                            priv_fail = true;
-                        }
+                        target_uid = Some((*pw).pw_uid);
+                        target_gid = Some((*pw).pw_gid);
                         if libc::initgroups(c_usr.as_ptr(), (*pw).pw_gid) != 0 {
-                            priv_fail = true;
-                        }
-                        if libc::setuid((*pw).pw_uid) != 0 {
                             priv_fail = true;
                         }
                     }
                 } else if let Ok(uid) = user_name.parse::<u32>() {
-                    if unsafe { libc::setuid(uid) } != 0 {
-                        priv_fail = true;
-                    }
+                    target_uid = Some(uid);
                 } else {
                     priv_fail = true;
                 }
             }
+
+            if let Some(ref group_name) = svc.group {
+                let c_grp = match CString::new(group_name.as_str()) {
+                    Ok(c) => c,
+                    Err(_) => unsafe { libc::_exit(126) },
+                };
+                let gr = unsafe { libc::getgrnam(c_grp.as_ptr()) };
+                if !gr.is_null() {
+                    target_gid = Some(unsafe { (*gr).gr_gid });
+                } else if let Ok(gid) = group_name.parse::<u32>() {
+                    target_gid = Some(gid);
+                } else {
+                    priv_fail = true;
+                }
+            }
+
+            if !svc.supplementary_groups.is_empty() {
+                let mut gids: Vec<libc::gid_t> = Vec::new();
+                let num_existing = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+                if num_existing > 0 {
+                    gids.resize(num_existing as usize, 0);
+                    unsafe { libc::getgroups(num_existing, gids.as_mut_ptr()) };
+                }
+                for grp in &svc.supplementary_groups {
+                    let c_grp = match CString::new(grp.as_str()) {
+                        Ok(c) => c,
+                        Err(_) => {
+                            priv_fail = true;
+                            break;
+                        }
+                    };
+                    let gr = unsafe { libc::getgrnam(c_grp.as_ptr()) };
+                    if !gr.is_null() {
+                        let gid = unsafe { (*gr).gr_gid };
+                        if !gids.contains(&gid) {
+                            gids.push(gid);
+                        }
+                    } else if let Ok(gid) = grp.parse::<libc::gid_t>() {
+                        if !gids.contains(&gid) {
+                            gids.push(gid);
+                        }
+                    } else {
+                        priv_fail = true;
+                        break;
+                    }
+                }
+                if !priv_fail && !gids.is_empty()
+                    && unsafe { libc::setgroups(gids.len(), gids.as_ptr()) } != 0
+                {
+                    priv_fail = true;
+                }
+            }
+
+            if let Some(gid) = target_gid {
+                if unsafe { libc::setgid(gid) } != 0 {
+                    priv_fail = true;
+                }
+            }
+
+            if let Some(uid) = target_uid {
+                if unsafe { libc::setuid(uid) } != 0 {
+                    priv_fail = true;
+                }
+            }
+
             if priv_fail {
                 unsafe { libc::_exit(126) };
             }
@@ -607,6 +652,7 @@ impl Supervisor {
         }
 
         // Parent process
+        crate::mount::place_in_cgroup(pid);
         let mut exec_succeeded = false;
         if report_failures {
             unsafe {
@@ -813,9 +859,16 @@ impl Supervisor {
         }
     }
 
-    /// Handle process exits from zombie reaper.
     pub fn handle_process_exits(&mut self, exits: &[ProcessExitInfo]) {
         for exit in exits {
+            // Check if this was a vendor HAL daemon (tracked in container.running_hal_pids)
+            if let Some(hal_name) = self.container.handle_hal_exit(exit.pid) {
+                self.log_msg(&format!(
+                    "Vendor HAL {} terminated, self-healing watchdog triggered",
+                    hal_name
+                ));
+            }
+
             if let Some(unit_name) = self.pid_to_unit.remove(&exit.pid) {
                 let is_success = exit.exited_cleanly && exit.exit_code == 0;
                 self.log_msg(&format!(
@@ -825,7 +878,7 @@ impl Supervisor {
 
                 // Always clear watchdog and clear PID (unless re-adopted below)
                 self.last_watchdogs.remove(&unit_name);
-                self.watchdog_aborted.remove(&unit_name);
+                let was_watchdog = self.watchdog_aborted.remove(&unit_name);
                 self.dag.set_pid(&unit_name, None);
 
                 // Explicit stop check: if unit was deactivating, transition directly to Inactive
@@ -933,10 +986,19 @@ impl Supervisor {
                     }
                 } else {
                     self.pending_units.remove(&unit_name);
+                    let is_clean_signal = exit.signal.is_some_and(|sig| {
+                        sig == libc::SIGINT || sig == libc::SIGTERM || sig == libc::SIGHUP
+                    });
                     let should_restart = match restart_policy {
                         utim_core::unit::RestartPolicy::Always => true,
                         utim_core::unit::RestartPolicy::OnFailure => !is_success,
                         utim_core::unit::RestartPolicy::OnSuccess => is_success,
+                        utim_core::unit::RestartPolicy::OnAbnormal => {
+                            was_watchdog || (!exit.exited_cleanly && !is_clean_signal)
+                        }
+                        utim_core::unit::RestartPolicy::OnAbort => {
+                            !exit.exited_cleanly && !is_clean_signal
+                        }
                         _ => false,
                     };
 
@@ -953,14 +1015,6 @@ impl Supervisor {
                     } else {
                         self.dag.set_state(&unit_name, UnitState::Failed);
                     }
-                }
-
-                // Check if this was a vendor HAL daemon
-                if let Some(hal_name) = self.container.handle_hal_exit(exit.pid) {
-                    self.log_msg(&format!(
-                        "Vendor HAL {} terminated, self-healing watchdog triggered",
-                        hal_name
-                    ));
                 }
             }
         }
@@ -988,6 +1042,64 @@ impl Supervisor {
         }
     }
 
+    /// Calculate the next epoll timeout in milliseconds based on pending restarts,
+    /// stopping timeouts, watchdogs, and PSI pressure checks.
+    pub fn next_deadline_ms(&self, last_psi_check: &Instant) -> i32 {
+        let now = Instant::now();
+        let mut min_timeout_ms = 5000i64;
+
+        // PSI check deadline (5s interval)
+        let psi_elapsed = last_psi_check.elapsed().as_millis().min(i64::MAX as u128) as i64;
+        let psi_remaining = 5000i64.saturating_sub(psi_elapsed).max(50);
+        min_timeout_ms = min_timeout_ms.min(psi_remaining);
+
+        // Pending delayed restarts
+        for (_, restart_at) in &self.pending_restarts {
+            if *restart_at > now {
+                let rem = restart_at
+                    .checked_duration_since(now)
+                    .unwrap_or(Duration::ZERO)
+                    .as_millis()
+                    .min(5000) as i64;
+                min_timeout_ms = min_timeout_ms.min(rem.max(10));
+            } else {
+                min_timeout_ms = min_timeout_ms.min(10);
+            }
+        }
+
+        // Stopping timeouts (SIGTERM -> SIGKILL escalation)
+        for since in self.stopping_since.values() {
+            let elapsed = now
+                .checked_duration_since(*since)
+                .unwrap_or(Duration::ZERO)
+                .as_millis()
+                .min(i64::MAX as u128) as i64;
+            let timeout = self.stop_timeout.as_millis().min(i64::MAX as u128) as i64;
+            let rem = timeout.saturating_sub(elapsed).max(50);
+            min_timeout_ms = min_timeout_ms.min(rem);
+        }
+
+        // Watchdog deadlines
+        for (name, last_ping) in &self.last_watchdogs {
+            if let Some(node) = self.dag.get(name) {
+                if let Some(ref svc) = node.unit.service {
+                    if !svc.watchdog_sec.is_zero() {
+                        let wd_ms = svc.watchdog_sec.as_millis().min(i64::MAX as u128) as i64;
+                        let elapsed = now
+                            .checked_duration_since(*last_ping)
+                            .unwrap_or(Duration::ZERO)
+                            .as_millis()
+                            .min(i64::MAX as u128) as i64;
+                        let rem = wd_ms.saturating_sub(elapsed).max(50);
+                        min_timeout_ms = min_timeout_ms.min(rem);
+                    }
+                }
+            }
+        }
+
+        min_timeout_ms.clamp(50, 5000) as i32
+    }
+
     /// Escalate stops that ignored SIGTERM: after `stop_timeout`, SIGKILL.
     /// Called once per event-loop iteration (event-driven, no extra wakeups).
     pub fn process_stop_timeouts(&mut self) {
@@ -996,7 +1108,7 @@ impl Supervisor {
         for (name, since) in &self.stopping_since {
             if let Some(node) = self.dag.get(name) {
                 if node.state == UnitState::Deactivating
-                    && now.duration_since(*since) >= self.stop_timeout
+                    && now.checked_duration_since(*since).unwrap_or(Duration::ZERO) >= self.stop_timeout
                 {
                     escalate.push((name.clone(), node.pid));
                 }
@@ -1039,7 +1151,7 @@ impl Supervisor {
                 if node.state == UnitState::Active {
                     if let Some(ref svc) = node.unit.service {
                         if svc.watchdog_sec > Duration::ZERO
-                            && now.duration_since(*last_ping) > svc.watchdog_sec
+                            && now.checked_duration_since(*last_ping).is_some_and(|d| d > svc.watchdog_sec)
                         {
                             expired.push((name.clone(), node.pid));
                         }
@@ -1135,25 +1247,74 @@ impl Supervisor {
 /// supervisor's epoll/signalfd/listeners. Uses /proc/self/fd when available
 /// with an _SC_OPEN_MAX fallback (no allocation on failure paths of note).
 fn close_fds_except(keep: &[i32]) {
-    let mut fds: Vec<i32> = Vec::new();
-    if let Ok(entries) = std::fs::read_dir("/proc/self/fd") {
-        for entry in entries.flatten() {
-            if let Some(n) = entry.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) {
-                if n >= 3 && !keep.contains(&n) {
-                    fds.push(n);
+    // 1. Try close_range syscall first (Linux 5.9+)
+    #[cfg(target_os = "linux")]
+    {
+        let mut sorted_keep = keep.to_vec();
+        sorted_keep.sort_unstable();
+        sorted_keep.retain(|&fd| fd >= 3);
+        sorted_keep.dedup();
+
+        let mut start: u32 = 3;
+        let mut ok = true;
+        for &k in &sorted_keep {
+            let k = k as u32;
+            if k > start {
+                let ret = unsafe { libc::syscall(libc::SYS_close_range, start, k - 1, 0) };
+                if ret != 0 {
+                    ok = false;
+                    break;
+                }
+            }
+            start = k.saturating_add(1);
+        }
+        if ok {
+            let ret = unsafe { libc::syscall(libc::SYS_close_range, start, !0u32, 0) };
+            if ret == 0 {
+                return;
+            }
+        }
+    }
+
+    // 2. Iterate /proc/self/fd using libc opendir to know the dirfd and avoid double-close
+    let c_proc_fd = b"/proc/self/fd\0";
+    let dir = unsafe { libc::opendir(c_proc_fd.as_ptr() as *const libc::c_char) };
+    if !dir.is_null() {
+        let dir_fd = unsafe { libc::dirfd(dir) };
+        let mut to_close = [0i32; 1024];
+        let mut count = 0;
+
+        loop {
+            let entry = unsafe { libc::readdir(dir) };
+            if entry.is_null() {
+                break;
+            }
+            let d_name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+            if let Ok(s) = d_name.to_str() {
+                if let Ok(n) = s.parse::<i32>() {
+                    if n >= 3 && n != dir_fd && !keep.contains(&n) {
+                        if count < to_close.len() {
+                            to_close[count] = n;
+                            count += 1;
+                        } else {
+                            unsafe { libc::close(n) };
+                        }
+                    }
                 }
             }
         }
-        // The read_dir itself holds an fd; closing it via drop happens after.
-        for fd in fds {
+        unsafe { libc::closedir(dir) };
+
+        for &fd in &to_close[..count] {
             unsafe { libc::close(fd) };
         }
     } else {
         let max = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
-        let max = if max > 0 { max } else { 1024 };
+        let max = if max > 0 { max.min(4096) } else { 1024 };
         for fd in 3..max {
+            let fd = fd as i32;
             if !keep.contains(&fd) {
-                unsafe { libc::close(fd as i32) };
+                unsafe { libc::close(fd) };
             }
         }
     }
@@ -1560,5 +1721,112 @@ ExecStart=/bin/true
         assert_eq!(node.state, UnitState::Active);
         // PID must be cleared to None to prevent dangling PID and signal targeting!
         assert_eq!(node.pid, None);
+    }
+
+    #[test]
+    fn test_restart_policy_on_abnormal_and_on_abort() {
+        let mut supervisor = Supervisor::new();
+        let content_abnormal = "[Unit]\nDescription=Abnormal\n[Service]\nRestart=on-abnormal\nExecStart=/bin/sleep 10\n";
+        let unit_abnormal = utim_core::unit::parse_unit(
+            "abnormal.service",
+            Path::new("/test/abnormal.service"),
+            content_abnormal,
+        );
+        supervisor.dag.insert(unit_abnormal);
+
+        let content_abort = "[Unit]\nDescription=Abort\n[Service]\nRestart=on-abort\nExecStart=/bin/sleep 10\n";
+        let unit_abort = utim_core::unit::parse_unit(
+            "abort.service",
+            Path::new("/test/abort.service"),
+            content_abort,
+        );
+        supervisor.dag.insert(unit_abort);
+
+        // 1. Clean exit (code 0) -> no restart for either
+        supervisor.dag.set_state("abnormal.service", UnitState::Active);
+        supervisor.dag.set_pid("abnormal.service", Some(1001));
+        supervisor.pid_to_unit.insert(1001, "abnormal.service".to_string());
+        supervisor.handle_process_exits(&[ProcessExitInfo {
+            pid: 1001,
+            status: 0,
+            exited_cleanly: true,
+            exit_code: 0,
+            signal: None,
+        }]);
+        assert_eq!(supervisor.dag.get("abnormal.service").unwrap().state, UnitState::Inactive);
+        assert!(supervisor.pending_restarts.is_empty());
+
+        // 2. Non-zero exit (exit 1) -> no restart for on-abnormal or on-abort
+        supervisor.dag.set_state("abnormal.service", UnitState::Active);
+        supervisor.dag.set_pid("abnormal.service", Some(1002));
+        supervisor.pid_to_unit.insert(1002, "abnormal.service".to_string());
+        supervisor.handle_process_exits(&[ProcessExitInfo {
+            pid: 1002,
+            status: 256,
+            exited_cleanly: true,
+            exit_code: 1,
+            signal: None,
+        }]);
+        assert_eq!(supervisor.dag.get("abnormal.service").unwrap().state, UnitState::Failed);
+        assert!(supervisor.pending_restarts.is_empty());
+
+        // 3. Clean signal (SIGTERM) -> no restart
+        supervisor.dag.set_state("abnormal.service", UnitState::Active);
+        supervisor.dag.set_pid("abnormal.service", Some(1003));
+        supervisor.pid_to_unit.insert(1003, "abnormal.service".to_string());
+        supervisor.handle_process_exits(&[ProcessExitInfo {
+            pid: 1003,
+            status: libc::SIGTERM,
+            exited_cleanly: false,
+            exit_code: -1,
+            signal: Some(libc::SIGTERM),
+        }]);
+        assert_eq!(supervisor.dag.get("abnormal.service").unwrap().state, UnitState::Failed);
+        assert!(supervisor.pending_restarts.is_empty());
+
+        // 4. Abnormal signal (SIGABRT) -> restart scheduled for on-abnormal
+        supervisor.dag.set_state("abnormal.service", UnitState::Active);
+        supervisor.dag.set_pid("abnormal.service", Some(1004));
+        supervisor.pid_to_unit.insert(1004, "abnormal.service".to_string());
+        supervisor.handle_process_exits(&[ProcessExitInfo {
+            pid: 1004,
+            status: libc::SIGABRT,
+            exited_cleanly: false,
+            exit_code: -1,
+            signal: Some(libc::SIGABRT),
+        }]);
+        assert_eq!(supervisor.dag.get("abnormal.service").unwrap().state, UnitState::Activating);
+        assert_eq!(supervisor.pending_restarts.len(), 1);
+        supervisor.pending_restarts.clear();
+
+        // 5. Abnormal signal (SIGSEGV) -> restart scheduled for on-abort
+        supervisor.dag.set_state("abort.service", UnitState::Active);
+        supervisor.dag.set_pid("abort.service", Some(1005));
+        supervisor.pid_to_unit.insert(1005, "abort.service".to_string());
+        supervisor.handle_process_exits(&[ProcessExitInfo {
+            pid: 1005,
+            status: libc::SIGSEGV,
+            exited_cleanly: false,
+            exit_code: -1,
+            signal: Some(libc::SIGSEGV),
+        }]);
+        assert_eq!(supervisor.dag.get("abort.service").unwrap().state, UnitState::Activating);
+        assert_eq!(supervisor.pending_restarts.len(), 1);
+        supervisor.pending_restarts.clear();
+
+        // 6. Watchdog timeout abort -> restart scheduled for on-abnormal
+        supervisor.dag.set_state("abnormal.service", UnitState::Active);
+        supervisor.dag.set_pid("abnormal.service", Some(1006));
+        supervisor.pid_to_unit.insert(1006, "abnormal.service".to_string());
+        supervisor.watchdog_aborted.insert("abnormal.service".to_string());
+        supervisor.handle_process_exits(&[ProcessExitInfo {
+            pid: 1006,
+            status: libc::SIGKILL,
+            exited_cleanly: false,
+            exit_code: -1,
+            signal: Some(libc::SIGKILL),
+        }]);
+        assert_eq!(supervisor.dag.get("abnormal.service").unwrap().state, UnitState::Activating);
+        assert_eq!(supervisor.pending_restarts.len(), 1);
     }
 }

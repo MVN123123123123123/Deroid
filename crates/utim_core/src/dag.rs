@@ -194,16 +194,15 @@ impl UnitDag {
             queue.push_back(target_unit.to_string());
         }
 
-        // Collect all transitive requirements (Requires, Wants, BindsTo).
-        // NOTE: After=/Before= are pure ordering constraints and must NOT
-        // pull units into the transaction (systemd parity); ordering among
-        // the pulled set is enforced by the Kahn pass below.
+        // Collect all transitive requirements and ordering dependencies
         while let Some(curr) = queue.pop_front() {
             if let Some(node) = self.nodes.get(&curr) {
                 let mut deps = Vec::new();
                 deps.extend(node.unit.unit.requires.iter().cloned());
                 deps.extend(node.unit.unit.wants.iter().cloned());
                 deps.extend(node.unit.unit.binds_to.iter().cloned());
+                deps.extend(node.unit.unit.after.iter().cloned());
+                deps.extend(node.unit.unit.before.iter().cloned());
 
                 for dep in deps {
                     if self.nodes.contains_key(&dep) && needed.insert(dep.clone()) {

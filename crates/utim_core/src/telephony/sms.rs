@@ -274,8 +274,20 @@ pub fn encode_address_semi_octets(number: &str) -> (u8, Vec<u8>) {
     (type_of_address, bcd)
 }
 
-/// Decode semi-octets into a phone number string
+/// Decode semi-octets into a phone number or alphanumeric string
 pub fn decode_address_semi_octets(bcd: &[u8], num_digits: usize, type_of_address: u8) -> String {
+    if (type_of_address & 0x70) == 0x50 {
+        // Alphanumeric Address (GSM 7-bit default alphabet per 3GPP TS 23.040 9.1.2.5)
+        let septet_count = (num_digits * 4) / 7;
+        let septets = unpack_7bit(bcd, septet_count);
+        let mut out = String::with_capacity(septet_count);
+        for s in septets {
+            let code = (s & 0x7F) as usize;
+            out.push(GSM_7BIT_TO_CHAR[code]);
+        }
+        return out;
+    }
+
     let mut out = String::with_capacity(num_digits + 1);
     if type_of_address == 0x91 {
         out.push('+');

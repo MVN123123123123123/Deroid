@@ -100,14 +100,16 @@ impl<'a> WlMessage<'a> {
     /// Read null-terminated string padded to 4-byte boundary
     pub fn read_string(&self, offset: usize) -> Option<(&'a str, usize)> {
         let len = self.read_u32(offset)? as usize;
+        let start = offset.checked_add(4)?;
         if len == 0 {
-            return Some(("", offset + 4));
+            return Some(("", start));
         }
-        let start = offset + 4;
-        let end = start + len;
-        if end > self.payload.len() {
+        let padded_len = len.checked_add(3)? & !3;
+        let next_offset = start.checked_add(padded_len)?;
+        if next_offset > self.payload.len() {
             return None;
         }
+        let end = start.checked_add(len)?;
         let slice = &self.payload[start..end];
         let trimmed = if slice.last() == Some(&0) {
             &slice[..slice.len() - 1]
@@ -115,8 +117,7 @@ impl<'a> WlMessage<'a> {
             slice
         };
         let s = std::str::from_utf8(trimmed).ok()?;
-        let padded_len = (len + 3) & !3;
-        Some((s, start + padded_len))
+        Some((s, next_offset))
     }
 }
 

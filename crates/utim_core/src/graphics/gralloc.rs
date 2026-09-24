@@ -183,8 +183,8 @@ impl DmaBufBuffer {
 
         // Modifiers for compression
         let (mod_hi, mod_lo) = if self.is_ubwc {
-            // DRM_FORMAT_MOD_QCOM_COMPRESSED: (0x0a << 56) | ...
-            (0x0a000000, 0x00000001)
+            // DRM_FORMAT_MOD_QCOM_COMPRESSED: (0x05 << 56) | ...
+            (0x05000000, 0x00000001)
         } else if self.is_afbc {
             // DRM_FORMAT_MOD_ARM_AFBC: (0x08 << 56) | ...
             (0x08000000, 0x00000001)
@@ -720,7 +720,7 @@ mod tests {
         assert_eq!(buf.planes[1].offset, buf.planes[0].size_bytes as u64);
 
         let (_, mod_hi, _) = buf.wayland_dmabuf_params();
-        assert_eq!(mod_hi, 0x0a000000); // QCOM modifier
+        assert_eq!(mod_hi, 0x05000000); // QCOM modifier
     }
 
     #[test]

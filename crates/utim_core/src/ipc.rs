@@ -1,7 +1,7 @@
 //! IPC Protocol between UTIM daemon and CLI tools (utimctl, deb-systemd-*).
 //! Self-contained line-based protocol without external serialization dependencies.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
@@ -154,7 +154,8 @@ impl IpcResponse {
             IpcResponse::UnitList(units) => {
                 let mut out = String::from("UNITS_BEGIN\n");
                 for (name, state, desc) in units {
-                    out.push_str(&format!("{}|{}|{}\n", name, state, desc.replace('\n', " ")));
+                    let escaped_desc = desc.replace(['|', '\n'], " ");
+                    out.push_str(&format!("{}|{}|{}\n", name, state, escaped_desc));
                 }
                 out.push_str("UNITS_END\n");
                 out
@@ -173,9 +174,8 @@ impl IpcResponse {
         let mut line = String::new();
         // Bound each response line: a malicious/compromised daemon cannot
         // force unbounded client memory growth.
-        let mut limited = reader.take(MAX_IPC_LINE_BYTES);
+        let mut limited = reader.by_ref().take(MAX_IPC_LINE_BYTES);
         let n = limited.read_line(&mut line)?;
-        drop(limited);
         if n == 0 {
             return Ok(None);
         }
@@ -217,9 +217,8 @@ impl IpcResponse {
                     break;
                 }
                 line.clear();
-                let mut limited = reader.take(MAX_IPC_LINE_BYTES);
+                let mut limited = reader.by_ref().take(MAX_IPC_LINE_BYTES);
                 let n = limited.read_line(&mut line)?;
-                drop(limited);
                 if n == 0 {
                     break;
                 }
@@ -227,7 +226,7 @@ impl IpcResponse {
                 if item == "UNITS_END" {
                     break;
                 }
-                let parts: Vec<&str> = item.split('|').collect();
+                let parts: Vec<&str> = item.splitn(3, '|').collect();
                 if parts.len() >= 3 {
                     list.push((
                         parts[0].to_string(),
@@ -264,7 +263,7 @@ impl IpcResponse {
 /// Send a request to UTIM and receive the response.
 /// Read/write timeouts keep a hung daemon from blocking the CLI forever.
 pub fn send_ipc_request(socket_path: &Path, req: &IpcRequest) -> std::io::Result<IpcResponse> {
-    let stream = UnixStream::connect(socket_path)?;
+    let mut stream = UnixStream::connect(socket_path)?;
     stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(std::time::Duration::from_secs(10)))?;
     stream.write_all(req.serialize().as_bytes())?;

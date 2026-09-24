@@ -2,6 +2,7 @@
 
 mod container;
 mod mount;
+mod network;
 mod notify;
 mod reaper;
 mod server;
@@ -13,7 +14,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::io::RawFd;
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use utim_core::dag::UnitState;
@@ -57,6 +58,11 @@ fn main() {
         println!("[UTIM] Initializing Android Binder nodes (/dev/binder, /dev/vndbinder, /dev/hwbinder)...");
         if let Err(e) = setup_binder_devnodes() {
             eprintln!("[UTIM] Warning: Binder devnode error: {}", e);
+        }
+
+        println!("[UTIM] Initializing network subsystem (lo, eth0, DNS)...");
+        if let Err(e) = network::setup_network_subsystem() {
+            eprintln!("[UTIM] Warning: Network setup error: {}", e);
         }
     } else {
         // In user / test mode, ensure /run/utim and /run/systemd/system exist if writable
@@ -359,11 +365,17 @@ fn handle_client_connection(
     supervisor: &mut Supervisor,
     stream: UnixStream,
     search_paths: &[PathBuf],
+    peer_uid: u32,
 ) {
-    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let Ok(stream_clone) = stream.try_clone() else {
+        return;
+    };
+    use std::io::Read;
+    let reader = BufReader::new(stream_clone);
     let mut line = String::new();
+    let mut limited = reader.take(utim_core::ipc::MAX_IPC_LINE_BYTES);
 
-    if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
+    if limited.read_line(&mut line).is_err() || line.trim().is_empty() {
         return;
     }
 
@@ -372,6 +384,21 @@ fn handle_client_connection(
         let _ = write_response(&stream, &resp);
         return;
     };
+
+    if peer_uid != 0 {
+        match req {
+            IpcRequest::Status(_)
+            | IpcRequest::ListUnits
+            | IpcRequest::IsActive(_)
+            | IpcRequest::IsEnabled(_)
+            | IpcRequest::AnalyzeTime => {}
+            _ => {
+                let resp = IpcResponse::Err("Permission denied: root privileges required".to_string());
+                let _ = write_response(&stream, &resp);
+                return;
+            }
+        }
+    }
 
     let resp = match req {
         IpcRequest::Start(unit) => match supervisor.start_unit(&unit) {
@@ -423,8 +450,62 @@ fn handle_client_connection(
             supervisor.load_systemd_units(search_paths);
             IpcResponse::Ok("Configuration reloaded".to_string())
         }
-        IpcRequest::Enable(unit) => IpcResponse::Ok(format!("Enabled {}", unit)),
-        IpcRequest::Disable(unit) => IpcResponse::Ok(format!("Disabled {}", unit)),
+        IpcRequest::Enable(unit) => {
+            if let Some(node) = supervisor.dag.get(&unit) {
+                let unit_path = &node.unit.path;
+                let install = &node.unit.install;
+                let mut targets = install.wanted_by.clone();
+                if targets.is_empty() && install.required_by.is_empty() && install.alias.is_empty() {
+                    targets.push("multi-user.target".to_string());
+                }
+                for target in targets {
+                    let target_name = if target.contains('.') { target } else { format!("{}.target", target) };
+                    let wants_dir = PathBuf::from(format!("/etc/systemd/system/{}.wants", target_name));
+                    let _ = fs::create_dir_all(&wants_dir);
+                    let symlink_path = wants_dir.join(&unit);
+                    let _ = fs::remove_file(&symlink_path);
+                    let _ = std::os::unix::fs::symlink(unit_path, &symlink_path);
+                }
+                for req in &install.required_by {
+                    let req_name = if req.contains('.') { req.clone() } else { format!("{}.target", req) };
+                    let req_dir = PathBuf::from(format!("/etc/systemd/system/{}.requires", req_name));
+                    let _ = fs::create_dir_all(&req_dir);
+                    let symlink_path = req_dir.join(&unit);
+                    let _ = fs::remove_file(&symlink_path);
+                    let _ = std::os::unix::fs::symlink(unit_path, &symlink_path);
+                }
+                for alias in &install.alias {
+                    let alias_path = PathBuf::from(format!("/etc/systemd/system/{}", alias));
+                    let _ = fs::remove_file(&alias_path);
+                    let _ = std::os::unix::fs::symlink(unit_path, &alias_path);
+                }
+                IpcResponse::Ok(format!("Enabled {}", unit))
+            } else {
+                IpcResponse::Err(format!("Unit {} not found", unit))
+            }
+        }
+        IpcRequest::Disable(unit) => {
+            let etc = Path::new("/etc/systemd/system");
+            if let Ok(entries) = fs::read_dir(etc) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if p.is_dir() {
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        if name.ends_with(".wants") || name.ends_with(".requires") {
+                            let link = p.join(&unit);
+                            if link.is_symlink() || link.exists() {
+                                let _ = fs::remove_file(&link);
+                            }
+                        }
+                    }
+                }
+            }
+            let direct = etc.join(&unit);
+            if direct.is_symlink() || direct.exists() {
+                let _ = fs::remove_file(&direct);
+            }
+            IpcResponse::Ok(format!("Disabled {}", unit))
+        }
         IpcRequest::IsActive(unit) => {
             if let Some(node) = supervisor.dag.get(&unit) {
                 if node.state == UnitState::Active {
@@ -436,7 +517,33 @@ fn handle_client_connection(
                 IpcResponse::Err("unknown".to_string())
             }
         }
-        IpcRequest::IsEnabled(unit) => IpcResponse::Ok(format!("enabled {}", unit)),
+        IpcRequest::IsEnabled(unit) => {
+            let mut is_enabled = false;
+            let etc = Path::new("/etc/systemd/system");
+            if let Ok(entries) = fs::read_dir(etc) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if p.is_dir() {
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        if name.ends_with(".wants") || name.ends_with(".requires") {
+                            let link = p.join(&unit);
+                            if link.is_symlink() || link.exists() {
+                                is_enabled = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if !is_enabled && etc.join(&unit).exists() {
+                is_enabled = true;
+            }
+            if is_enabled {
+                IpcResponse::Ok("enabled".to_string())
+            } else {
+                IpcResponse::Ok("disabled".to_string())
+            }
+        }
         IpcRequest::FreezeCgroup(slice) => match supervisor.mpg.set_cgroup_freeze(&slice, true) {
             Ok(_) => IpcResponse::Ok(format!("Frozen {}", slice)),
             Err(e) => IpcResponse::Err(e.to_string()),

@@ -11,6 +11,8 @@ pub struct MobilePowerGovernor {
     battery_dir: PathBuf,
     active_wake_locks: HashSet<String>,
     charge_limit_percent: u32,
+    wake_lock_file: Option<fs::File>,
+    wake_unlock_file: Option<fs::File>,
 }
 
 impl Default for MobilePowerGovernor {
@@ -35,14 +37,20 @@ impl MobilePowerGovernor {
             battery_dir,
             active_wake_locks: HashSet::new(),
             charge_limit_percent: 80,
+            wake_lock_file: None,
+            wake_unlock_file: None,
         }
     }
 
     /// Acquire a partial Android kernel wake lock.
     pub fn acquire_wake_lock(&mut self, name: &str) -> io::Result<()> {
-        let wake_lock_path = self.sys_power_dir.join("wake_lock");
-        if wake_lock_path.exists() {
-            let mut file = OpenOptions::new().write(true).open(&wake_lock_path)?;
+        if self.wake_lock_file.is_none() {
+            let wake_lock_path = self.sys_power_dir.join("wake_lock");
+            if wake_lock_path.exists() {
+                self.wake_lock_file = OpenOptions::new().write(true).open(&wake_lock_path).ok();
+            }
+        }
+        if let Some(ref mut file) = self.wake_lock_file {
             file.write_all(name.as_bytes())?;
             file.flush()?;
         }
@@ -52,9 +60,13 @@ impl MobilePowerGovernor {
 
     /// Release a held Android kernel wake lock.
     pub fn release_wake_lock(&mut self, name: &str) -> io::Result<()> {
-        let wake_unlock_path = self.sys_power_dir.join("wake_unlock");
-        if wake_unlock_path.exists() {
-            let mut file = OpenOptions::new().write(true).open(&wake_unlock_path)?;
+        if self.wake_unlock_file.is_none() {
+            let wake_unlock_path = self.sys_power_dir.join("wake_unlock");
+            if wake_unlock_path.exists() {
+                self.wake_unlock_file = OpenOptions::new().write(true).open(&wake_unlock_path).ok();
+            }
+        }
+        if let Some(ref mut file) = self.wake_unlock_file {
             file.write_all(name.as_bytes())?;
             file.flush()?;
         }

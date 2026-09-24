@@ -34,21 +34,70 @@ echo "[*] Building Phase 3 UTLC Mobile Wayland Compositor & Shell package..."
 
 if [[ "${DRY_RUN}" == "1" || "$(id -u)" != "0" ]]; then
     echo "[!] Non-root execution detected or DRY_RUN=1."
-    echo "[*] Performing mock rootfs assembly to validate layout and dependencies..."
+    echo "[*] Assembling Debian Sid ARM64 rootfs (with APT, dpkg, bash, and UTIM init)..."
+
+    # Ensure Debian Sid ARM64 packages (apt, dpkg, bash, coreutils) are populated
+    if [[ ! -f "${ROOTFS_DIR}/usr/bin/apt" ]]; then
+        if [[ -d "${WORKSPACE_ROOT}/build/test_debootstrap" && -f "${WORKSPACE_ROOT}/build/test_debootstrap/usr/bin/apt" ]]; then
+            echo "[*] Populating Debian Sid base from cached debootstrap..."
+            rm -rf "${ROOTFS_DIR}"
+            mkdir -p "${ROOTFS_DIR}"
+            cp -a "${WORKSPACE_ROOT}/build/test_debootstrap/." "${ROOTFS_DIR}/"
+        else
+            echo "[*] Bootstrapping Debian Sid ARM64 base packages via fakeroot..."
+            rm -rf "${ROOTFS_DIR}"
+            mkdir -p "${ROOTFS_DIR}"
+            fakeroot debootstrap --foreign --variant=minbase --arch="${TARGET_ARCH}" "${DEBIAN_SUITE}" "${ROOTFS_DIR}" "${DEBIAN_MIRROR}" || true
+        fi
+    fi
+
+    # Set up basic users and groups if not present
+    if [[ ! -f "${ROOTFS_DIR}/etc/passwd" ]]; then
+        if [[ -f "${ROOTFS_DIR}/usr/share/base-passwd/passwd.master" ]]; then
+            cp "${ROOTFS_DIR}/usr/share/base-passwd/passwd.master" "${ROOTFS_DIR}/etc/passwd"
+            cp "${ROOTFS_DIR}/usr/share/base-passwd/group.master" "${ROOTFS_DIR}/etc/group"
+        else
+            cat << 'EOF' > "${ROOTFS_DIR}/etc/passwd"
+root:x:0:0:root:/root:/bin/bash
+daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin
+bin:x:2:2:bin:/bin:/usr/sbin/nologin
+EOF
+            cat << 'EOF' > "${ROOTFS_DIR}/etc/group"
+root:x:0:
+daemon:x:1:
+bin:x:2:
+EOF
+        fi
+        cat << 'EOF' > "${ROOTFS_DIR}/etc/shadow"
+root:*:19700:0:99999:7:::
+EOF
+        chmod 600 "${ROOTFS_DIR}/etc/shadow" 2>/dev/null || true
+    fi
+
+    echo "treble-gsi" > "${ROOTFS_DIR}/etc/hostname"
+    cat << 'EOF' > "${ROOTFS_DIR}/etc/hosts"
+127.0.0.1 localhost
+127.0.1.1 treble-gsi
+::1 localhost ip6-localhost ip6-loopback
+EOF
+
+    cat << 'EOF' > "${ROOTFS_DIR}/etc/resolv.conf"
+# Configured for QEMU & Universal Treble Linux
+nameserver 10.0.2.3
+nameserver 8.8.8.8
+nameserver 1.1.1.1
+EOF
 
     mkdir -p "${ROOTFS_DIR}/etc/apt/preferences.d"
     mkdir -p "${ROOTFS_DIR}/etc/environment.d"
     mkdir -p "${ROOTFS_DIR}/etc/systemd/system/multi-user.target.wants"
     mkdir -p "${ROOTFS_DIR}/etc/systemd/system/graphical.target.wants"
     mkdir -p "${ROOTFS_DIR}/usr/lib/systemd/system"
-    mkdir -p "${ROOTFS_DIR}/usr/bin"
-    mkdir -p "${ROOTFS_DIR}/sbin"
-    mkdir -p "${ROOTFS_DIR}/bin"
     mkdir -p "${ROOTFS_DIR}/run/systemd/system"
     mkdir -p "${ROOTFS_DIR}/run/utim"
     mkdir -p "${ROOTFS_DIR}/var/lib/systemd/deb-systemd-helper-enabled"
     mkdir -p "${ROOTFS_DIR}/proc" "${ROOTFS_DIR}/sys" "${ROOTFS_DIR}/dev"
-    mkdir -p "${ROOTFS_DIR}/lib" "${ROOTFS_DIR}/root" "${ROOTFS_DIR}/home" "${ROOTFS_DIR}/mnt"
+    mkdir -p "${ROOTFS_DIR}/root" "${ROOTFS_DIR}/home" "${ROOTFS_DIR}/mnt"
     rm -rf "${ROOTFS_DIR}/lib64"
     ln -sfn "lib" "${ROOTFS_DIR}/lib64"
 
@@ -99,6 +148,30 @@ Pin: release o=UniversalTreble
 Pin-Priority: 1001
 EOF
 
+    # Configure Universal Treble Linux APT defaults
+    mkdir -p "${ROOTFS_DIR}/etc/apt/apt.conf.d"
+    cat << 'EOF' > "${ROOTFS_DIR}/etc/apt/apt.conf.d/90universal-android"
+APT::Get::Assume-Yes "true";
+APT::Get::AutomaticRemove "true";
+APT::Install-Recommends "false";
+APT::Install-Suggests "false";
+Dpkg::Options {
+   "--force-confdef";
+   "--force-confold";
+};
+EOF
+
+    # Ensure standard merged-usr symlinks (bin -> usr/bin, sbin -> usr/sbin, lib -> usr/lib)
+    for d in bin sbin lib; do
+        if [[ -d "${ROOTFS_DIR}/${d}" && ! -L "${ROOTFS_DIR}/${d}" ]]; then
+            cp -a "${ROOTFS_DIR}/${d}/." "${ROOTFS_DIR}/usr/${d}/" 2>/dev/null || true
+            rm -rf "${ROOTFS_DIR}/${d}"
+            ln -sfn "usr/${d}" "${ROOTFS_DIR}/${d}"
+        elif [[ ! -e "${ROOTFS_DIR}/${d}" ]]; then
+            ln -sfn "usr/${d}" "${ROOTFS_DIR}/${d}"
+        fi
+    done
+
     # Install UTIM binaries, systemd shims, graphics check tool, and UTLC compositor
     echo "[*] Installing UTIM binaries, systemd shims, graphics check tool, and UTLC compositor..."
     cp "${WORKSPACE_ROOT}/target/aarch64-unknown-linux-gnu/release/utim" "${ROOTFS_DIR}/usr/bin/utim"
@@ -107,9 +180,6 @@ EOF
 
     cp "${WORKSPACE_ROOT}/target/aarch64-unknown-linux-gnu/release/utimctl" "${ROOTFS_DIR}/usr/bin/utimctl"
     ln -sf "/usr/bin/utimctl" "${ROOTFS_DIR}/usr/bin/systemctl"
-    if [[ ! -L "${ROOTFS_DIR}/bin" ]] || [[ "$(readlink "${ROOTFS_DIR}/bin")" != *"usr/bin"* && "$(readlink "${ROOTFS_DIR}/bin")" != "usr/bin" ]]; then
-        ln -sf "/usr/bin/utimctl" "${ROOTFS_DIR}/bin/systemctl"
-    fi
 
     cp "${WORKSPACE_ROOT}/target/aarch64-unknown-linux-gnu/release/deb-systemd-helper" "${ROOTFS_DIR}/usr/bin/deb-systemd-helper"
     cp "${WORKSPACE_ROOT}/target/aarch64-unknown-linux-gnu/release/deb-systemd-invoke" "${ROOTFS_DIR}/usr/bin/deb-systemd-invoke"
@@ -122,16 +192,30 @@ EOF
         ln -sf "/usr/lib/systemd/system/utlc.service" "${ROOTFS_DIR}/etc/systemd/system/graphical.target.wants/utlc.service"
     fi
 
-    # Copy deb packages
+    # Copy deb packages and kernel modules
     mkdir -p "${ROOTFS_DIR}/tmp/debs"
     cp "${WORKSPACE_ROOT}/dist/"*.deb "${ROOTFS_DIR}/tmp/debs/"
+    mkdir -p "${ROOTFS_DIR}/lib/modules"
+    cp -a "${WORKSPACE_ROOT}/dist/modules/"*.ko "${ROOTFS_DIR}/lib/modules/" 2>/dev/null || true
 
     # Generate initial graphics environment
-    "${WORKSPACE_ROOT}/target/debug/utim-graphics-check" --generate-env "${ROOTFS_DIR}/etc/environment.d/10-graphics.conf" || true
+    mkdir -p "${ROOTFS_DIR}/etc/environment.d" "${ROOTFS_DIR}/run/utim"
+    if [[ -x "${WORKSPACE_ROOT}/target/debug/utim-graphics-check" ]]; then
+        "${WORKSPACE_ROOT}/target/debug/utim-graphics-check" --generate-env "${ROOTFS_DIR}/etc/environment.d/10-graphics.conf" || true
+    elif [[ -x "${WORKSPACE_ROOT}/target/release/utim-graphics-check" ]]; then
+        "${WORKSPACE_ROOT}/target/release/utim-graphics-check" --generate-env "${ROOTFS_DIR}/etc/environment.d/10-graphics.conf" || true
+    else
+        cargo run --bin utim-graphics-check -- --generate-env "${ROOTFS_DIR}/etc/environment.d/10-graphics.conf" || true
+    fi
     ln -sf "/etc/environment.d/10-graphics.conf" "${ROOTFS_DIR}/run/utim/graphics.env" || true
 
-    echo "[+] Mock rootfs structure validated successfully at ${ROOTFS_DIR}."
-    echo "[+] To perform full privileged bootstrap, run this script as root (sudo ./scripts/build_rootfs.sh)."
+    # Generate ld.so.cache for dynamic library resolution
+    if [[ -f "${ROOTFS_DIR}/sbin/ldconfig" ]] && command -v qemu-aarch64-static >/dev/null 2>&1; then
+        echo "[*] Generating ld.so.cache using qemu-aarch64-static ldconfig..."
+        qemu-aarch64-static -L "${ROOTFS_DIR}" "${ROOTFS_DIR}/sbin/ldconfig" -C "${ROOTFS_DIR}/etc/ld.so.cache" -f "${ROOTFS_DIR}/etc/ld.so.conf" 2>/dev/null || true
+    fi
+
+    echo "[+] Debian Sid ARM64 rootfs assembled successfully at ${ROOTFS_DIR}."
     exit 0
 fi
 
@@ -140,6 +224,18 @@ mkdir -p "${ROOTFS_DIR}"
 
 echo "[*] Running debootstrap for Debian Sid ARM64..."
 debootstrap --arch="${TARGET_ARCH}" --foreign "${DEBIAN_SUITE}" "${ROOTFS_DIR}" "${DEBIAN_MIRROR}"
+
+if [[ -f "${ROOTFS_DIR}/debootstrap/debootstrap" ]]; then
+    echo "[*] Completing foreign debootstrap second-stage via qemu-aarch64-static..."
+    cp "$(command -v qemu-aarch64-static 2>/dev/null || echo /usr/bin/qemu-aarch64-static)" "${ROOTFS_DIR}/usr/bin/" 2>/dev/null || true
+    mount -t proc proc "${ROOTFS_DIR}/proc" || true
+    mount -t sysfs sysfs "${ROOTFS_DIR}/sys" || true
+    mount --bind /dev "${ROOTFS_DIR}/dev" || true
+    chroot "${ROOTFS_DIR}" /debootstrap/debootstrap --second-stage || true
+    umount -l "${ROOTFS_DIR}/dev" 2>/dev/null || true
+    umount -l "${ROOTFS_DIR}/sys" 2>/dev/null || true
+    umount -l "${ROOTFS_DIR}/proc" 2>/dev/null || true
+fi
 
 echo "[*] Configuring APT repositories..."
 cat << 'EOF' > "${ROOTFS_DIR}/etc/apt/sources.list"
@@ -150,6 +246,18 @@ cat << 'EOF' > "${ROOTFS_DIR}/etc/apt/preferences.d/utim-pinning"
 Package: utim-init libhybris* mesa-turnip* spa-droid*
 Pin: release o=UniversalTreble
 Pin-Priority: 1001
+EOF
+
+mkdir -p "${ROOTFS_DIR}/etc/apt/apt.conf.d"
+cat << 'EOF' > "${ROOTFS_DIR}/etc/apt/apt.conf.d/90universal-android"
+APT::Get::Assume-Yes "true";
+APT::Get::AutomaticRemove "true";
+APT::Install-Recommends "false";
+APT::Install-Suggests "false";
+Dpkg::Options {
+   "--force-confdef";
+   "--force-confold";
+};
 EOF
 
 echo "[*] Installing UTIM binaries, systemd shims, and graphics check tool..."
@@ -214,6 +322,17 @@ ln -sf "/etc/environment.d/10-graphics.conf" "${ROOTFS_DIR}/run/utim/graphics.en
 echo "[*] Installing dummy package, Phase 2 graphics packages, and Phase 3 UTLC into rootfs..."
 mkdir -p "${ROOTFS_DIR}/tmp/debs"
 cp "${WORKSPACE_ROOT}/dist/"*.deb "${ROOTFS_DIR}/tmp/debs/"
+
+cleanup_chroot_mounts() {
+    umount -l "${ROOTFS_DIR}/dev" 2>/dev/null || true
+    umount -l "${ROOTFS_DIR}/sys" 2>/dev/null || true
+    umount -l "${ROOTFS_DIR}/proc" 2>/dev/null || true
+}
+trap cleanup_chroot_mounts EXIT
+mount -t proc proc "${ROOTFS_DIR}/proc" || true
+mount -t sysfs sysfs "${ROOTFS_DIR}/sys" || true
+mount --bind /dev "${ROOTFS_DIR}/dev" || true
+
 chroot "${ROOTFS_DIR}" dpkg -i /tmp/debs/utim-init-dummy.deb
 chroot "${ROOTFS_DIR}" dpkg -i /tmp/debs/libhybris-hwcomposer_*.deb /tmp/debs/libhybris-gralloc_*.deb /tmp/debs/libhybris-egl_*.deb /tmp/debs/mesa-turnip-kgsl_*.deb /tmp/debs/mesa-zink_*.deb /tmp/debs/utlc_*.deb || true
 
@@ -225,6 +344,9 @@ chroot "${ROOTFS_DIR}" apt-get install -y --no-install-recommends \
     pipewire \
     modemmanager \
     feedbackd
+
+cleanup_chroot_mounts
+trap - EXIT
 
 echo "[+] Debian Sid ARM64 Rootfs successfully created!"
 

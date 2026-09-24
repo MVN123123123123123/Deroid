@@ -34,6 +34,7 @@ impl ControlServer {
         self.listener.as_raw_fd()
     }
 
+    #[allow(dead_code)]
     pub fn accept(&self) -> io::Result<UnixStream> {
         let (stream, _) = self.listener.accept()?;
         stream.set_read_timeout(Some(std::time::Duration::from_secs(3)))?;
@@ -71,5 +72,4 @@ pub fn peer_cred(stream: &UnixStream) -> io::Result<libc::ucred> {
         return Err(io::Error::last_os_error());
     }
     Ok(cred)
-}
 }

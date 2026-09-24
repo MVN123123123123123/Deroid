@@ -181,7 +181,7 @@ impl CameraDeviceInfo {
 }
 
 /// Captured Frame Buffer Descriptor
-#[derive(Debug, Clone)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct CapturedFrame {
     pub frame_number: u64,
     pub timestamp_ns: u64,
@@ -191,6 +191,42 @@ pub struct CapturedFrame {
     pub stride: u32,
     pub buffer_size: usize,
     pub dmabuf_fd: i32,
+}
+
+impl Clone for CapturedFrame {
+    fn clone(&self) -> Self {
+        let dup_fd = if self.dmabuf_fd >= 0 {
+            let fd = unsafe { libc::fcntl(self.dmabuf_fd, libc::F_DUPFD_CLOEXEC, 0) };
+            if fd >= 0 {
+                fd
+            } else {
+                -1
+            }
+        } else {
+            self.dmabuf_fd
+        };
+        Self {
+            frame_number: self.frame_number,
+            timestamp_ns: self.timestamp_ns,
+            width: self.width,
+            height: self.height,
+            format: self.format,
+            stride: self.stride,
+            buffer_size: self.buffer_size,
+            dmabuf_fd: dup_fd,
+        }
+    }
+}
+
+impl Drop for CapturedFrame {
+    fn drop(&mut self) {
+        if self.dmabuf_fd >= 0 {
+            unsafe {
+                libc::close(self.dmabuf_fd);
+            }
+            self.dmabuf_fd = -1;
+        }
+    }
 }
 
 /// Camera HAL3 Device Handle

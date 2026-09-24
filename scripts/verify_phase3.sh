@@ -104,7 +104,7 @@ for bin in "${BINARIES[@]}"; do
         continue
     fi
 
-    if "${WORKSPACE_ROOT}/target/debug/utim-graphics-check" --check-elf "${bin_path}" --json | grep -q '"is_64k_compatible":true'; then
+    if "${WORKSPACE_ROOT}/target/debug/utim-graphics-check" --check-elf "${bin_path}" --json | grep '"is_64k_compatible":true' >/dev/null; then
         pass "Binary ${bin} is strictly 64KB page aligned (p_align >= 0x10000)"
     else
         fail "Binary ${bin} failed 64KB page alignment test!"
@@ -240,7 +240,7 @@ fi
 echo "[*] Verifying 64KB ELF alignment of utlc inside Debian package..."
 TMP_EXTRACT="$(mktemp -d)"
 dpkg-deb -x "${UTLC_DEB}" "${TMP_EXTRACT}"
-if "${WORKSPACE_ROOT}/target/debug/utim-graphics-check" --check-elf "${TMP_EXTRACT}/usr/bin/utlc" --json | grep -q '"is_64k_compatible":true'; then
+if "${WORKSPACE_ROOT}/target/debug/utim-graphics-check" --check-elf "${TMP_EXTRACT}/usr/bin/utlc" --json | grep '"is_64k_compatible":true' >/dev/null; then
     pass "Packaged /usr/bin/utlc binary is strictly 64KB page aligned"
 else
     fail "Packaged /usr/bin/utlc is NOT 64KB page aligned!"

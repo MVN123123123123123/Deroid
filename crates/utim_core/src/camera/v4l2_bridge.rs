@@ -137,7 +137,14 @@ impl V4l2LoopbackBridge {
 
     /// ioctl VIDIOC_REQBUFS
     pub fn request_buffers(&mut self, count: u32) -> Result<u32, &'static str> {
+        if self.is_streaming {
+            return Err("Cannot request buffers while streaming");
+        }
         self.allocated_buffers.clear();
+        if count == 0 {
+            // Per V4L2 spec, requesting 0 buffers frees all allocated buffers and returns Ok(0)
+            return Ok(0);
+        }
         let alloc_count = count.clamp(1, 16);
         for i in 0..alloc_count {
             self.allocated_buffers.push(V4l2Buffer {
@@ -163,14 +170,18 @@ impl V4l2LoopbackBridge {
         Ok(())
     }
 
-    /// ioctl VIDIOC_DQBUF: dequeue next available frame
+    /// ioctl VIDIOC_DQBUF: dequeue next available frame in strict FIFO sequence order
     pub fn dequeue_buffer(&mut self) -> Result<V4l2Buffer, &'static str> {
-        let buf = self
+        let best_idx = self
             .allocated_buffers
-            .iter_mut()
-            .find(|b| b.queued && b.bytesused > 0)
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.queued && b.bytesused > 0)
+            .min_by_key(|(_, b)| b.sequence)
+            .map(|(idx, _)| idx)
             .ok_or("No queued buffer with data ready")?;
 
+        let buf = &mut self.allocated_buffers[best_idx];
         buf.queued = false;
         let out = buf.clone();
         buf.bytesused = 0;

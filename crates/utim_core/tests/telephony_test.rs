@@ -140,6 +140,13 @@ fn test_milestone_4_2_sms_pdu_encoding_and_concatenation() {
     let decoded_num = decode_address_semi_octets(&bcd, 10, toa);
     assert_eq!(decoded_num, number);
 
+    // 3b. Alphanumeric address decoding (Type of Address: 0xD0 or 0x50)
+    let alpha_text = "ALPHANUM";
+    let alpha_septets = encode_gsm7(alpha_text).unwrap();
+    let alpha_packed = pack_7bit(&alpha_septets);
+    let decoded_alpha = decode_address_semi_octets(&alpha_packed, 14, 0xD0);
+    assert_eq!(decoded_alpha, alpha_text);
+
     // 4. SMS-SUBMIT PDU encoding
     let pdu_submit = encode_sms_submit_pdu("+1234567890", "Test message from UTIM GSI: €100");
     assert!(!pdu_submit.is_empty());

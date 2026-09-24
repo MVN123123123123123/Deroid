@@ -59,6 +59,10 @@ fn test_duration_parsing_edge_cases() {
     assert_eq!(parse_duration("0"), Duration::ZERO);
     assert_eq!(parse_duration("no"), Duration::ZERO);
     assert_eq!(parse_duration("infinity"), Duration::ZERO);
+    assert_eq!(parse_duration("inf"), Duration::ZERO);
+    assert_eq!(parse_duration("INF"), Duration::ZERO);
+    assert_eq!(parse_duration("Infinity"), Duration::ZERO);
+    assert_eq!(parse_duration("No"), Duration::ZERO);
     assert_eq!(parse_duration("invalid_str"), Duration::ZERO);
 
     assert_eq!(parse_duration("100ms"), Duration::from_millis(100));
@@ -323,3 +327,50 @@ fn test_expand_command_args_systemd_compliance() {
     let expanded = expand_command_args(&raw, &env);
     assert_eq!(expanded, vec!["after"]);
 }
+
+#[test]
+fn test_wayland_read_string_overflow_and_bounds() {
+    use utim_core::compositor::protocols::{WlHeader, WlMessage};
+
+    let dummy_header = WlHeader {
+        object_id: 1,
+        opcode: 1,
+        length: 8,
+    };
+
+    // String len claiming 100 bytes when payload is 8 bytes
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&100u32.to_ne_bytes());
+    payload.extend_from_slice(b"abcd");
+    let msg = WlMessage {
+        header: dummy_header,
+        payload: &payload,
+    };
+    assert_eq!(msg.read_string(0), None);
+
+    // Malicious wire format: length near usize::MAX that could overflow (len + 3) & !3
+    let mut bad_payload = Vec::new();
+    bad_payload.extend_from_slice(&u32::MAX.to_ne_bytes());
+    bad_payload.extend_from_slice(b"abcd");
+    let msg_bad = WlMessage {
+        header: dummy_header,
+        payload: &bad_payload,
+    };
+    assert_eq!(msg_bad.read_string(0), None);
+
+    // Legitimate null-terminated string with 4-byte padding
+    let mut ok_payload = Vec::new();
+    let text = b"hello\0";
+    let len = text.len() as u32; // 6
+    ok_payload.extend_from_slice(&len.to_ne_bytes());
+    ok_payload.extend_from_slice(text);
+    ok_payload.extend_from_slice(&[0u8, 0u8]); // padded to 8 bytes
+    let msg_ok = WlMessage {
+        header: dummy_header,
+        payload: &ok_payload,
+    };
+    let (s, next) = msg_ok.read_string(0).unwrap();
+    assert_eq!(s, "hello");
+    assert_eq!(next, 4 + 8);
+}
+

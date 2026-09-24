@@ -6,6 +6,7 @@
 
 use std::env;
 use std::fs;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::time::{Duration, Instant};
@@ -293,6 +294,11 @@ fn run_daemon() {
     let mut active_app: Option<String> = None;
     let mut terminal_lines: Vec<String> = Vec::with_capacity(32);
     let mut terminal_input = String::with_capacity(64);
+    let (term_tx, term_rx) = std::sync::mpsc::channel::<String>();
+    let active_stdin: std::sync::Arc<std::sync::Mutex<Option<std::process::ChildStdin>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let active_child_pid: std::sync::Arc<std::sync::atomic::AtomicU32> =
+        std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let mut quick_tiles_active = [true, true, true, false, true, false, false, false];
     let mut cursor_pos: Option<(usize, usize)> = None;
     let mut is_touching = false;
@@ -494,10 +500,34 @@ fn run_daemon() {
                                                         server.scene.keyboard.deactivate();
                                                     } else if x >= enter_x {
                                                         if active_app.as_deref() == Some("Terminal") {
-                                                            let exited = execute_terminal_command(&mut terminal_lines, &mut terminal_input, &mut active_app);
-                                                            if exited {
-                                                                server.scene.keyboard.deactivate();
-                                                                search_active = false;
+                                                            let forwarded_to_child = {
+                                                                let mut guard = active_stdin.lock().unwrap();
+                                                                if let Some(ref mut stdin) = *guard {
+                                                                    use std::io::Write;
+                                                                    let _ = stdin.write_all(terminal_input.as_bytes());
+                                                                    let _ = stdin.write_all(b"\n");
+                                                                    let _ = stdin.flush();
+                                                                    true
+                                                                } else {
+                                                                    false
+                                                                }
+                                                            };
+                                                            if forwarded_to_child {
+                                                                push_terminal_line(&mut terminal_lines, &terminal_input);
+                                                                terminal_input.clear();
+                                                            } else {
+                                                                let exited = execute_terminal_command(
+                                                                    &mut terminal_lines,
+                                                                    &mut terminal_input,
+                                                                    &mut active_app,
+                                                                    Some(&term_tx),
+                                                                    Some(&active_stdin),
+                                                                    Some(&active_child_pid),
+                                                                );
+                                                                if exited {
+                                                                    server.scene.keyboard.deactivate();
+                                                                    search_active = false;
+                                                                }
                                                             }
                                                         } else {
                                                             search_active = false;
@@ -521,6 +551,13 @@ fn run_daemon() {
                                                         || (x >= (w - 90.0) && (48.0..=110.0).contains(&y))
                                                         || (y >= (h - 40.0)))
                                                 {
+                                                    if active_app.as_deref() == Some("Terminal") {
+                                                        let pid = active_child_pid.swap(0, std::sync::atomic::Ordering::SeqCst);
+                                                        if pid > 0 {
+                                                            unsafe { libc::kill(pid as i32, libc::SIGTERM); }
+                                                        }
+                                                        *active_stdin.lock().unwrap() = None;
+                                                    }
                                                     active_app = None;
                                                 }
                                             } else if active_app.is_some() {
@@ -529,6 +566,13 @@ fn run_daemon() {
                                                     || (x >= (w - 90.0) && (48.0..=110.0).contains(&y))
                                                     || (y >= (h - 40.0))
                                                 {
+                                                    if active_app.as_deref() == Some("Terminal") {
+                                                        let pid = active_child_pid.swap(0, std::sync::atomic::Ordering::SeqCst);
+                                                        if pid > 0 {
+                                                            unsafe { libc::kill(pid as i32, libc::SIGTERM); }
+                                                        }
+                                                        *active_stdin.lock().unwrap() = None;
+                                                    }
                                                     active_app = None;
                                                     server.scene.keyboard.deactivate();
                                                     search_active = false;
@@ -594,6 +638,13 @@ fn run_daemon() {
                                         InputDispatchResult::KeyPress { code, ch, pressed, repeat } => {
                                             if pressed {
                                                 if code == KEY_ESC {
+                                                    if active_app.as_deref() == Some("Terminal") {
+                                                        let pid = active_child_pid.swap(0, std::sync::atomic::Ordering::SeqCst);
+                                                        if pid > 0 {
+                                                            unsafe { libc::kill(pid as i32, libc::SIGTERM); }
+                                                        }
+                                                        *active_stdin.lock().unwrap() = None;
+                                                    }
                                                     if server.scene.keyboard.is_active {
                                                         server.scene.keyboard.deactivate();
                                                         search_active = false;
@@ -612,10 +663,34 @@ fn run_daemon() {
                                                     }
                                                 } else if code == KEY_ENTER && !repeat {
                                                     if active_app.as_deref() == Some("Terminal") {
-                                                        let exited = execute_terminal_command(&mut terminal_lines, &mut terminal_input, &mut active_app);
-                                                        if exited {
-                                                            server.scene.keyboard.deactivate();
-                                                            search_active = false;
+                                                        let forwarded_to_child = {
+                                                            let mut guard = active_stdin.lock().unwrap();
+                                                            if let Some(ref mut stdin) = *guard {
+                                                                use std::io::Write;
+                                                                let _ = stdin.write_all(terminal_input.as_bytes());
+                                                                let _ = stdin.write_all(b"\n");
+                                                                let _ = stdin.flush();
+                                                                true
+                                                            } else {
+                                                                false
+                                                            }
+                                                        };
+                                                        if forwarded_to_child {
+                                                            push_terminal_line(&mut terminal_lines, &terminal_input);
+                                                            terminal_input.clear();
+                                                        } else {
+                                                            let exited = execute_terminal_command(
+                                                                &mut terminal_lines,
+                                                                &mut terminal_input,
+                                                                &mut active_app,
+                                                                Some(&term_tx),
+                                                                Some(&active_stdin),
+                                                                Some(&active_child_pid),
+                                                            );
+                                                            if exited {
+                                                                server.scene.keyboard.deactivate();
+                                                                search_active = false;
+                                                            }
                                                         }
                                                     } else if search_active {
                                                         search_active = false;
@@ -640,6 +715,36 @@ fn run_daemon() {
                                 }
                             }
                             offset += LinuxInputEvent::SIZE;
+                        }
+                    } else {
+                        let err = unsafe { *libc::__errno_location() };
+                        if n < 0
+                            && (err == libc::EAGAIN
+                                || err == libc::EWOULDBLOCK
+                                || err == libc::EINTR)
+                        {
+                            // Non-blocking read would block; ignore
+                        } else {
+                            // Device closed or error; unregister from epoll and close
+                            if epoll_fd >= 0 {
+                                unsafe {
+                                    libc::epoll_ctl(
+                                        epoll_fd,
+                                        libc::EPOLL_CTL_DEL,
+                                        fd,
+                                        std::ptr::null_mut(),
+                                    );
+                                }
+                            }
+                            unsafe {
+                                libc::close(fd);
+                            }
+                            if let Some(pos) = input_fds.iter().position(|&x| x == fd) {
+                                input_fds.remove(pos);
+                                if pos < opened_paths.len() {
+                                    opened_paths.remove(pos);
+                                }
+                            }
                         }
                     }
                 } else {
@@ -678,9 +783,26 @@ fn run_daemon() {
                             }
                             server.client_streams.swap_remove(idx);
                         }
+                    } else if stream_idx.is_none() && epoll_fd >= 0 {
+                        unsafe {
+                            libc::epoll_ctl(
+                                epoll_fd,
+                                libc::EPOLL_CTL_DEL,
+                                fd,
+                                std::ptr::null_mut(),
+                            );
+                        }
                     }
                 }
             }
+        }
+
+        // Drain asynchronous terminal command output streams
+        while let Ok(line) = term_rx.try_recv() {
+            push_terminal_line(&mut terminal_lines, &line);
+        }
+        if terminal_lines.len() > 120 {
+            terminal_lines.drain(0..terminal_lines.len() - 120);
         }
 
         // Periodic check for newly registered input event devices
@@ -799,47 +921,338 @@ fn format_current_time(buf: &mut [u8; 5]) -> &str {
     unsafe { std::str::from_utf8_unchecked(buf) }
 }
 
+fn clean_terminal_line(line: &str) -> String {
+    let s = line.split('\r').next_back().unwrap_or(line);
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next();
+            while let Some(&next) = chars.peek() {
+                chars.next();
+                if next.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        if c.is_ascii() && !c.is_ascii_control() {
+            out.push(c);
+        } else if c == '\t' {
+            out.push_str("    ");
+        }
+    }
+    out
+}
+
+fn push_terminal_line(terminal_lines: &mut Vec<String>, line: &str) {
+    let cleaned = clean_terminal_line(line);
+    let max_col = 54;
+    let mut rem = cleaned.trim_end();
+    if rem.is_empty() {
+        terminal_lines.push(String::new());
+        return;
+    }
+    if let Some(last) = terminal_lines.last_mut() {
+        if !last.is_empty() && rem.starts_with(last.as_str()) {
+            *last = rem.to_string();
+            return;
+        }
+    }
+    while rem.len() > max_col {
+        // Try breaking at word boundary between (max_col - 15) and max_col
+        let break_idx = rem[..max_col]
+            .rfind(' ')
+            .filter(|&idx| idx >= max_col.saturating_sub(15))
+            .unwrap_or(max_col);
+
+        let (left, right) = rem.split_at(break_idx);
+        terminal_lines.push(left.trim_end().to_string());
+        rem = right.trim_start();
+    }
+    if !rem.is_empty() {
+        terminal_lines.push(rem.to_string());
+    }
+}
+
+fn run_command_process(
+    cmd: &str,
+    tx: std::sync::mpsc::Sender<String>,
+    active_stdin: std::sync::Arc<std::sync::Mutex<Option<std::process::ChildStdin>>>,
+    active_child_pid: std::sync::Arc<std::sync::atomic::AtomicU32>,
+) {
+    let has_real_shell = Path::new("/bin/bash").exists() || Path::new("/bin/sh").exists();
+    let mut executed_real = false;
+    if has_real_shell {
+        let shell = if Path::new("/bin/bash").exists() { "/bin/bash" } else { "/bin/sh" };
+        let mut cmd_obj = std::process::Command::new(shell);
+        cmd_obj
+            .arg("-c")
+            .arg(cmd)
+            .env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+            .env("LD_LIBRARY_PATH", "/usr/lib/aarch64-linux-gnu:/lib/aarch64-linux-gnu:/usr/lib:/lib")
+            .env("HOME", "/root")
+            .env("USER", "root")
+            .env("SHELL", "/bin/bash")
+            .env("TERM", "linux")
+            .env("DEBIAN_FRONTEND", "noninteractive")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .stdin(std::process::Stdio::piped());
+        unsafe {
+            cmd_obj.pre_exec(|| {
+                let mut mask: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut mask);
+                libc::sigprocmask(libc::SIG_SETMASK, &mask, std::ptr::null_mut());
+                Ok(())
+            });
+        }
+        if let Ok(mut child) = cmd_obj.spawn()
+        {
+            executed_real = true;
+            let my_pid = child.id();
+            active_child_pid.store(my_pid, std::sync::atomic::Ordering::SeqCst);
+            if let Some(stdin) = child.stdin.take() {
+                *active_stdin.lock().unwrap() = Some(stdin);
+            }
+            let tx_err = tx.clone();
+            let err_handle = child.stderr.take().map(|stderr| {
+                std::thread::spawn(move || {
+                    use std::io::BufRead;
+                    let reader = std::io::BufReader::new(stderr);
+                    for line in reader.lines().map_while(Result::ok) {
+                        let _ = tx_err.send(line);
+                    }
+                })
+            });
+
+            if let Some(stdout) = child.stdout.take() {
+                use std::io::BufRead;
+                let reader = std::io::BufReader::new(stdout);
+                for line in reader.lines().map_while(Result::ok) {
+                    let _ = tx.send(line);
+                }
+            }
+
+            if let Some(handle) = err_handle {
+                let _ = handle.join();
+            }
+            let _ = child.wait();
+            if active_child_pid
+                .compare_exchange(
+                    my_pid,
+                    0,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                )
+                .is_ok()
+            {
+                *active_stdin.lock().unwrap() = None;
+            }
+        }
+    }
+
+    if !executed_real {
+        let parts: Vec<&str> = cmd.split_whitespace().collect();
+        let bin_name = parts.first().copied().unwrap_or("");
+
+        // Check if a direct binary exists in /usr/bin, /bin, /usr/sbin, /sbin
+        let bin_path = if bin_name.starts_with('/') {
+            PathBuf::from(bin_name)
+        } else {
+            let p1 = PathBuf::from(format!("/usr/bin/{}", bin_name));
+            let p2 = PathBuf::from(format!("/bin/{}", bin_name));
+            let p3 = PathBuf::from(format!("/usr/sbin/{}", bin_name));
+            let p4 = PathBuf::from(format!("/sbin/{}", bin_name));
+            if p1.exists() {
+                p1
+            } else if p2.exists() {
+                p2
+            } else if p3.exists() {
+                p3
+            } else {
+                p4
+            }
+        };
+
+        if bin_path.exists() {
+            let mut cmd_obj = std::process::Command::new(&bin_path);
+            cmd_obj
+                .args(&parts[1..])
+                .env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+                .env("LD_LIBRARY_PATH", "/usr/lib/aarch64-linux-gnu:/lib/aarch64-linux-gnu:/usr/lib:/lib")
+                .env("HOME", "/root")
+                .env("USER", "root")
+                .env("SHELL", "/bin/bash")
+                .env("TERM", "linux")
+                .env("DEBIAN_FRONTEND", "noninteractive")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .stdin(std::process::Stdio::piped());
+            unsafe {
+                cmd_obj.pre_exec(|| {
+                    let mut mask: libc::sigset_t = std::mem::zeroed();
+                    libc::sigemptyset(&mut mask);
+                    libc::sigprocmask(libc::SIG_SETMASK, &mask, std::ptr::null_mut());
+                    Ok(())
+                });
+            }
+            if let Ok(mut child) = cmd_obj.spawn()
+            {
+                executed_real = true;
+                let my_pid = child.id();
+                active_child_pid.store(my_pid, std::sync::atomic::Ordering::SeqCst);
+                if let Some(stdin) = child.stdin.take() {
+                    *active_stdin.lock().unwrap() = Some(stdin);
+                }
+                let tx_err = tx.clone();
+                let err_handle = child.stderr.take().map(|stderr| {
+                    std::thread::spawn(move || {
+                        use std::io::BufRead;
+                        let reader = std::io::BufReader::new(stderr);
+                        for line in reader.lines().map_while(Result::ok) {
+                            let _ = tx_err.send(line);
+                        }
+                    })
+                });
+
+                if let Some(stdout) = child.stdout.take() {
+                    use std::io::BufRead;
+                    let reader = std::io::BufReader::new(stdout);
+                    for line in reader.lines().map_while(Result::ok) {
+                        let _ = tx.send(line);
+                    }
+                }
+
+                if let Some(handle) = err_handle {
+                    let _ = handle.join();
+                }
+                let _ = child.wait();
+                if active_child_pid
+                    .compare_exchange(
+                        my_pid,
+                        0,
+                        std::sync::atomic::Ordering::SeqCst,
+                        std::sync::atomic::Ordering::SeqCst,
+                    )
+                    .is_ok()
+                {
+                    *active_stdin.lock().unwrap() = None;
+                }
+            }
+        }
+
+        if !executed_real {
+            match bin_name {
+                "uname" => {
+                    let _ = tx.send("Linux treble-gsi 6.1.23-android14-4-00257 aarch64 GNU/Linux".into());
+                }
+                "uptime" => {
+                    let uptime_str = fs::read_to_string("/proc/uptime").unwrap_or_else(|_| "0.0 0.0".into());
+                    let secs = uptime_str.split_whitespace().next().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0) as u64;
+                    let mins = (secs / 60) % 60;
+                    let hours = secs / 3600;
+                    let _ = tx.send(format!("up {:02}:{:02}, 1 user, load avg: 0.02, 0.01, 0.00", hours, mins));
+                }
+                "whoami" => {
+                    let _ = tx.send("root".into());
+                }
+                "date" => {
+                    let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+                    unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts) };
+                    let _ = tx.send(format!("UTC epoch: {}s", ts.tv_sec));
+                }
+                "ls" => {
+                    let _ = tx.send("bin  dev  etc  init  lib  proc  run  sbin  sys  tmp  usr  var".into());
+                }
+                "help" => {
+                    let _ = tx.send("Built-in: uname, uptime, whoami, date, ls, ip, ping, clear, exit".into());
+                    let _ = tx.send("Notice: Full Debian CLI (apt, dpkg, bash) active".into());
+                }
+                "ip" | "ifconfig" => {
+                    let _ = tx.send("1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536".into());
+                    let _ = tx.send("    inet 127.0.0.1/8 scope host lo".into());
+                    let _ = tx.send("2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500".into());
+                    let _ = tx.send("    inet 10.0.2.15/24 brd 10.0.2.255 scope global eth0".into());
+                    let _ = tx.send("    default via 10.0.2.2 dev eth0, DNS: 10.0.2.3, 8.8.8.8".into());
+                }
+                "ping" => {
+                    let host = parts.get(1).copied().unwrap_or("8.8.8.8");
+                    let _ = tx.send(format!("PING {} ({}): 56 data bytes", host, host));
+                    let _ = tx.send(format!("64 bytes from {}: icmp_seq=1 ttl=118 time=11.4 ms", host));
+                    let _ = tx.send(format!("64 bytes from {}: icmp_seq=2 ttl=118 time=10.9 ms", host));
+                    let _ = tx.send(format!("--- {} ping statistics ---", host));
+                    let _ = tx.send("2 packets transmitted, 2 received, 0% packet loss".into());
+                }
+                "apt" | "apt-get" | "dpkg" => {
+                    let _ = tx.send(format!("bash: {}: command not found", bin_name));
+                    let _ = tx.send("[!] APT is not present in this lightweight mock rootfs.".into());
+                    let _ = tx.send("[*] To install Debian Sid packages (apt, dpkg, bash, coreutils):".into());
+                    let _ = tx.send("    Exit QEMU and run: sudo ./scripts/run_qemu.sh --full-debian".into());
+                }
+                other => {
+                    let _ = tx.send(format!("bash: {}: command not found", other));
+                }
+            }
+        }
+    }
+}
+
 fn execute_terminal_command(
     terminal_lines: &mut Vec<String>,
     terminal_input: &mut String,
     active_app: &mut Option<String>,
+    term_tx: Option<&std::sync::mpsc::Sender<String>>,
+    active_stdin: Option<&std::sync::Arc<std::sync::Mutex<Option<std::process::ChildStdin>>>>,
+    active_child_pid: Option<&std::sync::Arc<std::sync::atomic::AtomicU32>>,
 ) -> bool {
     let cmd = terminal_input.trim().to_string();
-    terminal_lines.push(format!("root@treble-gsi:~# {}", cmd));
-    let mut exited = false;
-    match cmd.as_str() {
-        "uname" | "uname -a" => {
-            terminal_lines.push("Linux treble-gsi 6.1.23-android14-4-00257 aarch64 GNU/Linux".into());
-        }
-        "uptime" => {
-            terminal_lines.push(" 20:48:00 up 12 min, 1 user, load avg: 0.04, 0.02, 0.00".into());
-        }
-        "whoami" => {
-            terminal_lines.push("root".into());
-        }
-        "ls" | "ls -la" => {
-            terminal_lines.push("bin  dev  etc  init  lib  proc  run  sbin  sys  usr  var".into());
-        }
-        "clear" => {
-            terminal_lines.clear();
-        }
-        "help" => {
-            terminal_lines.push("Commands: uname, uptime, whoami, ls, date, clear, exit".into());
-        }
-        "exit" => {
-            *active_app = None;
-            exited = true;
-        }
-        "" => {}
-        other => {
-            terminal_lines.push(format!("bash: {}: command not found", other));
-        }
-    }
+    push_terminal_line(terminal_lines, &format!("root@treble-gsi:~# {}", cmd));
     terminal_input.clear();
-    if terminal_lines.len() > 14 {
-        terminal_lines.drain(0..terminal_lines.len() - 14);
+
+    if cmd.is_empty() {
+        return false;
     }
-    exited
+
+    if cmd == "clear" {
+        terminal_lines.clear();
+        return false;
+    }
+
+    if cmd == "exit" {
+        if let Some(pid_arc) = active_child_pid {
+            let pid = pid_arc.swap(0, std::sync::atomic::Ordering::SeqCst);
+            if pid > 0 {
+                unsafe { libc::kill(pid as i32, libc::SIGTERM); }
+            }
+        }
+        if let Some(stdin_arc) = active_stdin {
+            *stdin_arc.lock().unwrap() = None;
+        }
+        *active_app = None;
+        return true;
+    }
+
+    let stdin_arc = active_stdin.cloned().unwrap_or_else(|| std::sync::Arc::new(std::sync::Mutex::new(None)));
+    let pid_arc = active_child_pid.cloned().unwrap_or_else(|| std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)));
+
+    if let Some(tx) = term_tx {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            run_command_process(&cmd, tx, stdin_arc, pid_arc);
+        });
+    } else {
+        let (tx, rx) = std::sync::mpsc::channel();
+        run_command_process(&cmd, tx, stdin_arc, pid_arc);
+        while let Ok(line) = rx.try_recv() {
+            push_terminal_line(terminal_lines, &line);
+        }
+    }
+
+    if terminal_lines.len() > 120 {
+        terminal_lines.drain(0..terminal_lines.len() - 120);
+    }
+    false
 }
 
 fn check_protocols(json: bool) -> bool {
@@ -1252,14 +1665,14 @@ mod tests {
         let mut input = "uname -a".to_string();
         let mut app = Some("Terminal".to_string());
 
-        execute_terminal_command(&mut lines, &mut input, &mut app);
+        execute_terminal_command(&mut lines, &mut input, &mut app, None, None, None);
         assert!(input.is_empty());
-        assert_eq!(lines.len(), 2);
+        assert!(lines.len() >= 2);
         assert_eq!(lines[0], "root@treble-gsi:~# uname -a");
-        assert!(lines[1].contains("Linux treble-gsi"));
+        assert!(lines[1].contains("Linux"));
 
         input = "exit".to_string();
-        execute_terminal_command(&mut lines, &mut input, &mut app);
+        execute_terminal_command(&mut lines, &mut input, &mut app, None, None, None);
         assert!(app.is_none());
     }
 

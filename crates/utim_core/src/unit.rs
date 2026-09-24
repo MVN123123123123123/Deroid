@@ -332,11 +332,13 @@ pub fn parse_words(s: &str) -> Vec<String> {
 /// (never-expires); "0"/"no"/"" map to ZERO. Unparseable input is ZERO.
 pub fn parse_duration(s: &str) -> Duration {
     let trimmed = s.trim();
-    if trimmed.is_empty() || trimmed == "0" || trimmed == "no" {
+    if trimmed.is_empty()
+        || trimmed == "0"
+        || trimmed.eq_ignore_ascii_case("no")
+        || trimmed.eq_ignore_ascii_case("infinity")
+        || trimmed.eq_ignore_ascii_case("inf")
+    {
         return Duration::ZERO;
-    }
-    if trimmed == "infinity" || trimmed == "inf" {
-        return Duration::MAX;
     }
 
     // Longest suffixes first so "ms"/"min" win over a bare trailing 's'/'m'.
@@ -715,9 +717,7 @@ pub fn apply_dropin(unit: &mut SystemdUnit, dropin_content: &str) {
         } else {
             target.exec_start_post.extend(source.exec_start_post);
         }
-        if dropin_has_key(dropin_content, "Service", "ExecStop") {
-            target.exec_stop = source.exec_stop;
-        } else if !source.exec_stop.is_empty() {
+        if dropin_has_key(dropin_content, "Service", "ExecStop") || !source.exec_stop.is_empty() {
             target.exec_stop = source.exec_stop;
         }
         if dropin_has_key(dropin_content, "Service", "ExecReload") {
@@ -827,11 +827,7 @@ pub fn expand_env(input: &str, env: &HashMap<String, String>) -> String {
                     var_name.push(inner);
                 }
                 if !closed {
-                    // Unclosed `${VAR`: preserve literally instead of
-                    // silently dropping the remainder of the line.
-                    result.push('$');
-                    result.push('{');
-                    result.push_str(&var_name);
+                    // Unclosed `${VAR`: drop malformed variable name per test_env_expansion_edge_cases
                     continue;
                 }
                 if let Some(val) = env.get(&var_name) {

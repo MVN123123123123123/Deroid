@@ -152,7 +152,7 @@ fn test_gralloc_linear_and_compressed_allocations() {
     assert_eq!(buf_ubwc.planes[1].size_bytes % 4096, 0); // 4KB page aligned metadata
 
     let (_, mod_hi, _mod_lo) = buf_ubwc.wayland_dmabuf_params();
-    assert_eq!(mod_hi, 0x0a000000); // QCOM modifier prefix
+    assert_eq!(mod_hi, 0x05000000); // QCOM modifier prefix
 
     // 3. ARM AFBC Compressed RGBA_8888
     let buf_afbc = gralloc

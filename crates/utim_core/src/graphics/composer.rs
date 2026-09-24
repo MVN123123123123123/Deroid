@@ -243,8 +243,74 @@ impl fmt::Display for HwcError {
 
 impl std::error::Error for HwcError {}
 
+/// Fixed-size stack-allocated container for per-layer release fences (up to 32 layers)
+/// eliminating heap allocation per frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseFences {
+    entries: [(u64, Option<i32>); 32],
+    count: usize,
+}
+
+impl Default for ReleaseFences {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ReleaseFences {
+    pub const fn new() -> Self {
+        Self {
+            entries: [(0, None); 32],
+            count: 0,
+        }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    pub fn contains_key(&self, key: &u64) -> bool {
+        self.entries[..self.count].iter().any(|(k, _)| k == key)
+    }
+
+    pub fn get(&self, key: &u64) -> Option<&Option<i32>> {
+        self.entries[..self.count]
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v)
+    }
+
+    pub fn insert(&mut self, key: u64, fence: Option<i32>) {
+        if let Some(entry) = self.entries[..self.count].iter_mut().find(|(k, _)| *k == key) {
+            entry.1 = fence;
+            return;
+        }
+        if self.count < 32 {
+            self.entries[self.count] = (key, fence);
+            self.count += 1;
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&u64, &Option<i32>)> {
+        self.entries[..self.count].iter().map(|(k, v)| (k, v))
+    }
+}
+
+impl std::ops::Index<&u64> for ReleaseFences {
+    type Output = Option<i32>;
+    fn index(&self, key: &u64) -> &Self::Output {
+        self.get(key).expect("Key not found in ReleaseFences")
+    }
+}
+
 /// Presentation output: present fence and per-layer release fences.
-pub type PresentFences = (Option<i32>, HashMap<u64, Option<i32>>);
+pub type PresentFences = (Option<i32>, ReleaseFences);
 
 /// Dynamic Hardware Composer Bridge (supports AIDL composer3 and HIDL composer@2.x).
 pub struct HwcComposer {
@@ -585,7 +651,15 @@ impl HwcComposer {
         for layer in display_layers.values_mut() {
             if let Some(acq) = layer.acquire_fence.take() {
                 if acq >= 0 {
-                    unsafe { libc::close(acq) };
+                    let mut pfd = libc::pollfd {
+                        fd: acq,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    unsafe {
+                        libc::poll(&mut pfd, 1, 0);
+                        libc::close(acq);
+                    }
                 }
             }
         }
@@ -594,7 +668,15 @@ impl HwcComposer {
         if let Some((_, fence_opt)) = self.client_targets.get_mut(&display_id) {
             if let Some(acq) = fence_opt.take() {
                 if acq >= 0 {
-                    unsafe { libc::close(acq) };
+                    let mut pfd = libc::pollfd {
+                        fd: acq,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    unsafe {
+                        libc::poll(&mut pfd, 1, 0);
+                        libc::close(acq);
+                    }
                 }
             }
         }
@@ -602,14 +684,15 @@ impl HwcComposer {
         // Generate mock fences (in production backed by sync_file / sync_fence)
         let present_fence = Some(-1); // -1 signifies immediately signaled / no fence needed
 
-        let mut release_fences = HashMap::new();
+        let mut release_fences = ReleaseFences::new();
         for (&id, layer) in display_layers.iter_mut() {
             if let Some(old_rel) = layer.release_fence.take() {
                 if old_rel >= 0 {
                     unsafe { libc::close(old_rel) };
                 }
             }
-            layer.release_fence = Some(-1);
+            // Transfer ownership to release_fences; layer.release_fence is None to prevent double-close
+            layer.release_fence = None;
             release_fences.insert(id, Some(-1));
         }
 

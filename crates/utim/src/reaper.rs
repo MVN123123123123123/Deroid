@@ -12,6 +12,9 @@ impl SignalHandler {
     pub fn new() -> io::Result<Self> {
         let mut mask: libc::sigset_t = unsafe { mem::zeroed() };
         unsafe {
+            // Ignore SIGPIPE so client socket disconnects don't kill PID 1 with a kernel panic
+            libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+
             libc::sigemptyset(&mut mask);
             libc::sigaddset(&mut mask, libc::SIGCHLD);
             libc::sigaddset(&mut mask, libc::SIGTERM);

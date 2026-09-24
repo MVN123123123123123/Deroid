@@ -54,7 +54,7 @@ else
     fail "Cargo config missing 64KB page alignment flags"
 fi
 
-if rustup target list | grep -q "aarch64-unknown-linux-gnu (installed)"; then
+if rustup target list | grep "aarch64-unknown-linux-gnu (installed)" >/dev/null; then
     pass "rustup target aarch64-unknown-linux-gnu is installed"
 else
     fail "rustup target aarch64-unknown-linux-gnu not found"
@@ -113,7 +113,7 @@ for bin in "${BINARIES[@]}"; do
     fi
 
     # Check alignment via utim-graphics-check --check-elf
-    if "${WORKSPACE_ROOT}/target/debug/utim-graphics-check" --check-elf "${bin_path}" --json | grep -q '"is_64k_compatible":true'; then
+    if "${WORKSPACE_ROOT}/target/debug/utim-graphics-check" --check-elf "${bin_path}" --json | grep '"is_64k_compatible":true' >/dev/null; then
         pass "Binary ${bin} is strictly 64KB page aligned (p_align >= 0x10000)"
     else
         fail "Binary ${bin} failed 64KB page alignment test!"
@@ -167,7 +167,7 @@ SHLIBS=(
 for shlib in "${SHLIBS[@]}"; do
     shlib_name="$(basename "${shlib}")"
     if [[ -f "${shlib}" ]]; then
-        if "${WORKSPACE_ROOT}/target/debug/utim-graphics-check" --check-elf "${shlib}" --json | grep -q '"is_64k_compatible":true'; then
+        if "${WORKSPACE_ROOT}/target/debug/utim-graphics-check" --check-elf "${shlib}" --json | grep '"is_64k_compatible":true' >/dev/null; then
             pass "Shared library ${shlib_name} has 64KB page alignment"
         else
             fail "Shared library ${shlib_name} is NOT 64KB aligned!"

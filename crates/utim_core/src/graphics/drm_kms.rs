@@ -69,7 +69,7 @@ struct DrmModeGetConnector {
     count_modes: u32,
     count_props: u32,
     count_encoders: u32,
-    pad: u32,
+    encoder_id: u32,
     connector_id: u32,
     connector_type: u32,
     connector_type_id: u32,
@@ -77,6 +77,7 @@ struct DrmModeGetConnector {
     mm_width: u32,
     mm_height: u32,
     subpixel: u32,
+    pad: u32,
 }
 
 #[repr(C)]
@@ -284,8 +285,8 @@ impl DrmKmsDevice {
                 handle: create_dumb.handle,
             };
             unsafe {
-                libc::ioctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &mut destroy);
                 libc::ioctl(fd, DRM_IOCTL_MODE_RMFB, &mut fb_cmd.fb_id);
+                libc::ioctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &mut destroy);
             }
             return Err(err);
         }
@@ -306,8 +307,8 @@ impl DrmKmsDevice {
                 handle: create_dumb.handle,
             };
             unsafe {
-                libc::ioctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &mut destroy);
                 libc::ioctl(fd, DRM_IOCTL_MODE_RMFB, &mut fb_cmd.fb_id);
+                libc::ioctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &mut destroy);
             }
             return Err(err);
         }
@@ -327,7 +328,19 @@ impl DrmKmsDevice {
             mode: selected_mode,
         };
 
-        let _ = unsafe { libc::ioctl(fd, DRM_IOCTL_MODE_SETCRTC, &mut crtc) };
+        let ret = unsafe { libc::ioctl(fd, DRM_IOCTL_MODE_SETCRTC, &mut crtc) };
+        if ret < 0 {
+            let err = io::Error::last_os_error();
+            unsafe {
+                libc::munmap(mmap_ptr as *mut libc::c_void, create_dumb.size as usize);
+                libc::ioctl(fd, DRM_IOCTL_MODE_RMFB, &mut fb_cmd.fb_id);
+                let mut destroy = DrmModeDestroyDumb {
+                    handle: create_dumb.handle,
+                };
+                libc::ioctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &mut destroy);
+            }
+            return Err(err);
+        }
 
         Ok(Self {
             file,
@@ -583,32 +596,44 @@ impl DrmKmsDevice {
             draw_rounded_rect(buf, stride, w, h, 16, content_y, w - 32, content_h, 18, 0xFF0A0E17);
 
             if app_name == "Terminal" {
-                // Interactive Linux Shell Terminal Window
+                // Interactive Linux Shell Terminal Window with Scale 3 Monospace Font
                 let mut line_y = content_y + 24;
-                draw_text(buf, stride, w, h, 36, line_y, "Universal Treble Linux 1.0 (Debian Sid ARM64)", 0xFF38BDF8, 2);
+                draw_text(buf, stride, w, h, 36, line_y, "Universal Treble Linux 1.0 (Debian Sid ARM64)", 0xFF38BDF8, 3);
+                line_y += 38;
+                draw_text(buf, stride, w, h, 36, line_y, "Linux 6.1.23-android14-4-00257 (Android GKI)", 0xFF94A3B8, 2);
                 line_y += 26;
-                draw_text(buf, stride, w, h, 36, line_y, "Linux 6.1.23-android14-4-00257 (Android GKI)", 0xFF94A3B8, 1);
-                line_y += 20;
-                draw_text(buf, stride, w, h, 36, line_y, "UTIM PID 1 init | UTLC Wayland Compositor", 0xFF94A3B8, 1);
+                draw_text(buf, stride, w, h, 36, line_y, "UTIM PID 1 init | UTLC Wayland Compositor", 0xFF94A3B8, 2);
                 line_y += 26;
-                draw_text(buf, stride, w, h, 36, line_y, "Type below or with physical keyboard (help, uname, ls, date)", 0xFF64748B, 1);
-                line_y += 34;
+                draw_text(buf, stride, w, h, 36, line_y, "Debian Sid ARM64 GNU/Linux - APT Package Manager Active", 0xFF64748B, 2);
+                line_y += 38;
 
-                // Past terminal command lines
-                for line in state.terminal_lines {
-                    if line_y + 24 < content_y + content_h - 40 {
-                        draw_text(buf, stride, w, h, 36, line_y, line, 0xFFE2E8F0, 1);
-                        line_y += 20;
+                // Terminal text scaling (Scale 3 = 18x21px font cell, 34px line height)
+                let line_h = 34;
+                let header_used = line_y - content_y;
+                let available_h = content_h.saturating_sub(header_used + 45);
+                let max_lines = (available_h / line_h).saturating_sub(1);
+
+                // Auto-scroll viewport: show the most recent lines so the active prompt is always visible
+                let visible_lines = if state.terminal_lines.len() > max_lines {
+                    &state.terminal_lines[state.terminal_lines.len() - max_lines..]
+                } else {
+                    state.terminal_lines
+                };
+
+                for line in visible_lines {
+                    if line_y + line_h <= content_y + content_h - 40 {
+                        draw_text(buf, stride, w, h, 36, line_y, line, 0xFFE2E8F0, 3);
+                        line_y += line_h;
                     }
                 }
 
-                // Active prompt line with typed characters and blinking cursor
-                if line_y + 24 < content_y + content_h {
-                    draw_text(buf, stride, w, h, 36, line_y, "root@treble-gsi:~# ", 0xFF10B981, 1);
-                    let prompt_w = 19 * 6;
-                    draw_text(buf, stride, w, h, 36 + prompt_w, line_y, state.terminal_input, 0xFFFFFFFF, 1);
-                    let cursor_x = 36 + prompt_w + state.terminal_input.len() * 6;
-                    draw_rect(buf, stride, w, h, cursor_x, line_y, 6, 12, 0xFF10B981);
+                // Active prompt line with typed characters and blinking cursor (Scale 3)
+                if line_y + line_h <= content_y + content_h {
+                    draw_text(buf, stride, w, h, 36, line_y, "root@treble-gsi:~# ", 0xFF10B981, 3);
+                    let prompt_w = 19 * 18;
+                    draw_text(buf, stride, w, h, 36 + prompt_w, line_y, state.terminal_input, 0xFFFFFFFF, 3);
+                    let cursor_x = 36 + prompt_w + state.terminal_input.len() * 18;
+                    draw_rect(buf, stride, w, h, cursor_x, line_y, 14, 22, 0xFF10B981);
                 }
             } else if app_name == "Settings" {
                 // Interactive Mobile Settings Page
@@ -1069,7 +1094,22 @@ fn draw_padlock(buf: &mut [u32], stride: usize, w: usize, h: usize, cx: usize, c
 // 5x7 Minimal Zero-Allocation Monospace Bitmap Font for Mobile UI
 static FONT_5X7: [[u8; 5]; 96] = {
     let mut table = [[0u8; 5]; 96];
-    table[0] = [0x00, 0x00, 0x00, 0x00, 0x00];
+    table[0] = [0x00, 0x00, 0x00, 0x00, 0x00];  // Space
+    table[1] = [0x00, 0x00, 0x5f, 0x00, 0x00];  // !
+    table[2] = [0x00, 0x07, 0x00, 0x07, 0x00];  // "
+    table[3] = [0x14, 0x7f, 0x14, 0x7f, 0x14];  // #
+    table[4] = [0x24, 0x2a, 0x7f, 0x2a, 0x12];  // $
+    table[5] = [0x23, 0x13, 0x08, 0x64, 0x62];  // %
+    table[6] = [0x36, 0x49, 0x55, 0x22, 0x50];  // &
+    table[7] = [0x00, 0x05, 0x03, 0x00, 0x00];  // '
+    table[8] = [0x00, 0x1c, 0x22, 0x41, 0x00];  // (
+    table[9] = [0x00, 0x41, 0x22, 0x1c, 0x00];  // )
+    table[10] = [0x14, 0x08, 0x3e, 0x08, 0x14]; // *
+    table[11] = [0x08, 0x08, 0x3e, 0x08, 0x08]; // +
+    table[12] = [0x00, 0x50, 0x30, 0x00, 0x00]; // ,
+    table[13] = [0x08, 0x08, 0x08, 0x08, 0x08]; // -
+    table[14] = [0x00, 0x60, 0x60, 0x00, 0x00]; // .
+    table[15] = [0x20, 0x10, 0x08, 0x04, 0x02]; // /
     table[16] = [0x3e, 0x51, 0x49, 0x45, 0x3e]; // 0
     table[17] = [0x00, 0x42, 0x7f, 0x40, 0x00]; // 1
     table[18] = [0x42, 0x61, 0x51, 0x49, 0x46]; // 2
@@ -1082,22 +1122,11 @@ static FONT_5X7: [[u8; 5]; 96] = {
     table[25] = [0x06, 0x49, 0x49, 0x29, 0x1e]; // 9
     table[26] = [0x00, 0x36, 0x36, 0x00, 0x00]; // :
     table[27] = [0x00, 0x56, 0x36, 0x00, 0x00]; // ;
-    table[1] = [0x00, 0x41, 0x7f, 0x41, 0x00]; // !
-    table[2] = [0x00, 0x07, 0x00, 0x07, 0x00]; // "
-    table[3] = [0x28, 0x7f, 0x28, 0x7f, 0x28]; // #
-    table[4] = [0x24, 0x2a, 0x7f, 0x2a, 0x12]; // $
-    table[6] = [0x32, 0x49, 0x59, 0x25, 0x26]; // &
-    table[7] = [0x00, 0x05, 0x03, 0x00, 0x00]; // '
-    table[8] = [0x00, 0x1c, 0x22, 0x41, 0x00]; // (
-    table[9] = [0x00, 0x41, 0x22, 0x1c, 0x00]; // )
-    table[11] = [0x08, 0x08, 0x3e, 0x08, 0x08]; // +
     table[28] = [0x08, 0x14, 0x22, 0x41, 0x00]; // <
     table[29] = [0x14, 0x14, 0x14, 0x14, 0x14]; // =
+    table[30] = [0x00, 0x41, 0x22, 0x14, 0x08]; // >
     table[31] = [0x02, 0x01, 0x51, 0x09, 0x06]; // ?
     table[32] = [0x32, 0x49, 0x79, 0x41, 0x3e]; // @
-    table[5] = [0x23, 0x13, 0x08, 0x64, 0x62];  // %
-    table[30] = [0x00, 0x41, 0x22, 0x14, 0x08]; // >
-    table[63] = [0x00, 0x41, 0x00, 0x41, 0x00]; // |
     table[33] = [0x7e, 0x11, 0x11, 0x11, 0x7e]; // A
     table[34] = [0x7f, 0x49, 0x49, 0x49, 0x36]; // B
     table[35] = [0x3e, 0x41, 0x41, 0x41, 0x22]; // C
@@ -1124,6 +1153,12 @@ static FONT_5X7: [[u8; 5]; 96] = {
     table[56] = [0x63, 0x14, 0x08, 0x14, 0x63]; // X
     table[57] = [0x07, 0x08, 0x70, 0x08, 0x07]; // Y
     table[58] = [0x61, 0x51, 0x49, 0x45, 0x43]; // Z
+    table[59] = [0x00, 0x7f, 0x41, 0x41, 0x00]; // [
+    table[60] = [0x02, 0x04, 0x08, 0x10, 0x20]; // \
+    table[61] = [0x00, 0x41, 0x41, 0x7f, 0x00]; // ]
+    table[62] = [0x04, 0x02, 0x01, 0x02, 0x04]; // ^
+    table[63] = [0x40, 0x40, 0x40, 0x40, 0x40]; // _
+    table[64] = [0x00, 0x01, 0x02, 0x00, 0x00]; // `
     table[65] = [0x20, 0x54, 0x54, 0x54, 0x78]; // a
     table[66] = [0x7f, 0x48, 0x44, 0x44, 0x38]; // b
     table[67] = [0x38, 0x44, 0x44, 0x44, 0x20]; // c
@@ -1150,6 +1185,10 @@ static FONT_5X7: [[u8; 5]; 96] = {
     table[88] = [0x44, 0x28, 0x10, 0x28, 0x44]; // x
     table[89] = [0x0c, 0x50, 0x50, 0x50, 0x3c]; // y
     table[90] = [0x44, 0x64, 0x54, 0x4c, 0x44]; // z
+    table[91] = [0x00, 0x08, 0x36, 0x41, 0x00]; // {
+    table[92] = [0x00, 0x00, 0x7f, 0x00, 0x00]; // |
+    table[93] = [0x00, 0x41, 0x36, 0x08, 0x00]; // }
+    table[94] = [0x08, 0x04, 0x08, 0x10, 0x08]; // ~
     table
 };
 

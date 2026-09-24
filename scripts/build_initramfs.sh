@@ -71,11 +71,14 @@ fi
 
 # 1b. Extract GPU & Display kernel modules from Android vendor partition
 if [[ -f "${ANDROID_VENDOR}" ]]; then
-    echo "[*] Extracting GPU and DRM kernel modules from ${ANDROID_VENDOR}..."
+    echo "[*] Extracting GPU, DRM, and Network kernel modules from ${ANDROID_VENDOR}..."
     7z e -y "${ANDROID_VENDOR}" \
         lib/modules/virtio-gpu.ko \
         lib/modules/drm_dma_helper.ko \
         lib/modules/virtio_input.ko \
+        lib/modules/failover.ko \
+        lib/modules/net_failover.ko \
+        lib/modules/virtio_net.ko \
         "-o${RAMDISK_BUILD_DIR}/lib/modules" >/dev/null 2>&1 || true
 fi
 
@@ -98,6 +101,12 @@ cat << 'EOF' > "${RAMDISK_BUILD_DIR}/init.c"
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <net/if.h>
+#include <linux/route.h>
 #include <errno.h>
 
 static int load_module(const char *path) {
@@ -132,7 +141,12 @@ int main(int argc, char *argv[]) {
     printf(" [UTIM-BOOT] Universal Treble Linux Early Initramfs Loader\n");
     printf("============================================================\n");
 
-    mount("tmpfs", "/dev", "tmpfs", 0, "mode=0755");
+    if (mount("devtmpfs", "/dev", "devtmpfs", 0, "mode=0755") != 0) {
+        mount("tmpfs", "/dev", "tmpfs", 0, "mode=0755");
+        mknod("/dev/console", S_IFCHR | 0600, makedev(5, 1));
+        mknod("/dev/null", S_IFCHR | 0666, makedev(1, 3));
+        mknod("/dev/kmsg", S_IFCHR | 0660, makedev(1, 11));
+    }
     mount("proc", "/proc", "proc", 0, NULL);
     mount("sysfs", "/sys", "sysfs", 0, NULL);
 
@@ -150,6 +164,62 @@ int main(int argc, char *argv[]) {
     load_module("/lib/modules/virtio-gpu.ko");
     load_module("/lib/modules/virtio_input.ko");
 
+    // Load network drivers for virtio-net
+    load_module("/lib/modules/failover.ko");
+    load_module("/lib/modules/net_failover.ko");
+    load_module("/lib/modules/virtio_net.ko");
+
+    // Configure loopback and eth0 network interfaces early
+    int net_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (net_sock >= 0) {
+        struct ifreq ifr;
+        memset(&ifr, 0, sizeof(ifr));
+        strncpy(ifr.ifr_name, "lo", IFNAMSIZ - 1);
+        ifr.ifr_flags = IFF_UP | IFF_RUNNING;
+        ioctl(net_sock, SIOCSIFFLAGS, &ifr);
+
+        memset(&ifr, 0, sizeof(ifr));
+        strncpy(ifr.ifr_name, "eth0", IFNAMSIZ - 1);
+        struct sockaddr_in *sin = (struct sockaddr_in *)&ifr.ifr_addr;
+        sin->sin_family = AF_INET;
+        sin->sin_addr.s_addr = inet_addr("10.0.2.15");
+        ioctl(net_sock, SIOCSIFADDR, &ifr);
+
+        sin = (struct sockaddr_in *)&ifr.ifr_netmask;
+        sin->sin_family = AF_INET;
+        sin->sin_addr.s_addr = inet_addr("255.255.255.0");
+        ioctl(net_sock, SIOCSIFNETMASK, &ifr);
+
+        sin = (struct sockaddr_in *)&ifr.ifr_broadaddr;
+        sin->sin_family = AF_INET;
+        sin->sin_addr.s_addr = inet_addr("10.0.2.255");
+        ioctl(net_sock, SIOCSIFBRDADDR, &ifr);
+
+        ifr.ifr_flags = IFF_UP | IFF_RUNNING | IFF_BROADCAST | IFF_MULTICAST;
+        ioctl(net_sock, SIOCSIFFLAGS, &ifr);
+
+        struct rtentry rt;
+        memset(&rt, 0, sizeof(rt));
+        sin = (struct sockaddr_in *)&rt.rt_dst;
+        sin->sin_family = AF_INET;
+        sin->sin_addr.s_addr = INADDR_ANY;
+
+        sin = (struct sockaddr_in *)&rt.rt_genmask;
+        sin->sin_family = AF_INET;
+        sin->sin_addr.s_addr = INADDR_ANY;
+
+        sin = (struct sockaddr_in *)&rt.rt_gateway;
+        sin->sin_family = AF_INET;
+        sin->sin_addr.s_addr = inet_addr("10.0.2.2");
+
+        rt.rt_flags = RTF_UP | RTF_GATEWAY;
+        rt.rt_dev = "eth0";
+        ioctl(net_sock, SIOCADDRT, &rt);
+
+        close(net_sock);
+        printf("[UTIM-BOOT] Configured network stack: eth0 (10.0.2.15/24) via gateway 10.0.2.2\n");
+    }
+
     // Parse root= and init= from kernel cmdline
     char root_dev[128] = "/dev/vda";
     char init_path[128] = "/init";
@@ -159,13 +229,17 @@ int main(int argc, char *argv[]) {
     const char *dev_name = strrchr(root_dev, '/');
     dev_name = dev_name ? dev_name + 1 : root_dev;
 
-    // Poll for block device in sysfs
+    // Poll for block device in sysfs (/sys/class/block/<name>/dev or /sys/block/<name>/dev)
     char sys_path[256];
-    snprintf(sys_path, sizeof(sys_path), "/sys/block/%s/dev", dev_name);
+    snprintf(sys_path, sizeof(sys_path), "/sys/class/block/%s/dev", dev_name);
 
     int fd = -1;
     for (int i = 0; i < 50; i++) {
         fd = open(sys_path, O_RDONLY);
+        if (fd < 0) {
+            snprintf(sys_path, sizeof(sys_path), "/sys/block/%s/dev", dev_name);
+            fd = open(sys_path, O_RDONLY);
+        }
         if (fd >= 0) break;
         usleep(100000);
     }
@@ -192,13 +266,37 @@ int main(int argc, char *argv[]) {
     }
     printf("[UTIM-BOOT] Successfully mounted root device %s on /sysroot\n", root_dev);
 
+    // Ensure working DNS configuration in /sysroot/etc/resolv.conf
+    mkdir("/sysroot/etc", 0755);
+    unlink("/sysroot/etc/resolv.conf");
+    FILE *f_res = fopen("/sysroot/etc/resolv.conf", "w");
+    if (f_res) {
+        fprintf(f_res, "# Configured by UTIM Early Bootloader\n");
+        fprintf(f_res, "nameserver 10.0.2.3\n");
+        fprintf(f_res, "nameserver 8.8.8.8\n");
+        fprintf(f_res, "nameserver 1.1.1.1\n");
+        fclose(f_res);
+    }
+
+    FILE *f_hosts = fopen("/sysroot/etc/hosts", "w");
+    if (f_hosts) {
+        fprintf(f_hosts, "127.0.0.1\tlocalhost treble-gsi\n");
+        fprintf(f_hosts, "::1\t\tlocalhost ip6-localhost ip6-loopback\n");
+        fclose(f_hosts);
+    }
+
     // Unmount early filesystems so UTIM PID 1 can mount them cleanly with proper flags
     umount("/proc");
     umount("/sys");
     umount("/dev");
 
-    // Switch root into /sysroot
-    if (chdir("/sysroot") != 0 || chroot(".") != 0 || chdir("/") != 0) {
+    // Switch root into /sysroot via pivot_root (fallback to chroot)
+    mkdir("/sysroot/oldroot", 0755);
+    if (syscall(SYS_pivot_root, "/sysroot", "/sysroot/oldroot") == 0) {
+        chdir("/");
+        umount2("/oldroot", MNT_DETACH);
+        rmdir("/oldroot");
+    } else if (chdir("/sysroot") != 0 || chroot(".") != 0 || chdir("/") != 0) {
         printf("[UTIM-BOOT] Fatal: switch_root/chroot to /sysroot failed (errno %d)\n", errno);
         while (1) sleep(1);
     }

@@ -60,9 +60,35 @@ impl<const N: usize> ByteRingBuffer<N> {
 
     /// Push a slice of bytes, overwriting oldest if capacity exceeded.
     pub fn write_overwrite(&mut self, data: &[u8]) {
-        for &b in data {
-            self.push_overwrite(b);
+        if N == 0 || data.is_empty() {
+            return;
         }
+
+        if data.len() >= N {
+            let chunk = &data[data.len() - N..];
+            self.buf.copy_from_slice(chunk);
+            self.head = 0;
+            self.tail = 0;
+            self.count = N;
+            return;
+        }
+
+        let new_count = (self.count + data.len()).min(N);
+        if self.count + data.len() > N {
+            let overwritten = (self.count + data.len()) - N;
+            self.head = (self.head + overwritten) % N;
+        }
+
+        let first_chunk = (N - self.tail).min(data.len());
+        self.buf[self.tail..self.tail + first_chunk].copy_from_slice(&data[..first_chunk]);
+
+        if first_chunk < data.len() {
+            let second_chunk = data.len() - first_chunk;
+            self.buf[..second_chunk].copy_from_slice(&data[first_chunk..]);
+        }
+
+        self.tail = (self.tail + data.len()) % N;
+        self.count = new_count;
     }
 
     /// Read available bytes into output slice. Returns number of bytes read.
@@ -86,8 +112,8 @@ impl<const N: usize> ByteRingBuffer<N> {
         let mut remaining = self.count;
         while remaining > 0 {
             let chunk = remaining.min(tmp.len());
-            for i in 0..chunk {
-                tmp[i] = self.buf[idx];
+            for byte in tmp.iter_mut().take(chunk) {
+                *byte = self.buf[idx];
                 idx += 1;
                 if idx == N {
                     idx = 0;
