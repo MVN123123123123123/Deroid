@@ -55,22 +55,22 @@ pub fn setup_network_subsystem() -> io::Result<()> {
                 let mut ifr: libc::ifreq = std::mem::zeroed();
                 copy_name(&mut ifr.ifr_name, &name);
 
-                // Set IP 10.0.2.15
+                // Set IP 10.0.2.15 (network byte order in memory: [10, 0, 2, 15])
                 let sin = &mut *(&mut ifr.ifr_ifru.ifru_addr as *mut _ as *mut libc::sockaddr_in);
                 sin.sin_family = libc::AF_INET as libc::sa_family_t;
-                sin.sin_addr.s_addr = u32::from_be_bytes([10, 0, 2, 15]);
+                sin.sin_addr.s_addr = u32::from_ne_bytes([10, 0, 2, 15]);
                 libc::ioctl(sock, libc::SIOCSIFADDR, &ifr);
 
                 // Set Netmask 255.255.255.0
                 let sin = &mut *(&mut ifr.ifr_ifru.ifru_netmask as *mut _ as *mut libc::sockaddr_in);
                 sin.sin_family = libc::AF_INET as libc::sa_family_t;
-                sin.sin_addr.s_addr = u32::from_be_bytes([255, 255, 255, 0]);
+                sin.sin_addr.s_addr = u32::from_ne_bytes([255, 255, 255, 0]);
                 libc::ioctl(sock, libc::SIOCSIFNETMASK, &ifr);
 
                 // Set Broadcast 10.0.2.255
                 let sin = &mut *(&mut ifr.ifr_ifru.ifru_broadaddr as *mut _ as *mut libc::sockaddr_in);
                 sin.sin_family = libc::AF_INET as libc::sa_family_t;
-                sin.sin_addr.s_addr = u32::from_be_bytes([10, 0, 2, 255]);
+                sin.sin_addr.s_addr = u32::from_ne_bytes([10, 0, 2, 255]);
                 libc::ioctl(sock, libc::SIOCSIFBRDADDR, &ifr);
 
                 // Set Flags UP | RUNNING | BROADCAST | MULTICAST
@@ -90,13 +90,19 @@ pub fn setup_network_subsystem() -> io::Result<()> {
 
                 let gw = &mut *(&mut rt.rt_gateway as *mut _ as *mut libc::sockaddr_in);
                 gw.sin_family = libc::AF_INET as libc::sa_family_t;
-                gw.sin_addr.s_addr = u32::from_be_bytes([10, 0, 2, 2]);
+                gw.sin_addr.s_addr = u32::from_ne_bytes([10, 0, 2, 2]);
 
                 rt.rt_flags = (libc::RTF_UP | libc::RTF_GATEWAY) as libc::c_ushort;
                 let c_name = std::ffi::CString::new(name.as_bytes()).unwrap_or_default();
                 rt.rt_dev = c_name.as_ptr() as *mut libc::c_char;
 
-                libc::ioctl(sock, libc::SIOCADDRT, &rt);
+                let res = libc::ioctl(sock, libc::SIOCADDRT, &rt);
+                if res < 0 {
+                    let err = io::Error::last_os_error();
+                    if err.raw_os_error() != Some(libc::EEXIST) {
+                        eprintln!("[UTIM] Warning: Failed to set default gateway: {}", err);
+                    }
+                }
             }
         }
 

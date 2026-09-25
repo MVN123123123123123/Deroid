@@ -390,6 +390,15 @@ pub struct TerminalTabInfo<'a> {
     pub is_active: bool,
 }
 
+/// Zero-allocation descriptor for an app icon displayed in the home screen grid
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppGridItem<'a> {
+    pub id: &'a str,
+    pub name: &'a str,
+    pub color: u32,
+    pub glyph: &'a str,
+}
+
 pub struct DrmInteractiveState<'a> {
     pub time_str: &'a str,
     pub is_locked: bool,
@@ -406,6 +415,7 @@ pub struct DrmInteractiveState<'a> {
     pub terminal_running: bool,
     pub terminal_tabs: &'a [TerminalTabInfo<'a>],
     pub terminal_active_tab: usize,
+    pub grid_apps: &'a [AppGridItem<'a>],
 }
 
 impl<'a> Default for DrmInteractiveState<'a> {
@@ -426,6 +436,7 @@ impl<'a> Default for DrmInteractiveState<'a> {
             terminal_running: false,
             terminal_tabs: &[],
             terminal_active_tab: 0,
+            grid_apps: &[],
         }
     }
 }
@@ -733,6 +744,61 @@ impl DrmKmsDevice {
                         card_y += 72;
                     }
                 }
+            } else if app_name == "Firefox" || app_name == "Browser" || app_name.contains("Firefox") {
+                // Interactive Modern Mobile Browser Window
+                let bar_top = content_y + 12;
+                let bar_h = 46;
+                let pad = 16;
+                let url_w = w - pad * 2 - 32;
+
+                // Browser Navigation & Address Bar
+                draw_rounded_rect(buf, stride, w, h, pad + 16, bar_top, url_w, bar_h, 14, 0xFF1E293B);
+                // SSL Lock indicator (Emerald)
+                draw_rounded_rect(buf, stride, w, h, pad + 28, bar_top + 14, 16, 16, 4, 0xFF10B981);
+                draw_text(buf, stride, w, h, pad + 32, bar_top + 15, "*", 0xFFFFFFFF, 1);
+                // URL display
+                draw_text(buf, stride, w, h, pad + 54, bar_top + 14, "https://duckduckgo.com", 0xFFF8FAFC, 2);
+                // Reload icon on right side
+                draw_text(buf, stride, w, h, pad + 16 + url_w - 30, bar_top + 14, "O", 0xFF94A3B8, 2);
+
+                // Browser Content View
+                let page_y = bar_top + bar_h + 16;
+                let page_h = content_h.saturating_sub(bar_h + 36);
+                draw_rounded_rect(buf, stride, w, h, pad + 16, page_y, url_w, page_h, 16, 0xFF0F172A);
+
+                // Firefox Branding & Status
+                let center_x = w / 2;
+                draw_rounded_rect(buf, stride, w, h, center_x - 36, page_y + 36, 72, 72, 20, 0xFFFF5722);
+                draw_text_centered(buf, stride, w, h, center_x, page_y + 54, "F", 0xFFFFFFFF, 4);
+
+                draw_text_centered(buf, stride, w, h, center_x, page_y + 130, "Firefox Web Browser", 0xFFFFFFFF, 3);
+                draw_text_centered(buf, stride, w, h, center_x, page_y + 165, "Wayland Native Mobile Client (wayland-0)", 0xFF10B981, 2);
+
+                // Quick dial shortcuts
+                let qd_y = page_y + 210;
+                let qd_w = (url_w - 40) / 2;
+                let qd_h = 64;
+
+                let shortcuts = [
+                    ("DuckDuckGo", "Web Search", 0xFFDE5833),
+                    ("Debian Sid", "Package Archive", 0xFFD70A53),
+                    ("Treble Linux", "GSI Mobile Docs", 0xFF3B82F6),
+                    ("GitHub", "Code Repository", 0xFF24292F),
+                ];
+
+                for (idx, (stitle, ssub, scolor)) in shortcuts.iter().enumerate() {
+                    let col = idx % 2;
+                    let row = idx / 2;
+                    let sx = pad + 20 + col * (qd_w + 12);
+                    let sy = qd_y + row * (qd_h + 14);
+                    if sy + qd_h < page_y + page_h - 20 {
+                        draw_rounded_rect(buf, stride, w, h, sx, sy, qd_w, qd_h, 12, 0xFF1E293B);
+                        draw_rounded_rect(buf, stride, w, h, sx + 12, sy + 14, 36, 36, 8, *scolor);
+                        draw_text_centered(buf, stride, w, h, sx + 30, sy + 22, &stitle[..1], 0xFFFFFFFF, 2);
+                        draw_text(buf, stride, w, h, sx + 56, sy + 14, stitle, 0xFFFFFFFF, 2);
+                        draw_text(buf, stride, w, h, sx + 56, sy + 38, ssub, 0xFF94A3B8, 1);
+                    }
+                }
             } else {
                 // Generic Modern Mobile App Screen
                 draw_text_centered(buf, stride, w, h, w / 2, content_y + 80, app_name, 0xFF38BDF8, 4);
@@ -787,28 +853,39 @@ impl DrmKmsDevice {
                 draw_text(buf, stride, w, h, search_x + search_w - 36, search_y + 16, "*", 0xFFEA4335, 3);
             }
 
-            // 7. App Grid Icons (4 columns x 3 rows)
+            // 7. App Grid Icons (4 columns x dynamic rows)
             let grid_top = search_y + 90;
             let cols = 4;
             let col_width = w / cols;
             let icon_size = 64;
 
-            let apps = [
-                ("Phone", 0xFF10B981, "P"),
-                ("Messages", 0xFF3B82F6, "M"),
-                ("Browser", 0xFF06B6D4, "B"),
-                ("Camera", 0xFFF43F5E, "C"),
-                ("Gallery", 0xFF8B5CF6, "G"),
-                ("Settings", 0xFF64748B, "S"),
-                ("Files", 0xFFF59E0B, "F"),
-                ("Music", 0xFFD946EF, "M"),
-                ("Terminal", 0xFF1E293B, ">"),
-                ("Treble OS", 0xFF6366F1, "U"),
-                ("Contacts", 0xFF14B8A6, "C"),
-                ("Clock", 0xFFEF4444, "T"),
+            let default_apps = [
+                AppGridItem { id: "phone", name: "Phone", color: 0xFF10B981, glyph: "P" },
+                AppGridItem { id: "messages", name: "Messages", color: 0xFF3B82F6, glyph: "M" },
+                AppGridItem { id: "browser", name: "Browser", color: 0xFF06B6D4, glyph: "B" },
+                AppGridItem { id: "camera", name: "Camera", color: 0xFFF43F5E, glyph: "C" },
+                AppGridItem { id: "gallery", name: "Gallery", color: 0xFF8B5CF6, glyph: "G" },
+                AppGridItem { id: "settings", name: "Settings", color: 0xFF64748B, glyph: "S" },
+                AppGridItem { id: "files", name: "Files", color: 0xFFF59E0B, glyph: "F" },
+                AppGridItem { id: "music", name: "Music", color: 0xFFD946EF, glyph: "M" },
+                AppGridItem { id: "terminal", name: "Terminal", color: 0xFF1E293B, glyph: ">" },
+                AppGridItem { id: "treble", name: "Treble OS", color: 0xFF6366F1, glyph: "U" },
+                AppGridItem { id: "contacts", name: "Contacts", color: 0xFF14B8A6, glyph: "C" },
+                AppGridItem { id: "clock", name: "Clock", color: 0xFFEF4444, glyph: "T" },
             ];
 
-            for (idx, (name, color, glyph)) in apps.iter().enumerate() {
+            let apps: &[AppGridItem] = if !state.grid_apps.is_empty() {
+                state.grid_apps
+            } else {
+                &default_apps[..]
+            };
+
+            let dock_h = 100;
+            let dock_y = h - dock_h - 40;
+            let max_rows = (dock_y.saturating_sub(grid_top + 20)) / 115;
+            let max_apps = max_rows * cols;
+
+            for (idx, app) in apps.iter().take(max_apps).enumerate() {
                 let row = idx / cols;
                 let col = idx % cols;
                 let cx = col * col_width + col_width / 2;
@@ -816,9 +893,9 @@ impl DrmKmsDevice {
 
                 let ix = cx.saturating_sub(icon_size / 2);
                 let iy = cy.saturating_sub(icon_size / 2);
-                draw_rounded_rect(buf, stride, w, h, ix, iy, icon_size, icon_size, 16, *color);
-                draw_text_centered(buf, stride, w, h, cx, cy - 10, glyph, 0xFFFFFFFF, 3);
-                draw_text_centered(buf, stride, w, h, cx, cy + 42, name, 0xFFE2E8F0, 1);
+                draw_rounded_rect(buf, stride, w, h, ix, iy, icon_size, icon_size, 16, app.color);
+                draw_text_centered(buf, stride, w, h, cx, cy - 10, app.glyph, 0xFFFFFFFF, 3);
+                draw_text_centered(buf, stride, w, h, cx, cy + 42, app.name, 0xFFE2E8F0, 1);
             }
 
             // 8. Persistent Hotseat Dock at Bottom
@@ -1041,6 +1118,15 @@ fn interactive_state_hash(state: &DrmInteractiveState) -> u64 {
     }
     if let Some(last) = state.terminal_lines.last() {
         for b in last.bytes() {
+            mix(b);
+        }
+    }
+    mix(state.grid_apps.len() as u8);
+    for app in state.grid_apps {
+        for b in app.name.bytes() {
+            mix(b);
+        }
+        for b in app.color.to_ne_bytes() {
             mix(b);
         }
     }

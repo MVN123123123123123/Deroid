@@ -124,6 +124,18 @@ pub fn mount_early_filesystems() -> io::Result<()> {
         }
     }
 
+    // 10. Guarantee root and tmp permissions for desktop apps (e.g. Firefox)
+    unsafe {
+        if let Ok(c_root_home) = CString::new("/root") {
+            libc::chown(c_root_home.as_ptr(), 0, 0);
+            libc::chmod(c_root_home.as_ptr(), 0o700);
+        }
+        if let Ok(c_tmp_dir) = CString::new("/tmp") {
+            libc::chown(c_tmp_dir.as_ptr(), 0, 0);
+            libc::chmod(c_tmp_dir.as_ptr(), 0o1777);
+        }
+    }
+
     if let Some(e) = first_err {
         return Err(e);
     }

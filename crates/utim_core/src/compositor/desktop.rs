@@ -229,16 +229,25 @@ impl DesktopCatalogue {
 
     /// Load standard desktop directories
     pub fn scan_system_directories(&mut self) {
+        self.apps.clear();
         let paths = [
             Path::new("/usr/share/applications"),
             Path::new("/usr/local/share/applications"),
             Path::new("/etc/xdg/autostart"),
+            Path::new("/root/.local/share/applications"),
+            Path::new("/home/linux/.local/share/applications"),
         ];
         for path in &paths {
             if path.is_dir() {
                 self.scan_directory(path);
             }
         }
+    }
+
+    pub fn find_app(&self, id_or_name: &str) -> Option<&DesktopApp> {
+        self.apps.iter().find(|a| {
+            a.id.eq_ignore_ascii_case(id_or_name) || a.name.eq_ignore_ascii_case(id_or_name)
+        })
     }
 
     /// Scan a single directory

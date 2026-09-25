@@ -26,7 +26,171 @@ use utim_core::compositor::protocols::{ProtocolRegistry, WaylandInterface};
 use utim_core::compositor::server::WaylandServer;
 use utim_core::compositor::systemui::{QuickTileKind, SystemUiShade};
 use utim_core::graphics::composer::{HwcComposer, HwcVersion};
-use utim_core::graphics::{DrmInteractiveState, DrmKmsDevice, TerminalTabInfo};
+use utim_core::graphics::{AppGridItem, DrmInteractiveState, DrmKmsDevice, TerminalTabInfo};
+
+#[derive(Debug, Clone)]
+pub struct ManagedApp {
+    pub id: String,
+    pub name: String,
+    pub exec: String,
+    pub color: u32,
+    pub glyph: String,
+}
+
+impl ManagedApp {
+    pub fn new(id: &str, name: &str, exec: &str, color: u32, glyph: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            name: name.to_string(),
+            exec: exec.to_string(),
+            color,
+            glyph: glyph.to_string(),
+        }
+    }
+}
+
+fn get_app_color(name_or_id: &str) -> u32 {
+    const PALETTE: [u32; 10] = [
+        0xFF3B82F6, // Sky Blue
+        0xFF10B981, // Emerald Green
+        0xFF8B5CF6, // Violet
+        0xFFF59E0B, // Amber
+        0xFFEC4899, // Pink
+        0xFF06B6D4, // Cyan
+        0xFF6366F1, // Indigo
+        0xFF14B8A6, // Teal
+        0xFFF97316, // Vibrant Orange
+        0xFF64748B, // Slate
+    ];
+    let mut hash: u32 = 0;
+    for b in name_or_id.bytes() {
+        hash = hash.wrapping_mul(31).wrapping_add(b as u32);
+    }
+    PALETTE[(hash as usize) % PALETTE.len()]
+}
+
+fn launch_desktop_app(exec_cmd: &str, socket_dir: &str) {
+    if exec_cmd.is_empty() {
+        return;
+    }
+    println!("[UTLC] Launching desktop application: '{}'", exec_cmd);
+    let parts: Vec<&str> = exec_cmd.split_whitespace().collect();
+    if parts.is_empty() {
+        return;
+    }
+    let prog = parts[0];
+    let args = &parts[1..];
+
+    let _ = std::fs::create_dir_all(socket_dir);
+    let _ = std::fs::create_dir_all("/run/user/0");
+    let _ = std::fs::create_dir_all("/tmp");
+
+    // Ensure root home permissions are intact
+    unsafe {
+        if let Ok(c_root) = std::ffi::CString::new("/root") {
+            libc::chown(c_root.as_ptr(), 0, 0);
+        }
+    }
+
+    match std::process::Command::new(prog)
+        .args(args)
+        .env("WAYLAND_DISPLAY", "wayland-0")
+        .env("XDG_RUNTIME_DIR", socket_dir)
+        .env("GDK_BACKEND", "wayland")
+        .env("MOZ_ENABLE_WAYLAND", "1")
+        .env("HOME", "/root")
+        .env("USER", "root")
+        .env("SHELL", "/bin/bash")
+        .env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+        .spawn()
+    {
+        Ok(child) => {
+            println!("[UTLC] Spawned '{}' with PID {}", prog, child.id());
+        }
+        Err(e) => {
+            eprintln!("[UTLC] Error spawning '{}': {}", prog, e);
+        }
+    }
+}
+
+fn build_all_apps(catalogue: &DesktopCatalogue) -> Vec<ManagedApp> {
+    let mut apps = Vec::new();
+
+    // Check if Firefox is installed in the catalogue
+    let firefox_installed = catalogue.apps().iter().find(|a| {
+        a.id.eq_ignore_ascii_case("firefox")
+            || a.id.eq_ignore_ascii_case("firefox-esr")
+            || a.name.to_lowercase().contains("firefox")
+    });
+
+    let browser_exec = if let Some(ff) = firefox_installed {
+        let clean = ff.clean_exec();
+        if clean.is_empty() {
+            "/usr/bin/firefox".to_string()
+        } else {
+            clean
+        }
+    } else {
+        String::new()
+    };
+
+    // 1. Built-in Core System Apps
+    apps.push(ManagedApp::new("phone", "Phone", "", 0xFF10B981, "P"));
+    apps.push(ManagedApp::new("messages", "Messages", "", 0xFF3B82F6, "M"));
+    apps.push(ManagedApp::new("browser", "Browser", &browser_exec, 0xFF06B6D4, "B"));
+    apps.push(ManagedApp::new("camera", "Camera", "", 0xFFF43F5E, "C"));
+    apps.push(ManagedApp::new("gallery", "Gallery", "", 0xFF8B5CF6, "G"));
+    apps.push(ManagedApp::new("settings", "Settings", "", 0xFF64748B, "S"));
+    apps.push(ManagedApp::new("files", "Files", "", 0xFFF59E0B, "F"));
+    apps.push(ManagedApp::new("music", "Music", "", 0xFFD946EF, "M"));
+    apps.push(ManagedApp::new("terminal", "Terminal", "", 0xFF1E293B, ">"));
+    apps.push(ManagedApp::new("treble", "Treble OS", "", 0xFF6366F1, "U"));
+    apps.push(ManagedApp::new("contacts", "Contacts", "", 0xFF14B8A6, "C"));
+    apps.push(ManagedApp::new("clock", "Clock", "", 0xFFEF4444, "T"));
+
+    // 2. Discovered installed applications from /usr/share/applications etc.
+    for d_app in catalogue.apps() {
+        if d_app.no_display || d_app.id.eq_ignore_ascii_case("utlc") {
+            continue;
+        }
+
+        let is_firefox = d_app.id.eq_ignore_ascii_case("firefox")
+            || d_app.id.eq_ignore_ascii_case("firefox-esr")
+            || d_app.name.to_lowercase().contains("firefox");
+
+        let display_name = if is_firefox {
+            "Firefox".to_string()
+        } else if d_app.name.len() > 12 {
+            d_app.name[..12].to_string()
+        } else {
+            d_app.name.clone()
+        };
+
+        let color = if is_firefox {
+            0xFFFF5722
+        } else {
+            get_app_color(&d_app.id)
+        };
+
+        let glyph = if is_firefox {
+            "F".to_string()
+        } else {
+            d_app.name.chars().next().unwrap_or('A').to_uppercase().to_string()
+        };
+
+        let mut exec = d_app.clean_exec();
+        if exec.is_empty() && is_firefox {
+            exec = "/usr/bin/firefox".to_string();
+        }
+
+        // Avoid adding duplicate if already present in base apps
+        if !apps.iter().any(|a| a.name.eq_ignore_ascii_case(&display_name)) {
+            apps.push(ManagedApp::new(&d_app.id, &display_name, &exec, color, &glyph));
+        }
+    }
+
+    apps
+}
 
 fn main() {
     unsafe {
@@ -139,8 +303,15 @@ fn run_daemon() {
     println!("[*] Initializing Hardware Composer: {:?}", hwc_version);
     let hwc = HwcComposer::new(hwc_version);
 
-    let socket_dir = env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/run/user/1000".into());
-    let socket_path = PathBuf::from(socket_dir).join("wayland-0");
+    let socket_dir = env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| {
+        if unsafe { libc::geteuid() } == 0 {
+            "/run/user/0".into()
+        } else {
+            "/run/user/1000".into()
+        }
+    });
+    let _ = fs::create_dir_all(&socket_dir);
+    let socket_path = PathBuf::from(&socket_dir).join("wayland-0");
 
     let mut server = WaylandServer::new(&socket_path, 1080, 2400, 120.0, hwc);
     server.power_sync.configure_self_oom_score();
@@ -303,6 +474,12 @@ fn run_daemon() {
     let mut cursor_pos: Option<(usize, usize)> = None;
     let mut is_touching = false;
     let mut last_input_rescan = Instant::now();
+
+    let mut desktop_catalogue = DesktopCatalogue::new();
+    desktop_catalogue.scan_system_directories();
+    let mut all_managed_apps = build_all_apps(&desktop_catalogue);
+    let mut last_catalogue_scan = Instant::now();
+    let catalogue_scan_interval = Duration::from_secs(2);
 
     let mut running = true;
     let mut last_frame = Instant::now();
@@ -611,24 +788,38 @@ fn run_daemon() {
                                                     // Tap search pill -> activate search & virtual keyboard
                                                     search_active = true;
                                                     server.scene.keyboard.activate();
-                                                } else if (325.0..=325.0 + 3.0 * 115.0).contains(&y) {
+                                                } else if (325.0..(h - 150.0)).contains(&y) {
                                                     // App grid icons
                                                     let col_width = w / 4.0;
                                                     let col = (x / col_width).clamp(0.0, 3.0) as usize;
-                                                    let row = ((y - 325.0) / 115.0).clamp(0.0, 2.0) as usize;
+                                                    let row = ((y - 325.0) / 115.0) as usize;
                                                     let idx = row * 4 + col;
-                                                    let app_names = [
-                                                        "Phone", "Messages", "Browser", "Camera",
-                                                        "Gallery", "Settings", "Files", "Music",
-                                                        "Terminal", "Treble OS", "Contacts", "Clock",
-                                                    ];
-                                                    let app_to_launch = app_names[idx];
-                                                    active_app = Some(app_to_launch.to_string());
-                                                    if app_to_launch == "Terminal" {
-                                                        server.scene.keyboard.activate();
+
+                                                    let current_apps: Vec<&ManagedApp> = if search_active && !search_query.is_empty() {
+                                                        let q = search_query.to_lowercase();
+                                                        all_managed_apps
+                                                            .iter()
+                                                            .filter(|a| a.name.to_lowercase().contains(&q) || a.id.to_lowercase().contains(&q))
+                                                            .collect()
                                                     } else {
-                                                        server.scene.keyboard.deactivate();
-                                                        search_active = false;
+                                                        all_managed_apps.iter().collect()
+                                                    };
+
+                                                    if let Some(target_app) = current_apps.get(idx) {
+                                                        let app_to_launch = target_app.name.clone();
+                                                        let app_exec = target_app.exec.clone();
+
+                                                        active_app = Some(app_to_launch.clone());
+                                                        if app_to_launch == "Terminal" {
+                                                            server.scene.keyboard.activate();
+                                                        } else {
+                                                            server.scene.keyboard.deactivate();
+                                                            search_active = false;
+                                                        }
+
+                                                        if !app_exec.is_empty() {
+                                                            launch_desktop_app(&app_exec, &socket_dir);
+                                                        }
                                                     }
                                                 } else if y >= (h - 150.0) && y <= (h - 35.0) {
                                                     // Hotseat dock icons
@@ -646,6 +837,13 @@ fn run_daemon() {
                                                         } else {
                                                             server.scene.keyboard.deactivate();
                                                             search_active = false;
+                                                        }
+                                                        if app == "Browser" {
+                                                            if let Some(b_app) = all_managed_apps.iter().find(|a| a.name == "Browser" || a.name == "Firefox") {
+                                                                if !b_app.exec.is_empty() {
+                                                                    launch_desktop_app(&b_app.exec, &socket_dir);
+                                                                }
+                                                            }
                                                         }
                                                     }
                                                 } else if y >= (h - 30.0) {
@@ -958,6 +1156,32 @@ fn run_daemon() {
                     })
                     .collect();
 
+                if last_catalogue_scan.elapsed() >= catalogue_scan_interval {
+                    last_catalogue_scan = Instant::now();
+                    desktop_catalogue.scan_system_directories();
+                    all_managed_apps = build_all_apps(&desktop_catalogue);
+                }
+
+                let visible_apps: Vec<&ManagedApp> = if search_active && !search_query.is_empty() {
+                    let q = search_query.to_lowercase();
+                    all_managed_apps
+                        .iter()
+                        .filter(|a| a.name.to_lowercase().contains(&q) || a.id.to_lowercase().contains(&q))
+                        .collect()
+                } else {
+                    all_managed_apps.iter().collect()
+                };
+
+                let grid_items: Vec<AppGridItem> = visible_apps
+                    .iter()
+                    .map(|a| AppGridItem {
+                        id: &a.id,
+                        name: &a.name,
+                        color: a.color,
+                        glyph: &a.glyph,
+                    })
+                    .collect();
+
                 let drm_state = DrmInteractiveState {
                     time_str: t_str,
                     is_locked: server.scene.mode == utim_core::compositor::scene::ShellMode::LockScreen,
@@ -974,6 +1198,7 @@ fn run_daemon() {
                     terminal_running: active_tab.is_running(),
                     terminal_tabs: &tab_infos,
                     terminal_active_tab: active_tab_idx,
+                    grid_apps: &grid_items,
                 };
                 drm.render_interactive_ui(&drm_state);
                 drm.flush();
@@ -2130,5 +2355,77 @@ mod tests {
         assert_eq!(&t_str[2..3], ":");
         assert!(t_str[..2].chars().all(|c| c.is_ascii_digit()));
         assert!(t_str[3..].chars().all(|c| c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn test_build_all_apps_with_firefox() {
+        let mut catalogue = DesktopCatalogue::new();
+        let ff_entry = DesktopApp {
+            id: "firefox".to_string(),
+            name: "Firefox Web Browser".to_string(),
+            exec: "/usr/lib/firefox/firefox %u".to_string(),
+            icon: "firefox".to_string(),
+            categories: vec!["Network".to_string(), "WebBrowser".to_string()],
+            no_display: false,
+            terminal: false,
+            keywords: vec!["web".to_string(), "browser".to_string()],
+        };
+        catalogue.add_app(ff_entry);
+
+        let apps = build_all_apps(&catalogue);
+        // Base apps count is 12 + Firefox = 13
+        assert!(apps.len() >= 13);
+
+        // Check that "Firefox" app was added
+        let ff_app = apps.iter().find(|a| a.name == "Firefox");
+        assert!(ff_app.is_some(), "Firefox must appear on the home screen when installed");
+        let ff = ff_app.unwrap();
+        assert_eq!(ff.color, 0xFFFF5722);
+        assert_eq!(ff.glyph, "F");
+        assert_eq!(ff.exec, "/usr/lib/firefox/firefox");
+
+        // Check that the Browser shortcut is wired to Firefox
+        let browser_app = apps.iter().find(|a| a.name == "Browser").unwrap();
+        assert_eq!(browser_app.exec, "/usr/lib/firefox/firefox");
+    }
+
+    #[test]
+    fn test_build_all_apps_with_third_party() {
+        let mut catalogue = DesktopCatalogue::new();
+        let vlc = DesktopApp {
+            id: "vlc".to_string(),
+            name: "VLC media player".to_string(),
+            exec: "/usr/bin/vlc".to_string(),
+            icon: "vlc".to_string(),
+            categories: vec!["AudioVideo".to_string()],
+            no_display: false,
+            terminal: false,
+            keywords: vec![],
+        };
+        let calc = DesktopApp {
+            id: "calculator".to_string(),
+            name: "Calculator".to_string(),
+            exec: "gnome-calculator".to_string(),
+            icon: "calculator".to_string(),
+            categories: vec!["Utility".to_string()],
+            no_display: false,
+            terminal: false,
+            keywords: vec![],
+        };
+        catalogue.add_app(vlc);
+        catalogue.add_app(calc);
+
+        let apps = build_all_apps(&catalogue);
+        // Base 12 + 2 installed apps = 14
+        assert_eq!(apps.len(), 14);
+        assert!(apps.iter().any(|a| a.id == "vlc"));
+        assert!(apps.iter().any(|a| a.id == "calculator"));
+    }
+
+    #[test]
+    fn test_get_app_color_deterministic() {
+        let c1 = get_app_color("firefox");
+        let c2 = get_app_color("firefox");
+        assert_eq!(c1, c2);
     }
 }
