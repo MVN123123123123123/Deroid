@@ -141,9 +141,15 @@ EOF
 deb http://deb.debian.org/debian/ sid main contrib non-free non-free-firmware
 EOF
 
-    # Configure APT Pinning
+    # Configure APT Pinning (Block systemd completely and prioritize Treble packages)
+    cat << 'EOF' > "${ROOTFS_DIR}/etc/apt/preferences.d/00-no-systemd"
+Package: systemd systemd-sysv systemd-boot systemd-timesyncd systemd-resolved
+Pin: release *
+Pin-Priority: -1
+EOF
+
     cat << 'EOF' > "${ROOTFS_DIR}/etc/apt/preferences.d/utim-pinning"
-Package: utim-init utlc libhybris* mesa-turnip* spa-droid*
+Package: utim-init utim-init-dummy utlc libhybris* mesa-turnip* spa-droid*
 Pin: release o=UniversalTreble
 Pin-Priority: 1001
 EOF
@@ -186,6 +192,21 @@ EOF
     cp "${WORKSPACE_ROOT}/target/aarch64-unknown-linux-gnu/release/utim-graphics-check" "${ROOTFS_DIR}/usr/bin/utim-graphics-check"
     cp "${WORKSPACE_ROOT}/target/aarch64-unknown-linux-gnu/release/utlc" "${ROOTFS_DIR}/usr/bin/utlc"
 
+    # Install systemd helper shims (tmpfiles, sysusers, notify, escape)
+    if [[ -d "${SCRIPT_DIR}/shims" ]]; then
+        cp "${SCRIPT_DIR}/shims/systemd-tmpfiles" "${ROOTFS_DIR}/usr/bin/systemd-tmpfiles"
+        cp "${SCRIPT_DIR}/shims/systemd-sysusers" "${ROOTFS_DIR}/usr/bin/systemd-sysusers"
+        cp "${SCRIPT_DIR}/shims/systemd-notify" "${ROOTFS_DIR}/usr/bin/systemd-notify"
+        cp "${SCRIPT_DIR}/shims/systemd-escape" "${ROOTFS_DIR}/usr/bin/systemd-escape"
+        chmod 755 "${ROOTFS_DIR}/usr/bin/systemd-"*
+        if [[ -d "${ROOTFS_DIR}/bin" && ! -L "${ROOTFS_DIR}/bin" ]]; then
+            ln -sf "/usr/bin/systemd-tmpfiles" "${ROOTFS_DIR}/bin/systemd-tmpfiles"
+            ln -sf "/usr/bin/systemd-sysusers" "${ROOTFS_DIR}/bin/systemd-sysusers"
+            ln -sf "/usr/bin/systemd-notify" "${ROOTFS_DIR}/bin/systemd-notify"
+            ln -sf "/usr/bin/systemd-escape" "${ROOTFS_DIR}/bin/systemd-escape"
+        fi
+    fi
+
     # Install and enable UTLC systemd service
     if [[ -f "${WORKSPACE_ROOT}/utlc.service" ]]; then
         cp "${WORKSPACE_ROOT}/utlc.service" "${ROOTFS_DIR}/usr/lib/systemd/system/utlc.service"
@@ -197,6 +218,11 @@ EOF
     cp "${WORKSPACE_ROOT}/dist/"*.deb "${ROOTFS_DIR}/tmp/debs/"
     mkdir -p "${ROOTFS_DIR}/lib/modules"
     cp -a "${WORKSPACE_ROOT}/dist/modules/"*.ko "${ROOTFS_DIR}/lib/modules/" 2>/dev/null || true
+
+    # Populate dpkg status database with all base debs and UTIM packages
+    if [[ -f "${SCRIPT_DIR}/populate_dpkg_status.py" ]]; then
+        python3 "${SCRIPT_DIR}/populate_dpkg_status.py" "${ROOTFS_DIR}" || true
+    fi
 
     # Generate initial graphics environment
     mkdir -p "${ROOTFS_DIR}/etc/environment.d" "${ROOTFS_DIR}/run/utim"
@@ -242,8 +268,14 @@ cat << 'EOF' > "${ROOTFS_DIR}/etc/apt/sources.list"
 deb http://deb.debian.org/debian/ sid main contrib non-free non-free-firmware
 EOF
 
-cat << 'EOF' > "${ROOTFS_DIR}/etc/apt/preferences.d/utim-pinning"
-Package: utim-init libhybris* mesa-turnip* spa-droid*
+    cat << 'EOF' > "${ROOTFS_DIR}/etc/apt/preferences.d/00-no-systemd"
+Package: systemd systemd-sysv systemd-boot systemd-timesyncd systemd-resolved
+Pin: release *
+Pin-Priority: -1
+EOF
+
+    cat << 'EOF' > "${ROOTFS_DIR}/etc/apt/preferences.d/utim-pinning"
+Package: utim-init utim-init-dummy utlc libhybris* mesa-turnip* spa-droid*
 Pin: release o=UniversalTreble
 Pin-Priority: 1001
 EOF
@@ -275,6 +307,21 @@ ln -sf "/usr/bin/utim" "${ROOTFS_DIR}/init"
     cp "${WORKSPACE_ROOT}/target/aarch64-unknown-linux-gnu/release/deb-systemd-invoke" "${ROOTFS_DIR}/usr/bin/deb-systemd-invoke"
     cp "${WORKSPACE_ROOT}/target/aarch64-unknown-linux-gnu/release/utim-graphics-check" "${ROOTFS_DIR}/usr/bin/utim-graphics-check"
     cp "${WORKSPACE_ROOT}/target/aarch64-unknown-linux-gnu/release/utlc" "${ROOTFS_DIR}/usr/bin/utlc"
+
+    # Install systemd helper shims (tmpfiles, sysusers, notify, escape)
+    if [[ -d "${SCRIPT_DIR}/shims" ]]; then
+        cp "${SCRIPT_DIR}/shims/systemd-tmpfiles" "${ROOTFS_DIR}/usr/bin/systemd-tmpfiles"
+        cp "${SCRIPT_DIR}/shims/systemd-sysusers" "${ROOTFS_DIR}/usr/bin/systemd-sysusers"
+        cp "${SCRIPT_DIR}/shims/systemd-notify" "${ROOTFS_DIR}/usr/bin/systemd-notify"
+        cp "${SCRIPT_DIR}/shims/systemd-escape" "${ROOTFS_DIR}/usr/bin/systemd-escape"
+        chmod 755 "${ROOTFS_DIR}/usr/bin/systemd-"*
+        if [[ -d "${ROOTFS_DIR}/bin" && ! -L "${ROOTFS_DIR}/bin" ]]; then
+            ln -sf "/usr/bin/systemd-tmpfiles" "${ROOTFS_DIR}/bin/systemd-tmpfiles"
+            ln -sf "/usr/bin/systemd-sysusers" "${ROOTFS_DIR}/bin/systemd-sysusers"
+            ln -sf "/usr/bin/systemd-notify" "${ROOTFS_DIR}/bin/systemd-notify"
+            ln -sf "/usr/bin/systemd-escape" "${ROOTFS_DIR}/bin/systemd-escape"
+        fi
+    fi
 
     mkdir -p "${ROOTFS_DIR}/usr/lib/systemd/system"
     mkdir -p "${ROOTFS_DIR}/etc/systemd/system/graphical.target.wants"

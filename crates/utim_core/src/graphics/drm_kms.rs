@@ -381,7 +381,15 @@ impl DrmKmsDevice {
     }
 }
 
-#[derive(Debug, Clone)]
+/// Lightweight summary of a terminal tab for zero-copy presentation
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalTabInfo<'a> {
+    pub id: usize,
+    pub title: &'a str,
+    pub is_running: bool,
+    pub is_active: bool,
+}
+
 pub struct DrmInteractiveState<'a> {
     pub time_str: &'a str,
     pub is_locked: bool,
@@ -395,6 +403,9 @@ pub struct DrmInteractiveState<'a> {
     pub active_app: Option<&'a str>,
     pub terminal_lines: &'a [String],
     pub terminal_input: &'a str,
+    pub terminal_running: bool,
+    pub terminal_tabs: &'a [TerminalTabInfo<'a>],
+    pub terminal_active_tab: usize,
 }
 
 impl<'a> Default for DrmInteractiveState<'a> {
@@ -412,6 +423,9 @@ impl<'a> Default for DrmInteractiveState<'a> {
             active_app: None,
             terminal_lines: &[],
             terminal_input: "",
+            terminal_running: false,
+            terminal_tabs: &[],
+            terminal_active_tab: 0,
         }
     }
 }
@@ -596,15 +610,75 @@ impl DrmKmsDevice {
             draw_rounded_rect(buf, stride, w, h, 16, content_y, w - 32, content_h, 18, 0xFF0A0E17);
 
             if app_name == "Terminal" {
-                // Interactive Linux Shell Terminal Window with Scale 3 Monospace Font
-                let mut line_y = content_y + 24;
+                // Interactive Linux Shell Terminal Window with Tabbed Multi-Terminal Bar
+                let tab_bar_y = content_y + 12;
+                let tab_bar_h = 42;
+
+                // Render tabs if available
+                let default_single_tab = [TerminalTabInfo {
+                    id: 1,
+                    title: "Tab 1: bash",
+                    is_running: state.terminal_running,
+                    is_active: true,
+                }];
+                let tabs = if !state.terminal_tabs.is_empty() {
+                    state.terminal_tabs
+                } else {
+                    &default_single_tab[..]
+                };
+
+                let start_x = 36;
+                let tab_w = 200;
+                let spacing = 10;
+
+                for (i, tab) in tabs.iter().enumerate().take(4) {
+                    let tab_x = start_x + i * (tab_w + spacing);
+                    let is_active = tab.is_active || (tabs.len() == 1 && i == 0);
+
+                    // Tab background: vibrant sky highlight for active tab, subtle slate for inactive
+                    let bg_color = if is_active {
+                        0xFF0284C7 // Sky-600
+                    } else {
+                        0xFF1E293B // Slate-800
+                    };
+                    draw_rounded_rect(buf, stride, w, h, tab_x, tab_bar_y, tab_w, tab_bar_h, 8, bg_color);
+
+                    // Running indicator dot
+                    let text_offset_x = if tab.is_running {
+                        draw_rounded_rect(buf, stride, w, h, tab_x + 10, tab_bar_y + 16, 10, 10, 5, 0xFF10B981); // Emerald dot
+                        tab_x + 26
+                    } else {
+                        tab_x + 12
+                    };
+
+                    // Tab title (Scale 2)
+                    let text_color = if is_active { 0xFFFFFFFF } else { 0xFF94A3B8 };
+                    draw_text(buf, stride, w, h, text_offset_x, tab_bar_y + 12, tab.title, text_color, 2);
+
+                    // Close indicator 'x' on active tab when multiple tabs open
+                    if is_active && tabs.len() > 1 {
+                        draw_text(buf, stride, w, h, tab_x + tab_w - 20, tab_bar_y + 12, "x", 0xFFE2E8F0, 2);
+                    }
+                }
+
+                // Add Tab button [+] if less than 4 tabs
+                if tabs.len() < 4 {
+                    let plus_x = start_x + tabs.len() * (tab_w + spacing);
+                    draw_rounded_rect(buf, stride, w, h, plus_x, tab_bar_y, 56, tab_bar_h, 8, 0xFF334155);
+                    draw_text_centered(buf, stride, w, h, plus_x + 28, tab_bar_y + 10, "+", 0xFF38BDF8, 3);
+                }
+
+                // Divider line below tab bar
+                draw_rect(buf, stride, w, h, 24, tab_bar_y + tab_bar_h + 6, w - 48, 2, 0xFF1E293B);
+
+                let mut line_y = tab_bar_y + tab_bar_h + 16;
                 draw_text(buf, stride, w, h, 36, line_y, "Universal Treble Linux 1.0 (Debian Sid ARM64)", 0xFF38BDF8, 3);
                 line_y += 38;
                 draw_text(buf, stride, w, h, 36, line_y, "Linux 6.1.23-android14-4-00257 (Android GKI)", 0xFF94A3B8, 2);
                 line_y += 26;
                 draw_text(buf, stride, w, h, 36, line_y, "UTIM PID 1 init | UTLC Wayland Compositor", 0xFF94A3B8, 2);
                 line_y += 26;
-                draw_text(buf, stride, w, h, 36, line_y, "Debian Sid ARM64 GNU/Linux - APT Package Manager Active", 0xFF64748B, 2);
+                draw_text(buf, stride, w, h, 36, line_y, "Debian Sid ARM64 GNU/Linux - Multi-Tab Terminal Active", 0xFF64748B, 2);
                 line_y += 38;
 
                 // Terminal text scaling (Scale 3 = 18x21px font cell, 34px line height)
@@ -629,11 +703,15 @@ impl DrmKmsDevice {
 
                 // Active prompt line with typed characters and blinking cursor (Scale 3)
                 if line_y + line_h <= content_y + content_h {
-                    draw_text(buf, stride, w, h, 36, line_y, "root@treble-gsi:~# ", 0xFF10B981, 3);
-                    let prompt_w = 19 * 18;
-                    draw_text(buf, stride, w, h, 36 + prompt_w, line_y, state.terminal_input, 0xFFFFFFFF, 3);
-                    let cursor_x = 36 + prompt_w + state.terminal_input.len() * 18;
-                    draw_rect(buf, stride, w, h, cursor_x, line_y, 14, 22, 0xFF10B981);
+                    if state.terminal_running {
+                        draw_text(buf, stride, w, h, 36, line_y, "[running... (Ctrl+C to stop)]", 0xFFF59E0B, 3);
+                    } else {
+                        draw_text(buf, stride, w, h, 36, line_y, "root@treble-gsi:~# ", 0xFF10B981, 3);
+                        let prompt_w = 19 * 18;
+                        draw_text(buf, stride, w, h, 36 + prompt_w, line_y, state.terminal_input, 0xFFFFFFFF, 3);
+                        let cursor_x = 36 + prompt_w + state.terminal_input.len() * 18;
+                        draw_rect(buf, stride, w, h, cursor_x, line_y, 14, 22, 0xFF10B981);
+                    }
                 }
             } else if app_name == "Settings" {
                 // Interactive Mobile Settings Page
@@ -946,6 +1024,17 @@ fn interactive_state_hash(state: &DrmInteractiveState) -> u64 {
     }
     for b in state.terminal_input.bytes() {
         mix(b);
+    }
+    mix(state.terminal_running as u8);
+    mix(state.terminal_active_tab as u8);
+    mix(state.terminal_tabs.len() as u8);
+    for tab in state.terminal_tabs {
+        mix(tab.id as u8);
+        mix(tab.is_running as u8);
+        mix(tab.is_active as u8);
+        for b in tab.title.bytes() {
+            mix(b);
+        }
     }
     for b in state.terminal_lines.len().to_ne_bytes() {
         mix(b);

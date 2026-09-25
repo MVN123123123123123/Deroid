@@ -13,7 +13,7 @@ pub use composer::{
     CompositionType, DisplayConfig, HwcComposer, HwcError, HwcLayer, HwcVersion, PresentFences,
     Rect, Transform,
 };
-pub use drm_kms::{DrmInteractiveState, DrmKmsDevice};
+pub use drm_kms::{DrmInteractiveState, DrmKmsDevice, TerminalTabInfo};
 pub use elf_align::{
     inspect_elf_bytes, inspect_elf_file, verify_64k_alignment, ElfAlignmentReport,
 };

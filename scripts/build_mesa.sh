@@ -38,7 +38,8 @@ Version: 24.2.0-1
 Section: libs
 Priority: optional
 Architecture: arm64
-Depends: libc6 (>= 2.34), libdrm2 (>= 2.4.115)
+Depends: libc6 (>= 2.34)
+Recommends: libdrm2 (>= 2.4.115)
 Provides: mesa-vulkan-drivers, vulkan-icd
 Maintainer: Universal Treble Linux <developer@treble-linux.org>
 Description: Mesa Turnip Vulkan driver with direct Qualcomm KGSL backend

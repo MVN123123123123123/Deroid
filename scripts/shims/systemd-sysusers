@@ -1,0 +1,182 @@
+#!/bin/sh
+# ==============================================================================
+# systemd-sysusers - Minimal POSIX implementation for UTIM / Treble Linux
+# Handles Debian maintainer script sysusers creation
+# ==============================================================================
+set -e
+
+ROOT=""
+FILES=""
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --root=*)
+            ROOT="${1#--root=}"
+            shift
+            ;;
+        --root)
+            ROOT="$2"
+            shift 2
+            ;;
+        --version|-v)
+            echo "systemd 262 (systemd-sysusers utim-compat)"
+            exit 0
+            ;;
+        --help|-h)
+            echo "Usage: systemd-sysusers [--root=PATH] [FILES...]"
+            exit 0
+            ;;
+        --replace=*|--inline|--cat-config|-*)
+            shift
+            ;;
+        *)
+            FILES="${FILES:+$FILES }$1"
+            shift
+            ;;
+    esac
+done
+
+PASSWD_FILE="${ROOT}/etc/passwd"
+GROUP_FILE="${ROOT}/etc/group"
+
+user_exists() {
+    u_name="$1"
+    if [ -f "$PASSWD_FILE" ]; then
+        grep -q "^${u_name}:" "$PASSWD_FILE" 2>/dev/null
+    elif command -v getent >/dev/null 2>&1; then
+        getent passwd "$u_name" >/dev/null 2>&1
+    else
+        false
+    fi
+}
+
+group_exists() {
+    g_name="$1"
+    if [ -f "$GROUP_FILE" ]; then
+        grep -q "^${g_name}:" "$GROUP_FILE" 2>/dev/null
+    elif command -v getent >/dev/null 2>&1; then
+        getent group "$g_name" >/dev/null 2>&1
+    else
+        false
+    fi
+}
+
+create_group() {
+    g_name="$1"
+    g_id="$2"
+    if ! group_exists "$g_name"; then
+        if [ -n "$ROOT" ] && [ -f "$GROUP_FILE" ]; then
+            gid="${g_id:-}"
+            [ "$gid" = "-" ] && gid=""
+            if [ -z "$gid" ]; then
+                gid=$(awk -F: '$3 >= 100 && $3 < 1000 {if ($3 > max) max=$3} END {print (max ? max+1 : 105)}' "$GROUP_FILE" 2>/dev/null || echo 105)
+            fi
+            echo "${g_name}:x:${gid}:" >> "$GROUP_FILE"
+        elif command -v groupadd >/dev/null 2>&1; then
+            groupadd -r ${g_id:+${g_id#-}} "$g_name" 2>/dev/null || true
+        elif command -v addgroup >/dev/null 2>&1; then
+            addgroup --system "$g_name" 2>/dev/null || true
+        elif [ -f "$GROUP_FILE" ]; then
+            echo "${g_name}:x:105:" >> "$GROUP_FILE"
+        fi
+    fi
+}
+
+create_user() {
+    u_name="$1"
+    u_id="$2"
+    u_desc="$3"
+    u_home="$4"
+    u_shell="$5"
+
+    [ "$u_id" = "-" ] && u_id=""
+    [ "$u_desc" = "-" ] && u_desc=""
+    [ "$u_home" = "-" ] && u_home="/nonexistent"
+    [ "$u_shell" = "-" ] && u_shell="/usr/sbin/nologin"
+
+    if ! user_exists "$u_name"; then
+        create_group "$u_name" "$u_id"
+        if [ -n "$ROOT" ] && [ -f "$PASSWD_FILE" ]; then
+            uid="${u_id:-}"
+            [ -z "$uid" ] && uid=$(awk -F: '$3 >= 100 && $3 < 1000 {if ($3 > max) max=$3} END {print (max ? max+1 : 105)}' "$PASSWD_FILE" 2>/dev/null || echo 105)
+            echo "${u_name}:x:${uid}:${uid}:${u_desc}:${u_home}:${u_shell}" >> "$PASSWD_FILE"
+        elif command -v useradd >/dev/null 2>&1; then
+            useradd -r -M ${u_id:+-u "$u_id"} ${u_home:+-d "$u_home"} ${u_shell:+-s "$u_shell"} ${u_desc:+-c "$u_desc"} -g "$u_name" "$u_name" 2>/dev/null || true
+        elif command -v adduser >/dev/null 2>&1; then
+            adduser --system --no-create-home --ingroup "$u_name" "$u_name" 2>/dev/null || true
+        elif [ -f "$PASSWD_FILE" ]; then
+            echo "${u_name}:x:105:105:${u_desc}:${u_home}:${u_shell}" >> "$PASSWD_FILE"
+        fi
+    fi
+}
+
+process_file() {
+    target_file="$1"
+    [ -f "$target_file" ] || return 0
+
+    while IFS= read -r raw_line || [ -n "$raw_line" ]; do
+        line="$(echo "$raw_line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+        [ -z "$line" ] && continue
+        case "$line" in
+            \#*) continue ;;
+        esac
+
+        eval "set -- $line" 2>/dev/null || set -- $line
+        type="$1"
+        name="$2"
+        id="$3"
+        desc="$4"
+        home="$5"
+        shell="$6"
+
+        [ -z "$type" ] || [ -z "$name" ] && continue
+
+        case "$type" in
+            u)
+                create_user "$name" "$id" "$desc" "$home" "$shell"
+                ;;
+            g)
+                create_group "$name" "$id"
+                ;;
+            m)
+                user="$name"
+                group="$id"
+                if [ -n "$ROOT" ] && [ -f "$GROUP_FILE" ]; then
+                    sed -i -e "/^${group}:/ s/$/,${user}/" -e "/^${group}:/ s/:,/:/" "$GROUP_FILE" 2>/dev/null || true
+                elif command -v usermod >/dev/null 2>&1; then
+                    usermod -aG "$group" "$user" 2>/dev/null || true
+                elif command -v adduser >/dev/null 2>&1; then
+                    adduser "$user" "$group" 2>/dev/null || true
+                fi
+                ;;
+        esac
+    done < "$target_file"
+}
+
+if [ -n "$FILES" ]; then
+    for item in $FILES; do
+        if [ -f "$item" ]; then
+            process_file "$item"
+        else
+            for search_dir in "${ROOT}/usr/lib/sysusers.d" "${ROOT}/etc/sysusers.d" "/usr/lib/sysusers.d" "/etc/sysusers.d"; do
+                if [ -f "${search_dir}/${item}" ]; then
+                    process_file "${search_dir}/${item}"
+                    break
+                elif [ -f "${search_dir}/${item}.conf" ]; then
+                    process_file "${search_dir}/${item}.conf"
+                    break
+                fi
+            done
+        fi
+    done
+else
+    for dir in "${ROOT}/usr/lib/sysusers.d" "${ROOT}/etc/sysusers.d"; do
+        if [ -d "$dir" ]; then
+            for f in "$dir"/*.conf; do
+                [ -f "$f" ] && process_file "$f"
+            done
+        fi
+    done
+fi
+
+exit 0

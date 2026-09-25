@@ -59,7 +59,8 @@ Section: x11
 Priority: standard
 Architecture: arm64
 Maintainer: Universal Treble Linux <developer@treble-linux.org>
-Depends: libc6 (>= 2.34), libhybris-hwcomposer (>= 1.0.0) | android-framework, seatd
+Depends: libc6 (>= 2.34), libhybris-hwcomposer (>= 1.0.0) | android-framework
+Recommends: seatd
 Description: Universal Treble Launcher and Compositor for Android GSI
  UTLC is a unified, single-process, mobile-first Wayland compositor and
  Android-style launcher written in bare-metal Rust. It integrates direct

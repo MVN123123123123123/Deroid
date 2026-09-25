@@ -23,24 +23,42 @@ DO_REBUILD=0
 FULL_DEBIAN=0
 ENABLE_NET=1
 
+DEFAULT_LOG_PATH="${WORKSPACE_ROOT}/dist/qemu_terminal.log"
+LOG_PATH="${DEFAULT_LOG_PATH}"
+PID_FILE="${WORKSPACE_ROOT}/dist/qemu.pid"
+ENABLE_LOG=1
+EXPLICIT_LOG=0
+PULL_LOG_MODE=0
+PULL_DEST=""
+FOLLOW_LOG=0
+
 usage() {
     cat << EOF
 Usage: $0 [options]
 
 All-in-One Packaging & Testing Options:
-  -b, --build       Pack and build all components (Rust binaries, rootfs, disk image, initramfs) before boot
-  --rebuild         Clean old artifacts and rebuild everything fresh from scratch
-  --full-debian     Bootstrap full Debian Sid ARM64 rootfs (requires sudo debootstrap for real apt/dpkg)
-  --no-net          Disable virtual network interface (virtio-net-pci)
+  -b, --build           Pack and build all components (Rust binaries, rootfs, disk image, initramfs) before boot
+  --rebuild             Clean old artifacts and rebuild everything fresh from scratch
+  --full-debian         Bootstrap full Debian Sid ARM64 rootfs (requires sudo debootstrap for real apt/dpkg)
+  --no-net              Disable virtual network interface (virtio-net-pci)
 
 QEMU & Runtime Options:
-  --kernel <path>   Kernel binary (default: ${KERNEL_PATH})
-  --initrd <path>   Initramfs archive (default: ${INITRD_PATH})
-  --drive <path>    Raw rootfs disk image (default: ${DRIVE_PATH})
-  --test            Run in automated test mode (verifies UTIM boot and exits)
-  --timeout <sec>   Timeout in seconds for test mode (default: ${TIMEOUT_SECS})
-  --gui             Enable graphical display with virtio-gpu (default: -nographic)
-  -h, --help        Show this help message
+  --kernel <path>       Kernel binary (default: ${KERNEL_PATH})
+  --initrd <path>       Initramfs archive (default: ${INITRD_PATH})
+  --drive <path>        Raw rootfs disk image (default: ${DRIVE_PATH})
+  --test                Run in automated test mode (verifies UTIM boot and exits)
+  --timeout <sec>       Timeout in seconds for test mode (default: ${TIMEOUT_SECS})
+  --gui                 Enable graphical display with virtio-gpu (default: -nographic)
+
+Terminal & Logging Options:
+  -l, --log [path]      Pull and save device terminal (serial console) log to file
+                        (default: ${DEFAULT_LOG_PATH})
+  --log-file <path>     Alias for --log <path>
+  --serial-log [path]   Alias for --log [path]
+  --pull-log [path]     Pull terminal log from running device (or last session) to stdout or file
+  -f, --follow          Follow terminal log stream in real time (used with --pull-log)
+  --no-log              Disable device terminal logging to file
+  -h, --help            Show this help message
 EOF
     exit 1
 }
@@ -92,6 +110,69 @@ while [[ $# -gt 0 ]]; do
             GRAPHIC_MODE=1
             shift
             ;;
+        -l|--log|--log-file)
+            ENABLE_LOG=1
+            EXPLICIT_LOG=1
+            if [[ $# -gt 1 && ! "$2" =~ ^- ]]; then
+                LOG_PATH="$2"
+                shift 2
+            else
+                LOG_PATH="${DEFAULT_LOG_PATH}"
+                shift
+            fi
+            ;;
+        --log=*)
+            ENABLE_LOG=1
+            EXPLICIT_LOG=1
+            LOG_PATH="${1#*=}"
+            shift
+            ;;
+        --log-file=*)
+            ENABLE_LOG=1
+            EXPLICIT_LOG=1
+            LOG_PATH="${1#*=}"
+            shift
+            ;;
+        --serial-log)
+            ENABLE_LOG=1
+            EXPLICIT_LOG=1
+            if [[ $# -gt 1 && ! "$2" =~ ^- ]]; then
+                LOG_PATH="$2"
+                shift 2
+            else
+                LOG_PATH="${DEFAULT_LOG_PATH}"
+                shift
+            fi
+            ;;
+        --serial-log=*)
+            ENABLE_LOG=1
+            EXPLICIT_LOG=1
+            LOG_PATH="${1#*=}"
+            shift
+            ;;
+        --pull-log|--pull-logs)
+            PULL_LOG_MODE=1
+            if [[ $# -gt 1 && ! "$2" =~ ^- ]]; then
+                PULL_DEST="$2"
+                shift 2
+            else
+                PULL_DEST=""
+                shift
+            fi
+            ;;
+        --pull-log=*)
+            PULL_LOG_MODE=1
+            PULL_DEST="${1#*=}"
+            shift
+            ;;
+        -f|--follow)
+            FOLLOW_LOG=1
+            shift
+            ;;
+        --no-log)
+            ENABLE_LOG=0
+            shift
+            ;;
         -h|--help)
             usage
             ;;
@@ -101,6 +182,62 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+if [[ "${PULL_LOG_MODE}" == "1" ]]; then
+    SRC_LOG="${LOG_PATH}"
+
+    QEMU_RUNNING=0
+    RUNNING_PID=""
+    if [[ -f "${PID_FILE}" ]]; then
+        PID_VAL=$(cat "${PID_FILE}" 2>/dev/null || true)
+        if [[ -n "${PID_VAL}" ]] && kill -0 "${PID_VAL}" 2>/dev/null; then
+            QEMU_RUNNING=1
+            RUNNING_PID="${PID_VAL}"
+        else
+            rm -f "${PID_FILE}" 2>/dev/null || true
+        fi
+    fi
+    if [[ "${QEMU_RUNNING}" == "0" ]]; then
+        PID_VAL=$(pgrep -f "qemu-system-aarch64.*kernel-ranchu" 2>/dev/null | head -n 1 || true)
+        if [[ -n "${PID_VAL}" ]]; then
+            QEMU_RUNNING=1
+            RUNNING_PID="${PID_VAL}"
+        fi
+    fi
+
+    if [[ "${QEMU_RUNNING}" == "1" ]]; then
+        echo "[+] QEMU device is running (PID: ${RUNNING_PID})"
+    else
+        echo "[*] QEMU device is not currently running."
+    fi
+
+    if [[ ! -f "${SRC_LOG}" ]]; then
+        echo "[-] No terminal log found at: ${SRC_LOG}"
+        echo "    Tip: Start QEMU with --log (e.g. '$0 --gui --log') to capture terminal logs."
+        exit 1
+    fi
+
+    if [[ -n "${PULL_DEST}" ]]; then
+        mkdir -p "$(dirname "${PULL_DEST}")" 2>/dev/null || true
+        cp "${SRC_LOG}" "${PULL_DEST}"
+        LINE_COUNT=$(wc -l < "${PULL_DEST}")
+        echo "[+] Successfully pulled ${LINE_COUNT} lines from device terminal log to: ${PULL_DEST}"
+    else
+        if [[ "${FOLLOW_LOG}" == "1" ]]; then
+            echo "[*] Following terminal log of device (${SRC_LOG})... (Ctrl+C to stop)"
+            exec tail -f -n +1 "${SRC_LOG}"
+        else
+            echo "============================================================"
+            echo " [LOG] Device Terminal Log (${SRC_LOG})"
+            echo "============================================================"
+            cat "${SRC_LOG}"
+            echo "============================================================"
+            echo " [END] Pulled $(wc -l < "${SRC_LOG}") lines"
+            echo "============================================================"
+        fi
+    fi
+    exit 0
+fi
 
 if [[ ! -f "${KERNEL_PATH}" ]]; then
     echo "Error: Kernel not found at ${KERNEL_PATH}"
@@ -162,7 +299,7 @@ else
 fi
 
 # 2. Display configuration
-DISPLAY_OPTS=("-nographic")
+DISPLAY_OPTS=("-display" "none")
 if [[ "${GRAPHIC_MODE}" == "1" ]]; then
     DISPLAY_OPTS=(
         -device "virtio-gpu-pci,xres=1080,yres=2400"
@@ -183,6 +320,7 @@ if [[ "${ENABLE_NET}" == "1" ]]; then
 fi
 
 # 4. Assemble QEMU execution command
+mkdir -p "${WORKSPACE_ROOT}/dist"
 QEMU_CMD=(
     qemu-system-aarch64
     -M virt,gic-version=3
@@ -193,6 +331,7 @@ QEMU_CMD=(
     -initrd "${INITRD_PATH}"
     -drive "file=${DRIVE_PATH},if=virtio,format=raw"
     -append "console=ttyAMA0 root=/dev/vda rw init=/init loglevel=7 printk.devkmsg=on"
+    -pidfile "${PID_FILE}"
     "${DISPLAY_OPTS[@]}"
     "${NET_OPTS[@]}"
 )
@@ -240,5 +379,18 @@ if [[ "${TEST_MODE}" == "1" ]]; then
         exit 1
     fi
 else
-    exec "${QEMU_CMD[@]}" -serial mon:stdio
+    if [[ "${ENABLE_LOG}" == "1" ]]; then
+        mkdir -p "$(dirname "${LOG_PATH}")"
+        echo "============================================================"
+        echo " [*] Device Terminal Log Enabled:"
+        echo "     Host Logfile:   ${LOG_PATH}"
+        echo "     View real-time: ./scripts/run_qemu.sh --pull-log -f"
+        echo "     Inside VM:      /var/log/terminal.log"
+        echo "============================================================"
+        exec "${QEMU_CMD[@]}" \
+            -chardev "stdio,id=char0,mux=on,logfile=${LOG_PATH}" \
+            -serial "chardev:char0"
+    else
+        exec "${QEMU_CMD[@]}" -serial mon:stdio
+    fi
 fi

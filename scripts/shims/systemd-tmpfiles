@@ -1,0 +1,192 @@
+#!/bin/sh
+# ==============================================================================
+# systemd-tmpfiles - Minimal POSIX implementation for UTIM / Treble Linux
+# Handles Debian maintainer script tmpfiles creation (--create)
+# ==============================================================================
+set -e
+
+ROOT=""
+ACTION=""
+FILES=""
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --root=*)
+            ROOT="${1#--root=}"
+            shift
+            ;;
+        --root)
+            ROOT="$2"
+            shift 2
+            ;;
+        --create)
+            ACTION="create"
+            shift
+            ;;
+        --clean|--remove)
+            ACTION="clean"
+            shift
+            ;;
+        --version|-v)
+            echo "systemd 262 (systemd-tmpfiles utim-compat)"
+            exit 0
+            ;;
+        --help|-h)
+            echo "Usage: systemd-tmpfiles [--create|--clean|--remove] [--root=PATH] [FILES...]"
+            exit 0
+            ;;
+        --boot|--prefix=*|--user|--cat-config|--dry-run|-*)
+            shift
+            ;;
+        *)
+            FILES="${FILES:+$FILES }$1"
+            shift
+            ;;
+    esac
+done
+
+# If action is not create, nothing critical is needed for package install
+if [ "$ACTION" != "create" ]; then
+    exit 0
+fi
+
+# Ensure /etc/machine-id exists if queried
+MACHINE_ID_PATH="${ROOT}/etc/machine-id"
+if [ ! -f "$MACHINE_ID_PATH" ] && [ ! -L "$MACHINE_ID_PATH" ]; then
+    mkdir -p "$(dirname "$MACHINE_ID_PATH")" 2>/dev/null || true
+    if [ -f /proc/sys/kernel/random/uuid ]; then
+        tr -d '-' < /proc/sys/kernel/random/uuid 2>/dev/null | head -c 32 > "$MACHINE_ID_PATH" 2>/dev/null || true
+        echo "" >> "$MACHINE_ID_PATH" 2>/dev/null || true
+    elif command -v dbus-uuidgen >/dev/null 2>&1; then
+        dbus-uuidgen --ensure="$MACHINE_ID_PATH" 2>/dev/null || true
+    else
+        echo "00000000000000000000000000000001" > "$MACHINE_ID_PATH" 2>/dev/null || true
+    fi
+fi
+
+process_file() {
+    target_file="$1"
+    [ -f "$target_file" ] || return 0
+
+    while IFS= read -r raw_line || [ -n "$raw_line" ]; do
+        # Trim leading and trailing whitespace
+        line="$(echo "$raw_line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+        [ -z "$line" ] && continue
+        case "$line" in
+            \#*) continue ;;
+        esac
+
+        # Parse tmpfiles.d columns: Type Path Mode UID GID Age Argument...
+        f_type="" f_path="" f_mode="" f_uid="" f_gid="" f_age="" f_arg=""
+        set -- $line
+        f_type="$1"
+        f_path="$2"
+        f_mode="$3"
+        f_uid="$4"
+        f_gid="$5"
+        f_age="$6"
+        shift 6 2>/dev/null || shift $# 2>/dev/null || true
+        f_arg="$*"
+
+        [ -z "$f_type" ] || [ -z "$f_path" ] && continue
+
+        # Resolve destination path with ROOT prefix
+        rel_path="${f_path#/}"
+        dest="${ROOT:+${ROOT}/}${rel_path}"
+
+        case "$f_type" in
+            d|D|v|q|Q)
+                mkdir -p "$dest" 2>/dev/null || true
+                if [ -n "$f_mode" ] && [ "$f_mode" != "-" ]; then
+                    chmod "$f_mode" "$dest" 2>/dev/null || true
+                fi
+                if [ -n "$f_uid" ] && [ "$f_uid" != "-" ]; then
+                    chown "$f_uid${f_gid:+:$f_gid}" "$dest" 2>/dev/null || true
+                fi
+                ;;
+            f|F)
+                mkdir -p "$(dirname "$dest")" 2>/dev/null || true
+                if [ "$f_type" = "F" ]; then
+                    : > "$dest" 2>/dev/null || true
+                elif [ ! -e "$dest" ]; then
+                    touch "$dest" 2>/dev/null || true
+                fi
+                if [ -n "$f_arg" ] && [ "$f_arg" != "-" ]; then
+                    echo "$f_arg" > "$dest" 2>/dev/null || true
+                fi
+                if [ -n "$f_mode" ] && [ "$f_mode" != "-" ]; then
+                    chmod "$f_mode" "$dest" 2>/dev/null || true
+                fi
+                if [ -n "$f_uid" ] && [ "$f_uid" != "-" ]; then
+                    chown "$f_uid${f_gid:+:$f_gid}" "$dest" 2>/dev/null || true
+                fi
+                ;;
+            L|L+)
+                mkdir -p "$(dirname "$dest")" 2>/dev/null || true
+                if [ -n "$f_arg" ] && [ "$f_arg" != "-" ]; then
+                    if [ "$f_type" = "L+" ]; then
+                        rm -rf "$dest" 2>/dev/null || true
+                    fi
+                    if [ ! -e "$dest" ] && [ ! -L "$dest" ]; then
+                        ln -sf "$f_arg" "$dest" 2>/dev/null || true
+                    fi
+                fi
+                ;;
+            z|Z)
+                if [ -e "$dest" ]; then
+                    if [ -n "$f_mode" ] && [ "$f_mode" != "-" ]; then
+                        chmod "$f_mode" "$dest" 2>/dev/null || true
+                    fi
+                    if [ -n "$f_uid" ] && [ "$f_uid" != "-" ]; then
+                        chown "$f_uid${f_gid:+:$f_gid}" "$dest" 2>/dev/null || true
+                    fi
+                fi
+                ;;
+            *)
+                # Other types ignored safely
+                ;;
+        esac
+    done < "$target_file"
+}
+
+if [ -n "$FILES" ]; then
+    for item in $FILES; do
+        if [ -f "$item" ]; then
+            process_file "$item"
+        else
+            found=0
+            for search_dir in "${ROOT}/etc/tmpfiles.d" "${ROOT}/run/tmpfiles.d" "${ROOT}/usr/lib/tmpfiles.d" "${ROOT}/lib/tmpfiles.d"; do
+                if [ -f "${search_dir}/${item}" ]; then
+                    process_file "${search_dir}/${item}"
+                    found=1
+                    break
+                elif [ -f "${search_dir}/${item}.conf" ]; then
+                    process_file "${search_dir}/${item}.conf"
+                    found=1
+                    break
+                fi
+            done
+            if [ "$found" = "0" ]; then
+                for search_dir in "/etc/tmpfiles.d" "/run/tmpfiles.d" "/usr/lib/tmpfiles.d" "/lib/tmpfiles.d"; do
+                    if [ -f "${search_dir}/${item}" ]; then
+                        process_file "${search_dir}/${item}"
+                        break
+                    elif [ -f "${search_dir}/${item}.conf" ]; then
+                        process_file "${search_dir}/${item}.conf"
+                        break
+                    fi
+                done
+            fi
+        fi
+    done
+else
+    for dir in "${ROOT}/usr/lib/tmpfiles.d" "${ROOT}/lib/tmpfiles.d" "${ROOT}/run/tmpfiles.d" "${ROOT}/etc/tmpfiles.d"; do
+        if [ -d "$dir" ]; then
+            for f in "$dir"/*.conf; do
+                [ -f "$f" ] && process_file "$f"
+            done
+        fi
+    done
+fi
+
+exit 0

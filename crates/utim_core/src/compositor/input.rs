@@ -56,6 +56,7 @@ pub const KEY_I: u16 = 23;
 pub const KEY_O: u16 = 24;
 pub const KEY_P: u16 = 25;
 pub const KEY_ENTER: u16 = 28;
+pub const KEY_LEFTCTRL: u16 = 29;
 pub const KEY_A: u16 = 30;
 pub const KEY_S: u16 = 31;
 pub const KEY_D: u16 = 32;
@@ -77,6 +78,7 @@ pub const KEY_DOT: u16 = 52;
 pub const KEY_SLASH: u16 = 53;
 pub const KEY_RIGHTSHIFT: u16 = 54;
 pub const KEY_SPACE: u16 = 57;
+pub const KEY_RIGHTCTRL: u16 = 97;
 pub const KEY_UP: u16 = 103;
 pub const KEY_LEFT: u16 = 105;
 pub const KEY_RIGHT: u16 = 106;
@@ -113,7 +115,7 @@ pub enum InputDispatchResult {
     Touch(RawTouchEvent),
     Tap { x: f32, y: f32 },
     PointerMove { x: f32, y: f32 },
-    KeyPress { code: u16, ch: Option<char>, pressed: bool, repeat: bool },
+    KeyPress { code: u16, ch: Option<char>, pressed: bool, repeat: bool, ctrl: bool },
 }
 
 /// Zero-allocation evdev dispatcher and coordinate normalizer
@@ -130,6 +132,7 @@ pub struct InputDispatcher {
     pub touch_start_y: f32,
     pub touch_start_time: Instant,
     pub shift_active: bool,
+    pub ctrl_active: bool,
     touch_id_counter: i32,
     pending_abs_x: Option<f32>,
     pending_abs_y: Option<f32>,
@@ -150,6 +153,7 @@ impl InputDispatcher {
             touch_start_y: 0.0,
             touch_start_time: Instant::now(),
             shift_active: false,
+            ctrl_active: false,
             touch_id_counter: 1,
             pending_abs_x: None,
             pending_abs_y: None,
@@ -257,12 +261,16 @@ impl InputDispatcher {
                     if ev.code == KEY_LEFTSHIFT || ev.code == KEY_RIGHTSHIFT {
                         self.shift_active = pressed;
                     }
+                    if ev.code == KEY_LEFTCTRL || ev.code == KEY_RIGHTCTRL {
+                        self.ctrl_active = pressed;
+                    }
                     let ch = keycode_to_char(ev.code, self.shift_active);
                     InputDispatchResult::KeyPress {
                         code: ev.code,
                         ch,
                         pressed,
                         repeat,
+                        ctrl: self.ctrl_active,
                     }
                 }
             }
@@ -471,6 +479,7 @@ mod tests {
                 ch: Some('a'),
                 pressed: true,
                 repeat: false,
+                ctrl: false,
             }
         );
 
@@ -491,6 +500,45 @@ mod tests {
                 ch: Some('A'),
                 pressed: true,
                 repeat: false,
+                ctrl: false,
+            }
+        );
+
+        // Release Shift
+        let ev_shift_up = LinuxInputEvent {
+            time_sec: 0,
+            time_usec: 0,
+            type_: EV_KEY,
+            code: KEY_LEFTSHIFT,
+            value: 0,
+        };
+        dispatcher.process_event(&ev_shift_up);
+
+        // Test Ctrl + C
+        let ev_ctrl = LinuxInputEvent {
+            time_sec: 0,
+            time_usec: 0,
+            type_: EV_KEY,
+            code: KEY_LEFTCTRL,
+            value: 1,
+        };
+        dispatcher.process_event(&ev_ctrl);
+        let ev_c = LinuxInputEvent {
+            time_sec: 0,
+            time_usec: 0,
+            type_: EV_KEY,
+            code: KEY_C,
+            value: 1,
+        };
+        let res_ctrl_c = dispatcher.process_event(&ev_c);
+        assert_eq!(
+            res_ctrl_c,
+            InputDispatchResult::KeyPress {
+                code: KEY_C,
+                ch: Some('c'),
+                pressed: true,
+                repeat: false,
+                ctrl: true,
             }
         );
     }

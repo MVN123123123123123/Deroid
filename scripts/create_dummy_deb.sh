@@ -21,6 +21,22 @@ echo "[*] Constructing utim-init-dummy Debian package..."
 
 mkdir -p "${BUILD_DIR}/DEBIAN"
 mkdir -p "${BUILD_DIR}/usr/share/doc/utim-init-dummy"
+mkdir -p "${BUILD_DIR}/usr/bin"
+mkdir -p "${BUILD_DIR}/bin"
+
+# Install systemd helper shims
+if [[ -d "${SCRIPT_DIR}/shims" ]]; then
+    cp "${SCRIPT_DIR}/shims/systemd-tmpfiles" "${BUILD_DIR}/usr/bin/systemd-tmpfiles"
+    cp "${SCRIPT_DIR}/shims/systemd-sysusers" "${BUILD_DIR}/usr/bin/systemd-sysusers"
+    cp "${SCRIPT_DIR}/shims/systemd-notify" "${BUILD_DIR}/usr/bin/systemd-notify"
+    cp "${SCRIPT_DIR}/shims/systemd-escape" "${BUILD_DIR}/usr/bin/systemd-escape"
+    chmod 755 "${BUILD_DIR}/usr/bin/"*
+
+    ln -sf "/usr/bin/systemd-tmpfiles" "${BUILD_DIR}/bin/systemd-tmpfiles"
+    ln -sf "/usr/bin/systemd-sysusers" "${BUILD_DIR}/bin/systemd-sysusers"
+    ln -sf "/usr/bin/systemd-notify" "${BUILD_DIR}/bin/systemd-notify"
+    ln -sf "/usr/bin/systemd-escape" "${BUILD_DIR}/bin/systemd-escape"
+fi
 
 cat << 'EOF' > "${BUILD_DIR}/DEBIAN/control"
 Package: utim-init-dummy
@@ -28,9 +44,9 @@ Version: 1.0.0
 Section: admin
 Priority: required
 Architecture: all
-Provides: init, systemd-sysv, init-system-helpers, systemd
-Conflicts: sysvinit-core
-Replaces: systemd-sysv
+Provides: init, systemd-sysv, init-system-helpers, systemd, systemd-timesyncd, systemd-resolved, udev, systemd-tmpfiles, systemd-sysusers
+Conflicts: systemd, systemd-sysv, sysvinit-core
+Replaces: systemd, systemd-sysv
 Maintainer: Universal Treble Linux <developer@treble-linux.org>
 Description: Dummy package satisfying init dependencies for UTIM
  UTIM (Universal Treble Init Manager) is a phone-optimized bare-metal

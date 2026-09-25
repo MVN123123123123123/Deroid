@@ -17,7 +17,8 @@ use utim_core::compositor::gestures::{
 };
 use utim_core::compositor::ime::{ImeAction, VirtualKeyboard};
 use utim_core::compositor::input::{
-    InputDispatchResult, InputDispatcher, LinuxInputEvent, KEY_BACKSPACE, KEY_ENTER, KEY_ESC,
+    InputDispatchResult, InputDispatcher, LinuxInputEvent, KEY_1, KEY_2, KEY_3, KEY_4,
+    KEY_BACKSPACE, KEY_C, KEY_D, KEY_ENTER, KEY_ESC, KEY_L, KEY_T, KEY_TAB, KEY_W,
 };
 use utim_core::compositor::lockscreen::LockScreen;
 use utim_core::compositor::power_sync::UtimPowerSync;
@@ -25,9 +26,12 @@ use utim_core::compositor::protocols::{ProtocolRegistry, WaylandInterface};
 use utim_core::compositor::server::WaylandServer;
 use utim_core::compositor::systemui::{QuickTileKind, SystemUiShade};
 use utim_core::graphics::composer::{HwcComposer, HwcVersion};
-use utim_core::graphics::{DrmInteractiveState, DrmKmsDevice};
+use utim_core::graphics::{DrmInteractiveState, DrmKmsDevice, TerminalTabInfo};
 
 fn main() {
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
     let args: Vec<String> = env::args().collect();
     let json_output = args.iter().any(|a| a == "--json");
 
@@ -292,13 +296,9 @@ fn run_daemon() {
     let mut search_query = String::with_capacity(64);
     let mut search_active = false;
     let mut active_app: Option<String> = None;
-    let mut terminal_lines: Vec<String> = Vec::with_capacity(32);
-    let mut terminal_input = String::with_capacity(64);
-    let (term_tx, term_rx) = std::sync::mpsc::channel::<String>();
-    let active_stdin: std::sync::Arc<std::sync::Mutex<Option<std::process::ChildStdin>>> =
-        std::sync::Arc::new(std::sync::Mutex::new(None));
-    let active_child_pid: std::sync::Arc<std::sync::atomic::AtomicU32> =
-        std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let mut terminal_tabs: Vec<TerminalTab> = vec![TerminalTab::new(1)];
+    let mut active_tab_idx: usize = 0;
+    let mut next_tab_id: usize = 2;
     let mut quick_tiles_active = [true, true, true, false, true, false, false, false];
     let mut cursor_pos: Option<(usize, usize)> = None;
     let mut is_touching = false;
@@ -391,6 +391,11 @@ fn run_daemon() {
                                             let gesture_act = gesture_engine.process_touch(&raw_touch);
                                             match gesture_act {
                                                 GestureAction::Home { progress, .. } if progress >= 1.0 => {
+                                                    if active_app.as_deref() == Some("Terminal") {
+                                                        for tab in &terminal_tabs {
+                                                            tab.cleanup_child();
+                                                        }
+                                                    }
                                                     active_app = None;
                                                     server.scene.system_ui.close();
                                                     search_active = false;
@@ -410,6 +415,11 @@ fn run_daemon() {
                                                         server.scene.keyboard.deactivate();
                                                         search_active = false;
                                                     } else if active_app.is_some() {
+                                                        if active_app.as_deref() == Some("Terminal") {
+                                                            for tab in &terminal_tabs {
+                                                                tab.cleanup_child();
+                                                            }
+                                                        }
                                                         active_app = None;
                                                         server.scene.keyboard.deactivate();
                                                         search_active = false;
@@ -454,7 +464,7 @@ fn run_daemon() {
                                                     let idx = ((x - kb_x - 15.0) / r1_key_w).clamp(0.0, 9.0) as usize;
                                                     if let Some(ch) = row1[idx].chars().next() {
                                                         if active_app.as_deref() == Some("Terminal") {
-                                                            terminal_input.push(ch.to_ascii_lowercase());
+                                                            terminal_tabs[active_tab_idx].input.push(ch.to_ascii_lowercase());
                                                         } else if search_active {
                                                             search_query.push(ch.to_ascii_lowercase());
                                                         }
@@ -464,7 +474,7 @@ fn run_daemon() {
                                                     let idx = ((x - kb_x - 30.0) / r2_key_w).clamp(0.0, 8.0) as usize;
                                                     if let Some(ch) = row2[idx].chars().next() {
                                                         if active_app.as_deref() == Some("Terminal") {
-                                                            terminal_input.push(ch.to_ascii_lowercase());
+                                                            terminal_tabs[active_tab_idx].input.push(ch.to_ascii_lowercase());
                                                         } else if search_active {
                                                             search_query.push(ch.to_ascii_lowercase());
                                                         }
@@ -475,7 +485,7 @@ fn run_daemon() {
                                                     if x > kb_x + 15.0 + special_w + 7.0 * mid_w {
                                                         // Backspace
                                                         if active_app.as_deref() == Some("Terminal") {
-                                                            terminal_input.pop();
+                                                            terminal_tabs[active_tab_idx].input.pop();
                                                         } else if search_active {
                                                             search_query.pop();
                                                         }
@@ -483,7 +493,7 @@ fn run_daemon() {
                                                         let idx = ((x - kb_x - 15.0 - special_w) / mid_w).clamp(0.0, 6.0) as usize;
                                                         if let Some(ch) = row3[idx].chars().next() {
                                                             if active_app.as_deref() == Some("Terminal") {
-                                                                terminal_input.push(ch.to_ascii_lowercase());
+                                                                terminal_tabs[active_tab_idx].input.push(ch.to_ascii_lowercase());
                                                             } else if search_active {
                                                                 search_query.push(ch.to_ascii_lowercase());
                                                             }
@@ -500,42 +510,21 @@ fn run_daemon() {
                                                         server.scene.keyboard.deactivate();
                                                     } else if x >= enter_x {
                                                         if active_app.as_deref() == Some("Terminal") {
-                                                            let forwarded_to_child = {
-                                                                let mut guard = active_stdin.lock().unwrap();
-                                                                if let Some(ref mut stdin) = *guard {
-                                                                    use std::io::Write;
-                                                                    let _ = stdin.write_all(terminal_input.as_bytes());
-                                                                    let _ = stdin.write_all(b"\n");
-                                                                    let _ = stdin.flush();
-                                                                    true
-                                                                } else {
-                                                                    false
-                                                                }
-                                                            };
-                                                            if forwarded_to_child {
-                                                                push_terminal_line(&mut terminal_lines, &terminal_input);
-                                                                terminal_input.clear();
-                                                            } else {
-                                                                let exited = execute_terminal_command(
-                                                                    &mut terminal_lines,
-                                                                    &mut terminal_input,
-                                                                    &mut active_app,
-                                                                    Some(&term_tx),
-                                                                    Some(&active_stdin),
-                                                                    Some(&active_child_pid),
-                                                                );
-                                                                if exited {
-                                                                    server.scene.keyboard.deactivate();
-                                                                    search_active = false;
-                                                                }
-                                                            }
+                                                            handle_terminal_enter(
+                                                                &mut terminal_tabs,
+                                                                &mut active_tab_idx,
+                                                                &mut next_tab_id,
+                                                                &mut active_app,
+                                                                &mut server.scene.keyboard,
+                                                                &mut search_active,
+                                                            );
                                                         } else {
                                                             search_active = false;
                                                             server.scene.keyboard.deactivate();
                                                         }
                                                     } else if x >= space_x {
                                                         if active_app.as_deref() == Some("Terminal") {
-                                                            terminal_input.push(' ');
+                                                            terminal_tabs[active_tab_idx].input.push(' ');
                                                         } else if search_active {
                                                             search_query.push(' ');
                                                         }
@@ -552,11 +541,9 @@ fn run_daemon() {
                                                         || (y >= (h - 40.0)))
                                                 {
                                                     if active_app.as_deref() == Some("Terminal") {
-                                                        let pid = active_child_pid.swap(0, std::sync::atomic::Ordering::SeqCst);
-                                                        if pid > 0 {
-                                                            unsafe { libc::kill(pid as i32, libc::SIGTERM); }
+                                                        for tab in &terminal_tabs {
+                                                            tab.cleanup_child();
                                                         }
-                                                        *active_stdin.lock().unwrap() = None;
                                                     }
                                                     active_app = None;
                                                 }
@@ -567,18 +554,53 @@ fn run_daemon() {
                                                     || (y >= (h - 40.0))
                                                 {
                                                     if active_app.as_deref() == Some("Terminal") {
-                                                        let pid = active_child_pid.swap(0, std::sync::atomic::Ordering::SeqCst);
-                                                        if pid > 0 {
-                                                            unsafe { libc::kill(pid as i32, libc::SIGTERM); }
+                                                        for tab in &terminal_tabs {
+                                                            tab.cleanup_child();
                                                         }
-                                                        *active_stdin.lock().unwrap() = None;
                                                     }
                                                     active_app = None;
                                                     server.scene.keyboard.deactivate();
                                                     search_active = false;
                                                 } else if active_app.as_deref() == Some("Terminal") {
-                                                    // Tapping inside terminal brings keyboard back up
-                                                    server.scene.keyboard.activate();
+                                                    // Check if tab bar tapped (y: 120.0..=175.0)
+                                                    let start_x = 36.0;
+                                                    let tab_w = 200.0;
+                                                    let spacing = 10.0;
+                                                    let mut handled_tab_tap = false;
+
+                                                    if (120.0..=175.0).contains(&y) {
+                                                        for i in 0..terminal_tabs.len() {
+                                                            let tab_x = start_x + i as f32 * (tab_w + spacing);
+                                                            if x >= tab_x && x < tab_x + tab_w {
+                                                                if i == active_tab_idx && terminal_tabs.len() > 1 && x >= tab_x + tab_w - 35.0 {
+                                                                    terminal_tabs[i].cleanup_child();
+                                                                    terminal_tabs.remove(i);
+                                                                    if active_tab_idx >= terminal_tabs.len() {
+                                                                        active_tab_idx = terminal_tabs.len() - 1;
+                                                                    }
+                                                                } else {
+                                                                    active_tab_idx = i;
+                                                                }
+                                                                server.scene.keyboard.activate();
+                                                                handled_tab_tap = true;
+                                                                break;
+                                                            }
+                                                        }
+                                                        if !handled_tab_tap && terminal_tabs.len() < 4 {
+                                                            let plus_x = start_x + terminal_tabs.len() as f32 * (tab_w + spacing);
+                                                            if x >= plus_x && x <= plus_x + 60.0 {
+                                                                terminal_tabs.push(TerminalTab::new(next_tab_id));
+                                                                next_tab_id += 1;
+                                                                active_tab_idx = terminal_tabs.len() - 1;
+                                                                server.scene.keyboard.activate();
+                                                                handled_tab_tap = true;
+                                                            }
+                                                        }
+                                                    }
+                                                    if !handled_tab_tap {
+                                                        // Tapping inside terminal brings keyboard back up
+                                                        server.scene.keyboard.activate();
+                                                    }
                                                 }
                                             } else {
                                                 // Home screen hit testing
@@ -635,15 +657,102 @@ fn run_daemon() {
                                                 }
                                             }
                                         }
-                                        InputDispatchResult::KeyPress { code, ch, pressed, repeat } => {
+                                        InputDispatchResult::KeyPress {
+                                            code,
+                                            ch,
+                                            pressed,
+                                            repeat,
+                                            ctrl,
+                                        } => {
                                             if pressed {
-                                                if code == KEY_ESC {
-                                                    if active_app.as_deref() == Some("Terminal") {
-                                                        let pid = active_child_pid.swap(0, std::sync::atomic::Ordering::SeqCst);
-                                                        if pid > 0 {
-                                                            unsafe { libc::kill(pid as i32, libc::SIGTERM); }
+                                                if ctrl {
+                                                    if code == KEY_C {
+                                                        if active_app.as_deref() == Some("Terminal") {
+                                                            let tab = &mut terminal_tabs[active_tab_idx];
+                                                            tab.cleanup_child();
+                                                            let display_cmd = if tab.input.is_empty() { "^C" } else { &format!("{}^C", tab.input) };
+                                                            let full_line = format!("root@treble-gsi:~# {}", display_cmd);
+                                                            push_terminal_line(&mut tab.lines, &full_line);
+                                                            log_terminal_output(&full_line);
+                                                            tab.input.clear();
                                                         }
-                                                        *active_stdin.lock().unwrap() = None;
+                                                    } else if code == KEY_D {
+                                                        if active_app.as_deref() == Some("Terminal") {
+                                                            let (has_stdin, is_empty) = {
+                                                                let tab = &terminal_tabs[active_tab_idx];
+                                                                let has_stdin = tab.active_stdin.lock().unwrap().is_some();
+                                                                let is_empty = tab.input.is_empty();
+                                                                (has_stdin, is_empty)
+                                                            };
+                                                            if has_stdin {
+                                                                *terminal_tabs[active_tab_idx].active_stdin.lock().unwrap() = None;
+                                                            } else if is_empty {
+                                                                terminal_tabs[active_tab_idx].cleanup_child();
+                                                                terminal_tabs.remove(active_tab_idx);
+                                                                if terminal_tabs.is_empty() {
+                                                                    active_app = None;
+                                                                    server.scene.keyboard.deactivate();
+                                                                    search_active = false;
+                                                                    terminal_tabs.push(TerminalTab::new(1));
+                                                                    next_tab_id = 2;
+                                                                    active_tab_idx = 0;
+                                                                } else if active_tab_idx >= terminal_tabs.len() {
+                                                                    active_tab_idx = terminal_tabs.len() - 1;
+                                                                }
+                                                            }
+                                                        }
+                                                    } else if code == KEY_L {
+                                                        if active_app.as_deref() == Some("Terminal") {
+                                                            terminal_tabs[active_tab_idx].lines.clear();
+                                                        }
+                                                    } else if code == KEY_T {
+                                                        if active_app.as_deref() == Some("Terminal") && terminal_tabs.len() < 4 {
+                                                            terminal_tabs.push(TerminalTab::new(next_tab_id));
+                                                            next_tab_id += 1;
+                                                            active_tab_idx = terminal_tabs.len() - 1;
+                                                            server.scene.keyboard.activate();
+                                                        }
+                                                    } else if code == KEY_W {
+                                                        if active_app.as_deref() == Some("Terminal") {
+                                                            terminal_tabs[active_tab_idx].cleanup_child();
+                                                            terminal_tabs.remove(active_tab_idx);
+                                                            if terminal_tabs.is_empty() {
+                                                                active_app = None;
+                                                                server.scene.keyboard.deactivate();
+                                                                search_active = false;
+                                                                terminal_tabs.push(TerminalTab::new(1));
+                                                                next_tab_id = 2;
+                                                                active_tab_idx = 0;
+                                                            } else if active_tab_idx >= terminal_tabs.len() {
+                                                                active_tab_idx = terminal_tabs.len() - 1;
+                                                            }
+                                                        }
+                                                    } else if code == KEY_TAB {
+                                                        if active_app.as_deref() == Some("Terminal") && !terminal_tabs.is_empty() {
+                                                            active_tab_idx = (active_tab_idx + 1) % terminal_tabs.len();
+                                                        }
+                                                    } else if code == KEY_1 {
+                                                        if active_app.as_deref() == Some("Terminal") && !terminal_tabs.is_empty() {
+                                                            active_tab_idx = 0;
+                                                        }
+                                                    } else if code == KEY_2 {
+                                                        if active_app.as_deref() == Some("Terminal") && terminal_tabs.len() > 1 {
+                                                            active_tab_idx = 1;
+                                                        }
+                                                    } else if code == KEY_3 {
+                                                        if active_app.as_deref() == Some("Terminal") && terminal_tabs.len() > 2 {
+                                                            active_tab_idx = 2;
+                                                        }
+                                                    } else if code == KEY_4 {
+                                                        if active_app.as_deref() == Some("Terminal") && terminal_tabs.len() > 3 {
+                                                            active_tab_idx = 3;
+                                                        }
+                                                    }
+                                                } else if code == KEY_ESC {
+                                                    if active_app.as_deref() == Some("Terminal") {
+                                                        for tab in &terminal_tabs {
+                                                            tab.cleanup_child();
+                                                        }
                                                     }
                                                     if server.scene.keyboard.is_active {
                                                         server.scene.keyboard.deactivate();
@@ -657,41 +766,20 @@ fn run_daemon() {
                                                     }
                                                 } else if code == KEY_BACKSPACE {
                                                     if active_app.as_deref() == Some("Terminal") {
-                                                        terminal_input.pop();
+                                                        terminal_tabs[active_tab_idx].input.pop();
                                                     } else if search_active {
                                                         search_query.pop();
                                                     }
                                                 } else if code == KEY_ENTER && !repeat {
                                                     if active_app.as_deref() == Some("Terminal") {
-                                                        let forwarded_to_child = {
-                                                            let mut guard = active_stdin.lock().unwrap();
-                                                            if let Some(ref mut stdin) = *guard {
-                                                                use std::io::Write;
-                                                                let _ = stdin.write_all(terminal_input.as_bytes());
-                                                                let _ = stdin.write_all(b"\n");
-                                                                let _ = stdin.flush();
-                                                                true
-                                                            } else {
-                                                                false
-                                                            }
-                                                        };
-                                                        if forwarded_to_child {
-                                                            push_terminal_line(&mut terminal_lines, &terminal_input);
-                                                            terminal_input.clear();
-                                                        } else {
-                                                            let exited = execute_terminal_command(
-                                                                &mut terminal_lines,
-                                                                &mut terminal_input,
-                                                                &mut active_app,
-                                                                Some(&term_tx),
-                                                                Some(&active_stdin),
-                                                                Some(&active_child_pid),
-                                                            );
-                                                            if exited {
-                                                                server.scene.keyboard.deactivate();
-                                                                search_active = false;
-                                                            }
-                                                        }
+                                                        handle_terminal_enter(
+                                                            &mut terminal_tabs,
+                                                            &mut active_tab_idx,
+                                                            &mut next_tab_id,
+                                                            &mut active_app,
+                                                            &mut server.scene.keyboard,
+                                                            &mut search_active,
+                                                        );
                                                     } else if search_active {
                                                         search_active = false;
                                                         server.scene.keyboard.deactivate();
@@ -699,8 +787,8 @@ fn run_daemon() {
                                                 } else if let Some(c) = ch {
                                                     if !repeat {
                                                         if active_app.as_deref() == Some("Terminal") {
-                                                            if terminal_input.len() < 60 {
-                                                                terminal_input.push(c);
+                                                            if terminal_tabs[active_tab_idx].input.len() < 60 {
+                                                                terminal_tabs[active_tab_idx].input.push(c);
                                                             }
                                                         } else if search_active && search_query.len() < 40 {
                                                             search_query.push(c);
@@ -797,12 +885,14 @@ fn run_daemon() {
             }
         }
 
-        // Drain asynchronous terminal command output streams
-        while let Ok(line) = term_rx.try_recv() {
-            push_terminal_line(&mut terminal_lines, &line);
-        }
-        if terminal_lines.len() > 120 {
-            terminal_lines.drain(0..terminal_lines.len() - 120);
+        // Drain asynchronous terminal command output streams for all tabs
+        for tab in &mut terminal_tabs {
+            while let Ok(line) = tab.rx.try_recv() {
+                push_terminal_line(&mut tab.lines, &line);
+            }
+            if tab.lines.len() > 120 {
+                tab.lines.drain(0..tab.lines.len() - 120);
+            }
         }
 
         // Periodic check for newly registered input event devices
@@ -853,6 +943,21 @@ fn run_daemon() {
 
             if let Some(ref mut drm) = drm_display {
                 let t_str = format_current_time(&mut time_buf);
+                if active_tab_idx >= terminal_tabs.len() {
+                    active_tab_idx = terminal_tabs.len().saturating_sub(1);
+                }
+                let active_tab = &terminal_tabs[active_tab_idx];
+                let tab_infos: Vec<TerminalTabInfo> = terminal_tabs
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, tab)| TerminalTabInfo {
+                        id: tab.id,
+                        title: &tab.title,
+                        is_running: tab.is_running(),
+                        is_active: idx == active_tab_idx,
+                    })
+                    .collect();
+
                 let drm_state = DrmInteractiveState {
                     time_str: t_str,
                     is_locked: server.scene.mode == utim_core::compositor::scene::ShellMode::LockScreen,
@@ -864,8 +969,11 @@ fn run_daemon() {
                     shade_open: server.scene.system_ui.is_open(),
                     quick_tiles_active,
                     active_app: active_app.as_deref(),
-                    terminal_lines: &terminal_lines,
-                    terminal_input: &terminal_input,
+                    terminal_lines: &active_tab.lines,
+                    terminal_input: &active_tab.input,
+                    terminal_running: active_tab.is_running(),
+                    terminal_tabs: &tab_infos,
+                    terminal_active_tab: active_tab_idx,
                 };
                 drm.render_interactive_ui(&drm_state);
                 drm.flush();
@@ -921,25 +1029,218 @@ fn format_current_time(buf: &mut [u8; 5]) -> &str {
     unsafe { std::str::from_utf8_unchecked(buf) }
 }
 
+fn cleanup_terminal_child(
+    active_child_pid: &std::sync::atomic::AtomicU32,
+    active_stdin: &std::sync::Mutex<Option<std::process::ChildStdin>>,
+) {
+    let pid = active_child_pid.swap(0, std::sync::atomic::Ordering::SeqCst);
+    if pid > 0 {
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGINT);
+            libc::kill(pid as i32, libc::SIGINT);
+            libc::kill(-(pid as i32), libc::SIGKILL);
+            libc::kill(pid as i32, libc::SIGKILL);
+        }
+    }
+    *active_stdin.lock().unwrap() = None;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalAction {
+    Continue,
+    CloseTab,
+    NewTab,
+    SwitchTab(usize),
+}
+
+pub struct TerminalTab {
+    pub id: usize,
+    pub title: String,
+    pub lines: Vec<String>,
+    pub input: String,
+    pub tx: std::sync::mpsc::Sender<String>,
+    pub rx: std::sync::mpsc::Receiver<String>,
+    pub active_stdin: std::sync::Arc<std::sync::Mutex<Option<std::process::ChildStdin>>>,
+    pub active_child_pid: std::sync::Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl TerminalTab {
+    pub fn new(id: usize) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        Self {
+            id,
+            title: format!("Tab {}: bash", id),
+            lines: Vec::with_capacity(32),
+            input: String::with_capacity(64),
+            tx,
+            rx,
+            active_stdin: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            active_child_pid: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        }
+    }
+
+    pub fn is_running(&self) -> bool {
+        let pid = self.active_child_pid.load(std::sync::atomic::Ordering::SeqCst);
+        pid > 0 && unsafe { libc::kill(pid as i32, 0) == 0 }
+    }
+
+    pub fn cleanup_child(&self) {
+        cleanup_terminal_child(&self.active_child_pid, &self.active_stdin);
+    }
+}
+
+fn handle_terminal_enter(
+    terminal_tabs: &mut Vec<TerminalTab>,
+    active_tab_idx: &mut usize,
+    next_tab_id: &mut usize,
+    active_app: &mut Option<String>,
+    keyboard: &mut VirtualKeyboard,
+    search_active: &mut bool,
+) {
+    if *active_tab_idx >= terminal_tabs.len() {
+        *active_tab_idx = terminal_tabs.len().saturating_sub(1);
+    }
+    let tab = &mut terminal_tabs[*active_tab_idx];
+    let pid = tab.active_child_pid.load(std::sync::atomic::Ordering::SeqCst);
+    let is_alive = pid > 0 && unsafe { libc::kill(pid as i32, 0) == 0 };
+    let forwarded_to_child = if is_alive {
+        let mut guard = tab.active_stdin.lock().unwrap();
+        if let Some(ref mut stdin) = *guard {
+            use std::io::Write;
+            let _ = stdin.write_all(tab.input.as_bytes());
+            let _ = stdin.write_all(b"\n");
+            let _ = stdin.flush();
+            true
+        } else {
+            false
+        }
+    } else {
+        tab.active_child_pid.store(0, std::sync::atomic::Ordering::SeqCst);
+        *tab.active_stdin.lock().unwrap() = None;
+        false
+    };
+
+    if forwarded_to_child {
+        push_terminal_line(&mut tab.lines, &tab.input);
+        log_terminal_output(&tab.input);
+        tab.input.clear();
+    } else {
+        let tab_id = tab.id;
+        let mut title_buf = tab.title.clone();
+        let action = execute_terminal_command(
+            &mut tab.lines,
+            &mut tab.input,
+            active_app,
+            Some(&tab.tx),
+            Some(&tab.active_stdin),
+            Some(&tab.active_child_pid),
+            Some(&mut title_buf),
+            tab_id,
+        );
+        tab.title = title_buf;
+
+        match action {
+            TerminalAction::CloseTab => {
+                tab.cleanup_child();
+                terminal_tabs.remove(*active_tab_idx);
+                if terminal_tabs.is_empty() {
+                    *active_app = None;
+                    keyboard.deactivate();
+                    *search_active = false;
+                    terminal_tabs.push(TerminalTab::new(1));
+                    *next_tab_id = 2;
+                    *active_tab_idx = 0;
+                } else if *active_tab_idx >= terminal_tabs.len() {
+                    *active_tab_idx = terminal_tabs.len() - 1;
+                }
+            }
+            TerminalAction::NewTab => {
+                if terminal_tabs.len() < 4 {
+                    terminal_tabs.push(TerminalTab::new(*next_tab_id));
+                    *next_tab_id += 1;
+                    *active_tab_idx = terminal_tabs.len() - 1;
+                }
+            }
+            TerminalAction::SwitchTab(idx) => {
+                if idx < terminal_tabs.len() {
+                    *active_tab_idx = idx;
+                }
+            }
+            TerminalAction::Continue => {}
+        }
+    }
+}
+
+fn log_terminal_output(line: &str) {
+    use std::io::Write;
+    use std::fs::OpenOptions;
+
+    // 1. Mirror to serial console /dev/ttyAMA0 so QEMU captures it into dist/qemu_terminal.log
+    if let Ok(mut tty) = OpenOptions::new().write(true).open("/dev/ttyAMA0") {
+        let _ = writeln!(tty, "[UTLC-TERM] {}", line);
+    } else if let Ok(mut console) = OpenOptions::new().write(true).open("/dev/console") {
+        let _ = writeln!(console, "[UTLC-TERM] {}", line);
+    }
+
+    // 2. Append to persistent log file /var/log/terminal.log on device
+    if let Ok(mut log_file) = OpenOptions::new().create(true).append(true).open("/var/log/terminal.log") {
+        let _ = writeln!(log_file, "{}", line);
+    }
+}
+
 fn clean_terminal_line(line: &str) -> String {
     let s = line.split('\r').next_back().unwrap_or(line);
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
-        if c == '\x1b' && chars.peek() == Some(&'[') {
-            chars.next();
-            while let Some(&next) = chars.peek() {
+        if c == '\x1b' {
+            if chars.peek() == Some(&'[') {
                 chars.next();
-                if next.is_ascii_alphabetic() {
-                    break;
+                while let Some(&next) = chars.peek() {
+                    chars.next();
+                    if next >= '@' && next <= '~' {
+                        break;
+                    }
                 }
+                continue;
+            } else if chars.peek() == Some(&']') {
+                chars.next();
+                while let Some(next) = chars.next() {
+                    if next == '\x07' || (next == '\x1b' && chars.peek() == Some(&'\\')) {
+                        if next == '\x1b' {
+                            chars.next();
+                        }
+                        break;
+                    }
+                }
+                continue;
+            } else if chars.peek() == Some(&'(') || chars.peek() == Some(&')') {
+                chars.next();
+                chars.next();
+                continue;
             }
-            continue;
         }
-        if c.is_ascii() && !c.is_ascii_control() {
-            out.push(c);
-        } else if c == '\t' {
-            out.push_str("    ");
+        match c {
+            '─' | '━' | '═' => out.push('-'),
+            '│' | '┃' | '║' => out.push('|'),
+            '┌' | '┍' | '┎' | '┏' | '╭' | '╔' => out.push('+'),
+            '┐' | '┑' | '┒' | '┓' | '╮' | '╗' => out.push('+'),
+            '└' | '┕' | '┖' | '┗' | '╰' | '╚' => out.push('+'),
+            '┘' | '┙' | '┚' | '┛' | '╯' | '╝' => out.push('+'),
+            '├' | '┝' | '┞' | '┟' | '┠' | '┡' | '┢' | '┣' => out.push('+'),
+            '┤' | '┥' | '┦' | '┧' | '┨' | '┩' | '┪' | '┫' => out.push('+'),
+            '┬' | '┴' | '┼' => out.push('+'),
+            '•' | '·' | '●' => out.push('*'),
+            '…' => out.push_str("..."),
+            '‘' | '’' => out.push('\''),
+            '“' | '”' => out.push('"'),
+            '→' | '➔' | '➜' => out.push('>'),
+            '←' => out.push('<'),
+            '✓' | '✔' => out.push('v'),
+            '✗' | '✘' => out.push('x'),
+            '\t' => out.push_str("    "),
+            _ if c.is_ascii() && !c.is_ascii_control() => out.push(c),
+            _ => {}
         }
     }
     out
@@ -953,14 +1254,7 @@ fn push_terminal_line(terminal_lines: &mut Vec<String>, line: &str) {
         terminal_lines.push(String::new());
         return;
     }
-    if let Some(last) = terminal_lines.last_mut() {
-        if !last.is_empty() && rem.starts_with(last.as_str()) {
-            *last = rem.to_string();
-            return;
-        }
-    }
     while rem.len() > max_col {
-        // Try breaking at word boundary between (max_col - 15) and max_col
         let break_idx = rem[..max_col]
             .rfind(' ')
             .filter(|&idx| idx >= max_col.saturating_sub(15))
@@ -996,6 +1290,16 @@ fn run_command_process(
             .env("SHELL", "/bin/bash")
             .env("TERM", "linux")
             .env("DEBIAN_FRONTEND", "noninteractive")
+            .env_remove("WAYLAND_DISPLAY")
+            .env("WAYLAND_DISPLAY", "")
+            .env_remove("DISPLAY")
+            .env("DISPLAY", "")
+            .env("XDG_SESSION_TYPE", "tty")
+            .env("QT_QPA_PLATFORM", "offscreen")
+            .env("GDK_BACKEND", "x11")
+            .env("CI", "1")
+            .env("COLUMNS", "54")
+            .env("LINES", "25")
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .stdin(std::process::Stdio::piped());
@@ -1004,6 +1308,7 @@ fn run_command_process(
                 let mut mask: libc::sigset_t = std::mem::zeroed();
                 libc::sigemptyset(&mut mask);
                 libc::sigprocmask(libc::SIG_SETMASK, &mask, std::ptr::null_mut());
+                libc::setpgid(0, 0);
                 Ok(())
             });
         }
@@ -1021,6 +1326,7 @@ fn run_command_process(
                     use std::io::BufRead;
                     let reader = std::io::BufReader::new(stderr);
                     for line in reader.lines().map_while(Result::ok) {
+                        log_terminal_output(&line);
                         let _ = tx_err.send(line);
                     }
                 })
@@ -1030,6 +1336,7 @@ fn run_command_process(
                 use std::io::BufRead;
                 let reader = std::io::BufReader::new(stdout);
                 for line in reader.lines().map_while(Result::ok) {
+                    log_terminal_output(&line);
                     let _ = tx.send(line);
                 }
             }
@@ -1038,17 +1345,8 @@ fn run_command_process(
                 let _ = handle.join();
             }
             let _ = child.wait();
-            if active_child_pid
-                .compare_exchange(
-                    my_pid,
-                    0,
-                    std::sync::atomic::Ordering::SeqCst,
-                    std::sync::atomic::Ordering::SeqCst,
-                )
-                .is_ok()
-            {
-                *active_stdin.lock().unwrap() = None;
-            }
+            active_child_pid.store(0, std::sync::atomic::Ordering::SeqCst);
+            *active_stdin.lock().unwrap() = None;
         }
     }
 
@@ -1086,6 +1384,16 @@ fn run_command_process(
                 .env("SHELL", "/bin/bash")
                 .env("TERM", "linux")
                 .env("DEBIAN_FRONTEND", "noninteractive")
+                .env_remove("WAYLAND_DISPLAY")
+                .env("WAYLAND_DISPLAY", "")
+                .env_remove("DISPLAY")
+                .env("DISPLAY", "")
+                .env("XDG_SESSION_TYPE", "tty")
+                .env("QT_QPA_PLATFORM", "offscreen")
+                .env("GDK_BACKEND", "x11")
+                .env("CI", "1")
+                .env("COLUMNS", "54")
+                .env("LINES", "25")
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .stdin(std::process::Stdio::piped());
@@ -1094,6 +1402,7 @@ fn run_command_process(
                     let mut mask: libc::sigset_t = std::mem::zeroed();
                     libc::sigemptyset(&mut mask);
                     libc::sigprocmask(libc::SIG_SETMASK, &mask, std::ptr::null_mut());
+                    libc::setpgid(0, 0);
                     Ok(())
                 });
             }
@@ -1111,6 +1420,7 @@ fn run_command_process(
                         use std::io::BufRead;
                         let reader = std::io::BufReader::new(stderr);
                         for line in reader.lines().map_while(Result::ok) {
+                            log_terminal_output(&line);
                             let _ = tx_err.send(line);
                         }
                     })
@@ -1120,6 +1430,7 @@ fn run_command_process(
                     use std::io::BufRead;
                     let reader = std::io::BufReader::new(stdout);
                     for line in reader.lines().map_while(Result::ok) {
+                        log_terminal_output(&line);
                         let _ = tx.send(line);
                     }
                 }
@@ -1128,17 +1439,8 @@ fn run_command_process(
                     let _ = handle.join();
                 }
                 let _ = child.wait();
-                if active_child_pid
-                    .compare_exchange(
-                        my_pid,
-                        0,
-                        std::sync::atomic::Ordering::SeqCst,
-                        std::sync::atomic::Ordering::SeqCst,
-                    )
-                    .is_ok()
-                {
-                    *active_stdin.lock().unwrap() = None;
-                }
+                active_child_pid.store(0, std::sync::atomic::Ordering::SeqCst);
+                *active_stdin.lock().unwrap() = None;
             }
         }
 
@@ -1201,36 +1503,73 @@ fn run_command_process(
 fn execute_terminal_command(
     terminal_lines: &mut Vec<String>,
     terminal_input: &mut String,
-    active_app: &mut Option<String>,
+    _active_app: &mut Option<String>,
     term_tx: Option<&std::sync::mpsc::Sender<String>>,
     active_stdin: Option<&std::sync::Arc<std::sync::Mutex<Option<std::process::ChildStdin>>>>,
     active_child_pid: Option<&std::sync::Arc<std::sync::atomic::AtomicU32>>,
-) -> bool {
+    tab_title: Option<&mut String>,
+    tab_id: usize,
+) -> TerminalAction {
     let cmd = terminal_input.trim().to_string();
-    push_terminal_line(terminal_lines, &format!("root@treble-gsi:~# {}", cmd));
+    let prompt_line = format!("root@treble-gsi:~# {}", cmd);
+    push_terminal_line(terminal_lines, &prompt_line);
+    log_terminal_output(&prompt_line);
     terminal_input.clear();
 
     if cmd.is_empty() {
-        return false;
+        return TerminalAction::Continue;
     }
 
     if cmd == "clear" {
         terminal_lines.clear();
-        return false;
+        return TerminalAction::Continue;
     }
 
-    if cmd == "exit" {
+    if cmd == "exit" || cmd == "closetab" {
         if let Some(pid_arc) = active_child_pid {
-            let pid = pid_arc.swap(0, std::sync::atomic::Ordering::SeqCst);
-            if pid > 0 {
-                unsafe { libc::kill(pid as i32, libc::SIGTERM); }
+            if let Some(stdin_arc) = active_stdin {
+                cleanup_terminal_child(pid_arc, stdin_arc);
+            } else {
+                let pid = pid_arc.swap(0, std::sync::atomic::Ordering::SeqCst);
+                if pid > 0 {
+                    unsafe {
+                        libc::kill(-(pid as i32), libc::SIGKILL);
+                        libc::kill(pid as i32, libc::SIGKILL);
+                    }
+                }
             }
-        }
-        if let Some(stdin_arc) = active_stdin {
+        } else if let Some(stdin_arc) = active_stdin {
             *stdin_arc.lock().unwrap() = None;
         }
-        *active_app = None;
-        return true;
+        return TerminalAction::CloseTab;
+    }
+
+    if cmd == "newtab" {
+        return TerminalAction::NewTab;
+    }
+
+    if cmd.starts_with("tab ") {
+        if let Some(num_str) = cmd.split_whitespace().nth(1) {
+            if let Ok(num) = num_str.parse::<usize>() {
+                if (1..=4).contains(&num) {
+                    return TerminalAction::SwitchTab(num - 1);
+                }
+            }
+        }
+        push_terminal_line(terminal_lines, "Usage: tab <1..4>");
+        return TerminalAction::Continue;
+    }
+
+    if cmd == "tabs" {
+        push_terminal_line(terminal_lines, "=== Active Terminal Tabs ===");
+        push_terminal_line(terminal_lines, "Shortcuts: Ctrl+T (new tab), Ctrl+W (close tab), Ctrl+Tab / Ctrl+1..4 (switch)");
+        push_terminal_line(terminal_lines, "Commands: newtab, closetab, tab <1..4>, exit");
+        return TerminalAction::Continue;
+    }
+
+    let first_word = cmd.split_whitespace().next().unwrap_or("bash");
+    if let Some(title) = tab_title {
+        *title = format!("Tab {}: {}", tab_id, first_word);
     }
 
     let stdin_arc = active_stdin.cloned().unwrap_or_else(|| std::sync::Arc::new(std::sync::Mutex::new(None)));
@@ -1252,7 +1591,7 @@ fn execute_terminal_command(
     if terminal_lines.len() > 120 {
         terminal_lines.drain(0..terminal_lines.len() - 120);
     }
-    false
+    TerminalAction::Continue
 }
 
 fn check_protocols(json: bool) -> bool {
@@ -1665,15 +2004,65 @@ mod tests {
         let mut input = "uname -a".to_string();
         let mut app = Some("Terminal".to_string());
 
-        execute_terminal_command(&mut lines, &mut input, &mut app, None, None, None);
+        let res = execute_terminal_command(&mut lines, &mut input, &mut app, None, None, None, None, 1);
+        assert_eq!(res, TerminalAction::Continue);
         assert!(input.is_empty());
         assert!(lines.len() >= 2);
         assert_eq!(lines[0], "root@treble-gsi:~# uname -a");
         assert!(lines[1].contains("Linux"));
 
         input = "exit".to_string();
-        execute_terminal_command(&mut lines, &mut input, &mut app, None, None, None);
-        assert!(app.is_none());
+        let res = execute_terminal_command(&mut lines, &mut input, &mut app, None, None, None, None, 1);
+        assert_eq!(res, TerminalAction::CloseTab);
+    }
+
+    #[test]
+    fn test_multiple_terminal_tabs() {
+        let mut tabs = vec![TerminalTab::new(1), TerminalTab::new(2)];
+        let mut active_tab = 0;
+        let mut next_id = 3;
+        let mut app = Some("Terminal".to_string());
+        let mut kb = VirtualKeyboard::new(1080.0, 2400.0);
+        let mut search = false;
+
+        // Run uname in Tab 1
+        tabs[0].input = "uname".to_string();
+        handle_terminal_enter(&mut tabs, &mut active_tab, &mut next_id, &mut app, &mut kb, &mut search);
+        if let Ok(line) = tabs[0].rx.recv_timeout(Duration::from_millis(500)) {
+            push_terminal_line(&mut tabs[0].lines, &line);
+        }
+        assert!(tabs[0].lines.len() >= 2);
+        assert!(tabs[0].lines[1].contains("Linux"));
+
+        // Switch to Tab 2
+        active_tab = 1;
+        tabs[1].input = "whoami".to_string();
+        handle_terminal_enter(&mut tabs, &mut active_tab, &mut next_id, &mut app, &mut kb, &mut search);
+        if let Ok(line) = tabs[1].rx.recv_timeout(Duration::from_millis(500)) {
+            push_terminal_line(&mut tabs[1].lines, &line);
+        }
+        assert!(tabs[1].lines.len() >= 2);
+        assert!(tabs[1].lines[1] == "root" || tabs[1].lines[1] == "linux");
+
+        // Wait for whoami process to finish
+        for _ in 0..50 {
+            if !tabs[1].is_running() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // Open Tab 3 via "newtab" command
+        tabs[1].input = "newtab".to_string();
+        handle_terminal_enter(&mut tabs, &mut active_tab, &mut next_id, &mut app, &mut kb, &mut search);
+        assert_eq!(tabs.len(), 3);
+        assert_eq!(active_tab, 2);
+
+        // Close Tab 3 via "exit"
+        tabs[2].input = "exit".to_string();
+        handle_terminal_enter(&mut tabs, &mut active_tab, &mut next_id, &mut app, &mut kb, &mut search);
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(active_tab, 1);
     }
 
     #[test]
