@@ -250,6 +250,28 @@ impl DesktopCatalogue {
         })
     }
 
+    fn binary_exists(clean_exec: &str) -> bool {
+        let first = match clean_exec.split_whitespace().next() {
+            Some(f) => f,
+            None => return false,
+        };
+        let path = Path::new(first);
+        if path.is_absolute() {
+            path.exists()
+        } else {
+            if let Ok(env_path) = std::env::var("PATH") {
+                for dir in env_path.split(':') {
+                    if Path::new(dir).join(first).exists() {
+                        return true;
+                    }
+                }
+            }
+            ["/usr/bin", "/usr/local/bin", "/bin", "/usr/games"]
+                .iter()
+                .any(|d| Path::new(d).join(first).exists())
+        }
+    }
+
     /// Scan a single directory
     pub fn scan_directory(&mut self, dir: &Path) {
         if let Ok(entries) = fs::read_dir(dir) {
@@ -263,7 +285,9 @@ impl DesktopCatalogue {
                         .to_string();
                     if let Ok(content) = fs::read_to_string(&path) {
                         if let Some(app) = parse_desktop_entry(&id, &content) {
-                            self.add_app(app);
+                            if Self::binary_exists(&app.clean_exec()) {
+                                self.add_app(app);
+                            }
                         }
                     }
                 }

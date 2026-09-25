@@ -7,6 +7,7 @@
 
 pub mod desktop;
 pub mod gestures;
+pub mod icons;
 pub mod ime;
 pub mod input;
 pub mod launcher;
@@ -19,6 +20,7 @@ pub mod server;
 pub mod systemui;
 
 pub use desktop::{fuzzy_match, parse_desktop_entry, DesktopApp, DesktopCatalogue};
+pub use icons::{IconCache, ICON_MAX_EDGE};
 pub use gestures::{
     cubic_bezier_ease_out, EdgeSide, GestureAction, GestureConfig, GestureEngine, RawTouchEvent,
     TouchPhase,

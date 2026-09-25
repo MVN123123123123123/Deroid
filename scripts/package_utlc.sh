@@ -18,12 +18,9 @@ trap cleanup EXIT
 
 echo "[*] Constructing UTLC (Universal Treble Launcher & Compositor) Debian package..."
 
-# 1. Verify aarch64 binary is built
 AARCH64_BIN="${WORKSPACE_ROOT}/target/aarch64-unknown-linux-gnu/release/utlc"
-if [[ ! -f "${AARCH64_BIN}" ]]; then
-    echo "[*] Building release aarch64 binary for utlc..."
-    cargo build --release -p utlc --target aarch64-unknown-linux-gnu
-fi
+echo "[*] Building release aarch64 binary for utlc..."
+cargo build --release -p utlc --target aarch64-unknown-linux-gnu
 
 mkdir -p "${BUILD_DIR}/DEBIAN"
 mkdir -p "${BUILD_DIR}/usr/bin"
@@ -37,6 +34,14 @@ chmod 755 "${BUILD_DIR}/usr/bin/utlc"
 
 if [[ -f "${WORKSPACE_ROOT}/utlc.service" ]]; then
     cp "${WORKSPACE_ROOT}/utlc.service" "${BUILD_DIR}/usr/lib/systemd/system/utlc.service"
+fi
+
+# 2.5 Install launcher icons into hicolor theme
+if [[ -d "${WORKSPACE_ROOT}/assets/icons" ]]; then
+    mkdir -p "${BUILD_DIR}/usr/share"
+    cp -a "${WORKSPACE_ROOT}/assets/icons" "${BUILD_DIR}/usr/share/"
+    mkdir -p "${BUILD_DIR}/usr/share/pixmaps"
+    cp -a "${WORKSPACE_ROOT}/assets/icons/hicolor/64x64/apps/"*.png "${BUILD_DIR}/usr/share/pixmaps/" 2>/dev/null || true
 fi
 
 # 3. Create desktop entry for shell

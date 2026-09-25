@@ -69,6 +69,11 @@ pub enum GestureAction {
     NotificationShade {
         progress: f32,
     },
+    /// Center screen swipe (e.g., page switch or app drawer pull)
+    Swipe {
+        delta_x: f32,
+        delta_y: f32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -95,7 +100,12 @@ enum GestureState {
         current_x: f32,
         current_y: f32,
     },
-    TrackingCenter,
+    TrackingCenter {
+        start_x: f32,
+        start_y: f32,
+        current_x: f32,
+        current_y: f32,
+    },
 }
 
 /// Gesture Engine Configuration
@@ -192,7 +202,12 @@ impl GestureEngine {
                         GestureAction::None
                     }
                     EdgeSide::Center => {
-                        self.state = GestureState::TrackingCenter;
+                        self.state = GestureState::TrackingCenter {
+                            start_x: event.x,
+                            start_y: event.y,
+                            current_x: event.x,
+                            current_y: event.y,
+                        };
                         GestureAction::None
                     }
                 }
@@ -282,6 +297,15 @@ impl GestureEngine {
                         GestureAction::NotificationShade { progress }
                     }
 
+                    GestureState::TrackingCenter {
+                        current_x,
+                        current_y,
+                        ..
+                    } => {
+                        *current_x = event.x;
+                        *current_y = event.y;
+                        GestureAction::None
+                    }
                     _ => GestureAction::None,
                 }
             }
@@ -352,6 +376,23 @@ impl GestureEngine {
                         }
                     }
 
+                    GestureState::TrackingCenter {
+                        start_x,
+                        start_y,
+                        current_x,
+                        current_y,
+                    } => {
+                        let dx = *current_x - *start_x;
+                        let dy = *current_y - *start_y;
+                        if dx.abs() >= 40.0 || dy.abs() >= 40.0 {
+                            GestureAction::Swipe {
+                                delta_x: dx,
+                                delta_y: dy,
+                            }
+                        } else {
+                            GestureAction::None
+                        }
+                    }
                     _ => GestureAction::None,
                 };
 

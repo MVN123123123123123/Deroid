@@ -404,3 +404,67 @@ fn test_milestone_3_6_power_governor_and_oom_synchronization() {
     assert_eq!(power.active_foreground_pid, Some(2001));
     assert_eq!(power.recents_pids, vec![2002, 2003]);
 }
+
+#[test]
+fn test_milestone_3_7_app_icon_resolution_pipeline() {
+    use std::rc::Rc;
+    use utim_core::compositor::IconCache;
+    use utim_core::graphics::{decode_png, AppGridItem, RgbaImage};
+
+    mod fixtures {
+        #![allow(dead_code)]
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/png_fixtures.rs"
+        ));
+    }
+    use fixtures::*;
+
+    // 1. A freedesktop-style theme tree is resolved in one batched sweep.
+    let root = std::env::temp_dir().join(format!("utim_icons_it_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let apps_dir = root.join("hicolor").join("48x48").join("apps");
+    std::fs::create_dir_all(&apps_dir).unwrap();
+    std::fs::write(apps_dir.join("demo-app.png"), RGBA8_PNG).unwrap();
+
+    let mut cache = IconCache::with_roots(vec![root.clone()], "hicolor");
+    let keys: Vec<String> = vec!["demo-app".to_string(), "absent".to_string()];
+    cache.resolve_keys(&keys);
+
+    let icon: Rc<RgbaImage> = cache.get("demo-app").expect("icon resolved from theme tree");
+    assert_eq!(icon.pixels, RGBA8_EXPECT, "in-crate decoder produced RGBA8");
+    assert!(icon.width <= 64 && icon.height <= 64, "icons are cached at tile size");
+
+    // 2. Misses are remembered so the sweep is not repeated every frame.
+    assert!(cache.get("absent").is_none());
+    assert!(cache.knows("absent"));
+    cache.resolve_keys(&keys);
+    assert!(cache.get("absent").is_none());
+
+    // 3. The decoded bitmap plugs straight into the launcher grid descriptor,
+    //    and its presence/absence is what tells the renderer to blit vs glyph.
+    let with_icon = AppGridItem {
+        id: "demo",
+        name: "Demo",
+        color: 0xFF10B981,
+        glyph: "D",
+        icon: Some(&icon),
+    };
+    let without_icon = AppGridItem {
+        icon: None,
+        ..with_icon
+    };
+    assert_ne!(with_icon, without_icon, "icon presence is observable state");
+
+    // 4. Round-trip: the cached bytes are a valid PNG decode target as well.
+    let direct = decode_png(RGBA8_PNG).expect("decode_png is exported");
+    assert_eq!(direct.pixels, icon.pixels);
+
+    // 5. Invalidating misses (app set changed) allows the new icon to appear.
+    cache.invalidate_misses();
+    std::fs::write(apps_dir.join("absent.png"), GRAY1_PNG).unwrap();
+    cache.resolve_keys(&keys);
+    assert!(cache.get("absent").is_some(), "newly installed icon resolves");
+
+    let _ = std::fs::remove_dir_all(&root);
+}

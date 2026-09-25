@@ -114,6 +114,7 @@ pub enum InputDispatchResult {
     None,
     Touch(RawTouchEvent),
     Tap { x: f32, y: f32 },
+    LongPress { x: f32, y: f32 },
     PointerMove { x: f32, y: f32 },
     KeyPress { code: u16, ch: Option<char>, pressed: bool, repeat: bool, ctrl: bool },
 }
@@ -234,11 +235,17 @@ impl InputDispatcher {
                         let dy = (self.cursor_y - self.touch_start_y).abs();
                         let dur = self.touch_start_time.elapsed();
 
-                        let res = if dx < 25.0 && dy < 25.0 && dur.as_millis() < 400 {
-                            // Quick, small-movement release is a Tap
-                            InputDispatchResult::Tap {
-                                x: self.cursor_x,
-                                y: self.cursor_y,
+                        let res = if dx < 25.0 && dy < 25.0 {
+                            if dur.as_millis() >= 400 {
+                                InputDispatchResult::LongPress {
+                                    x: self.cursor_x,
+                                    y: self.cursor_y,
+                                }
+                            } else {
+                                InputDispatchResult::Tap {
+                                    x: self.cursor_x,
+                                    y: self.cursor_y,
+                                }
                             }
                         } else {
                             InputDispatchResult::Touch(RawTouchEvent {
@@ -253,6 +260,11 @@ impl InputDispatcher {
                         res
                     } else {
                         InputDispatchResult::None
+                    }
+                } else if ev.code == 0x111 /* BTN_RIGHT */ && ev.value == 0 {
+                    InputDispatchResult::LongPress {
+                        x: self.cursor_x,
+                        y: self.cursor_y,
                     }
                 } else {
                     // Physical/virtio Keyboard key

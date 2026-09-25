@@ -189,6 +189,7 @@ impl MobileScene {
                     self.recents.snap_to_index(new_idx);
                 }
             }
+            GestureAction::Swipe { .. } => {}
             GestureAction::None => {}
         }
     }

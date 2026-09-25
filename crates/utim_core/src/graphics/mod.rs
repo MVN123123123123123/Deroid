@@ -7,6 +7,7 @@ pub mod drm_kms;
 pub mod elf_align;
 pub mod gpu;
 pub mod gralloc;
+pub mod png;
 pub mod vsync;
 
 pub use composer::{
@@ -14,6 +15,7 @@ pub use composer::{
     Rect, Transform,
 };
 pub use drm_kms::{AppGridItem, DrmInteractiveState, DrmKmsDevice, TerminalTabInfo};
+pub use png::{decode_png, RgbaImage};
 pub use elf_align::{
     inspect_elf_bytes, inspect_elf_file, verify_64k_alignment, ElfAlignmentReport,
 };

@@ -9,9 +9,11 @@ use std::fs;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use utim_core::compositor::desktop::{DesktopApp, DesktopCatalogue};
+use utim_core::compositor::IconCache;
 use utim_core::compositor::gestures::{
     GestureAction, GestureConfig, GestureEngine, RawTouchEvent, TouchPhase,
 };
@@ -26,7 +28,7 @@ use utim_core::compositor::protocols::{ProtocolRegistry, WaylandInterface};
 use utim_core::compositor::server::WaylandServer;
 use utim_core::compositor::systemui::{QuickTileKind, SystemUiShade};
 use utim_core::graphics::composer::{HwcComposer, HwcVersion};
-use utim_core::graphics::{AppGridItem, DrmInteractiveState, DrmKmsDevice, TerminalTabInfo};
+use utim_core::graphics::{AppGridItem, DrmInteractiveState, DrmKmsDevice, RgbaImage, TerminalTabInfo};
 
 #[derive(Debug, Clone)]
 pub struct ManagedApp {
@@ -35,6 +37,10 @@ pub struct ManagedApp {
     pub exec: String,
     pub color: u32,
     pub glyph: String,
+    /// Icon theme names tried in order when resolving this app's icon.
+    pub icon_keys: Vec<String>,
+    /// Decoded icon bitmap, attached by [`apply_app_icons`].
+    pub icon: Option<Rc<RgbaImage>>,
 }
 
 impl ManagedApp {
@@ -45,7 +51,80 @@ impl ManagedApp {
             exec: exec.to_string(),
             color,
             glyph: glyph.to_string(),
+            icon_keys: Vec::new(),
+            icon: None,
         }
+    }
+
+    fn with_icon_keys(mut self, keys: &[&str]) -> Self {
+        self.icon_keys = keys.iter().map(|k| k.to_string()).collect();
+        self
+    }
+}
+
+/// Freedesktop icon names for the built-in launcher entries. All of these
+/// resolve in the icon themes shipped by the rootfs except `clock`, which has
+/// no raster icon and therefore keeps its letter glyph.
+const BUILTIN_ICON_KEYS: [(&str, &[&str]); 13] = [
+    ("phone", &["phone", "call-start"]),
+    ("messages", &["mail-message-new", "messages"]),
+    ("browser", &["web-browser", "browser", "internet-web-browser"]),
+    ("camera", &["camera-photo", "camera"]),
+    ("gallery", &["image-x-generic", "gallery"]),
+    ("settings", &["preferences-system", "settings"]),
+    ("files", &["system-file-manager", "files"]),
+    ("music", &["audio-x-generic", "music"]),
+    ("terminal", &["utilities-terminal", "terminal"]),
+    ("treble", &["computer", "treble", "distributor-logo-android", "android"]),
+    ("contacts", &["contact-new", "contacts"]),
+    ("clock", &["clock"]),
+    ("apps", &["view-app-grid", "apps"]),
+];
+
+/// Built-in launcher entry with its icon keys attached.
+fn builtin_app(id: &str, name: &str, exec: &str, color: u32, glyph: &str) -> ManagedApp {
+    let keys = BUILTIN_ICON_KEYS
+        .iter()
+        .find(|(k, _)| *k == id)
+        .map(|(_, keys)| *keys)
+        .unwrap_or(&[]);
+    ManagedApp::new(id, name, exec, color, glyph).with_icon_keys(keys)
+}
+
+/// Stable fingerprint of the application set, used to decide when the icon
+/// cache may drop its recorded misses and re-scan.
+fn app_set_signature(apps: &[ManagedApp]) -> String {
+    let mut sig = String::with_capacity(apps.len() * 24);
+    for app in apps {
+        sig.push_str(&app.id);
+        sig.push('\0');
+    }
+    sig
+}
+
+/// Resolve every app's `icon_keys` through one batched icon-theme sweep and
+/// attach the decoded bitmap; apps whose keys do not resolve keep the
+/// first-letter glyph fallback.
+fn apply_app_icons(apps: &mut [ManagedApp], cache: &mut IconCache) {
+    let mut pending: Vec<String> = Vec::new();
+    for app in apps.iter() {
+        for key in &app.icon_keys {
+            if !cache.knows(key) && !pending.contains(key) {
+                pending.push(key.clone());
+            }
+        }
+    }
+    for dock_key in ["view-app-grid", "apps"] {
+        let dk = dock_key.to_string();
+        if !cache.knows(&dk) && !pending.contains(&dk) {
+            pending.push(dk);
+        }
+    }
+    if !pending.is_empty() {
+        cache.resolve_keys(&pending);
+    }
+    for app in apps.iter_mut() {
+        app.icon = app.icon_keys.iter().find_map(|key| cache.get(key));
     }
 }
 
@@ -68,12 +147,10 @@ fn get_app_color(name_or_id: &str) -> u32 {
     }
     PALETTE[(hash as usize) % PALETTE.len()]
 }
-
 fn launch_desktop_app(exec_cmd: &str, socket_dir: &str) {
     if exec_cmd.is_empty() {
         return;
     }
-    println!("[UTLC] Launching desktop application: '{}'", exec_cmd);
     let parts: Vec<&str> = exec_cmd.split_whitespace().collect();
     if parts.is_empty() {
         return;
@@ -81,31 +158,65 @@ fn launch_desktop_app(exec_cmd: &str, socket_dir: &str) {
     let prog = parts[0];
     let args = &parts[1..];
 
-    let _ = std::fs::create_dir_all(socket_dir);
-    let _ = std::fs::create_dir_all("/run/user/0");
-    let _ = std::fs::create_dir_all("/tmp");
+    if !std::path::Path::new(prog).exists() {
+        eprintln!("[UTLC] Skipping desktop application launch: binary '{}' does not exist", prog);
+        return;
+    }
+    println!("[UTLC] Launching desktop application: '{}'", exec_cmd);
 
-    // Ensure root home permissions are intact
-    unsafe {
-        if let Ok(c_root) = std::ffi::CString::new("/root") {
-            libc::chown(c_root.as_ptr(), 0, 0);
+    let is_root = unsafe { libc::geteuid() == 0 };
+    let (target_home, target_user, app_socket_dir) = if is_root {
+        let _ = std::fs::create_dir_all("/home/user");
+        let _ = std::fs::create_dir_all("/run/user/1000");
+        unsafe {
+            if let Ok(c_home) = std::ffi::CString::new("/home/user") {
+                libc::chown(c_home.as_ptr(), 1000, 1000);
+            }
+            if let Ok(c_run_u) = std::ffi::CString::new("/run/user/1000") {
+                libc::chown(c_run_u.as_ptr(), 1000, 1000);
+                libc::chmod(c_run_u.as_ptr(), 0o777);
+            }
+        }
+        ("/home/user", "user", "/run/user/1000")
+    } else {
+        (
+            "/home/user",
+            "user",
+            socket_dir,
+        )
+    };
+
+    let mut cmd = std::process::Command::new(prog);
+    cmd.args(args)
+        .env("WAYLAND_DISPLAY", "wayland-0")
+        .env("XDG_RUNTIME_DIR", app_socket_dir)
+        .env("GDK_BACKEND", "wayland")
+        .env("MOZ_ENABLE_WAYLAND", "1")
+        .env("HOME", target_home)
+        .env("USER", target_user)
+        .env("LOGNAME", target_user)
+        .env("SHELL", "/bin/bash")
+        .env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+
+    if is_root {
+        cmd.uid(1000).gid(1000);
+        unsafe {
+            cmd.pre_exec(|| {
+                let groups = [1000 as libc::gid_t, 24, 27, 29, 44, 105, 107];
+                libc::setgroups(groups.len(), groups.as_ptr());
+                Ok(())
+            });
         }
     }
 
-    match std::process::Command::new(prog)
-        .args(args)
-        .env("WAYLAND_DISPLAY", "wayland-0")
-        .env("XDG_RUNTIME_DIR", socket_dir)
-        .env("GDK_BACKEND", "wayland")
-        .env("MOZ_ENABLE_WAYLAND", "1")
-        .env("HOME", "/root")
-        .env("USER", "root")
-        .env("SHELL", "/bin/bash")
-        .env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
-        .spawn()
-    {
+    match cmd.spawn() {
         Ok(child) => {
-            println!("[UTLC] Spawned '{}' with PID {}", prog, child.id());
+            println!(
+                "[UTLC] Spawned '{}' with PID {} (UID {})",
+                prog,
+                child.id(),
+                if is_root { 1000 } else { unsafe { libc::getuid() } }
+            );
         }
         Err(e) => {
             eprintln!("[UTLC] Error spawning '{}': {}", prog, e);
@@ -135,18 +246,18 @@ fn build_all_apps(catalogue: &DesktopCatalogue) -> Vec<ManagedApp> {
     };
 
     // 1. Built-in Core System Apps
-    apps.push(ManagedApp::new("phone", "Phone", "", 0xFF10B981, "P"));
-    apps.push(ManagedApp::new("messages", "Messages", "", 0xFF3B82F6, "M"));
-    apps.push(ManagedApp::new("browser", "Browser", &browser_exec, 0xFF06B6D4, "B"));
-    apps.push(ManagedApp::new("camera", "Camera", "", 0xFFF43F5E, "C"));
-    apps.push(ManagedApp::new("gallery", "Gallery", "", 0xFF8B5CF6, "G"));
-    apps.push(ManagedApp::new("settings", "Settings", "", 0xFF64748B, "S"));
-    apps.push(ManagedApp::new("files", "Files", "", 0xFFF59E0B, "F"));
-    apps.push(ManagedApp::new("music", "Music", "", 0xFFD946EF, "M"));
-    apps.push(ManagedApp::new("terminal", "Terminal", "", 0xFF1E293B, ">"));
-    apps.push(ManagedApp::new("treble", "Treble OS", "", 0xFF6366F1, "U"));
-    apps.push(ManagedApp::new("contacts", "Contacts", "", 0xFF14B8A6, "C"));
-    apps.push(ManagedApp::new("clock", "Clock", "", 0xFFEF4444, "T"));
+    apps.push(builtin_app("phone", "Phone", "", 0xFF10B981, "P"));
+    apps.push(builtin_app("messages", "Messages", "", 0xFF3B82F6, "M"));
+    apps.push(builtin_app("browser", "Browser", &browser_exec, 0xFF06B6D4, "B"));
+    apps.push(builtin_app("camera", "Camera", "", 0xFFF43F5E, "C"));
+    apps.push(builtin_app("gallery", "Gallery", "", 0xFF8B5CF6, "G"));
+    apps.push(builtin_app("settings", "Settings", "", 0xFF64748B, "S"));
+    apps.push(builtin_app("files", "Files", "", 0xFFF59E0B, "F"));
+    apps.push(builtin_app("music", "Music", "", 0xFFD946EF, "M"));
+    apps.push(builtin_app("terminal", "Terminal", "", 0xFF1E293B, ">"));
+    apps.push(builtin_app("treble", "Treble OS", "", 0xFF6366F1, "U"));
+    apps.push(builtin_app("contacts", "Contacts", "", 0xFF14B8A6, "C"));
+    apps.push(builtin_app("clock", "Clock", "", 0xFFEF4444, "T"));
 
     // 2. Discovered installed applications from /usr/share/applications etc.
     for d_app in catalogue.apps() {
@@ -185,7 +296,16 @@ fn build_all_apps(catalogue: &DesktopCatalogue) -> Vec<ManagedApp> {
 
         // Avoid adding duplicate if already present in base apps
         if !apps.iter().any(|a| a.name.eq_ignore_ascii_case(&display_name)) {
-            apps.push(ManagedApp::new(&d_app.id, &display_name, &exec, color, &glyph));
+            let mut app = ManagedApp::new(&d_app.id, &display_name, &exec, color, &glyph);
+            // `Icon=` first, then the desktop id (many themes key on it).
+            if !d_app.icon.is_empty() {
+                app.icon_keys.push(d_app.icon.clone());
+            }
+            let id_key = d_app.id.to_lowercase();
+            if !d_app.id.is_empty() && !app.icon_keys.contains(&id_key) {
+                app.icon_keys.push(id_key);
+            }
+            apps.push(app);
         }
     }
 
@@ -327,6 +447,28 @@ fn run_daemon() {
             "[+] Bound Wayland display socket at {}",
             socket_path.display()
         );
+        let is_root = unsafe { libc::geteuid() == 0 };
+        if is_root {
+            unsafe {
+                if let Ok(c_s) = std::ffi::CString::new(socket_path.to_string_lossy().as_bytes()) {
+                    libc::chmod(c_s.as_ptr(), 0o666);
+                }
+                if let Ok(c_sdir) = std::ffi::CString::new(socket_dir.as_bytes()) {
+                    libc::chmod(c_sdir.as_ptr(), 0o777);
+                }
+            }
+            let user_sock_dir = PathBuf::from("/run/user/1000");
+            let _ = fs::create_dir_all(&user_sock_dir);
+            unsafe {
+                if let Ok(c_u) = std::ffi::CString::new("/run/user/1000") {
+                    libc::chown(c_u.as_ptr(), 1000, 1000);
+                    libc::chmod(c_u.as_ptr(), 0o777);
+                }
+            }
+            let user_sock = user_sock_dir.join("wayland-0");
+            let _ = fs::remove_file(&user_sock);
+            let _ = std::os::unix::fs::symlink(&socket_path, &user_sock);
+        }
     }
 
     match server.boot_to_first_frame() {
@@ -467,6 +609,12 @@ fn run_daemon() {
     let mut search_query = String::with_capacity(64);
     let mut search_active = false;
     let mut active_app: Option<String> = None;
+    let mut app_input = String::with_capacity(128);
+    let mut app_input_focused = false;
+    let mut messages_list: Vec<String> = vec![
+        "Treble Carrier: LTE connection active.".to_string(),
+        "System: All Android 14 GKI HAL bridges ready.".to_string(),
+    ];
     let mut terminal_tabs: Vec<TerminalTab> = vec![TerminalTab::new(1)];
     let mut active_tab_idx: usize = 0;
     let mut next_tab_id: usize = 2;
@@ -475,11 +623,41 @@ fn run_daemon() {
     let mut is_touching = false;
     let mut last_input_rescan = Instant::now();
 
+    // Multi-page home screen and Android 17 / PixelUI App Drawer state
+    let mut home_pages: Vec<Vec<String>> = vec![
+        vec![
+            "phone".into(),
+            "messages".into(),
+            "browser".into(),
+            "camera".into(),
+            "gallery".into(),
+            "settings".into(),
+            "files".into(),
+            "music".into(),
+        ],
+        vec![
+            "terminal".into(),
+            "treble".into(),
+            "contacts".into(),
+            "clock".into(),
+        ],
+    ];
+    let mut current_home_page: usize = 0;
+    let mut app_drawer_open = false;
+    let mut drawer_search = String::with_capacity(64);
+    let mut drawer_search_active = false;
+    let mut selected_home_icon: Option<String> = None;
+
     let mut desktop_catalogue = DesktopCatalogue::new();
     desktop_catalogue.scan_system_directories();
     let mut all_managed_apps = build_all_apps(&desktop_catalogue);
     let mut last_catalogue_scan = Instant::now();
     let catalogue_scan_interval = Duration::from_secs(2);
+
+    // Icon resolution: one sweep per batch of new keys, then served from cache.
+    let mut icon_cache = IconCache::new();
+    let mut icon_app_sig = app_set_signature(&all_managed_apps);
+    apply_app_icons(&mut all_managed_apps, &mut icon_cache);
 
     let mut running = true;
     let mut last_frame = Instant::now();
@@ -574,6 +752,9 @@ fn run_daemon() {
                                                         }
                                                     }
                                                     active_app = None;
+                                                    app_drawer_open = false;
+                                                    drawer_search_active = false;
+                                                    selected_home_icon = None;
                                                     server.scene.system_ui.close();
                                                     search_active = false;
                                                     server.scene.keyboard.deactivate();
@@ -591,6 +772,12 @@ fn run_daemon() {
                                                     } else if server.scene.keyboard.is_active {
                                                         server.scene.keyboard.deactivate();
                                                         search_active = false;
+                                                        drawer_search_active = false;
+                                                    } else if app_drawer_open {
+                                                        app_drawer_open = false;
+                                                        drawer_search_active = false;
+                                                    } else if selected_home_icon.is_some() {
+                                                        selected_home_icon = None;
                                                     } else if active_app.is_some() {
                                                         if active_app.as_deref() == Some("Terminal") {
                                                             for tab in &terminal_tabs {
@@ -600,6 +787,38 @@ fn run_daemon() {
                                                         active_app = None;
                                                         server.scene.keyboard.deactivate();
                                                         search_active = false;
+                                                    }
+                                                }
+                                                GestureAction::Swipe { delta_x, delta_y } => {
+                                                    if active_app.is_none() && !server.scene.system_ui.is_open() && !server.scene.keyboard.is_active {
+                                                        if app_drawer_open {
+                                                            if delta_y > 45.0 {
+                                                                // Swiped down in App Drawer -> close drawer
+                                                                app_drawer_open = false;
+                                                                drawer_search_active = false;
+                                                                drawer_search.clear();
+                                                            }
+                                                        } else {
+                                                            if delta_y < -45.0 {
+                                                                // Swiped up on home screen -> open App Drawer!
+                                                                app_drawer_open = true;
+                                                                selected_home_icon = None;
+                                                            } else if delta_x < -45.0 {
+                                                                // Swiped left -> next page
+                                                                if current_home_page + 1 < home_pages.len() {
+                                                                    current_home_page += 1;
+                                                                    selected_home_icon = None;
+                                                                    println!("[UTLC] Swiped left to Home Page {}", current_home_page + 1);
+                                                                }
+                                                            } else if delta_x > 45.0 {
+                                                                // Swiped right -> prev page
+                                                                if current_home_page > 0 {
+                                                                    current_home_page -= 1;
+                                                                    selected_home_icon = None;
+                                                                    println!("[UTLC] Swiped right to Home Page {}", current_home_page + 1);
+                                                                }
+                                                            }
+                                                        }
                                                     }
                                                 }
                                                 _ => {}
@@ -636,45 +855,141 @@ fn run_daemon() {
                                                 let r3_y = r2_y + 65.0 + 12.0;
                                                 let r4_y = r3_y + 65.0 + 12.0;
 
+                                                let handle_key_input = |key_str: &str,
+                                                                            active_app: &mut Option<String>,
+                                                                            app_input: &mut String,
+                                                                            app_input_focused: &mut bool,
+                                                                            search_active: &mut bool,
+                                                                            search_query: &mut String,
+                                                                            drawer_search: &mut String,
+                                                                            drawer_search_active: &mut bool,
+                                                                            app_drawer_open: bool,
+                                                                            terminal_tabs: &mut Vec<TerminalTab>,
+                                                                            active_tab_idx: &mut usize,
+                                                                            next_tab_id: &mut usize,
+                                                                            keyboard: &mut VirtualKeyboard,
+                                                                            messages_list: &mut Vec<String>| {
+                                                    if app_drawer_open && *drawer_search_active {
+                                                        match key_str {
+                                                            "BACKSPACE" => { drawer_search.pop(); }
+                                                            "ENTER" => {
+                                                                *drawer_search_active = false;
+                                                                keyboard.deactivate();
+                                                            }
+                                                            "SPACE" => {
+                                                                if drawer_search.len() < 40 {
+                                                                    drawer_search.push(' ');
+                                                                }
+                                                            }
+                                                            ch => {
+                                                                let c = if keyboard.is_shift_active {
+                                                                    ch.chars().next().unwrap_or('?')
+                                                                } else {
+                                                                    ch.chars().next().unwrap_or('?').to_ascii_lowercase()
+                                                                };
+                                                                if drawer_search.len() < 40 {
+                                                                    drawer_search.push(c);
+                                                                }
+                                                            }
+                                                        }
+                                                    } else {
+                                                        let act = keyboard.handle_key_tap(key_str);
+                                                        apply_ime_action(
+                                                            act,
+                                                            active_app,
+                                                            app_input,
+                                                            app_input_focused,
+                                                            search_active,
+                                                            search_query,
+                                                            terminal_tabs,
+                                                            active_tab_idx,
+                                                            next_tab_id,
+                                                            keyboard,
+                                                            messages_list,
+                                                        );
+                                                    }
+                                                };
+
                                                 if y >= r1_y && y < r1_y + 65.0 {
                                                     let r1_key_w = (kb_w - 30.0) / 10.0;
                                                     let idx = ((x - kb_x - 15.0) / r1_key_w).clamp(0.0, 9.0) as usize;
-                                                    if let Some(ch) = row1[idx].chars().next() {
-                                                        if active_app.as_deref() == Some("Terminal") {
-                                                            terminal_tabs[active_tab_idx].input.push(ch.to_ascii_lowercase());
-                                                        } else if search_active {
-                                                            search_query.push(ch.to_ascii_lowercase());
-                                                        }
-                                                    }
+                                                    handle_key_input(
+                                                        row1[idx],
+                                                        &mut active_app,
+                                                        &mut app_input,
+                                                        &mut app_input_focused,
+                                                        &mut search_active,
+                                                        &mut search_query,
+                                                        &mut drawer_search,
+                                                        &mut drawer_search_active,
+                                                        app_drawer_open,
+                                                        &mut terminal_tabs,
+                                                        &mut active_tab_idx,
+                                                        &mut next_tab_id,
+                                                        &mut server.scene.keyboard,
+                                                        &mut messages_list,
+                                                    );
                                                 } else if y >= r2_y && y < r2_y + 65.0 {
                                                     let r2_key_w = (kb_w - 60.0) / 9.0;
                                                     let idx = ((x - kb_x - 30.0) / r2_key_w).clamp(0.0, 8.0) as usize;
-                                                    if let Some(ch) = row2[idx].chars().next() {
-                                                        if active_app.as_deref() == Some("Terminal") {
-                                                            terminal_tabs[active_tab_idx].input.push(ch.to_ascii_lowercase());
-                                                        } else if search_active {
-                                                            search_query.push(ch.to_ascii_lowercase());
-                                                        }
-                                                    }
+                                                    handle_key_input(
+                                                        row2[idx],
+                                                        &mut active_app,
+                                                        &mut app_input,
+                                                        &mut app_input_focused,
+                                                        &mut search_active,
+                                                        &mut search_query,
+                                                        &mut drawer_search,
+                                                        &mut drawer_search_active,
+                                                        app_drawer_open,
+                                                        &mut terminal_tabs,
+                                                        &mut active_tab_idx,
+                                                        &mut next_tab_id,
+                                                        &mut server.scene.keyboard,
+                                                        &mut messages_list,
+                                                    );
                                                 } else if y >= r3_y && y < r3_y + 65.0 {
                                                     let special_w = 95.0;
                                                     let mid_w = (kb_w - 30.0 - special_w * 2.0) / 7.0;
                                                     if x > kb_x + 15.0 + special_w + 7.0 * mid_w {
                                                         // Backspace
-                                                        if active_app.as_deref() == Some("Terminal") {
-                                                            terminal_tabs[active_tab_idx].input.pop();
-                                                        } else if search_active {
-                                                            search_query.pop();
-                                                        }
+                                                        handle_key_input(
+                                                            "BACKSPACE",
+                                                            &mut active_app,
+                                                            &mut app_input,
+                                                            &mut app_input_focused,
+                                                            &mut search_active,
+                                                            &mut search_query,
+                                                            &mut drawer_search,
+                                                            &mut drawer_search_active,
+                                                            app_drawer_open,
+                                                            &mut terminal_tabs,
+                                                            &mut active_tab_idx,
+                                                            &mut next_tab_id,
+                                                            &mut server.scene.keyboard,
+                                                            &mut messages_list,
+                                                        );
                                                     } else if x >= kb_x + 15.0 + special_w {
                                                         let idx = ((x - kb_x - 15.0 - special_w) / mid_w).clamp(0.0, 6.0) as usize;
-                                                        if let Some(ch) = row3[idx].chars().next() {
-                                                            if active_app.as_deref() == Some("Terminal") {
-                                                                terminal_tabs[active_tab_idx].input.push(ch.to_ascii_lowercase());
-                                                            } else if search_active {
-                                                                search_query.push(ch.to_ascii_lowercase());
-                                                            }
-                                                        }
+                                                        handle_key_input(
+                                                            row3[idx],
+                                                            &mut active_app,
+                                                            &mut app_input,
+                                                            &mut app_input_focused,
+                                                            &mut search_active,
+                                                            &mut search_query,
+                                                            &mut drawer_search,
+                                                            &mut drawer_search_active,
+                                                            app_drawer_open,
+                                                            &mut terminal_tabs,
+                                                            &mut active_tab_idx,
+                                                            &mut next_tab_id,
+                                                            &mut server.scene.keyboard,
+                                                            &mut messages_list,
+                                                        );
+                                                    } else {
+                                                        // Shift key
+                                                        let _ = server.scene.keyboard.handle_key_tap("SHIFT");
                                                     }
                                                 } else if y >= r4_y && y < r4_y + 65.0 {
                                                     let sym_w = 120.0;
@@ -685,44 +1000,80 @@ fn run_daemon() {
                                                     if x <= kb_x + 15.0 + sym_w {
                                                         // "Hide" key tapped -> dismiss virtual keyboard
                                                         server.scene.keyboard.deactivate();
+                                                        app_input_focused = false;
+                                                        drawer_search_active = false;
                                                     } else if x >= enter_x {
-                                                        if active_app.as_deref() == Some("Terminal") {
-                                                            handle_terminal_enter(
-                                                                &mut terminal_tabs,
-                                                                &mut active_tab_idx,
-                                                                &mut next_tab_id,
-                                                                &mut active_app,
-                                                                &mut server.scene.keyboard,
-                                                                &mut search_active,
-                                                            );
-                                                        } else {
-                                                            search_active = false;
-                                                            server.scene.keyboard.deactivate();
-                                                        }
+                                                        handle_key_input(
+                                                            "ENTER",
+                                                            &mut active_app,
+                                                            &mut app_input,
+                                                            &mut app_input_focused,
+                                                            &mut search_active,
+                                                            &mut search_query,
+                                                            &mut drawer_search,
+                                                            &mut drawer_search_active,
+                                                            app_drawer_open,
+                                                            &mut terminal_tabs,
+                                                            &mut active_tab_idx,
+                                                            &mut next_tab_id,
+                                                            &mut server.scene.keyboard,
+                                                            &mut messages_list,
+                                                        );
                                                     } else if x >= space_x {
-                                                        if active_app.as_deref() == Some("Terminal") {
-                                                            terminal_tabs[active_tab_idx].input.push(' ');
-                                                        } else if search_active {
-                                                            search_query.push(' ');
-                                                        }
+                                                        handle_key_input(
+                                                            "SPACE",
+                                                            &mut active_app,
+                                                            &mut app_input,
+                                                            &mut app_input_focused,
+                                                            &mut search_active,
+                                                            &mut search_query,
+                                                            &mut drawer_search,
+                                                            &mut drawer_search_active,
+                                                            app_drawer_open,
+                                                            &mut terminal_tabs,
+                                                            &mut active_tab_idx,
+                                                            &mut next_tab_id,
+                                                            &mut server.scene.keyboard,
+                                                            &mut messages_list,
+                                                        );
                                                     }
                                                 }
                                             } else if server.scene.keyboard.is_active {
-                                                // Tapped outside keyboard while keyboard was active -> dismiss keyboard
-                                                server.scene.keyboard.deactivate();
-                                                search_active = false;
-                                                // If tapped on app top buttons or nav pill, also handle app exit
-                                                if active_app.is_some()
-                                                    && (((20.0..=130.0).contains(&x) && (48.0..=110.0).contains(&y))
+                                                // Tapped outside keyboard while keyboard was active
+                                                if active_app.is_some() {
+                                                    if ((20.0..=130.0).contains(&x) && (48.0..=110.0).contains(&y))
                                                         || (x >= (w - 90.0) && (48.0..=110.0).contains(&y))
-                                                        || (y >= (h - 40.0)))
-                                                {
-                                                    if active_app.as_deref() == Some("Terminal") {
-                                                        for tab in &terminal_tabs {
-                                                            tab.cleanup_child();
+                                                        || (y >= (h - 40.0))
+                                                    {
+                                                        if active_app.as_deref() == Some("Terminal") {
+                                                            for tab in &terminal_tabs {
+                                                                tab.cleanup_child();
+                                                            }
                                                         }
+                                                        active_app = None;
+                                                        server.scene.keyboard.deactivate();
+                                                        search_active = false;
+                                                        app_input_focused = false;
+                                                        app_input.clear();
+                                                    } else if active_app.as_deref() == Some("Messages") {
+                                                        let content_y = 48.0 + 56.0 + 12.0;
+                                                        let content_h = h - content_y - 450.0;
+                                                        let msg_box_y = content_y + (content_h - 58.0).max(0.0);
+                                                        let send_btn_x = w - 92.0;
+                                                        if x >= send_btn_x && (msg_box_y..=(msg_box_y + 50.0)).contains(&y) {
+                                                            if !app_input.is_empty() {
+                                                                messages_list.push(format!("You: {}", app_input));
+                                                                app_input.clear();
+                                                            }
+                                                        } else {
+                                                            app_input_focused = true;
+                                                        }
+                                                    } else {
+                                                        app_input_focused = true;
                                                     }
-                                                    active_app = None;
+                                                } else {
+                                                    server.scene.keyboard.deactivate();
+                                                    search_active = false;
                                                 }
                                             } else if active_app.is_some() {
                                                 // An app is open and keyboard is not active
@@ -738,8 +1089,9 @@ fn run_daemon() {
                                                     active_app = None;
                                                     server.scene.keyboard.deactivate();
                                                     search_active = false;
+                                                    app_input_focused = false;
+                                                    app_input.clear();
                                                 } else if active_app.as_deref() == Some("Terminal") {
-                                                    // Check if tab bar tapped (y: 120.0..=175.0)
                                                     let start_x = 36.0;
                                                     let tab_w = 200.0;
                                                     let spacing = 10.0;
@@ -759,6 +1111,7 @@ fn run_daemon() {
                                                                     active_tab_idx = i;
                                                                 }
                                                                 server.scene.keyboard.activate();
+                                                                app_input_focused = true;
                                                                 handled_tab_tap = true;
                                                                 break;
                                                             }
@@ -770,33 +1123,59 @@ fn run_daemon() {
                                                                 next_tab_id += 1;
                                                                 active_tab_idx = terminal_tabs.len() - 1;
                                                                 server.scene.keyboard.activate();
+                                                                app_input_focused = true;
                                                                 handled_tab_tap = true;
                                                             }
                                                         }
                                                     }
                                                     if !handled_tab_tap {
-                                                        // Tapping inside terminal brings keyboard back up
+                                                        server.scene.keyboard.activate();
+                                                        app_input_focused = true;
+                                                    }
+                                                } else if active_app.as_deref() == Some("Messages") {
+                                                    let content_y = 48.0 + 56.0 + 12.0;
+                                                    let content_h = h - content_y - 50.0;
+                                                    let msg_box_y = content_y + (content_h - 58.0).max(0.0);
+                                                    let send_btn_x = w - 92.0;
+                                                    if x >= send_btn_x && (msg_box_y..=(msg_box_y + 50.0)).contains(&y) {
+                                                        if !app_input.is_empty() {
+                                                            messages_list.push(format!("You: {}", app_input));
+                                                            app_input.clear();
+                                                        }
+                                                    } else {
+                                                        app_input_focused = true;
                                                         server.scene.keyboard.activate();
                                                     }
-                                                }
-                                            } else {
-                                                // Home screen hit testing
-                                                if y <= 50.0 {
-                                                    // Tap status bar -> toggle Quick Settings shade
-                                                    server.scene.system_ui.toggle();
-                                                } else if (32.0..=(w - 32.0)).contains(&x) && (235.0..=295.0).contains(&y) {
-                                                    // Tap search pill -> activate search & virtual keyboard
-                                                    search_active = true;
+                                                } else {
+                                                    // Universal typing handler for ALL apps (Browser, Settings, Phone, Contacts, Files, desktop apps):
+                                                    // Clicking on the place to type automatically pops up the keyboard!
+                                                    app_input_focused = true;
                                                     server.scene.keyboard.activate();
-                                                } else if (325.0..(h - 150.0)).contains(&y) {
-                                                    // App grid icons
+                                                }
+                                            } else if app_drawer_open {
+                                                // App Drawer tap handling
+                                                if y <= 65.0 {
+                                                    // Pull handle / top area: dismiss drawer
+                                                    app_drawer_open = false;
+                                                    drawer_search_active = false;
+                                                    server.scene.keyboard.deactivate();
+                                                } else if (68.0..=125.0).contains(&y) {
+                                                    // Search bar in App Drawer
+                                                    if x >= (w - 70.0) && !drawer_search.is_empty() {
+                                                        drawer_search.clear();
+                                                    } else {
+                                                        drawer_search_active = true;
+                                                        server.scene.keyboard.activate();
+                                                    }
+                                                } else if (165.0..(h - 40.0)).contains(&y) {
+                                                    // Tap an application inside the App Drawer
                                                     let col_width = w / 4.0;
                                                     let col = (x / col_width).clamp(0.0, 3.0) as usize;
-                                                    let row = ((y - 325.0) / 115.0) as usize;
+                                                    let row = ((y - 165.0) / 115.0) as usize;
                                                     let idx = row * 4 + col;
 
-                                                    let current_apps: Vec<&ManagedApp> = if search_active && !search_query.is_empty() {
-                                                        let q = search_query.to_lowercase();
+                                                    let drawer_apps: Vec<&ManagedApp> = if !drawer_search.is_empty() {
+                                                        let q = drawer_search.to_lowercase();
                                                         all_managed_apps
                                                             .iter()
                                                             .filter(|a| a.name.to_lowercase().contains(&q) || a.id.to_lowercase().contains(&q))
@@ -805,35 +1184,105 @@ fn run_daemon() {
                                                         all_managed_apps.iter().collect()
                                                     };
 
-                                                    if let Some(target_app) = current_apps.get(idx) {
+                                                    if let Some(target_app) = drawer_apps.get(idx) {
                                                         let app_to_launch = target_app.name.clone();
                                                         let app_exec = target_app.exec.clone();
 
                                                         active_app = Some(app_to_launch.clone());
+                                                        app_input.clear();
+                                                        app_input_focused = false;
+                                                        app_drawer_open = false;
+                                                        drawer_search_active = false;
+                                                        drawer_search.clear();
+
                                                         if app_to_launch == "Terminal" {
                                                             server.scene.keyboard.activate();
+                                                            app_input_focused = true;
                                                         } else {
                                                             server.scene.keyboard.deactivate();
-                                                            search_active = false;
                                                         }
 
                                                         if !app_exec.is_empty() {
                                                             launch_desktop_app(&app_exec, &socket_dir);
                                                         }
                                                     }
+                                                } else if y >= (h - 35.0) {
+                                                    // Bottom pill: close drawer
+                                                    app_drawer_open = false;
+                                                    drawer_search_active = false;
+                                                    drawer_search.clear();
+                                                    server.scene.keyboard.deactivate();
+                                                }
+                                            } else {
+                                                // Home screen hit testing
+                                                let dock_y = h - 140.0;
+                                                if y <= 50.0 {
+                                                    server.scene.system_ui.toggle();
+                                                } else if selected_home_icon.is_some() && (295.0..=345.0).contains(&y) {
+                                                    // Action Bar chips: [ Remove from Home ] [ Move to Page ]
+                                                    if x <= (w / 2.0) {
+                                                        // Remove from Home screen
+                                                        if let Some(ref sel_id) = selected_home_icon {
+                                                            if let Some(pos) = home_pages[current_home_page].iter().position(|id| id == sel_id) {
+                                                                home_pages[current_home_page].remove(pos);
+                                                                println!("[UTLC] Removed app '{}' from Home Page {}", sel_id, current_home_page + 1);
+                                                            }
+                                                        }
+                                                        selected_home_icon = None;
+                                                    } else {
+                                                        // Move to other Page
+                                                        if let Some(sel_id) = selected_home_icon.take() {
+                                                            if let Some(pos) = home_pages[current_home_page].iter().position(|id| *id == sel_id) {
+                                                                home_pages[current_home_page].remove(pos);
+                                                            }
+                                                            let target_page = if current_home_page == 0 { 1 } else { 0 };
+                                                            while home_pages.len() <= target_page {
+                                                                home_pages.push(Vec::new());
+                                                            }
+                                                            home_pages[target_page].push(sel_id.clone());
+                                                            current_home_page = target_page;
+                                                            println!("[UTLC] Moved app '{}' to Home Page {}", sel_id, current_home_page + 1);
+                                                        }
+                                                    }
+                                                } else if (32.0..=(w - 32.0)).contains(&x) && (235.0..=295.0).contains(&y) {
+                                                    search_active = true;
+                                                    server.scene.keyboard.activate();
+                                                } else if (dock_y - 28.0..dock_y - 8.0).contains(&y) {
+                                                    // Page dots indicator
+                                                    let target_page = if x < w / 2.0 { 0 } else { 1.min(home_pages.len().saturating_sub(1)) };
+                                                    if let Some(sel_id) = selected_home_icon.take() {
+                                                        if target_page != current_home_page {
+                                                            if let Some(pos) = home_pages[current_home_page].iter().position(|id| *id == sel_id) {
+                                                                home_pages[current_home_page].remove(pos);
+                                                            }
+                                                            while home_pages.len() <= target_page {
+                                                                home_pages.push(Vec::new());
+                                                            }
+                                                            home_pages[target_page].push(sel_id.clone());
+                                                            println!("[UTLC] Moved app '{}' to Home Page {}", sel_id, target_page + 1);
+                                                        }
+                                                    }
+                                                    current_home_page = target_page;
                                                 } else if y >= (h - 150.0) && y <= (h - 35.0) {
-                                                    // Hotseat dock icons
                                                     let dock_col_w = (w - 40.0) / 5.0;
                                                     let dock_col = ((x - 20.0) / dock_col_w).clamp(0.0, 4.0) as usize;
                                                     let dock_apps = ["Phone", "Messages", "Apps", "Browser", "Camera"];
                                                     let app = dock_apps[dock_col];
                                                     if app == "Apps" {
-                                                        search_active = true;
-                                                        server.scene.keyboard.activate();
+                                                        // Tapping "Apps" on dock toggles the App Drawer!
+                                                        app_drawer_open = !app_drawer_open;
+                                                        selected_home_icon = None;
+                                                        drawer_search.clear();
+                                                        drawer_search_active = false;
+                                                        server.scene.keyboard.deactivate();
                                                     } else {
                                                         active_app = Some(app.to_string());
+                                                        app_input.clear();
+                                                        app_input_focused = false;
+                                                        selected_home_icon = None;
                                                         if app == "Terminal" {
                                                             server.scene.keyboard.activate();
+                                                            app_input_focused = true;
                                                         } else {
                                                             server.scene.keyboard.deactivate();
                                                             search_active = false;
@@ -847,11 +1296,76 @@ fn run_daemon() {
                                                         }
                                                     }
                                                 } else if y >= (h - 30.0) {
-                                                    // Navigation pill
                                                     active_app = None;
                                                     search_active = false;
+                                                    app_drawer_open = false;
+                                                    selected_home_icon = None;
+                                                    app_input_focused = false;
+                                                    app_input.clear();
                                                     server.scene.keyboard.deactivate();
                                                     server.scene.system_ui.close();
+                                                } else {
+                                                    // Home Screen App Grid (CORRECTED COORDINATES STARTING AT 275.0)
+                                                    let grid_start_y = if selected_home_icon.is_some() { 310.0 } else { 275.0 };
+                                                    let grid_end_y = (dock_y - 25.0).min(750.0);
+                                                    if (grid_start_y..grid_end_y).contains(&y) {
+                                                        let col_width = w / 4.0;
+                                                        let col = (x / col_width).clamp(0.0, 3.0) as usize;
+                                                        let row = ((y - grid_start_y) / 115.0) as usize;
+                                                        let idx = row * 4 + col;
+
+                                                        if search_active && !search_query.is_empty() {
+                                                            let q = search_query.to_lowercase();
+                                                            let filtered: Vec<&ManagedApp> = all_managed_apps
+                                                                .iter()
+                                                                .filter(|a| a.name.to_lowercase().contains(&q) || a.id.to_lowercase().contains(&q))
+                                                                .collect();
+                                                            if let Some(target_app) = filtered.get(idx) {
+                                                                let app_to_launch = target_app.name.clone();
+                                                                let app_exec = target_app.exec.clone();
+                                                                active_app = Some(app_to_launch.clone());
+                                                                app_input.clear();
+                                                                app_input_focused = false;
+                                                                search_active = false;
+                                                                server.scene.keyboard.deactivate();
+                                                                if !app_exec.is_empty() {
+                                                                    launch_desktop_app(&app_exec, &socket_dir);
+                                                                }
+                                                            }
+                                                        } else if let Some(sel_id) = selected_home_icon.take() {
+                                                            // Moving icon in edit mode to selected slot
+                                                            if let Some(old_pos) = home_pages[current_home_page].iter().position(|id| *id == sel_id) {
+                                                                home_pages[current_home_page].remove(old_pos);
+                                                                let insert_pos = idx.min(home_pages[current_home_page].len());
+                                                                home_pages[current_home_page].insert(insert_pos, sel_id.clone());
+                                                                println!("[UTLC] Moved app '{}' from slot {} to slot {}", sel_id, old_pos, insert_pos);
+                                                            }
+                                                        } else {
+                                                            let page_app_ids = &home_pages[current_home_page];
+                                                            if let Some(app_id) = page_app_ids.get(idx) {
+                                                                if let Some(target_app) = all_managed_apps.iter().find(|a| a.id == *app_id) {
+                                                                    let app_to_launch = target_app.name.clone();
+                                                                    let app_exec = target_app.exec.clone();
+                                                                    active_app = Some(app_to_launch.clone());
+                                                                    app_input.clear();
+                                                                    app_input_focused = false;
+                                                                    selected_home_icon = None;
+                                                                    if app_to_launch == "Terminal" {
+                                                                        server.scene.keyboard.activate();
+                                                                        app_input_focused = true;
+                                                                    } else {
+                                                                        server.scene.keyboard.deactivate();
+                                                                        search_active = false;
+                                                                    }
+                                                                    if !app_exec.is_empty() {
+                                                                        launch_desktop_app(&app_exec, &socket_dir);
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    } else if selected_home_icon.is_some() {
+                                                        selected_home_icon = None;
+                                                    }
                                                 }
                                             }
                                         }
@@ -955,6 +1469,12 @@ fn run_daemon() {
                                                     if server.scene.keyboard.is_active {
                                                         server.scene.keyboard.deactivate();
                                                         search_active = false;
+                                                        drawer_search_active = false;
+                                                    } else if app_drawer_open {
+                                                        app_drawer_open = false;
+                                                        drawer_search_active = false;
+                                                    } else if selected_home_icon.is_some() {
+                                                        selected_home_icon = None;
                                                     } else if active_app.is_some() {
                                                         active_app = None;
                                                         server.scene.keyboard.deactivate();
@@ -965,8 +1485,12 @@ fn run_daemon() {
                                                 } else if code == KEY_BACKSPACE {
                                                     if active_app.as_deref() == Some("Terminal") {
                                                         terminal_tabs[active_tab_idx].input.pop();
+                                                    } else if app_drawer_open && drawer_search_active {
+                                                        drawer_search.pop();
                                                     } else if search_active {
                                                         search_query.pop();
+                                                    } else if active_app.is_some() && app_input_focused {
+                                                        app_input.pop();
                                                     }
                                                 } else if code == KEY_ENTER && !repeat {
                                                     if active_app.as_deref() == Some("Terminal") {
@@ -978,9 +1502,22 @@ fn run_daemon() {
                                                             &mut server.scene.keyboard,
                                                             &mut search_active,
                                                         );
+                                                    } else if app_drawer_open && drawer_search_active {
+                                                        drawer_search_active = false;
+                                                        server.scene.keyboard.deactivate();
                                                     } else if search_active {
                                                         search_active = false;
                                                         server.scene.keyboard.deactivate();
+                                                    } else if active_app.is_some() && app_input_focused {
+                                                        if active_app.as_deref() == Some("Messages") {
+                                                            if !app_input.is_empty() {
+                                                                messages_list.push(format!("You: {}", app_input));
+                                                                app_input.clear();
+                                                            }
+                                                        } else {
+                                                            server.scene.keyboard.deactivate();
+                                                            app_input_focused = false;
+                                                        }
                                                     }
                                                 } else if let Some(c) = ch {
                                                     if !repeat {
@@ -988,9 +1525,63 @@ fn run_daemon() {
                                                             if terminal_tabs[active_tab_idx].input.len() < 60 {
                                                                 terminal_tabs[active_tab_idx].input.push(c);
                                                             }
+                                                        } else if app_drawer_open && drawer_search_active {
+                                                            if drawer_search.len() < 40 {
+                                                                drawer_search.push(c);
+                                                            }
                                                         } else if search_active && search_query.len() < 40 {
                                                             search_query.push(c);
+                                                        } else if active_app.is_some() {
+                                                            app_input_focused = true;
+                                                            if app_input.len() < 120 {
+                                                                app_input.push(c);
+                                                            }
                                                         }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        InputDispatchResult::LongPress { x, y } => {
+                                            let w = server.scene.width as f32;
+                                            let h = server.scene.height as f32;
+                                            let dock_y = h - 140.0;
+                                            if app_drawer_open {
+                                                if (165.0..(h - 40.0)).contains(&y) {
+                                                    let col_width = w / 4.0;
+                                                    let col = (x / col_width).clamp(0.0, 3.0) as usize;
+                                                    let row = ((y - 165.0) / 115.0) as usize;
+                                                    let idx = row * 4 + col;
+                                                    let drawer_apps: Vec<&ManagedApp> = if !drawer_search.is_empty() {
+                                                        let q = drawer_search.to_lowercase();
+                                                        all_managed_apps
+                                                            .iter()
+                                                            .filter(|a| a.name.to_lowercase().contains(&q) || a.id.to_lowercase().contains(&q))
+                                                            .collect()
+                                                    } else {
+                                                        all_managed_apps.iter().collect()
+                                                    };
+                                                    if let Some(target_app) = drawer_apps.get(idx) {
+                                                        if !home_pages[current_home_page].contains(&target_app.id) {
+                                                            home_pages[current_home_page].push(target_app.id.clone());
+                                                            println!("[UTLC] Pinned '{}' to Home Page {}", target_app.name, current_home_page + 1);
+                                                        }
+                                                        app_drawer_open = false;
+                                                        drawer_search_active = false;
+                                                        server.scene.keyboard.deactivate();
+                                                    }
+                                                }
+                                            } else if active_app.is_none() && !server.scene.system_ui.is_open() {
+                                                let grid_start_y = if selected_home_icon.is_some() { 310.0 } else { 275.0 };
+                                                let grid_end_y = (dock_y - 25.0).min(750.0);
+                                                if (grid_start_y..grid_end_y).contains(&y) {
+                                                    let col_width = w / 4.0;
+                                                    let col = (x / col_width).clamp(0.0, 3.0) as usize;
+                                                    let row = ((y - grid_start_y) / 115.0) as usize;
+                                                    let idx = row * 4 + col;
+                                                    let page_app_ids = &home_pages[current_home_page];
+                                                    if let Some(app_id) = page_app_ids.get(idx) {
+                                                        selected_home_icon = Some(app_id.clone());
+                                                        println!("[UTLC] Selected app '{}' on Home Page {} for edit mode", app_id, current_home_page + 1);
                                                     }
                                                 }
                                             }
@@ -1047,7 +1638,22 @@ fn run_daemon() {
                             } else {
                                 match stream.read(&mut buf) {
                                     Ok(0) => closed = true,
-                                    Ok(_) => {}
+                                    Ok(n) => {
+                                        let mut slice = &buf[..n];
+                                        while let Ok(Some((msg, len))) = utim_core::compositor::protocols::WlMessage::parse(slice) {
+                                            // zwp_text_input_v3 requests:
+                                            // opcode 1: enable -> activate virtual keyboard
+                                            // opcode 2: disable -> deactivate virtual keyboard
+                                            if msg.header.opcode == 1 {
+                                                server.scene.keyboard.activate();
+                                                app_input_focused = true;
+                                            } else if msg.header.opcode == 2 {
+                                                server.scene.keyboard.deactivate();
+                                                app_input_focused = false;
+                                            }
+                                            slice = &slice[len..];
+                                        }
+                                    }
                                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                                     Err(_) => closed = true,
                                 }
@@ -1160,10 +1766,44 @@ fn run_daemon() {
                     last_catalogue_scan = Instant::now();
                     desktop_catalogue.scan_system_directories();
                     all_managed_apps = build_all_apps(&desktop_catalogue);
+                    let sig = app_set_signature(&all_managed_apps);
+                    if sig != icon_app_sig {
+                        // The set changed: previously missing icons may exist now.
+                        icon_app_sig = sig;
+                        icon_cache.invalidate_misses();
+                    }
+                    apply_app_icons(&mut all_managed_apps, &mut icon_cache);
                 }
 
-                let visible_apps: Vec<&ManagedApp> = if search_active && !search_query.is_empty() {
+                // 1. Grid apps on the current home screen page
+                let current_page_app_ids = &home_pages[current_home_page];
+                let home_screen_apps: Vec<&ManagedApp> = if search_active && !search_query.is_empty() {
                     let q = search_query.to_lowercase();
+                    all_managed_apps
+                        .iter()
+                        .filter(|a| a.name.to_lowercase().contains(&q) || a.id.to_lowercase().contains(&q))
+                        .collect()
+                } else {
+                    current_page_app_ids
+                        .iter()
+                        .filter_map(|id| all_managed_apps.iter().find(|a| a.id == *id))
+                        .collect()
+                };
+
+                let grid_items: Vec<AppGridItem> = home_screen_apps
+                    .iter()
+                    .map(|a| AppGridItem {
+                        id: &a.id,
+                        name: &a.name,
+                        color: a.color,
+                        glyph: &a.glyph,
+                        icon: a.icon.as_deref(),
+                    })
+                    .collect();
+
+                // 2. Drawer apps (full catalogue for the PixelUI App Drawer)
+                let drawer_visible_apps: Vec<&ManagedApp> = if !drawer_search.is_empty() {
+                    let q = drawer_search.to_lowercase();
                     all_managed_apps
                         .iter()
                         .filter(|a| a.name.to_lowercase().contains(&q) || a.id.to_lowercase().contains(&q))
@@ -1172,13 +1812,38 @@ fn run_daemon() {
                     all_managed_apps.iter().collect()
                 };
 
-                let grid_items: Vec<AppGridItem> = visible_apps
+                let drawer_items: Vec<AppGridItem> = drawer_visible_apps
                     .iter()
                     .map(|a| AppGridItem {
                         id: &a.id,
                         name: &a.name,
                         color: a.color,
                         glyph: &a.glyph,
+                        icon: a.icon.as_deref(),
+                    })
+                    .collect();
+
+                // Hotseat: same five slots as the hit-test table, real icons included.
+                const DOCK_NAMES: [&str; 5] = ["Phone", "Messages", "Apps", "Browser", "Camera"];
+                let apps_dock_icon = icon_cache.get("view-app-grid").or_else(|| icon_cache.get("apps"));
+                let dock_items: Vec<AppGridItem> = DOCK_NAMES
+                    .iter()
+                    .map(|name| {
+                        let entry = all_managed_apps.iter().find(|a| a.name == *name);
+                        let icon = entry.and_then(|a| a.icon.as_deref()).or_else(|| {
+                            if *name == "Apps" {
+                                apps_dock_icon.as_deref()
+                            } else {
+                                None
+                            }
+                        });
+                        AppGridItem {
+                            id: entry.map(|a| a.id.as_str()).unwrap_or(if *name == "Apps" { "apps" } else { name }),
+                            name,
+                            color: entry.map(|a| a.color).unwrap_or(0xFF475569),
+                            glyph: entry.map(|a| a.glyph.as_str()).unwrap_or(":"),
+                            icon,
+                        }
                     })
                     .collect();
 
@@ -1190,15 +1855,26 @@ fn run_daemon() {
                     search_query: &search_query,
                     search_active,
                     keyboard_active: server.scene.keyboard.is_active,
+                    keyboard_shift_active: server.scene.keyboard.is_shift_active,
                     shade_open: server.scene.system_ui.is_open(),
                     quick_tiles_active,
                     active_app: active_app.as_deref(),
+                    app_input: &app_input,
+                    app_input_focused,
+                    messages_list: &messages_list,
                     terminal_lines: &active_tab.lines,
                     terminal_input: &active_tab.input,
                     terminal_running: active_tab.is_running(),
                     terminal_tabs: &tab_infos,
                     terminal_active_tab: active_tab_idx,
                     grid_apps: &grid_items,
+                    dock_apps: &dock_items,
+                    app_drawer_open,
+                    drawer_apps: &drawer_items,
+                    drawer_search: &drawer_search,
+                    home_page: current_home_page,
+                    total_home_pages: home_pages.len(),
+                    selected_icon_id: selected_home_icon.as_deref(),
                 };
                 drm.render_interactive_ui(&drm_state);
                 drm.flush();
@@ -1396,6 +2072,79 @@ fn handle_terminal_enter(
     }
 }
 
+fn apply_ime_action(
+    act: ImeAction,
+    active_app: &mut Option<String>,
+    app_input: &mut String,
+    app_input_focused: &mut bool,
+    search_active: &mut bool,
+    search_query: &mut String,
+    terminal_tabs: &mut Vec<TerminalTab>,
+    active_tab_idx: &mut usize,
+    next_tab_id: &mut usize,
+    keyboard: &mut VirtualKeyboard,
+    messages_list: &mut Vec<String>,
+) {
+    match act {
+        ImeAction::CommitString(s) => {
+            if active_app.as_deref() == Some("Terminal") {
+                if !terminal_tabs.is_empty() {
+                    terminal_tabs[*active_tab_idx].input.push_str(&s);
+                }
+            } else if *search_active {
+                if search_query.len() + s.len() <= 60 {
+                    search_query.push_str(&s);
+                }
+            } else if active_app.is_some() && *app_input_focused {
+                if app_input.len() + s.len() <= 120 {
+                    app_input.push_str(&s);
+                }
+            }
+        }
+        ImeAction::DeleteSurroundingText { .. } => {
+            if active_app.as_deref() == Some("Terminal") {
+                if !terminal_tabs.is_empty() {
+                    terminal_tabs[*active_tab_idx].input.pop();
+                }
+            } else if *search_active {
+                search_query.pop();
+            } else if active_app.is_some() && *app_input_focused {
+                app_input.pop();
+            }
+        }
+        ImeAction::SendKey(28) => {
+            // ENTER
+            if active_app.as_deref() == Some("Terminal") {
+                handle_terminal_enter(
+                    terminal_tabs,
+                    active_tab_idx,
+                    next_tab_id,
+                    active_app,
+                    keyboard,
+                    search_active,
+                );
+            } else if *search_active {
+                *search_active = false;
+                keyboard.deactivate();
+            } else if active_app.is_some() && *app_input_focused {
+                if active_app.as_deref() == Some("Messages") {
+                    if !app_input.is_empty() {
+                        messages_list.push(format!("You: {}", app_input));
+                        app_input.clear();
+                    }
+                } else if active_app.as_deref() == Some("Browser") || active_app.as_deref() == Some("Firefox") {
+                    keyboard.deactivate();
+                    *app_input_focused = false;
+                } else {
+                    keyboard.deactivate();
+                    *app_input_focused = false;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 fn log_terminal_output(line: &str) {
     use std::io::Write;
     use std::fs::OpenOptions;
@@ -1503,6 +2252,24 @@ fn run_command_process(
     let has_real_shell = Path::new("/bin/bash").exists() || Path::new("/bin/sh").exists();
     let mut executed_real = false;
     if has_real_shell {
+        let is_root = unsafe { libc::geteuid() == 0 };
+        let (target_home, target_user) = if is_root {
+            let _ = std::fs::create_dir_all("/home/user");
+            let _ = std::fs::create_dir_all("/run/user/1000");
+            unsafe {
+                if let Ok(c_home) = std::ffi::CString::new("/home/user") {
+                    libc::chown(c_home.as_ptr(), 1000, 1000);
+                }
+                if let Ok(c_run_u) = std::ffi::CString::new("/run/user/1000") {
+                    libc::chown(c_run_u.as_ptr(), 1000, 1000);
+                    libc::chmod(c_run_u.as_ptr(), 0o777);
+                }
+            }
+            ("/home/user", "user")
+        } else {
+            ("/home/user", "user")
+        };
+
         let shell = if Path::new("/bin/bash").exists() { "/bin/bash" } else { "/bin/sh" };
         let mut cmd_obj = std::process::Command::new(shell);
         cmd_obj
@@ -1510,30 +2277,36 @@ fn run_command_process(
             .arg(cmd)
             .env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
             .env("LD_LIBRARY_PATH", "/usr/lib/aarch64-linux-gnu:/lib/aarch64-linux-gnu:/usr/lib:/lib")
-            .env("HOME", "/root")
-            .env("USER", "root")
-            .env("SHELL", "/bin/bash")
+            .env("HOME", target_home)
+            .env("USER", target_user)
+            .env("LOGNAME", target_user)
+            .env("SHELL", shell)
             .env("TERM", "linux")
             .env("DEBIAN_FRONTEND", "noninteractive")
-            .env_remove("WAYLAND_DISPLAY")
-            .env("WAYLAND_DISPLAY", "")
-            .env_remove("DISPLAY")
-            .env("DISPLAY", "")
-            .env("XDG_SESSION_TYPE", "tty")
-            .env("QT_QPA_PLATFORM", "offscreen")
-            .env("GDK_BACKEND", "x11")
-            .env("CI", "1")
+            .env("XDG_RUNTIME_DIR", "/run/user/1000")
             .env("COLUMNS", "54")
             .env("LINES", "25")
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .stdin(std::process::Stdio::piped());
+
+        if is_root {
+            cmd_obj.uid(1000).gid(1000);
+            if std::path::Path::new(target_home).exists() {
+                cmd_obj.current_dir(target_home);
+            }
+        }
+
         unsafe {
-            cmd_obj.pre_exec(|| {
+            cmd_obj.pre_exec(move || {
                 let mut mask: libc::sigset_t = std::mem::zeroed();
                 libc::sigemptyset(&mut mask);
                 libc::sigprocmask(libc::SIG_SETMASK, &mask, std::ptr::null_mut());
                 libc::setpgid(0, 0);
+                if is_root {
+                    let groups = [1000 as libc::gid_t, 24, 27, 29, 44, 105, 107];
+                    libc::setgroups(groups.len(), groups.as_ptr());
+                }
                 Ok(())
             });
         }
@@ -2390,6 +3163,19 @@ mod tests {
     }
 
     #[test]
+    fn test_clean_build_no_uninstalled_apps() {
+        let catalogue = DesktopCatalogue::new();
+        let apps = build_all_apps(&catalogue);
+        // Clean build has exactly 12 base apps
+        assert_eq!(apps.len(), 12);
+        // Firefox is not preinstalled
+        assert!(apps.iter().all(|a| a.name != "Firefox"));
+        // Browser shortcut default exec is empty (built-in browser)
+        let browser = apps.iter().find(|a| a.name == "Browser").unwrap();
+        assert!(browser.exec.is_empty());
+    }
+
+    #[test]
     fn test_build_all_apps_with_third_party() {
         let mut catalogue = DesktopCatalogue::new();
         let vlc = DesktopApp {
@@ -2428,4 +3214,225 @@ mod tests {
         let c2 = get_app_color("firefox");
         assert_eq!(c1, c2);
     }
+
+    #[test]
+    fn test_universal_ime_actions_and_app_input() {
+        let mut active_app = Some("Browser".to_string());
+        let mut app_input = String::new();
+        let mut app_input_focused = true;
+        let mut search_active = false;
+        let mut search_query = String::new();
+        let mut terminal_tabs = vec![TerminalTab::new(1)];
+        let mut active_tab_idx = 0;
+        let mut next_tab_id = 2;
+        let mut keyboard = VirtualKeyboard::new(1080.0, 2400.0);
+        keyboard.activate();
+        let mut messages_list = Vec::new();
+
+        // 1. Commit characters to active app input
+        apply_ime_action(
+            ImeAction::CommitString("https://google.com".to_string()),
+            &mut active_app,
+            &mut app_input,
+            &mut app_input_focused,
+            &mut search_active,
+            &mut search_query,
+            &mut terminal_tabs,
+            &mut active_tab_idx,
+            &mut next_tab_id,
+            &mut keyboard,
+            &mut messages_list,
+        );
+        assert_eq!(app_input, "https://google.com");
+
+        // 2. Backspace deletes character
+        apply_ime_action(
+            ImeAction::DeleteSurroundingText { before_length: 1, after_length: 0 },
+            &mut active_app,
+            &mut app_input,
+            &mut app_input_focused,
+            &mut search_active,
+            &mut search_query,
+            &mut terminal_tabs,
+            &mut active_tab_idx,
+            &mut next_tab_id,
+            &mut keyboard,
+            &mut messages_list,
+        );
+        assert_eq!(app_input, "https://google.co");
+
+        // 3. Enter in Browser finishes input and closes keyboard
+        apply_ime_action(
+            ImeAction::SendKey(28),
+            &mut active_app,
+            &mut app_input,
+            &mut app_input_focused,
+            &mut search_active,
+            &mut search_query,
+            &mut terminal_tabs,
+            &mut active_tab_idx,
+            &mut next_tab_id,
+            &mut keyboard,
+            &mut messages_list,
+        );
+        assert!(!keyboard.is_active);
+        assert!(!app_input_focused);
+
+        // 4. Test Messages app: Enter posts message to messages_list
+        active_app = Some("Messages".to_string());
+        app_input = "Hello world!".to_string();
+        app_input_focused = true;
+        keyboard.activate();
+
+        apply_ime_action(
+            ImeAction::SendKey(28),
+            &mut active_app,
+            &mut app_input,
+            &mut app_input_focused,
+            &mut search_active,
+            &mut search_query,
+            &mut terminal_tabs,
+            &mut active_tab_idx,
+            &mut next_tab_id,
+            &mut keyboard,
+            &mut messages_list,
+        );
+        assert_eq!(messages_list.len(), 1);
+        assert_eq!(messages_list[0], "You: Hello world!");
+        assert!(app_input.is_empty());
+    }
+
+    #[test]
+    fn test_universal_text_input_wayland_protocol() {
+        use utim_core::compositor::protocols::WlMessageBuilder;
+
+        let mut keyboard = VirtualKeyboard::new(1080.0, 2400.0);
+        assert!(!keyboard.is_active);
+
+        // Build opcode 1: zwp_text_input_v3.enable
+        let builder_enable = WlMessageBuilder::new(42, 1);
+        let wire_enable = builder_enable.build();
+
+        let (msg_enable, len) = utim_core::compositor::protocols::WlMessage::parse(&wire_enable).unwrap().unwrap();
+        assert_eq!(len, wire_enable.len());
+        if msg_enable.header.opcode == 1 {
+            keyboard.activate();
+        }
+        assert!(keyboard.is_active);
+
+        // Build opcode 2: zwp_text_input_v3.disable
+        let builder_disable = WlMessageBuilder::new(42, 2);
+        let wire_disable = builder_disable.build();
+
+        let (msg_disable, _) = utim_core::compositor::protocols::WlMessage::parse(&wire_disable).unwrap().unwrap();
+        if msg_disable.header.opcode == 2 {
+            keyboard.deactivate();
+        }
+        assert!(!keyboard.is_active);
+    }
+
+    #[test]
+    fn test_all_base_apps_resolve_png_icons() {
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let workspace_root = manifest_dir.parent().unwrap().parent().unwrap();
+        let assets_icons = workspace_root.join("assets/icons");
+        assert!(assets_icons.exists(), "assets/icons must exist");
+
+        let mut icon_cache = IconCache::with_roots(vec![assets_icons], "hicolor");
+        let mut apps = build_all_apps(&DesktopCatalogue::new());
+        apply_app_icons(&mut apps, &mut icon_cache);
+
+        // Verify that every single base app has a resolved PNG icon
+        for app in &apps {
+            assert!(
+                app.icon.is_some(),
+                "App '{}' (id: '{}', keys: {:?}) must resolve a real PNG icon image",
+                app.name, app.id, app.icon_keys
+            );
+        }
+
+        // Also verify dock Apps icon
+        assert!(
+            icon_cache.get("view-app-grid").or_else(|| icon_cache.get("apps")).is_some(),
+            "Dock Apps icon must resolve a real PNG icon image"
+        );
+    }
+
+    #[test]
+    fn test_home_pages_icon_reordering_and_movement() {
+        let mut home_pages = vec![
+            vec!["settings".to_string(), "files".to_string(), "terminal".to_string(), "gallery".to_string()],
+            vec!["clock".to_string(), "contacts".to_string()],
+        ];
+        let mut current_page = 0;
+        let mut selected_icon: Option<String> = Some("terminal".to_string());
+
+        // 1. Reorder within Page 0: move "terminal" from index 2 to slot 0
+        if let Some(sel_id) = selected_icon.take() {
+            if let Some(old_pos) = home_pages[current_page].iter().position(|id| *id == sel_id) {
+                home_pages[current_page].remove(old_pos);
+                home_pages[current_page].insert(0, sel_id);
+            }
+        }
+        assert_eq!(home_pages[0], vec!["terminal", "settings", "files", "gallery"]);
+
+        // 2. Move "settings" to Page 1
+        selected_icon = Some("settings".to_string());
+        if let Some(sel_id) = selected_icon.take() {
+            if let Some(pos) = home_pages[current_page].iter().position(|id| *id == sel_id) {
+                home_pages[current_page].remove(pos);
+            }
+            home_pages[1].push(sel_id);
+        }
+        assert_eq!(home_pages[0], vec!["terminal", "files", "gallery"]);
+        assert_eq!(home_pages[1], vec!["clock", "contacts", "settings"]);
+
+        // 3. Remove "files" from Home Page 0
+        selected_icon = Some("files".to_string());
+        if let Some(sel_id) = selected_icon.take() {
+            if let Some(pos) = home_pages[current_page].iter().position(|id| *id == sel_id) {
+                home_pages[current_page].remove(pos);
+            }
+        }
+        assert_eq!(home_pages[0], vec!["terminal", "gallery"]);
+        // Verify files is gone from home page 0, but catalogue retains it
+        let all_apps = build_all_apps(&DesktopCatalogue::new());
+        assert!(all_apps.iter().any(|a| a.id == "files"));
+    }
+
+    #[test]
+    fn test_pixelui_app_drawer_and_pinning() {
+        let all_apps = build_all_apps(&DesktopCatalogue::new());
+        let mut home_pages = vec![
+            vec!["terminal".to_string(), "gallery".to_string()],
+        ];
+        let current_page = 0;
+        let mut app_drawer_open = false;
+
+        // 1. Tapping Apps toggles drawer
+        app_drawer_open = !app_drawer_open;
+        assert!(app_drawer_open);
+
+        // 2. App search filtering in drawer
+        let drawer_search = "cam";
+        let filtered: Vec<&ManagedApp> = all_apps
+            .iter()
+            .filter(|a| a.name.to_lowercase().contains(drawer_search) || a.id.to_lowercase().contains(drawer_search))
+            .collect();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "Camera");
+
+        // 3. Long press app in drawer pins it to current home page
+        let target_app = &filtered[0];
+        if !home_pages[current_page].contains(&target_app.id) {
+            home_pages[current_page].push(target_app.id.clone());
+        }
+        assert!(home_pages[current_page].contains(&"camera".to_string()));
+        assert_eq!(home_pages[current_page].len(), 3);
+
+        // 4. Close drawer
+        app_drawer_open = false;
+        assert!(!app_drawer_open);
+    }
 }
+

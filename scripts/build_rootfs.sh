@@ -74,6 +74,32 @@ EOF
         chmod 600 "${ROOTFS_DIR}/etc/shadow" 2>/dev/null || true
     fi
 
+    # Ensure unprivileged mobile userspace (UID 1000: user) exists
+    if ! grep -q "^user:" "${ROOTFS_DIR}/etc/passwd" 2>/dev/null; then
+        echo "user:x:1000:1000:Universal Treble User:/home/user:/bin/bash" >> "${ROOTFS_DIR}/etc/passwd"
+    fi
+    if ! grep -q "^user:" "${ROOTFS_DIR}/etc/group" 2>/dev/null; then
+        echo "user:x:1000:" >> "${ROOTFS_DIR}/etc/group"
+    fi
+    if ! grep -q "^user:" "${ROOTFS_DIR}/etc/shadow" 2>/dev/null; then
+        echo "user:*:19700:0:99999:7:::" >> "${ROOTFS_DIR}/etc/shadow"
+    fi
+    for grp in audio video input render sudo dialout netdev seat; do
+        if grep -q "^${grp}:" "${ROOTFS_DIR}/etc/group" 2>/dev/null; then
+            sed -i "s/^${grp}:.*/&,user/" "${ROOTFS_DIR}/etc/group"
+            sed -i "s/:,user/:user/" "${ROOTFS_DIR}/etc/group"
+        else
+            echo "${grp}:x:999:user" >> "${ROOTFS_DIR}/etc/group"
+        fi
+    done
+    mkdir -p "${ROOTFS_DIR}/home/user" "${ROOTFS_DIR}/run/user/1000" "${ROOTFS_DIR}/run/user/0"
+    chmod 755 "${ROOTFS_DIR}/home/user"
+    chmod 700 "${ROOTFS_DIR}/run/user/1000"
+    mkdir -p "${ROOTFS_DIR}/etc/sudoers.d"
+    chmod 644 "${ROOTFS_DIR}/etc/sudoers.d/99-universal-treble" 2>/dev/null || true
+    echo "user ALL=(ALL:ALL) NOPASSWD: ALL" > "${ROOTFS_DIR}/etc/sudoers.d/99-universal-treble"
+    chmod 440 "${ROOTFS_DIR}/etc/sudoers.d/99-universal-treble" 2>/dev/null || true
+
     echo "treble-gsi" > "${ROOTFS_DIR}/etc/hostname"
     cat << 'EOF' > "${ROOTFS_DIR}/etc/hosts"
 127.0.0.1 localhost
@@ -211,6 +237,17 @@ EOF
     if [[ -f "${WORKSPACE_ROOT}/utlc.service" ]]; then
         cp "${WORKSPACE_ROOT}/utlc.service" "${ROOTFS_DIR}/usr/lib/systemd/system/utlc.service"
         ln -sf "/usr/lib/systemd/system/utlc.service" "${ROOTFS_DIR}/etc/systemd/system/graphical.target.wants/utlc.service"
+    fi
+
+    # Install launcher icon assets
+    if [[ ! -d "${WORKSPACE_ROOT}/assets/icons" && -f "${SCRIPT_DIR}/download_icons.py" ]]; then
+        python3 "${SCRIPT_DIR}/download_icons.py" || true
+    fi
+    if [[ -d "${WORKSPACE_ROOT}/assets/icons" ]]; then
+        mkdir -p "${ROOTFS_DIR}/usr/share"
+        cp -a "${WORKSPACE_ROOT}/assets/icons" "${ROOTFS_DIR}/usr/share/"
+        mkdir -p "${ROOTFS_DIR}/usr/share/pixmaps"
+        cp -a "${WORKSPACE_ROOT}/assets/icons/hicolor/64x64/apps/"*.png "${ROOTFS_DIR}/usr/share/pixmaps/" 2>/dev/null || true
     fi
 
     # Copy deb packages and kernel modules
@@ -384,13 +421,18 @@ chroot "${ROOTFS_DIR}" dpkg -i /tmp/debs/utim-init-dummy.deb
 chroot "${ROOTFS_DIR}" dpkg -i /tmp/debs/libhybris-hwcomposer_*.deb /tmp/debs/libhybris-gralloc_*.deb /tmp/debs/libhybris-egl_*.deb /tmp/debs/mesa-turnip-kgsl_*.deb /tmp/debs/mesa-zink_*.deb /tmp/debs/utlc_*.deb || true
 
 echo "[*] Installing core runtime packages: seatd, elogind, pipewire, modemmanager, feedbackd..."
+echo "[*] Installing icon themes (PNG-based) so the launcher can resolve real app icons..."
 chroot "${ROOTFS_DIR}" apt-get update
 chroot "${ROOTFS_DIR}" apt-get install -y --no-install-recommends \
     seatd \
     elogind \
     pipewire \
     modemmanager \
-    feedbackd
+    feedbackd \
+    hicolor-icon-theme \
+    adwaita-icon-theme-legacy \
+    gnome-icon-theme \
+    tango-icon-theme
 
 cleanup_chroot_mounts
 trap - EXIT
