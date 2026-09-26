@@ -7,6 +7,9 @@ pub mod drm_kms;
 pub mod elf_align;
 pub mod font;
 pub mod layout;
+// Offscreen render harness: only present in test builds, so the shipped
+// binary carries none of it.
+#[cfg(test)]
 pub mod screenshot;
 pub mod gpu;
 pub mod gralloc;

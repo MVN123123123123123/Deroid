@@ -312,6 +312,102 @@ mod tests {
         }
     }
 
+    /// The render path must not allocate.
+    ///
+    /// The frame is composed straight into a mapped DRM buffer at the panel's
+    /// refresh rate, so a heap allocation here is a latency spike on the UI
+    /// thread. This installs a counting global allocator, warms everything
+    /// that is legitimately one-off (icon decode, the harness buffer), and
+    /// then asserts that composing frames allocates nothing at all.
+    #[test]
+    fn paint_frame_does_not_allocate() {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+
+        // Per-thread, so the other tests running in parallel cannot pollute
+        // the count, and const-initialised so touching it from inside the
+        // allocator cannot itself allocate.
+        std::thread_local! {
+            static COUNT: Cell<usize> = const { Cell::new(0) };
+        }
+        struct Counting;
+        // SAFETY: the shim forwards to the system allocator unchanged and only
+        // bumps a thread-local counter.
+        unsafe impl GlobalAlloc for Counting {
+            unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+                bump();
+                System.alloc(l)
+            }
+            unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+                System.dealloc(p, l)
+            }
+            unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 {
+                bump();
+                System.realloc(p, l, n)
+            }
+            unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
+                bump();
+                System.alloc_zeroed(l)
+            }
+        }
+        #[global_allocator]
+        static ALLOC: Counting = Counting;
+
+        // Called from the allocator, including during thread teardown, so it
+        // must never panic.
+        fn bump() {
+            let _ = COUNT.try_with(|c| c.set(c.get() + 1));
+        }
+        fn allocations() -> usize {
+            COUNT.try_with(|c| c.get()).unwrap_or(0)
+        }
+
+        let icon = stub_icon_sized([80, 160, 240], 121);
+        let names = ["Phone", "Messages", "Camera", "Maps", "Music", "Store"];
+        let grid: Vec<AppGridItem> = names
+            .iter()
+            .map(|n| AppGridItem {
+                id: *n,
+                name: n,
+                color: 0xFF2563EB,
+                glyph: "A",
+                icon: Some(&icon),
+            })
+            .collect();
+        let snap = Snapshot {
+            w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 0.0,
+            drawer_open: false, launch_progress: 0.0, launch_origin: None, press_scale: 1.0,
+            home_page: 0, home_scroll: 0.0, selected: None, search_query: "pho",
+            search_active: true, keyboard: false, grid, drawer: Vec::new(), dock: Vec::new(),
+            active_app: None,
+        };
+        let mut c = Canvas::new(1080, 2400);
+        // Warm: the very first frame touches lazily initialised state.
+        c.draw(&snap);
+
+        let before = allocations();
+        for _ in 0..3 {
+            c.draw(&snap);
+        }
+        let after = allocations();
+        assert_eq!(
+            before,
+            after,
+            "paint_frame allocated {} times while composing a frame",
+            after - before
+        );
+
+        // Sanity check on the harness itself: a deliberate allocation has to be
+        // seen, otherwise the assertion above would pass for the wrong reason.
+        let probe = allocations();
+        let v: Vec<u8> = Vec::with_capacity(4096);
+        std::hint::black_box(&v);
+        assert!(
+            allocations() > probe,
+            "the allocation counter is not wired up"
+        );
+    }
+
     /// The drawer overlay is tested the same way: the sheet's own controls and
     /// grid must all be drawn where the input path looks for them.
     #[test]
