@@ -2115,7 +2115,10 @@ pub fn paint_frame(buf: &mut [u32], stride: usize, w: usize, h: usize, state: &D
             let cur_x = (ox - cur_w * 0.5).clamp(0.0, (w as f32 - cur_w).max(0.0));
             let cur_y = (oy - cur_h * 0.5).clamp(0.0, (h as f32 - cur_h).max(0.0));
             let radius = l.icon_radius + (l.nav_pill.radius.max(16.0) - l.icon_radius) * e;
-            let alpha = (e * 255.0) as u32;
+            // The card is the app's window from the first frame, so it is
+            // mostly opaque throughout; only the last stretch fades in the
+            // surface tint behind it.
+            let alpha = ((0.62 + 0.38 * e) * 255.0) as u32;
             let app_rgb = state.app_launch_color & 0x00FF_FFFF;
             // A hairline in the primary colour keeps the card edge crisp
             // while it is still small enough to read as a chip.
@@ -2454,6 +2457,7 @@ fn draw_icon_bitmap_i32(
             cy as i32 - y,
             x,
             tw as i32,
+            th as i32,
             radius as i32,
             r2,
         ) {
@@ -2659,6 +2663,7 @@ fn draw_rounded_rect_i32(
             cy as i32 - y,
             x,
             rw as i32,
+            rh as i32,
             radius as i32,
             r2,
         ) {
@@ -3090,6 +3095,33 @@ pub fn draw_text_centered_clipped(
     );
 }
 
+/// Test probe: draw a rounded rect with integer geometry.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn paint_rect_probe(
+    buf: &mut [u32],
+    stride: usize,
+    x: usize,
+    y: usize,
+    rw: usize,
+    rh: usize,
+    radius: usize,
+    color: u32,
+) {
+    draw_rounded_rect(
+        buf,
+        stride,
+        stride,
+        (stride * 16).min(4096),
+        x,
+        y,
+        rw,
+        rh,
+        radius,
+        color,
+    );
+}
+
 /// Rounded rectangle from float geometry.
 #[allow(clippy::too_many_arguments)]
 #[inline]
@@ -3187,13 +3219,16 @@ fn rounded_span(
     cy: i32,
     x: i32,
     rw: i32,
+    rh: i32,
     radius: i32,
     r2: i32,
 ) -> Option<(i32, i32)> {
+    // `rh`, not `rw`: a rect taller than it is wide must still have its lower
+    // rows filled, which a shared extent silently dropped.
     let dy = if cy < radius {
         radius - cy
-    } else if cy >= rw - radius {
-        cy - (rw - radius)
+    } else if cy >= rh - radius {
+        cy - (rh - radius)
     } else {
         0
     };

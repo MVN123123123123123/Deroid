@@ -22,7 +22,9 @@ pub struct Snapshot<'a> {
     pub drawer_open: bool,
     pub launch_progress: f32,
     pub launch_origin: Option<(f32, f32)>,
+    pub launch_color: u32,
     pub press_scale: f32,
+    pub pressed_icon: Option<&'a str>,
     pub home_page: usize,
     pub home_scroll: f32,
     pub selected: Option<&'a str>,
@@ -47,7 +49,9 @@ impl<'a> Clone for Snapshot<'a> {
             drawer_open: self.drawer_open,
             launch_progress: self.launch_progress,
             launch_origin: self.launch_origin,
+            launch_color: self.launch_color,
             press_scale: self.press_scale,
+            pressed_icon: self.pressed_icon,
             home_page: self.home_page,
             home_scroll: self.home_scroll,
             selected: self.selected,
@@ -72,8 +76,9 @@ impl<'a> Snapshot<'a> {
             drawer_progress: self.drawer_progress,
             app_launch_progress: self.launch_progress,
             app_launch_origin: self.launch_origin,
-            app_launch_color: 0xFF2563EB,
+            app_launch_color: self.launch_color,
             icon_press_scale: self.press_scale,
+            pressed_icon_id: self.pressed_icon,
             home_page: self.home_page,
             home_scroll_offset: self.home_scroll,
             selected_icon_id: self.selected,
@@ -207,9 +212,9 @@ mod tests {
         let cases: Vec<(&str, Snapshot)> = vec![
             (
                 "home",
-                Snapshot {
+                Snapshot { launch_color: 0xFF2563EB,
                     w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 0.0,
-                    drawer_open: false, launch_progress: 0.0, launch_origin: None, press_scale: 1.0,
+                    drawer_open: false, launch_progress: 0.0, launch_origin: None, pressed_icon: None, press_scale: 1.0,
                     home_page: 0, home_scroll: 0.0, selected: None, search_query: "", search_active: false,
                     keyboard: false, grid: grid.clone(), drawer: Vec::new(), dock: dock.clone(),
                     active_app: None,
@@ -217,11 +222,11 @@ mod tests {
             ),
             (
                 "selected",
-                Snapshot {
+                Snapshot { launch_color: 0xFF2563EB,
                     selected: Some("Phone"),
-                    ..Snapshot {
+                    ..Snapshot { launch_color: 0xFF2563EB,
                         w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 0.0,
-                        drawer_open: false, launch_progress: 0.0, launch_origin: None, press_scale: 1.0,
+                        drawer_open: false, launch_progress: 0.0, launch_origin: None, pressed_icon: None, press_scale: 1.0,
                         home_page: 0, home_scroll: 0.0, selected: None, search_query: "",
                         search_active: false, keyboard: false, grid: grid.clone(), drawer: Vec::new(),
                         dock: dock.clone(), active_app: None,
@@ -374,9 +379,9 @@ mod tests {
                 icon: Some(&icon),
             })
             .collect();
-        let snap = Snapshot {
+        let snap = Snapshot { launch_color: 0xFF2563EB,
             w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 0.0,
-            drawer_open: false, launch_progress: 0.0, launch_origin: None, press_scale: 1.0,
+            drawer_open: false, launch_progress: 0.0, launch_origin: None, pressed_icon: None, press_scale: 1.0,
             home_page: 0, home_scroll: 0.0, selected: None, search_query: "pho",
             search_active: true, keyboard: false, grid, drawer: Vec::new(), dock: Vec::new(),
             active_app: None,
@@ -408,6 +413,218 @@ mod tests {
         );
     }
 
+    /// The app launch transform: the expanding card starts on the icon it was
+    /// launched from and ends covering the panel.
+    #[test]
+    fn launch_transform_grows_from_the_tapped_icon() {
+        use crate::graphics::layout::Layout;
+
+        let icon = stub_icon_sized([40, 40, 40], 121);
+        let grid = vec![AppGridItem {
+            id: "phone",
+            name: "Phone",
+            color: 0xFF2563EB,
+            glyph: "A",
+            icon: Some(&icon),
+        }];
+        let (w, h) = (1080usize, 2400usize);
+        let l = Layout::plain(w as f32, h as f32);
+        let target = l.grid_icon(0);
+        let origin = (target.center_x(), target.center_y());
+
+        // Sample the card's footprint at several progress values by finding
+        // the pixels of the expanding card inside the frame.
+        let mut spans = Vec::new();
+        for &t in &[0.15f32, 0.35, 0.6, 0.9] {
+            let snap = Snapshot {
+                w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 0.0,
+                drawer_open: false, launch_progress: t, launch_origin: Some(origin),
+                launch_color: 0xFFF03030,
+                pressed_icon: None, press_scale: 1.0, home_page: 0, home_scroll: 0.0, selected: None,
+                search_query: "", search_active: false, keyboard: false, grid: grid.clone(),
+                drawer: Vec::new(), dock: Vec::new(), active_app: None,
+            };
+            let mut c = Canvas::new(w, h);
+            c.draw(&snap);
+            let mut min_x = w;
+            let mut max_x = 0;
+            let mut min_y = h;
+            let mut max_y = 0;
+            for y in 0..h {
+                for x in 0..w {
+                    let p = c.buf[y * w + x];
+                    // The card is saturated red over a near black surface, so
+                    // "red dominant" identifies it and nothing else.
+                    let (r, g, b) = ((p >> 16) & 0xFF, (p >> 8) & 0xFF, p & 0xFF);
+                    if r > 60 && g < r / 3 && b < r / 3 {
+                        min_x = min_x.min(x);
+                        max_x = max_x.max(x);
+                        min_y = min_y.min(y);
+                        max_y = max_y.max(y);
+                    }
+                }
+            }
+
+            spans.push((t, min_x, max_x, min_y, max_y));
+        }
+
+        for (i, &(t, x0, x1, y0, y1)) in spans.iter().enumerate() {
+            assert!(x1 > x0 && y1 > y0, "t={t}: the card has no footprint");
+            // The card always grows out of the tapped icon, so the icon's
+            // centre is inside the footprint at every step.
+            assert!(
+                origin.0 >= x0 as f32 && origin.0 <= x1 as f32,
+                "t={t}: card x {}..{} does not cover the icon at {}",
+                x0,
+                x1,
+                origin.0
+            );
+            assert!(
+                origin.1 >= y0 as f32 && origin.1 <= y1 as f32,
+                "t={t}: card y {}..{} does not cover the icon at {}",
+                y0,
+                y1,
+                origin.1
+            );
+            if i == 0 {
+                let width = (x1 - x0) as f32;
+                assert!(
+                    width < l.w * 0.6,
+                    "the card should still be small early on, was {width} wide"
+                );
+            } else {
+                let prev = spans[i - 1];
+                assert!(
+                    (x1 - x0) > (prev.2 - prev.1) || (y1 - y0) > (prev.4 - prev.3),
+                    "t={t}: the card must keep growing"
+                );
+            }
+        }
+        // By the end of the transform the card covers the panel.
+        let (_, x0, x1, y0, y1) = spans[spans.len() - 1];
+        assert!(
+            (x1 - x0) as f32 > w as f32 * 0.9,
+            "card should cover the panel width, was {} of {}",
+            x1 - x0,
+            w
+        );
+        assert!(
+            (y1 - y0) as f32 > h as f32 * 0.9,
+            "card should cover the panel height, was {} of {}",
+            y1 - y0,
+            h
+        );
+    }
+
+    /// The press spring has to be visible: a compressed icon is smaller on
+    /// screen than an idle one.
+    #[test]
+    fn press_scale_visibly_compresses_the_icon() {
+        let icon = stub_icon_sized([40, 120, 240], 121);
+        let grid = vec![AppGridItem {
+            id: "phone",
+            name: "Phone",
+            color: 0xFF2563EB,
+            glyph: "A",
+            icon: Some(&icon),
+        }];
+        let dock = grid.clone();
+        fn base<'a>(
+            scale: f32,
+            pressed: Option<&'a str>,
+            grid: &'a [AppGridItem<'a>],
+            dock: &'a [AppGridItem<'a>],
+        ) -> Snapshot<'a> {
+            Snapshot {
+            w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 0.0,
+            drawer_open: false, launch_progress: 0.0, launch_origin: None, launch_color: 0xFF2563EB, press_scale: scale,
+            home_page: 0, home_scroll: 0.0, selected: None, search_query: "", search_active: false,
+            keyboard: false, grid: grid.to_vec(), drawer: Vec::new(), dock: dock.to_vec(),
+            active_app: None, pressed_icon: pressed,
+            }
+        }
+        let mut idle = Canvas::new(1080, 2400);
+        idle.draw(&base(1.0, None, &grid, &dock));
+        let mut pressed = Canvas::new(1080, 2400);
+        // The shell compresses a pressed icon to this scale.
+        pressed.draw(&base(0.90, Some("phone"), &grid, &dock));
+
+        // Count the coloured icon pixels: a 0.90 scale loses ~19% of the area.
+        let count = |c: &Canvas| {
+            c.buf
+                .iter()
+                .filter(|&&p| {
+                    let (r, g, b) = ((p >> 16) & 0xFF, (p >> 8) & 0xFF, p & 0xFF);
+                    r < 90 && g > 90 && b > 180
+                })
+                .count()
+        };
+        let (a, b) = (count(&idle), count(&pressed));
+        assert!(b < a, "pressed icon should be smaller: {b} vs {a}");
+        let ratio = b as f32 / a as f32;
+        assert!(
+            (0.72..0.92).contains(&ratio),
+            "press scale should shrink the icon to roughly 0.81 of its area, got {ratio}"
+        );
+    }
+
+    /// A rounded rectangle must be filled corner to corner, whatever its
+    /// proportions. The row-span helper this guards once derived the vertical
+    /// corner distance from the *width*, so every rounded rect taller than it
+    /// was wide lost its lower rows - which showed up as the launch card
+    /// covering only a square of the panel.
+    #[test]
+    fn rounded_rects_fill_their_whole_extent() {
+        // Room for the largest probe plus its origin.
+        let w = 400usize;
+        let h = 512usize;
+        // A range of aspect ratios, including tall and wide, plus degenerate
+        // shapes that must not panic.
+        for (rw, rh, radius) in [
+            (200usize, 40usize, 12usize),
+            (40, 200, 12),
+            (200, 200, 60),
+            (300, 60, 30),
+            (60, 300, 30),
+            (1, 300, 0),
+            (300, 1, 0),
+            (5, 5, 4),
+        ] {
+            let mut buf = vec![0xFF000000u32; w * h];
+            debug_assert!(150 + rh <= h && 100 + rw <= w, "probe does not fit");
+            crate::graphics::drm_kms::paint_rect_probe(
+                &mut buf, w, 100, 150, rw, rh, radius, 0xFFFFFFFF,
+            );
+            let lit = buf.iter().filter(|&&p| p == 0xFFFFFFFF).count();
+            // A rounded rect covers (rw*rh) minus the four corner cutouts.
+            let area = (rw * rh) as f32;
+            // Each corner loses a square of r^2 minus a quarter disc.
+            let cut = if radius > 0 {
+                4.0 * (1.0 - std::f32::consts::PI / 4.0) * (radius * radius) as f32
+            } else {
+                0.0
+            };
+            let expected = area - cut;
+            assert!(
+                lit as f32 >= expected * 0.95,
+                "{rw}x{rh} r={radius}: filled {lit} of about {expected}"
+            );
+            // And the corners themselves stay empty.
+            if radius > 1 {
+                assert_eq!(
+                    buf[150 * w + 100],
+                    0xFF000000,
+                    "{rw}x{rh} r={radius}: top-left corner leaked"
+                );
+                assert_eq!(
+                    buf[(150 + rh - 1) * w + 100],
+                    0xFF000000,
+                    "{rw}x{rh} r={radius}: bottom-left corner leaked"
+                );
+            }
+        }
+    }
+
     /// The drawer overlay is tested the same way: the sheet's own controls and
     /// grid must all be drawn where the input path looks for them.
     #[test]
@@ -427,9 +644,9 @@ mod tests {
                 icon: Some(&icon),
             })
             .collect();
-        let snap = Snapshot {
+        let snap = Snapshot { launch_color: 0xFF2563EB,
             w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 1.0,
-            drawer_open: true, launch_progress: 0.0, launch_origin: None, press_scale: 1.0,
+            drawer_open: true, launch_progress: 0.0, launch_origin: None, pressed_icon: None, press_scale: 1.0,
             home_page: 0, home_scroll: 0.0, selected: None, search_query: "", search_active: false,
             keyboard: false, grid: Vec::new(), drawer, dock: Vec::new(), active_app: None,
         };
@@ -512,9 +729,9 @@ mod tests {
                 icon: Some(&icon),
             })
             .collect();
-        let snap = Snapshot {
+        let snap = Snapshot { launch_color: 0xFF2563EB,
             w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 0.0,
-            drawer_open: false, launch_progress: 0.0, launch_origin: None, press_scale: 1.0,
+            drawer_open: false, launch_progress: 0.0, launch_origin: None, pressed_icon: None, press_scale: 1.0,
             home_page: 0, home_scroll: 0.0, selected: None, search_query: "", search_active: false,
             keyboard: false, grid, drawer: Vec::new(), dock, active_app: None,
         };
@@ -550,18 +767,18 @@ mod tests {
         let drawer = apps(&icon, &["Settings", "Terminal", "Recorder", "Podcast", "Weather", "Wallet", "Translate", "Contacts", "Files", "Fitness", "Drive", "Photos", "Clock", "Calculator", "Calendar", "Mail"], 0xFFF59E0B);
 
         let cases: Vec<(&str, Snapshot)> = vec![
-            ("home", Snapshot { w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 0.0, drawer_open: false, launch_progress: 0.0, launch_origin: None, press_scale: 1.0, home_page: 0, home_scroll: 0.0, selected: None, search_query: "", search_active: false, keyboard: false, grid: grid.clone(), drawer: drawer.clone(), dock: dock.clone(), active_app: None }),
-            ("home_selected", Snapshot { selected: Some("Phone"), ..Snapshot { w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 0.0, drawer_open: false, launch_progress: 0.0, launch_origin: None, press_scale: 1.0, home_page: 0, home_scroll: 0.0, selected: None, search_query: "", search_active: false, keyboard: false, grid: grid.clone(), drawer: drawer.clone(), dock: dock.clone(), active_app: None } }),
-            ("home_pressed", Snapshot { selected: Some("Music"), press_scale: 0.88, ..Snapshot { w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 0.0, drawer_open: false, launch_progress: 0.0, launch_origin: None, press_scale: 1.0, home_page: 0, home_scroll: 0.0, selected: None, search_query: "", search_active: false, keyboard: false, grid: grid.clone(), drawer: drawer.clone(), dock: dock.clone(), active_app: None } }),
-            ("search", Snapshot { search_active: true, search_query: "pho", ..Snapshot { w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 0.0, drawer_open: false, launch_progress: 0.0, launch_origin: None, press_scale: 1.0, home_page: 0, home_scroll: 0.0, selected: None, search_query: "", search_active: false, keyboard: false, grid: grid.clone(), drawer: drawer.clone(), dock: dock.clone(), active_app: None } }),
-            ("drawer", Snapshot { drawer_progress: 1.0, drawer_open: true, ..Snapshot { w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 0.0, drawer_open: false, launch_progress: 0.0, launch_origin: None, press_scale: 1.0, home_page: 0, home_scroll: 0.0, selected: None, search_query: "", search_active: false, keyboard: false, grid: grid.clone(), drawer: drawer.clone(), dock: dock.clone(), active_app: None } }),
-            ("drawer_mid", Snapshot { drawer_progress: 0.45, ..Snapshot { w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 0.0, drawer_open: false, launch_progress: 0.0, launch_origin: None, press_scale: 1.0, home_page: 0, home_scroll: 0.0, selected: None, search_query: "", search_active: false, keyboard: false, grid: grid.clone(), drawer: drawer.clone(), dock: dock.clone(), active_app: None } }),
-            ("page_swipe", Snapshot { home_page: 1, home_scroll: 90.0, ..Snapshot { w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 0.0, drawer_open: false, launch_progress: 0.0, launch_origin: None, press_scale: 1.0, home_page: 0, home_scroll: 0.0, selected: None, search_query: "", search_active: false, keyboard: false, grid: grid.clone(), drawer: drawer.clone(), dock: dock.clone(), active_app: None } }),
-            ("launch", Snapshot { launch_progress: 0.42, launch_origin: Some((540.0, 980.0)), ..Snapshot { w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 0.0, drawer_open: false, launch_progress: 0.0, launch_origin: None, press_scale: 1.0, home_page: 0, home_scroll: 0.0, selected: None, search_query: "", search_active: false, keyboard: false, grid: grid.clone(), drawer: drawer.clone(), dock: dock.clone(), active_app: None } }),
-            ("keyboard", Snapshot { keyboard: true, ..Snapshot { w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 0.0, drawer_open: false, launch_progress: 0.0, launch_origin: None, press_scale: 1.0, home_page: 0, home_scroll: 0.0, selected: None, search_query: "", search_active: false, keyboard: false, grid: grid.clone(), drawer: drawer.clone(), dock: dock.clone(), active_app: None } }),
-            ("lockscreen", Snapshot { locked: true, ..Snapshot { w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 0.0, drawer_open: false, launch_progress: 0.0, launch_origin: None, press_scale: 1.0, home_page: 0, home_scroll: 0.0, selected: None, search_query: "", search_active: false, keyboard: false, grid: grid.clone(), drawer: drawer.clone(), dock: dock.clone(), active_app: None } }),
-            ("shade", Snapshot { shade: true, ..Snapshot { w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 0.0, drawer_open: false, launch_progress: 0.0, launch_origin: None, press_scale: 1.0, home_page: 0, home_scroll: 0.0, selected: None, search_query: "", search_active: false, keyboard: false, grid: grid.clone(), drawer: drawer.clone(), dock: dock.clone(), active_app: None } }),
-            ("app", Snapshot { active_app: Some("Settings"), ..Snapshot { w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 0.0, drawer_open: false, launch_progress: 0.0, launch_origin: None, press_scale: 1.0, home_page: 0, home_scroll: 0.0, selected: None, search_query: "", search_active: false, keyboard: false, grid: grid.clone(), drawer: drawer.clone(), dock: dock.clone(), active_app: None } }),
+            ("home", Snapshot { w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 0.0, drawer_open: false, launch_progress: 0.0, launch_color: 0xFF2563EB, launch_origin: None, pressed_icon: None, press_scale: 1.0, home_page: 0, home_scroll: 0.0, selected: None, search_query: "", search_active: false, keyboard: false, grid: grid.clone(), drawer: drawer.clone(), dock: dock.clone(), active_app: None }),
+            ("home_selected", Snapshot { selected: Some("Phone"), ..Snapshot { w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 0.0, drawer_open: false, launch_progress: 0.0, launch_color: 0xFF2563EB, launch_origin: None, pressed_icon: None, press_scale: 1.0, home_page: 0, home_scroll: 0.0, selected: None, search_query: "", search_active: false, keyboard: false, grid: grid.clone(), drawer: drawer.clone(), dock: dock.clone(), active_app: None } }),
+            ("home_pressed", Snapshot { selected: Some("Music"), press_scale: 0.88, pressed_icon: Some("Music"), ..Snapshot { w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 0.0, drawer_open: false, launch_progress: 0.0, launch_origin: None, launch_color: 0xFF2563EB, press_scale: 1.0, pressed_icon: None, home_page: 0, home_scroll: 0.0, selected: None, search_query: "", search_active: false, keyboard: false, grid: grid.clone(), drawer: drawer.clone(), dock: dock.clone(), active_app: None } }),
+            ("search", Snapshot { search_active: true, search_query: "pho", ..Snapshot { w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 0.0, drawer_open: false, launch_progress: 0.0, launch_color: 0xFF2563EB, launch_origin: None, pressed_icon: None, press_scale: 1.0, home_page: 0, home_scroll: 0.0, selected: None, search_query: "", search_active: false, keyboard: false, grid: grid.clone(), drawer: drawer.clone(), dock: dock.clone(), active_app: None } }),
+            ("drawer", Snapshot { drawer_progress: 1.0, drawer_open: true, ..Snapshot { w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 0.0, drawer_open: false, launch_progress: 0.0, launch_color: 0xFF2563EB, launch_origin: None, pressed_icon: None, press_scale: 1.0, home_page: 0, home_scroll: 0.0, selected: None, search_query: "", search_active: false, keyboard: false, grid: grid.clone(), drawer: drawer.clone(), dock: dock.clone(), active_app: None } }),
+            ("drawer_mid", Snapshot { drawer_progress: 0.45, ..Snapshot { w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 0.0, drawer_open: false, launch_progress: 0.0, launch_color: 0xFF2563EB, launch_origin: None, pressed_icon: None, press_scale: 1.0, home_page: 0, home_scroll: 0.0, selected: None, search_query: "", search_active: false, keyboard: false, grid: grid.clone(), drawer: drawer.clone(), dock: dock.clone(), active_app: None } }),
+            ("page_swipe", Snapshot { home_page: 1, home_scroll: 90.0, ..Snapshot { w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 0.0, drawer_open: false, launch_progress: 0.0, launch_color: 0xFF2563EB, launch_origin: None, pressed_icon: None, press_scale: 1.0, home_page: 0, home_scroll: 0.0, selected: None, search_query: "", search_active: false, keyboard: false, grid: grid.clone(), drawer: drawer.clone(), dock: dock.clone(), active_app: None } }),
+            ("launch", Snapshot { launch_progress: 0.42, launch_color: 0xFF2563EB, launch_origin: Some((540.0, 980.0)), ..Snapshot { launch_color: 0xFF2563EB, w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 0.0, drawer_open: false, launch_progress: 0.0, launch_origin: None, pressed_icon: None, press_scale: 1.0, home_page: 0, home_scroll: 0.0, selected: None, search_query: "", search_active: false, keyboard: false, grid: grid.clone(), drawer: drawer.clone(), dock: dock.clone(), active_app: None } }),
+            ("keyboard", Snapshot { keyboard: true, ..Snapshot { w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 0.0, drawer_open: false, launch_progress: 0.0, launch_color: 0xFF2563EB, launch_origin: None, pressed_icon: None, press_scale: 1.0, home_page: 0, home_scroll: 0.0, selected: None, search_query: "", search_active: false, keyboard: false, grid: grid.clone(), drawer: drawer.clone(), dock: dock.clone(), active_app: None } }),
+            ("lockscreen", Snapshot { locked: true, ..Snapshot { w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 0.0, drawer_open: false, launch_progress: 0.0, launch_color: 0xFF2563EB, launch_origin: None, pressed_icon: None, press_scale: 1.0, home_page: 0, home_scroll: 0.0, selected: None, search_query: "", search_active: false, keyboard: false, grid: grid.clone(), drawer: drawer.clone(), dock: dock.clone(), active_app: None } }),
+            ("shade", Snapshot { shade: true, ..Snapshot { w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 0.0, drawer_open: false, launch_progress: 0.0, launch_color: 0xFF2563EB, launch_origin: None, pressed_icon: None, press_scale: 1.0, home_page: 0, home_scroll: 0.0, selected: None, search_query: "", search_active: false, keyboard: false, grid: grid.clone(), drawer: drawer.clone(), dock: dock.clone(), active_app: None } }),
+            ("app", Snapshot { active_app: Some("Settings"), ..Snapshot { w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 0.0, drawer_open: false, launch_progress: 0.0, launch_color: 0xFF2563EB, launch_origin: None, pressed_icon: None, press_scale: 1.0, home_page: 0, home_scroll: 0.0, selected: None, search_query: "", search_active: false, keyboard: false, grid: grid.clone(), drawer: drawer.clone(), dock: dock.clone(), active_app: None } }),
         ];
 
         // Also render a full page of a long label to check clipping/ellipsis.
@@ -573,7 +790,7 @@ mod tests {
         eprintln!("{} snapshots written to {dir}", cases.len());
         // A 360x640 variant proves the layout scales, not just the wallpaper.
         let base = cases[0].1.clone();
-        let small = Snapshot {
+        let small = Snapshot { launch_color: 0xFF2563EB,
             grid: grid.clone(),
             dock: dock.clone(),
             drawer: drawer.clone(),
