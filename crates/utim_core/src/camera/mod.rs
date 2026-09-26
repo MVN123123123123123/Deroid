@@ -3,9 +3,14 @@
 //! virtual video device (/dev/v4l2loopback).
 //! Enables zero-copy camera video capture for Linux desktop applications (Firefox WebRTC, Cheese).
 
+pub mod ascii_video;
 pub mod hal3;
 pub mod v4l2_bridge;
 
+pub use ascii_video::{
+    convert_nv12_to_ascii, convert_rgb_to_ascii, generate_ascii_test_pattern, luma_to_ascii,
+    AsciiCameraPreview, AsciiFrame, ASCII_COLS, ASCII_RAMP, ASCII_ROWS,
+};
 pub use hal3::{
     AeMode, AeState, AfMode, AfState, AwbMode, AwbState, Camera3aControls, CameraDeviceInfo,
     CameraFacing, CameraHal3Device, CameraPixelFormat, CameraStreamType, CapturedFrame, FlashMode,

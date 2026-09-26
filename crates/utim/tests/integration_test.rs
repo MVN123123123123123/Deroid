@@ -141,7 +141,7 @@ fn test_mpg_and_mmps_integration() {
     assert!(mpg.has_active_wake_locks());
     assert_eq!(
         fs::read_to_string(power_dir.join("wake_lock")).unwrap(),
-        "pipewire-playback"
+        "pipewire-playback\n"
     );
 
     // Music stopped: wakelock released -> allow deep autosleep
@@ -219,13 +219,28 @@ fn test_ipc_roundtrip_server_client() {
     let _ = fs::remove_file(&temp_sock);
 }
 
-fn get_workspace_binary(name: &str) -> std::path::PathBuf {
-    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let bin_path = manifest_dir.join("../../target/debug").join(name);
-    if bin_path.exists() {
-        return bin_path;
+fn workspace_binary(name: &str) -> std::path::PathBuf {
+    // Hermetic lookup with no `$PATH` fallback: the test executable lives
+    // in target/<profile>/deps/, so its ancestors locate the sibling
+    // helper binaries built for THIS profile (debug and release both
+    // work, unlike a hardcoded target/debug path). A `$PATH` fallback can
+    // silently execute the distro's same-named binary and still pass.
+    // (Note: `env!("CARGO_BIN_EXE_<name>")` is not usable here — cargo
+    // only sets it for binaries owned by the same package, and these
+    // helpers live in sibling crates.)
+    let exe = std::env::current_exe().expect("cannot locate test executable");
+    let profile_dir = exe
+        .parent()
+        .and_then(|d| d.parent())
+        .expect("unexpected test executable layout");
+    let bin = profile_dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+    if !bin.exists() {
+        panic!(
+            "missing binary {}: run `cargo build -p {name}` first (no $PATH fallback by design)",
+            bin.display()
+        );
     }
-    std::path::PathBuf::from(name)
+    bin
 }
 
 #[test]
@@ -251,7 +266,7 @@ WantedBy=multi-user.target
     let unit_path = lib_systemd.join("test-helper.service");
     fs::write(&unit_path, unit_content).unwrap();
 
-    let dsh_bin = get_workspace_binary("deb-systemd-helper");
+    let dsh_bin = workspace_binary("deb-systemd-helper");
 
     // 1. Enable unit with --root
     let status = std::process::Command::new(&dsh_bin)
@@ -383,7 +398,7 @@ WantedBy=multi-user.target
 
 #[test]
 fn test_deb_systemd_invoke_cli() {
-    let dsi_bin = get_workspace_binary("deb-systemd-invoke");
+    let dsi_bin = workspace_binary("deb-systemd-invoke");
 
     // 1. Offline / chroot check: when DEB_SYSTEMD_SYSTEM_DIR points to nonexistent directory,
     // deb-systemd-invoke must immediately exit with code 0 per Debian specification.

@@ -26,6 +26,9 @@ pub struct Supervisor {
     pub sockets: SocketActivationManager,
     pub container: AndroidHalContainer,
     pub log_ring: ByteRingBuffer<65536>,
+    /// FD for log output (stderr by default). Written with raw libc::write
+    /// (O_NONBLOCK where possible), errors ignored — never panics on EPIPE.
+    pub log_fd: libc::c_int,
     pub pid_to_unit: HashMap<i32, String>,
     pub pending_restarts: Vec<(String, Instant)>,
     pub restart_queue: HashSet<String>,
@@ -36,6 +39,10 @@ pub struct Supervisor {
     pub early_init_duration: Duration,
     pub stopping_since: HashMap<String, Instant>,
     pub stop_timeout: Duration,
+    /// Restart rate limiting (StartLimitBurst / StartLimitIntervalSec).
+    pub start_stamps: HashMap<String, (u32, Instant)>,
+    pub start_burst: u32,
+    pub start_interval: Duration,
 }
 
 impl Supervisor {
@@ -57,7 +64,27 @@ impl Supervisor {
             early_init_duration: Duration::ZERO,
             stopping_since: HashMap::new(),
             stop_timeout: Duration::from_secs(5),
+            start_stamps: HashMap::new(),
+            start_burst: 5,
+            start_interval: Duration::from_secs(10),
+            log_fd: 2,
         }
+    }
+
+    /// StartLimit burst gate. Returns false when the unit exceeded
+    /// start_burst restarts within start_interval (caller must mark Failed).
+    fn restart_allowed(&mut self, name: &str) -> bool {
+        let now = Instant::now();
+        let entry = self
+            .start_stamps
+            .entry(name.to_string())
+            .or_insert((0, now));
+        if entry.1.elapsed() > self.start_interval {
+            entry.0 = 0;
+            entry.1 = now;
+        }
+        entry.0 += 1;
+        entry.0 <= self.start_burst
     }
 
     /// Load unit files from systemd search paths with strict priority order
@@ -207,22 +234,15 @@ impl Supervisor {
             "/run/systemd/notify".to_string(),
         );
 
-        if let Some(pid) = node.pid {
-            env_map.insert("MAINPID".to_string(), pid.to_string());
-        }
-
+        // NOTE (B4): MAINPID/WATCHDOG_PID are set in the fork child from
+        // getpid(). Do not export stale node.pid here.
         if let Some(ref svc) = node.unit.service {
             if svc.watchdog_sec > Duration::ZERO {
                 env_map.insert(
                     "WATCHDOG_USEC".to_string(),
                     svc.watchdog_sec.as_micros().to_string(),
                 );
-                env_map.insert(
-                    "WATCHDOG_PID".to_string(),
-                    node.pid.map_or_else(|| "0".to_string(), |p| p.to_string()),
-                );
             }
-
             for (k, v) in &svc.environment {
                 env_map.insert(k.clone(), v.clone());
             }
@@ -263,7 +283,9 @@ impl Supervisor {
         let queue = self.dag.resolve_start_queue(unit_name);
         for name in &queue {
             if let Some(node) = self.dag.get(name) {
-                if node.state != UnitState::Active {
+                // B3: only enqueue spawnable states; never cancel a queued
+                // restart by dropping a Deactivating unit from pending.
+                if matches!(node.state, UnitState::Inactive | UnitState::Failed) {
                     self.pending_units.insert(name.clone());
                 }
             }
@@ -298,7 +320,11 @@ impl Supervisor {
             for name in &ready {
                 if self.pending_units.contains(name) {
                     self.spawn_unit(name)?;
-                    spawned_any = true;
+                    // Progress, not membership: only count it if spawn_unit
+                    // actually left the pending set, else this can hard-hang.
+                    if !self.pending_units.contains(name) {
+                        spawned_any = true;
+                    }
                 }
             }
             if !spawned_any {
@@ -345,7 +371,17 @@ impl Supervisor {
             }
             UnitKind::Socket => {
                 if let Some(ref sock) = node.unit.socket {
-                    let _ = self.sockets.bind_socket(unit_name, sock);
+                    // C5/B13: a socket that fails to bind must report Failed,
+                    // never Active.
+                    if let Err(e) = self.sockets.bind_socket(unit_name, sock) {
+                        self.log_msg(&format!(
+                            "Socket unit {} failed to bind: {}",
+                            unit_name, e
+                        ));
+                        self.dag.set_state(unit_name, UnitState::Failed);
+                        self.pending_units.remove(unit_name);
+                        return Ok(());
+                    }
                     self.dag.set_state(unit_name, UnitState::Active);
                     self.pending_units.remove(unit_name);
                     self.log_msg(&format!("Listening on socket: {}", unit_name));
@@ -362,7 +398,12 @@ impl Supervisor {
 
         let svc = node.unit.service.clone().unwrap_or_default();
         if svc.exec_start.is_empty() {
-            self.dag.set_state(unit_name, UnitState::Active);
+            // B6: a unit with no usable ExecStart must be Failed, never Active.
+            self.log_msg(&format!(
+                "Unit {} has no usable ExecStart (parse failed?); marking failed",
+                unit_name
+            ));
+            self.dag.set_state(unit_name, UnitState::Failed);
             self.pending_units.remove(unit_name);
             return Ok(());
         }
@@ -414,6 +455,13 @@ impl Supervisor {
 
         let pid = unsafe { libc::fork() };
         if pid < 0 {
+            // C4: fork failure must not leak the exec pipe fds.
+            if report_failures {
+                unsafe {
+                    libc::close(exec_pipe[0]);
+                    libc::close(exec_pipe[1]);
+                }
+            }
             return Err(io::Error::last_os_error());
         }
 
@@ -581,6 +629,15 @@ impl Supervisor {
             }
 
             let mut child_env_map = env_map.clone();
+            // B4: MAINPID/WATCHDOG_PID must be authoritative in the child via
+            // getpid(), not the stale pre-fork node.pid (usually None -> "0").
+            {
+                let my_pid = unsafe { libc::getpid() };
+                child_env_map.insert("MAINPID".to_string(), my_pid.to_string());
+                if svc.watchdog_sec > Duration::ZERO {
+                    child_env_map.insert("WATCHDOG_PID".to_string(), my_pid.to_string());
+                }
+            }
 
             // Socket activation fds: pass sockets starting at fd 3 (SD_LISTEN_FDS_START)
             if !socket_fds.is_empty() {
@@ -657,22 +714,47 @@ impl Supervisor {
         if report_failures {
             unsafe {
                 libc::close(exec_pipe[1]);
-                let mut err_code: libc::c_int = 0;
-                let n = libc::read(
-                    exec_pipe[0],
-                    &mut err_code as *mut _ as *mut libc::c_void,
-                    std::mem::size_of::<libc::c_int>(),
-                );
-                libc::close(exec_pipe[0]);
-                if n == 0 {
-                    // Pipe closed on successful child execve (due to O_CLOEXEC)
+                // P3: never block PID 1 forever on post-fork NSS
+                // (getpwnam/initgroups). Poll 2s, then treat timeout as
+                // unknown (assume started so boot can proceed).
+                let mut pfd = libc::pollfd {
+                    fd: exec_pipe[0],
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let pr = libc::poll(&mut pfd, 1, 2000);
+                if pr == 0 {
+                    self.log_msg(&format!(
+                        "Unit {} exec pipe timeout after 2s; assuming started",
+                        unit_name
+                    ));
+                    libc::close(exec_pipe[0]);
                     exec_succeeded = true;
                 } else {
-                    exec_succeeded = false;
-                    self.log_msg(&format!(
-                        "Unit {} execve failed with errno {}",
-                        unit_name, err_code
-                    ));
+                    let mut err_code: libc::c_int = 0;
+                    let n = libc::read(
+                        exec_pipe[0],
+                        &mut err_code as *mut _ as *mut libc::c_void,
+                        std::mem::size_of::<libc::c_int>(),
+                    );
+                    libc::close(exec_pipe[0]);
+                    if n == 0 {
+                        // Pipe closed on successful child execve (due to O_CLOEXEC)
+                        exec_succeeded = true;
+                    } else if n < 0 {
+                        let e = io::Error::last_os_error();
+                        self.log_msg(&format!(
+                            "Unit {} exec pipe read error: {}",
+                            unit_name, e
+                        ));
+                        exec_succeeded = false;
+                    } else {
+                        exec_succeeded = false;
+                        self.log_msg(&format!(
+                            "Unit {} execve failed with errno {}",
+                            unit_name, err_code
+                        ));
+                    }
                 }
             }
         }
@@ -797,28 +879,12 @@ impl Supervisor {
     }
 
     /// Handle sd_notify messages from child processes.
+    /// Identity comes from SO_PASSCRED (sender_pid) only. MAINPID in the
+    /// payload is a hint and is accepted only when the sender already owns
+    /// the unit (C3). No single-activating fallback: untrusted datagrams
+    /// must not complete another unit's startup.
     pub fn handle_notify_message(&mut self, msg: &NotifyMessage, sender_pid: Option<i32>) {
-        let unit_name = sender_pid
-            .and_then(|p| self.pid_to_unit.get(&p).cloned())
-            .or_else(|| {
-                // Fallback: match unambiguous activating notify service
-                let activating: Vec<String> = self
-                    .dag
-                    .all_nodes()
-                    .iter()
-                    .filter(|(_, n)| {
-                        n.state == UnitState::Activating
-                            && n.unit.service.as_ref().map(|s| s.service_type)
-                                == Some(ServiceType::Notify)
-                    })
-                    .map(|(k, _)| k.clone())
-                    .collect();
-                if activating.len() == 1 {
-                    Some(activating[0].clone())
-                } else {
-                    None
-                }
-            });
+        let unit_name = sender_pid.and_then(|p| self.pid_to_unit.get(&p).cloned());
 
         if let Some(ref name) = unit_name {
             if msg.watchdog {
@@ -851,6 +917,18 @@ impl Supervisor {
                 self.log_msg(&format!("Service {} reported errno: {}", name, err));
             }
             if let Some(new_pid) = msg.mainpid {
+                // C3: only the unit's own currently-tracked process may
+                // re-parent via MAINPID. sender_pid must already map to this
+                // unit, and the claimed pid must be valid.
+                if new_pid <= 1 {
+                    return;
+                }
+                let owned = sender_pid
+                    .and_then(|p| self.pid_to_unit.get(&p))
+                    .is_some_and(|n| n == name);
+                if !owned {
+                    return;
+                }
                 // Remove previous PID mapping for unit_name to avoid stale lookup or terminating new daemon
                 self.pid_to_unit.retain(|_pid, n| n != name);
                 self.dag.set_pid(name, Some(new_pid));
@@ -892,9 +970,24 @@ impl Supervisor {
                                 "Unit {} stopped, executing queued restart",
                                 unit_name
                             ));
-                            self.pending_restarts
-                                .push((unit_name.clone(), Instant::now()));
-                            self.dag.set_state(&unit_name, UnitState::Activating);
+                            // C4: dedup + rate-limit queued restarts as well.
+                            if !self.restart_allowed(&unit_name) {
+                                self.log_msg(&format!(
+                                    "Unit {} hit StartLimitBurst={}; entering failed state",
+                                    unit_name, self.start_burst
+                                ));
+                                self.dag.set_state(&unit_name, UnitState::Failed);
+                            } else {
+                                if !self
+                                    .pending_restarts
+                                    .iter()
+                                    .any(|(n, _)| n == &unit_name)
+                                {
+                                    self.pending_restarts
+                                        .push((unit_name.clone(), Instant::now()));
+                                }
+                                self.dag.set_state(&unit_name, UnitState::Activating);
+                            }
                         } else {
                             self.dag.set_state(&unit_name, UnitState::Inactive);
                             self.log_msg(&format!(
@@ -1003,13 +1096,31 @@ impl Supervisor {
                     };
 
                     if should_restart {
-                        self.log_msg(&format!(
-                            "Scheduling restart for {} in {:?}",
-                            unit_name, restart_sec
-                        ));
-                        self.pending_restarts
-                            .push((unit_name.clone(), Instant::now() + restart_sec));
-                        self.dag.set_state(&unit_name, UnitState::Activating);
+                        // C4: rate-limit restarts, floor backoff at 100ms,
+                        // dedup pending entries so a duplicate cannot orphan
+                        // a live process via set_pid overwrite.
+                        if !self.restart_allowed(&unit_name) {
+                            self.log_msg(&format!(
+                                "Unit {} hit StartLimitBurst={}; entering failed state",
+                                unit_name, self.start_burst
+                            ));
+                            self.dag.set_state(&unit_name, UnitState::Failed);
+                        } else {
+                            let delay = restart_sec.max(Duration::from_millis(100));
+                            self.log_msg(&format!(
+                                "Scheduling restart for {} in {:?}",
+                                unit_name, delay
+                            ));
+                            if !self
+                                .pending_restarts
+                                .iter()
+                                .any(|(n, _)| n == &unit_name)
+                            {
+                                self.pending_restarts
+                                    .push((unit_name.clone(), Instant::now() + delay));
+                            }
+                            self.dag.set_state(&unit_name, UnitState::Activating);
+                        }
                     } else if is_success {
                         self.dag.set_state(&unit_name, UnitState::Inactive);
                     } else {
@@ -1236,9 +1347,18 @@ impl Supervisor {
     }
 
     pub fn log_msg(&mut self, msg: &str) {
-        println!("[UTIM] {}", msg);
+        // Never use println!: with panic="abort" an EPIPE (closed log
+        // consumer) would SIGABRT PID 1 and kill the namespace. Use raw
+        // libc::write to log_fd and ignore all errors (EPIPE/EAGAIN).
         let formatted = format!("[UTIM] {}\n", msg);
         self.log_ring.write_overwrite(formatted.as_bytes());
+        unsafe {
+            libc::write(
+                self.log_fd,
+                formatted.as_ptr() as *const libc::c_void,
+                formatted.len(),
+            );
+        }
     }
 }
 
@@ -1519,10 +1639,11 @@ ExecStart=/bin/true
         );
         supervisor.dag.insert(unit);
 
-        // Transition to Activating with pid 9999
+        // Transition to Activating with pid 9999 (kernel-credential identity).
         let node = supervisor.dag.get_mut("notify-app.service").unwrap();
         node.state = UnitState::Activating;
         node.pid = Some(9999);
+        supervisor.pid_to_unit.insert(9999, "notify-app.service".to_string());
 
         // Case 1: Notify message with matching sender_pid
         let msg = NotifyMessage {
@@ -1542,12 +1663,13 @@ ExecStart=/bin/true
         let node = supervisor.dag.get_mut("notify-app.service").unwrap();
         node.state = UnitState::Activating;
 
-        // Case 2: Notify message with None sender_pid (e.g., standard client without SCM_CREDENTIALS or proxy)
-        // should hit single Activating fallback and transition to Active
+        // Case 2: Notify message with None sender_pid must NOT activate:
+        // identity comes from SO_PASSCRED only (C3). Untrusted datagrams
+        // cannot complete another unit's startup.
         supervisor.handle_notify_message(&msg, None);
         assert_eq!(
             supervisor.dag.get("notify-app.service").unwrap().state,
-            UnitState::Active
+            UnitState::Activating
         );
     }
 

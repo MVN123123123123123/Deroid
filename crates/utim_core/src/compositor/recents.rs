@@ -65,7 +65,7 @@ pub struct SplitScreenConfig {
     pub is_active: bool,
     pub top_app_pid: Option<i32>,
     pub bottom_app_pid: Option<i32>,
-    pub divider_y: f32, // y-coordinate dividing top and bottom (default H / 2.0)
+    divider_y: f32, // y-coordinate dividing top and bottom (default H / 2.0)
 }
 
 impl SplitScreenConfig {
@@ -76,6 +76,28 @@ impl SplitScreenConfig {
             bottom_app_pid: None,
             divider_y: display_height / 2.0,
         }
+    }
+
+    /// Current divider position (clamped to the last height it was set for).
+    pub fn divider_y(&self) -> f32 {
+        self.divider_y
+    }
+
+    /// Move the divider, clamped inside the live display height so neither
+    /// viewport can go negative.
+    pub fn set_divider(&mut self, y: f32, display_height: f32) {
+        self.divider_y = Self::clamp_divider(y, display_height);
+    }
+
+    fn clamp_divider(y: f32, display_height: f32) -> f32 {
+        y.clamp(1.0, (display_height - 1.0).max(1.0))
+    }
+
+    /// Divider clamped against the height actually being laid out: the stored
+    /// divider may be stale (built for a different height), so every viewport
+    /// re-validates instead of trusting it.
+    fn split(&self, display_height: f32) -> f32 {
+        Self::clamp_divider(self.divider_y, display_height)
     }
 
     pub fn enable(&mut self, top_pid: i32, bottom_pid: i32) {
@@ -91,16 +113,12 @@ impl SplitScreenConfig {
     }
 
     pub fn top_viewport(&self, display_width: f32) -> (f32, f32, f32, f32) {
-        (0.0, 0.0, display_width, self.divider_y)
+        (0.0, 0.0, display_width, self.divider_y.max(0.0))
     }
 
     pub fn bottom_viewport(&self, display_width: f32, display_height: f32) -> (f32, f32, f32, f32) {
-        (
-            0.0,
-            self.divider_y,
-            display_width,
-            display_height - self.divider_y,
-        )
+        let d = self.split(display_height);
+        (0.0, d, display_width, (display_height - d).max(0.0))
     }
 }
 
@@ -213,41 +231,46 @@ impl RecentsCarousel {
     /// Vertical swipe-to-kill release: if dragged upward > 150px, initiate kill
     pub fn on_card_vertical_release(&mut self, card_index: usize) -> Option<i32> {
         if let Some(card) = self.cards.get_mut(card_index) {
-            if card.y_offset < -150.0 && card.is_dismissable {
-                let pid = card.pid;
+            // Already dying: no re-arm of the grace period, no double kill.
+            if matches!(
+                card.kill_state,
+                KillProgress::GracePeriod { .. } | KillProgress::ForcedKill { .. }
+            ) {
+                return None;
+            }
+            let kill = card.y_offset < -150.0 && card.is_dismissable;
+            let pid = card.pid;
+            card.y_offset = 0.0;
+            if kill {
                 card.kill_state = KillProgress::GracePeriod {
                     initiated_at: Instant::now(),
                     pid,
                 };
                 return Some(pid);
-            } else {
-                card.y_offset = 0.0; // Reset
             }
         }
         None
     }
 
-    /// Check timeouts for closing apps and escalate to SIGKILL after 500ms
-    pub fn update_kill_lifecycle(&mut self, grace_period: Duration) -> Vec<(i32, bool)> {
-        // Returns list of (pid, is_force_kill)
-        let mut actions = Vec::new();
+    /// Check timeouts for closing apps and escalate to SIGKILL after 500ms.
+    /// Pushes into the caller-owned `out` buffer: no allocation on this
+    /// per-tick path.
+    pub fn update_kill_lifecycle(&mut self, grace_period: Duration, out: &mut Vec<(i32, bool)>) {
         let now = Instant::now();
 
         for card in &mut self.cards {
             if let KillProgress::GracePeriod { initiated_at, pid } = card.kill_state {
-                if now.duration_since(initiated_at) >= grace_period {
+                if now.saturating_duration_since(initiated_at) >= grace_period {
                     card.kill_state = KillProgress::ForcedKill { pid };
-                    actions.push((pid, true)); // Escalate to SIGKILL
+                    out.push((pid, true)); // Escalate to SIGKILL
                 }
             }
         }
-
-        actions
     }
 
-    /// Clear All: initiates graceful closure on all dismissable cards
-    pub fn clear_all(&mut self) -> Vec<i32> {
-        let mut pids = Vec::new();
+    /// Clear All: initiates graceful closure on all dismissable cards,
+    /// appending their pids to the caller-owned `out` buffer.
+    pub fn clear_all(&mut self, out: &mut Vec<i32>) {
         let now = Instant::now();
 
         for card in &mut self.cards {
@@ -256,11 +279,9 @@ impl RecentsCarousel {
                     initiated_at: now,
                     pid: card.pid,
                 };
-                pids.push(card.pid);
+                out.push(card.pid);
             }
         }
-
-        pids
     }
 
     pub fn update(&mut self, dt: f32) {
@@ -349,8 +370,30 @@ mod tests {
         }
 
         // Simulate grace period expiry (e.g. 500ms)
-        let escalated = carousel.update_kill_lifecycle(Duration::from_millis(0));
+        let mut escalated = Vec::new();
+        carousel.update_kill_lifecycle(Duration::from_millis(0), &mut escalated);
         assert_eq!(escalated, vec![(2002, true)]);
+    }
+
+    #[test]
+    fn test_kill_release_does_not_rearm() {
+        let mut carousel = RecentsCarousel::new(1080.0, 2400.0);
+        carousel.add_card(RecentsCard::new(
+            "calc".into(),
+            7,
+            "Calc".into(),
+            "".into(),
+            3,
+            None,
+            800.0,
+            1600.0,
+        ));
+        carousel.on_card_vertical_drag(0, -200.0);
+        assert_eq!(carousel.on_card_vertical_release(0), Some(7));
+        assert_eq!(carousel.cards[0].y_offset, 0.0);
+        // Repeat swipe on the dying card: no re-arm, no double kill.
+        carousel.on_card_vertical_drag(0, -200.0);
+        assert_eq!(carousel.on_card_vertical_release(0), None);
     }
 
     #[test]
@@ -364,6 +407,18 @@ mod tests {
 
         let bottom = split.bottom_viewport(1080.0, 2400.0);
         assert_eq!(bottom, (0.0, 1200.0, 1080.0, 1200.0));
+    }
+
+    #[test]
+    fn test_split_viewports_never_negative() {
+        let mut split = SplitScreenConfig::new(2400.0);
+        split.set_divider(3000.0, 2400.0); // clamped into range
+        assert!(split.divider_y() <= 2400.0);
+        let (_, _, _, h) = split.bottom_viewport(1080.0, 2400.0);
+        assert!(h >= 0.0);
+        // Stale divider against a shorter live display: still sane.
+        let (_, _, _, h2) = split.bottom_viewport(1080.0, 1280.0);
+        assert!(h2 >= 0.0);
     }
 
     #[test]
@@ -390,7 +445,8 @@ mod tests {
             1600.0,
         ));
 
-        let pids = carousel.clear_all();
+        let mut pids = Vec::new();
+        carousel.clear_all(&mut pids);
         assert_eq!(pids.len(), 2);
     }
 }

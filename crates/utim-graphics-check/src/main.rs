@@ -24,8 +24,11 @@ fn main() {
     }
 
     if let Some(pos) = args.iter().position(|a| a == "--generate-env") {
+        // Skip option tokens so `--generate-env --json` falls back to the
+        // default path instead of writing a file literally named `--json`.
         let out_path = args
             .get(pos + 1)
+            .filter(|s| !s.starts_with("--"))
             .cloned()
             .unwrap_or_else(|| "/run/utim/graphics.env".to_string());
         generate_env_file(&out_path);
@@ -43,7 +46,13 @@ fn main() {
             Vec::new()
         };
         if targets.is_empty() {
-            targets.push(env::current_exe().unwrap().to_string_lossy().to_string());
+            match env::current_exe() {
+                Ok(exe) => targets.push(exe.to_string_lossy().to_string()),
+                Err(e) => {
+                    eprintln!("[-] cannot determine current executable: {e}");
+                    process::exit(1);
+                }
+            }
         }
         let ok = check_elf_alignment(&targets, json_output);
         process::exit(if ok { 0 } else { 1 });
@@ -86,6 +95,16 @@ fn generate_env_file(path: &str) {
     );
 }
 
+/// Minimal JSON string escaper for `--json` output: user-supplied paths and
+/// error strings must not break the document structure.
+fn jesc(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+}
+
 fn check_elf_alignment(targets: &[String], json: bool) -> bool {
     let mut all_ok = true;
     for target in targets {
@@ -104,7 +123,7 @@ fn check_elf_alignment(targets: &[String], json: bool) -> bool {
                 if json {
                     println!(
                         r#"{{"file":"{}","is_64k_compatible":{},"min_align":{},"load_segments":{}}}"#,
-                        target,
+                        jesc(target),
                         report.is_64k_compatible,
                         report.min_load_align,
                         report.load_segments.len()
@@ -120,6 +139,11 @@ fn check_elf_alignment(targets: &[String], json: bool) -> bool {
                             "FAIL (<64KB)"
                         }
                     );
+                    if let Some(interp) = report.interpreter.as_deref() {
+                        // S22: a PASS covers the binary only; the loader was
+                        // not checked.
+                        println!("    interpreter: {} (ld.so NOT checked)", interp);
+                    }
                     for seg in &report.load_segments {
                         println!(
                             "    PT_LOAD[{}] vaddr=0x{:x} align=0x{:x} ({})",
@@ -138,7 +162,7 @@ fn check_elf_alignment(targets: &[String], json: bool) -> bool {
             Err(e) => {
                 all_ok = false;
                 if json {
-                    println!(r#"{{"file":"{}","error":"{}"}}"#, target, e);
+                    println!(r#"{{"file":"{}","error":"{}"}}"#, jesc(target), jesc(&e.to_string()));
                 } else {
                     eprintln!("[-] Error inspecting {}: {}", target, e);
                 }
@@ -156,29 +180,48 @@ fn run_full_diagnostics(json: bool) -> bool {
         .or_else(|_| fs::read_to_string("/vendor/manifest.xml"))
         .ok();
 
-    let hwc_version = HwcComposer::detect_version_from_manifest(manifest_content.as_deref());
+    // S1: checks 1-3 are meaningless without the HAL manifest they validate
+    // against; a green run on a machine with zero Android HALs proves nothing.
+    let Some(manifest_content) = manifest_content else {
+        eprintln!("[-] no /vendor/etc/vintf/manifest.xml: HWC/Gralloc cannot be validated");
+        return false;
+    };
+
+    let hwc_version = HwcComposer::detect_version_from_manifest(Some(manifest_content.as_str()));
     let (binder, vndbinder, hwbinder) = HalManager::verify_binder_devices();
 
     let mut hwc = HwcComposer::new(hwc_version);
     let display_cfg = DisplayConfig::standard_mobile(0, 1080, 2400, 120.0);
     hwc.register_display(display_cfg);
 
+    // A diagnostic tool must report, not abort: every fallible graphics
+    // call below returns false with a message instead of panicking (which
+    // would be SIGABRT under panic="abort").
+    macro_rules! ck {
+        ($e:expr) => {
+            match $e {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("[-] {e}");
+                    return false;
+                }
+            }
+        };
+    }
+
     // Validate 3 layers composition
-    let l1 = hwc.create_layer(0).unwrap();
-    let l2 = hwc.create_layer(0).unwrap();
-    let l3 = hwc.create_layer(0).unwrap();
-    hwc.set_layer_z_order(0, l1, 1).unwrap();
-    hwc.set_layer_z_order(0, l2, 2).unwrap();
-    hwc.set_layer_z_order(0, l3, 3).unwrap();
-    hwc.set_layer_composition_type(0, l1, CompositionType::Device)
-        .unwrap();
-    hwc.set_layer_composition_type(0, l2, CompositionType::Device)
-        .unwrap();
-    hwc.set_layer_composition_type(0, l3, CompositionType::Device)
-        .unwrap();
-    hwc.set_layer_buffer(0, l1, 1001, None).unwrap();
-    hwc.set_layer_buffer(0, l2, 1002, None).unwrap();
-    hwc.set_layer_buffer(0, l3, 1003, None).unwrap();
+    let l1 = ck!(hwc.create_layer(0));
+    let l2 = ck!(hwc.create_layer(0));
+    let l3 = ck!(hwc.create_layer(0));
+    ck!(hwc.set_layer_z_order(0, l1, 1));
+    ck!(hwc.set_layer_z_order(0, l2, 2));
+    ck!(hwc.set_layer_z_order(0, l3, 3));
+    ck!(hwc.set_layer_composition_type(0, l1, CompositionType::Device));
+    ck!(hwc.set_layer_composition_type(0, l2, CompositionType::Device));
+    ck!(hwc.set_layer_composition_type(0, l3, CompositionType::Device));
+    ck!(hwc.set_layer_buffer(0, l1, 1001, None));
+    ck!(hwc.set_layer_buffer(0, l2, 1002, None));
+    ck!(hwc.set_layer_buffer(0, l3, 1003, None));
 
     let hwc_validate_res = hwc.validate_display(0);
     let hwc_ok = hwc_validate_res.is_ok();
@@ -187,7 +230,7 @@ fn run_full_diagnostics(json: bool) -> bool {
     }
 
     // 2. Gralloc Check (Linear, UBWC, DMA-BUF)
-    let gralloc_version = GrallocManager::detect_version(manifest_content.as_deref());
+    let gralloc_version = GrallocManager::detect_version(Some(manifest_content.as_str()));
     let mut gralloc = GrallocManager::new(gralloc_version);
 
     let buf_linear = gralloc.allocate(
@@ -229,7 +272,13 @@ fn run_full_diagnostics(json: bool) -> bool {
     // 3. VSYNC Timing & Tear-Free Presentation Check across 60/90/120/144 Hz
     let mut vsync_rates_ok = Vec::new();
     for &rate in &STANDARD_REFRESH_RATES {
-        let cfg = VsyncConfig::new(rate).unwrap();
+        let cfg = match VsyncConfig::new(rate) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[-] vsync config {rate} Hz: {e}");
+                return false;
+            }
+        };
         let mut validator = VsyncPresentationValidator::new(cfg);
         let mut sim_vsync = 1_000_000_000u64;
         let mut rate_ok = true;
@@ -267,9 +316,11 @@ fn run_full_diagnostics(json: bool) -> bool {
         .map(|r| r.is_64k_compatible)
         .unwrap_or(false);
     if !elf_ok {
-        // If running in development debug mode on non-aarch64 x86_64 host, note that host elf might have 4k align
-        // but cross-compiled aarch64 binary must have 64k.
+        passed = false;
     }
+    let elf_interp = elf_report
+        .as_ref()
+        .and_then(|r| r.interpreter.clone());
 
     if json {
         println!(
@@ -357,8 +408,11 @@ fn run_full_diagnostics(json: bool) -> bool {
         println!(
             "       Binary: {} (64K Page Compliant: {})",
             current_exe.display(),
-            if elf_ok { "YES" } else { "CHECKING..." }
+            if elf_ok { "YES" } else { "NO (FAIL <64KB)" }
         );
+        if let Some(interp) = elf_interp.as_deref() {
+            println!("       interpreter: {} (ld.so NOT checked)", interp);
+        }
 
         println!("------------------------------------------------------------");
         println!(

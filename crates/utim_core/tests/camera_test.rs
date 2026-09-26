@@ -9,9 +9,9 @@
 
 use utim_core::camera::{
     AeMode, AfMode, AwbMode, CameraBringupStatus, CameraDeviceInfo, CameraFacing,
-    CameraHal3Device, CameraPixelFormat, CameraStreamType, FlashMode, V4l2LoopbackBridge,
-    V4L2_CAP_READWRITE, V4L2_CAP_STREAMING, V4L2_CAP_VIDEO_CAPTURE, V4L2_PIX_FMT_NV12,
-    V4L2_PIX_FMT_YUYV,
+    CameraHal3Device, CameraPixelFormat, CameraStreamType, FlashMode, V4l2Buffer,
+    V4l2LoopbackBridge, V4L2_CAP_READWRITE, V4L2_CAP_STREAMING, V4L2_CAP_VIDEO_CAPTURE,
+    V4L2_PIX_FMT_NV12, V4L2_PIX_FMT_YUYV,
 };
 
 fn create_mock_back_camera() -> CameraDeviceInfo {
@@ -193,7 +193,8 @@ fn test_milestone_5_1_desktop_apps_compatibility_pipeline() {
         assert_eq!(buf_idx, 0);
 
         // Desktop app dequeues buffer
-        let dq = v4l2.dequeue_buffer().expect("DQBUF failed");
+        let mut dq = V4l2Buffer::default();
+        v4l2.dequeue_buffer(&mut dq).expect("DQBUF failed");
         assert_eq!(dq.index, 0);
         assert_eq!(dq.bytesused as usize, frame.buffer_size);
     }
@@ -255,9 +256,13 @@ fn test_milestone_5_1_camera_streaming_edge_cases() {
     assert!(v4l2.feed_hal_frame(&frame4).is_err());
 
     // Dequeue in order
-    assert_eq!(v4l2.dequeue_buffer().unwrap().index, 0);
-    assert_eq!(v4l2.dequeue_buffer().unwrap().index, 1);
-    assert_eq!(v4l2.dequeue_buffer().unwrap().index, 2);
+    let mut dq = V4l2Buffer::default();
+    v4l2.dequeue_buffer(&mut dq).unwrap();
+    assert_eq!(dq.index, 0);
+    v4l2.dequeue_buffer(&mut dq).unwrap();
+    assert_eq!(dq.index, 1);
+    v4l2.dequeue_buffer(&mut dq).unwrap();
+    assert_eq!(dq.index, 2);
 
     // 3. Resolution mismatch rejection
     v4l2.queue_buffer(0).unwrap();

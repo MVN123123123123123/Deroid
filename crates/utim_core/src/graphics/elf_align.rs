@@ -3,7 +3,6 @@
 //! to guarantee compatibility with Android 15+ 16 KB page size kernels and 64 KB kernels.
 
 use std::fs::File;
-use std::io::Read;
 use std::path::Path;
 
 pub const REQUIRED_PAGE_ALIGNMENT: u64 = 65536; // 64 KB
@@ -41,6 +40,17 @@ pub struct ElfAlignmentReport {
     pub load_segments: Vec<ElfLoadSegment>,
     pub min_load_align: u64,
     pub is_64k_compatible: bool,
+    /// Path recorded in PT_INTERP, if any. A dynamically linked binary is only
+    /// as 64K-safe as its loader, which this check does not (and cannot) verify.
+    pub interpreter: Option<String>,
+}
+
+impl ElfAlignmentReport {
+    /// True when PT_INTERP is present: 64K safety of the loader/ld.so was NOT
+    /// verified, so a build gate must not pass the binary on this report alone.
+    pub fn dynamic_without_loader_check(&self) -> bool {
+        self.interpreter.is_some()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,6 +70,9 @@ pub enum ElfAlignError {
         vaddr: u64,
         offset: u64,
         align: u64,
+    },
+    DynamicWithoutLoaderCheck {
+        interpreter: String,
     },
 }
 
@@ -89,6 +102,10 @@ impl std::fmt::Display for ElfAlignError {
                 f,
                 "PT_LOAD segment {} alignment constraint violated: (vaddr 0x{:x} - offset 0x{:x}) % align 0x{:x} != 0",
                 segment_index, vaddr, offset, align
+            ),
+            ElfAlignError::DynamicWithoutLoaderCheck { interpreter } => write!(
+                f,
+                "dynamically linked via {interpreter}: 64K safety of the loader/ld.so was NOT verified; a 4 KB-aligned loader fails on 64 KB-page kernels even when this binary passes"
             ),
         }
     }
@@ -174,6 +191,7 @@ pub fn inspect_elf_bytes(
     let mut load_segments = Vec::new();
     let mut min_load_align = u64::MAX;
     let mut is_64k_compatible = true;
+    let mut interpreter: Option<String> = None;
 
     for i in 0..e_phnum {
         let entry_offset = e_phoff + (i * e_phentsize);
@@ -185,6 +203,26 @@ pub fn inspect_elf_bytes(
         let p_filesz = read_u64(entry_offset + 32);
         let p_memsz = read_u64(entry_offset + 40);
         let p_align = read_u64(entry_offset + 48);
+
+        if p_type == PT_INTERP {
+            // Best-effort: the interpreter string lives outside the program
+            // header table, so callers that pass a truncated window (see
+            // inspect_elf_file) may not have it in `bytes`.
+            if p_filesz > 0 && p_filesz <= 4096 {
+                if let Ok(s) = usize::try_from(p_offset) {
+                    if let Some(e) = s.checked_add(p_filesz as usize) {
+                        if e <= bytes.len() {
+                            let z = bytes[s..e]
+                                .iter()
+                                .position(|&b| b == 0)
+                                .unwrap_or(e - s);
+                            interpreter =
+                                Some(String::from_utf8_lossy(&bytes[s..s + z]).into_owned());
+                        }
+                    }
+                }
+            }
+        }
 
         if p_type == PT_LOAD {
             let is_pow2 = p_align > 0 && (p_align & (p_align - 1)) == 0;
@@ -237,20 +275,113 @@ pub fn inspect_elf_bytes(
         load_segments,
         min_load_align,
         is_64k_compatible,
+        interpreter,
     })
 }
 
 /// Inspect ELF segment alignment from a file path on disk.
 pub fn inspect_elf_file<P: AsRef<Path>>(path: P) -> Result<ElfAlignmentReport, ElfAlignError> {
+    use std::io::{Read, Seek, SeekFrom};
     let p = path.as_ref();
     let path_str = p.to_string_lossy().to_string();
 
-    let mut file = File::open(p).map_err(|e| ElfAlignError::IoError(e.to_string()))?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .map_err(|e| ElfAlignError::IoError(e.to_string()))?;
+    let mut f = File::open(p).map_err(|e| ElfAlignError::IoError(e.to_string()))?;
 
-    inspect_elf_bytes(&bytes, Some(&path_str))
+    // 64-byte ELF64 header is all we need to find the program header table.
+    let mut ehdr = [0u8; 64];
+    f.read_exact(&mut ehdr)
+        .map_err(|e| ElfAlignError::IoError(e.to_string()))?;
+    let u16at = |b: &[u8], o: usize| u16::from_le_bytes([b[o], b[o + 1]]);
+    let u32at = |b: &[u8], o: usize| {
+        u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
+    };
+    let u64at = |b: &[u8], o: usize| {
+        u64::from_le_bytes([
+            b[o], b[o + 1], b[o + 2], b[o + 3], b[o + 4], b[o + 5], b[o + 6], b[o + 7],
+        ])
+    };
+    let e_phoff = u64at(&ehdr, 32) as usize;
+    let e_phentsize = u16at(&ehdr, 54) as usize;
+    let mut e_phnum = u16at(&ehdr, 56) as usize;
+    if e_phentsize < 56 {
+        return Err(ElfAlignError::InvalidHeader(format!(
+            "bad e_phentsize {e_phentsize}"
+        )));
+    }
+    // PN_XNUM (0xFFFF): the real program-header count lives in
+    // shdr[0].sh_info. ELF64 sh_info is at shdr + 44 (sh_name:4, sh_type:4,
+    // flags:8, addr:8, offset:8, size:8, link:4, info:4). `e_phnum == 0`
+    // genuinely means zero segments and must not take this path.
+    if e_phnum == 0xFFFF {
+        let e_shoff = u64at(&ehdr, 40);
+        let e_shentsize = u16at(&ehdr, 58) as u64;
+        if e_shoff == 0 || e_shentsize < 64 {
+            return Err(ElfAlignError::InvalidHeader(
+                "PN_XNUM without a readable section header table".into(),
+            ));
+        }
+        f.seek(SeekFrom::Start(e_shoff))
+            .map_err(|e| ElfAlignError::IoError(e.to_string()))?;
+        let mut shdr0 = [0u8; 64];
+        f.read_exact(&mut shdr0)
+            .map_err(|e| ElfAlignError::IoError(e.to_string()))?;
+        let real = u32at(&shdr0, 44) as usize;
+        if real == 0 {
+            return Err(ElfAlignError::InvalidHeader(
+                "PN_XNUM with zero sh_info count".into(),
+            ));
+        }
+        e_phnum = real;
+    }
+    let end = e_phoff
+        .checked_add(e_phnum.checked_mul(e_phentsize).ok_or_else(|| {
+            ElfAlignError::InvalidHeader("program header table size overflow".into())
+        })?)
+        .ok_or_else(|| {
+            ElfAlignError::InvalidHeader("program header table offset overflow".into())
+        })?;
+
+    // Reuse the single bounds-checked parser: header + phdrs in one small buffer.
+    let mut bytes = vec![0u8; 64.max(end)];
+    bytes[..64].copy_from_slice(&ehdr);
+    if end > 64 {
+        f.seek(SeekFrom::Start(64))
+            .map_err(|e| ElfAlignError::IoError(e.to_string()))?;
+        f.read_exact(&mut bytes[64..end])
+            .map_err(|e| ElfAlignError::IoError(e.to_string()))?;
+    }
+    let mut report = inspect_elf_bytes(&bytes, Some(&path_str))?;
+    // The PT_INTERP payload lives outside the header+phdr window, so read it
+    // separately (bounded): without this a dynamic binary would be reported
+    // as static whenever its interpreter string is past `end`.
+    if report.interpreter.is_none() {
+        for i in 0..e_phnum {
+            let entry_offset = e_phoff + i * e_phentsize;
+            if entry_offset + 56 > bytes.len() {
+                break;
+            }
+            if u32at(&bytes, entry_offset) != PT_INTERP {
+                continue;
+            }
+            let p_offset = u64at(&bytes, entry_offset + 8);
+            let p_filesz = u64at(&bytes, entry_offset + 32);
+            if p_filesz == 0 || p_filesz > 4096 {
+                continue;
+            }
+            let mut buf = vec![0u8; p_filesz as usize];
+            if f.seek(SeekFrom::Start(p_offset)).is_err() {
+                continue;
+            }
+            if f.read_exact(&mut buf).is_err() {
+                continue;
+            }
+            let z = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+            report.interpreter =
+                Some(String::from_utf8_lossy(&buf[..z]).into_owned());
+            break;
+        }
+    }
+    Ok(report)
 }
 
 /// Assert that an ELF binary strictly complies with 64 KB page alignment.
@@ -261,6 +392,13 @@ pub fn verify_64k_alignment<P: AsRef<Path>>(path: P) -> Result<ElfAlignmentRepor
         return Err(ElfAlignError::InvalidHeader(
             "ELF binary contains no PT_LOAD segments".into(),
         ));
+    }
+    // Do not claim 64K safety we have not proven: a dynamically linked binary
+    // is only as 64K-safe as its loader, which this check does not verify.
+    if let Some(interp) = &report.interpreter {
+        return Err(ElfAlignError::DynamicWithoutLoaderCheck {
+            interpreter: interp.clone(),
+        });
     }
     for seg in &report.load_segments {
         if !seg.is_aligned_64k {
@@ -382,8 +520,7 @@ mod tests {
     }
 
     #[test]
-    fn test_elf_verify_64k_rejects_empty_load_segments() {
-        let temp = std::env::temp_dir().join("utim_test_empty_elf");
+    fn test_elf_verify_64k_rejects_empty_load_segments() {        let temp = std::env::temp_dir().join("utim_test_empty_elf");
         let mock_elf = create_mock_elf64(&[]);
         std::fs::write(&temp, mock_elf).unwrap();
 
@@ -393,6 +530,102 @@ mod tests {
                 assert!(s.contains("no PT_LOAD segments"));
             }
             _ => panic!("Expected InvalidHeader error for empty PT_LOAD"),
+        }
+
+        let _ = std::fs::remove_file(&temp);
+    }
+
+    fn create_mock_elf64_with_interp(load_aligns: &[u64], interp: &str) -> Vec<u8> {
+        let interp_bytes = interp.as_bytes();
+        let phnum = load_aligns.len() + 1;
+        let interp_off = (64 + phnum * 56) as u64;
+        let mut bytes = vec![0u8; interp_off as usize + interp_bytes.len() + 1];
+        bytes[0..4].copy_from_slice(b"\x7fELF");
+        bytes[4] = 2;
+        bytes[5] = 1;
+        bytes[6] = 1;
+        bytes[16] = 2;
+
+        let phoff = 64u64;
+        bytes[32..40].copy_from_slice(&phoff.to_le_bytes());
+        bytes[54..56].copy_from_slice(&(56u16).to_le_bytes());
+        bytes[56..58].copy_from_slice(&(phnum as u16).to_le_bytes());
+
+        for (i, &align) in load_aligns.iter().enumerate() {
+            let offset = 64 + i * 56;
+            let p_offset = (i as u64) * align;
+            let base_vaddr = if align > 1 {
+                (0x400000 / align) * align
+            } else {
+                0x400000
+            };
+            let p_vaddr = base_vaddr + (i as u64) * align;
+            bytes[offset..offset + 4].copy_from_slice(&PT_LOAD.to_le_bytes());
+            bytes[offset + 4..offset + 8].copy_from_slice(&5u32.to_le_bytes());
+            bytes[offset + 8..offset + 16].copy_from_slice(&p_offset.to_le_bytes());
+            bytes[offset + 16..offset + 24].copy_from_slice(&p_vaddr.to_le_bytes());
+            bytes[offset + 24..offset + 32].copy_from_slice(&p_vaddr.to_le_bytes());
+            bytes[offset + 32..offset + 40].copy_from_slice(&0x1000u64.to_le_bytes());
+            bytes[offset + 40..offset + 48].copy_from_slice(&0x1000u64.to_le_bytes());
+            bytes[offset + 48..offset + 56].copy_from_slice(&align.to_le_bytes());
+        }
+
+        let offset = 64 + load_aligns.len() * 56;
+        let filesz = interp_bytes.len() as u64 + 1;
+        bytes[offset..offset + 4].copy_from_slice(&PT_INTERP.to_le_bytes());
+        bytes[offset + 4..offset + 8].copy_from_slice(&4u32.to_le_bytes());
+        bytes[offset + 8..offset + 16].copy_from_slice(&interp_off.to_le_bytes());
+        bytes[offset + 32..offset + 40].copy_from_slice(&filesz.to_le_bytes());
+        bytes[offset + 40..offset + 48].copy_from_slice(&filesz.to_le_bytes());
+        bytes[offset + 48..offset + 56].copy_from_slice(&1u64.to_le_bytes());
+        bytes[interp_off as usize..interp_off as usize + interp_bytes.len()]
+            .copy_from_slice(interp_bytes);
+
+        bytes
+    }
+
+    #[test]
+    fn test_elf_interp_is_reported() {
+        // S22: PT_INTERP must be reported, not silently skipped.
+        let mock = create_mock_elf64_with_interp(&[65536], "/lib/ld-linux-aarch64.so.1");
+        let report = inspect_elf_bytes(&mock, None).expect("Parsed ELF");
+        assert!(report.is_64k_compatible);
+        assert_eq!(
+            report.interpreter.as_deref(),
+            Some("/lib/ld-linux-aarch64.so.1")
+        );
+        assert!(report.dynamic_without_loader_check());
+    }
+
+    #[test]
+    fn test_elf_static_binary_has_no_interpreter() {
+        let mock_elf = create_mock_elf64(&[65536]);
+        let report = inspect_elf_bytes(&mock_elf, None).expect("Parsed ELF");
+        assert_eq!(report.interpreter, None);
+        assert!(!report.dynamic_without_loader_check());
+    }
+
+    #[test]
+    fn test_elf_verify_64k_errors_on_dynamic_binary() {
+        // S22: a build gate must not pass a dynamic binary silently, even
+        // when its own PT_LOADs are 64K-aligned.
+        let temp = std::env::temp_dir().join("utim_test_dynamic_elf");
+        let mock = create_mock_elf64_with_interp(&[65536, 65536], "/lib/ld-linux-aarch64.so.1");
+        std::fs::write(&temp, mock).unwrap();
+
+        // inspect_elf_file reads the interp payload past the phdr window.
+        let report = inspect_elf_file(&temp).expect("Parsed ELF file");
+        assert_eq!(
+            report.interpreter.as_deref(),
+            Some("/lib/ld-linux-aarch64.so.1")
+        );
+
+        let err = verify_64k_alignment(&temp).unwrap_err();
+        match err {
+            ElfAlignError::DynamicWithoutLoaderCheck { interpreter } => {
+                assert_eq!(interpreter, "/lib/ld-linux-aarch64.so.1");
+            }
+            other => panic!("expected DynamicWithoutLoaderCheck, got {other}"),
         }
 
         let _ = std::fs::remove_file(&temp);

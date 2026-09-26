@@ -83,6 +83,9 @@ pub const KEY_UP: u16 = 103;
 pub const KEY_LEFT: u16 = 105;
 pub const KEY_RIGHT: u16 = 106;
 pub const KEY_DOWN: u16 = 108;
+pub const KEY_VOLUMEDOWN: u16 = 114;
+pub const KEY_VOLUMEUP: u16 = 115;
+pub const KEY_POWER: u16 = 116;
 
 /// Exactly 24 bytes on 64-bit Linux architectures (aarch64, x86_64)
 #[repr(C)]
@@ -94,6 +97,16 @@ pub struct LinuxInputEvent {
     pub code: u16,
     pub value: i32,
 }
+
+// The decoder below strides batches by this layout; a silent size change
+// desynchronises every event after the first.
+const _: () = assert!(
+    std::mem::size_of::<LinuxInputEvent>() == 24
+        && std::mem::align_of::<LinuxInputEvent>() == 8,
+    "LinuxInputEvent must match the kernel's struct input_event (64-bit)"
+);
+#[cfg(target_pointer_width = "32")]
+compile_error!("evdev struct input_event is 16 bytes on 32-bit targets");
 
 impl LinuxInputEvent {
     pub const SIZE: usize = std::mem::size_of::<Self>();
@@ -119,6 +132,14 @@ pub enum InputDispatchResult {
     KeyPress { code: u16, ch: Option<char>, pressed: bool, repeat: bool, ctrl: bool },
 }
 
+/// Clamp a coordinate into a display extent that may be degenerate (0x0
+/// or sub-1px during headless/mode-set failure). `f32::clamp` panics when
+/// min > max, so the extent is clamped first; release builds abort on panic.
+#[inline]
+fn to_screen(v: f32, extent: f32) -> f32 {
+    v.clamp(0.0, (extent - 1.0).max(0.0))
+}
+
 /// Zero-allocation evdev dispatcher and coordinate normalizer
 pub struct InputDispatcher {
     pub screen_width: f32,
@@ -137,9 +158,20 @@ pub struct InputDispatcher {
     touch_id_counter: i32,
     pending_abs_x: Option<f32>,
     pending_abs_y: Option<f32>,
+    /// Active protocol-B multi-touch slot (single-pointer engine: only
+    /// slot 0 drives touch state; other slots are tracked, not dispatched).
+    pub mt_slot: i32,
+    /// Kernel CLOCK_MONOTONIC reading of the anchor event, paired with the
+    /// local `Instant` it arrived at, so hardware timestamps map onto the
+    /// local clock without an `Instant::now()` per field.
+    anchor_kernel: Option<std::time::Duration>,
+    anchor_instant: Instant,
 }
 
 impl InputDispatcher {
+    /// Number of protocol-B slots tracked.
+    pub const MAX_MT_SLOTS: i32 = 10;
+
     pub fn new(screen_width: f32, screen_height: f32) -> Self {
         Self {
             screen_width,
@@ -158,35 +190,143 @@ impl InputDispatcher {
             touch_id_counter: 1,
             pending_abs_x: None,
             pending_abs_y: None,
+            mt_slot: 0,
+            anchor_kernel: None,
+            anchor_instant: Instant::now(),
+        }
+    }
+
+    /// Event timestamp from the kernel CLOCK_MONOTONIC stamp carried in the
+    /// evdev packet. Takes one local reading per call as the fallback for
+    /// synthetic (zero-stamped) events and for the anchor mapping.
+    fn event_timestamp(&mut self, ev: &LinuxInputEvent) -> Instant {
+        let now = Instant::now();
+        if ev.time_sec == 0 && ev.time_usec == 0 {
+            return now;
+        }
+        let kernel = std::time::Duration::from_secs(ev.time_sec)
+            .saturating_add(std::time::Duration::from_micros(ev.time_usec));
+        match self.anchor_kernel {
+            Some(anchor) => self.anchor_instant + kernel.saturating_sub(anchor),
+            None => {
+                self.anchor_kernel = Some(kernel);
+                self.anchor_instant = now;
+                now
+            }
+        }
+    }
+
+    /// Protocol-A/B finger-down edge: latch position, arm the tap timer.
+    fn start_touch(&mut self, ts: Instant) -> InputDispatchResult {
+        self.is_touch_down = true;
+        self.touch_start_x = self.cursor_x;
+        self.touch_start_y = self.cursor_y;
+        self.touch_start_time = ts;
+
+        InputDispatchResult::Touch(RawTouchEvent {
+            touch_id: self.touch_id_counter,
+            phase: TouchPhase::Down,
+            x: self.cursor_x,
+            y: self.cursor_y,
+            timestamp: ts,
+        })
+    }
+
+    /// Finger-lift edge shared by protocol A (BTN_TOUCH up) and protocol B
+    /// (TRACKING_ID -1): synthesise Tap / LongPress / Touch-Up.
+    fn finish_touch(&mut self, ts: Instant) -> InputDispatchResult {
+        self.is_touch_down = false;
+        let dx = (self.cursor_x - self.touch_start_x).abs();
+        let dy = (self.cursor_y - self.touch_start_y).abs();
+        let dur = ts.saturating_duration_since(self.touch_start_time);
+
+        let res = if dx < 25.0 && dy < 25.0 {
+            if dur.as_millis() >= 400 {
+                InputDispatchResult::LongPress {
+                    x: self.cursor_x,
+                    y: self.cursor_y,
+                }
+            } else {
+                InputDispatchResult::Tap {
+                    x: self.cursor_x,
+                    y: self.cursor_y,
+                }
+            }
+        } else {
+            InputDispatchResult::Touch(RawTouchEvent {
+                touch_id: self.touch_id_counter,
+                phase: TouchPhase::Up,
+                x: self.cursor_x,
+                y: self.cursor_y,
+                timestamp: ts,
+            })
+        };
+        self.touch_id_counter = self.touch_id_counter.wrapping_add(1);
+        res
+    }
+
+    /// Protocol-B down/up edge from ABS_MT_TRACKING_ID (authoritative; slot
+    /// 0 only in this single-pointer engine).
+    fn handle_mt_tracking_id(&mut self, value: i32, ts: Instant) -> InputDispatchResult {
+        if self.mt_slot != 0 {
+            return InputDispatchResult::None;
+        }
+        if value >= 0 {
+            if let Some(x) = self.pending_abs_x.take() {
+                self.cursor_x = x;
+            }
+            if let Some(y) = self.pending_abs_y.take() {
+                self.cursor_y = y;
+            }
+            self.start_touch(ts)
+        } else {
+            // TRACKING_ID -1: finger lifted.
+            if !self.is_touch_down {
+                return InputDispatchResult::None;
+            }
+            if let Some(x) = self.pending_abs_x.take() {
+                self.cursor_x = x;
+            }
+            if let Some(y) = self.pending_abs_y.take() {
+                self.cursor_y = y;
+            }
+            self.finish_touch(ts)
         }
     }
 
     /// Process a single raw Linux input event and produce high-level dispatched events
     pub fn process_event(&mut self, ev: &LinuxInputEvent) -> InputDispatchResult {
+        // One local reading per event; kernel stamps are mapped onto it.
+        let ts = self.event_timestamp(ev);
         match ev.type_ {
             EV_ABS => {
-                match ev.code {
-                    ABS_X | ABS_MT_POSITION_X => {
-                        let normalized_x = (ev.value as f32 / self.tablet_max_x) * self.screen_width;
-                        self.pending_abs_x = Some(normalized_x.clamp(0.0, self.screen_width - 1.0));
-                    }
-                    ABS_Y | ABS_MT_POSITION_Y => {
-                        let normalized_y = (ev.value as f32 / self.tablet_max_y) * self.screen_height;
-                        self.pending_abs_y = Some(normalized_y.clamp(0.0, self.screen_height - 1.0));
-                    }
-                    _ => {}
+                if ev.code == ABS_X || ev.code == ABS_MT_POSITION_X {
+                    let normalized_x = (ev.value as f32 / self.tablet_max_x) * self.screen_width;
+                    self.pending_abs_x = Some(to_screen(normalized_x, self.screen_width));
+                    InputDispatchResult::None
+                } else if ev.code == ABS_Y || ev.code == ABS_MT_POSITION_Y {
+                    let normalized_y = (ev.value as f32 / self.tablet_max_y) * self.screen_height;
+                    self.pending_abs_y = Some(to_screen(normalized_y, self.screen_height));
+                    InputDispatchResult::None
+                } else if ev.code == ABS_MT_SLOT {
+                    self.mt_slot = ev.value.clamp(0, Self::MAX_MT_SLOTS - 1);
+                    InputDispatchResult::None
+                } else if ev.code == ABS_MT_TRACKING_ID {
+                    // Protocol B: the authoritative down/up edge.
+                    self.handle_mt_tracking_id(ev.value, ts)
+                } else {
+                    InputDispatchResult::None
                 }
-                InputDispatchResult::None
             }
             EV_REL => {
                 match ev.code {
                     REL_X => {
                         let delta = (ev.value as f32) * self.mouse_sensitivity;
-                        self.cursor_x = (self.cursor_x + delta).clamp(0.0, self.screen_width - 1.0);
+                        self.cursor_x = to_screen(self.cursor_x + delta, self.screen_width);
                     }
                     REL_Y => {
                         let delta = (ev.value as f32) * self.mouse_sensitivity;
-                        self.cursor_y = (self.cursor_y + delta).clamp(0.0, self.screen_height - 1.0);
+                        self.cursor_y = to_screen(self.cursor_y + delta, self.screen_height);
                     }
                     _ => {}
                 }
@@ -196,7 +336,7 @@ impl InputDispatcher {
                         phase: TouchPhase::Move,
                         x: self.cursor_x,
                         y: self.cursor_y,
-                        timestamp: Instant::now(),
+                        timestamp: ts,
                     })
                 } else {
                     InputDispatchResult::PointerMove {
@@ -216,52 +356,14 @@ impl InputDispatcher {
 
                     if ev.value == 1 {
                         // Button Down -> TouchPhase::Down
-                        self.is_touch_down = true;
-                        self.touch_start_x = self.cursor_x;
-                        self.touch_start_y = self.cursor_y;
-                        self.touch_start_time = Instant::now();
-
-                        InputDispatchResult::Touch(RawTouchEvent {
-                            touch_id: self.touch_id_counter,
-                            phase: TouchPhase::Down,
-                            x: self.cursor_x,
-                            y: self.cursor_y,
-                            timestamp: Instant::now(),
-                        })
+                        self.start_touch(ts)
                     } else if ev.value == 0 {
-                        // Button Up -> TouchPhase::Up
-                        self.is_touch_down = false;
-                        let dx = (self.cursor_x - self.touch_start_x).abs();
-                        let dy = (self.cursor_y - self.touch_start_y).abs();
-                        let dur = self.touch_start_time.elapsed();
-
-                        let res = if dx < 25.0 && dy < 25.0 {
-                            if dur.as_millis() >= 400 {
-                                InputDispatchResult::LongPress {
-                                    x: self.cursor_x,
-                                    y: self.cursor_y,
-                                }
-                            } else {
-                                InputDispatchResult::Tap {
-                                    x: self.cursor_x,
-                                    y: self.cursor_y,
-                                }
-                            }
-                        } else {
-                            InputDispatchResult::Touch(RawTouchEvent {
-                                touch_id: self.touch_id_counter,
-                                phase: TouchPhase::Up,
-                                x: self.cursor_x,
-                                y: self.cursor_y,
-                                timestamp: Instant::now(),
-                            })
-                        };
-                        self.touch_id_counter = self.touch_id_counter.wrapping_add(1);
-                        res
+                        // Button Up -> TouchPhase::Up (Tap/LongPress/Move-Up)
+                        self.finish_touch(ts)
                     } else {
                         InputDispatchResult::None
                     }
-                } else if ev.code == 0x111 /* BTN_RIGHT */ && ev.value == 0 {
+                } else if ev.code == BTN_RIGHT && ev.value == 0 {
                     InputDispatchResult::LongPress {
                         x: self.cursor_x,
                         y: self.cursor_y,
@@ -304,7 +406,7 @@ impl InputDispatcher {
                                 phase: TouchPhase::Move,
                                 x: self.cursor_x,
                                 y: self.cursor_y,
-                                timestamp: Instant::now(),
+                                timestamp: ts,
                             })
                         } else {
                             InputDispatchResult::PointerMove {

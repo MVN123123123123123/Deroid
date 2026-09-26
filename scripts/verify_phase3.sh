@@ -116,7 +116,7 @@ header "4. Milestone 3.1: Smithay Wayland Compositor Core & HWC Backend"
 # ------------------------------------------------------------------------------
 
 echo "[*] Checking mobile Wayland protocol extensions..."
-PROTO_OUT=$("${WORKSPACE_ROOT}/target/debug/utlc" --check-protocols --json)
+if PROTO_OUT=$("${WORKSPACE_ROOT}/target/debug/utlc" --check-protocols --json); then :; else fail "utlc --check-protocols invocation failed"; PROTO_OUT=""; fi
 if echo "${PROTO_OUT}" | grep -q '"all_supported":true'; then
     pass "All mobile Wayland protocols verified (xdg-shell, wlr-layer-shell, linux-dmabuf, presentation-time, wp_viewporter, ext-idle-notify, text-input-v3, zwp_tablet_manager_v2)"
 else
@@ -124,7 +124,7 @@ else
 fi
 
 echo "[*] Checking boot-to-launcher time and resident RAM footprint (RSS)..."
-BENCH_OUT=$("${WORKSPACE_ROOT}/target/debug/utlc" --benchmark --json)
+if BENCH_OUT=$("${WORKSPACE_ROOT}/target/debug/utlc" --benchmark --json); then :; else fail "utlc --benchmark invocation failed"; BENCH_OUT=""; fi
 
 if echo "${BENCH_OUT}" | grep -q '"boot_target_met":true'; then
     pass "Boot-to-launcher time verified (< 450 ms target achieved)"
@@ -143,7 +143,7 @@ header "5. Milestone 3.2: Android Home Screen, Hotseat Dock & Zero-Copy App Draw
 # ------------------------------------------------------------------------------
 
 echo "[*] Checking zero-allocation .desktop parser and real-time fuzzy search..."
-DESK_OUT=$("${WORKSPACE_ROOT}/target/debug/utlc" --test-desktop --json)
+if DESK_OUT=$("${WORKSPACE_ROOT}/target/debug/utlc" --test-desktop --json); then :; else fail "utlc --test-desktop invocation failed"; DESK_OUT=""; fi
 if echo "${DESK_OUT}" | grep -q '"desktop_search_ok":true'; then
     pass "Zero-allocation .desktop parser and fuzzy search validated"
 else
@@ -161,7 +161,7 @@ header "6. Milestone 3.3: QuickStep Gesture Navigation & Recents Carousel"
 # ------------------------------------------------------------------------------
 
 echo "[*] Checking QuickStep gesture engine (< 8ms touch latency, Home, Recents, Back, Scrub)..."
-GEST_OUT=$("${WORKSPACE_ROOT}/target/debug/utlc" --test-gestures --json)
+if GEST_OUT=$("${WORKSPACE_ROOT}/target/debug/utlc" --test-gestures --json); then :; else fail "utlc --test-gestures invocation failed"; GEST_OUT=""; fi
 if echo "${GEST_OUT}" | grep -q '"all_passed":true'; then
     pass "All QuickStep gestures validated (Home ease-out, Recents hold/haptic, Back edge injection)"
 else
@@ -179,7 +179,7 @@ header "7. Milestone 3.4: SystemUI Status Bar, Notification Shade & Quick Settin
 # ------------------------------------------------------------------------------
 
 echo "[*] Checking SystemUI status bar (5G/LTE), Quick Settings tiles, and Notifications..."
-SYSUI_OUT=$("${WORKSPACE_ROOT}/target/debug/utlc" --test-systemui --json)
+if SYSUI_OUT=$("${WORKSPACE_ROOT}/target/debug/utlc" --test-systemui --json); then :; else fail "utlc --test-systemui invocation failed"; SYSUI_OUT=""; fi
 if echo "${SYSUI_OUT}" | grep -q '"all_passed":true'; then
     pass "SystemUI Status Bar, Quick Settings tiles (Torch, Wi-Fi), and Notification center verified"
 else
@@ -191,7 +191,7 @@ header "8. Milestone 3.5: Lock Screen, Biometrics & Virtual Keyboard (IME)"
 # ------------------------------------------------------------------------------
 
 echo "[*] Checking ambient lock screen and Android Fingerprint HAL bridge (< 300ms)..."
-LOCK_OUT=$("${WORKSPACE_ROOT}/target/debug/utlc" --test-lockscreen --json)
+if LOCK_OUT=$("${WORKSPACE_ROOT}/target/debug/utlc" --test-lockscreen --json); then :; else fail "utlc --test-lockscreen invocation failed"; LOCK_OUT=""; fi
 if echo "${LOCK_OUT}" | grep -q '"sub_300ms":true'; then
     pass "Lock screen and Fingerprint HAL bridge verified (sub-300ms biometric unlock)"
 else
@@ -199,7 +199,7 @@ else
 fi
 
 echo "[*] Checking integrated Gboard-style virtual keyboard (IME) and viewport push..."
-IME_OUT=$("${WORKSPACE_ROOT}/target/debug/utlc" --test-ime --json)
+if IME_OUT=$("${WORKSPACE_ROOT}/target/debug/utlc" --test-ime --json); then :; else fail "utlc --test-ime invocation failed"; IME_OUT=""; fi
 if echo "${IME_OUT}" | grep -q '"all_passed":true'; then
     pass "Virtual Keyboard (IME) text-input-v3 and window viewport push animation verified"
 else
@@ -211,11 +211,19 @@ header "9. Milestone 3.6: UTIM Power & OOM Governance Synchronization"
 # ------------------------------------------------------------------------------
 
 echo "[*] Checking UTIM MPG cgroup v2 freezing and dynamic OOM hierarchy..."
-PWR_OUT=$("${WORKSPACE_ROOT}/target/debug/utlc" --test-power-sync --json)
+if PWR_OUT=$("${WORKSPACE_ROOT}/target/debug/utlc" --test-power-sync --json); then :; else fail "utlc --test-power-sync invocation failed"; PWR_OUT=""; fi
 if echo "${PWR_OUT}" | grep -q '"all_passed":true'; then
     pass "UTIM Power Governor display sleep freezing and dynamic OOM hierarchy verified"
 else
     fail "UTIM power and OOM synchronization failed"
+fi
+
+echo "[*] Checking release-mode screenshot capture path..."
+if SCREENSHOT_TEST=$(cargo test --release -p utim_core --lib screenshot -- --nocapture 2>&1); then :; else fail "Screenshot release test command failed"; SCREENSHOT_TEST=""; fi
+if echo "${SCREENSHOT_TEST}" | grep -qE "test result: ok\. [1-9][0-9]* passed"; then
+    pass "Screenshot capture path verified in release mode (utim_core)"
+else
+    fail "Screenshot release-mode test failed"
 fi
 
 # ------------------------------------------------------------------------------

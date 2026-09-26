@@ -266,6 +266,10 @@ impl CameraHal3Device {
         if self.is_streaming {
             return Err("Cannot reconfigure stream while streaming is active");
         }
+        // H8: zero dimensions are never valid.
+        if width == 0 || height == 0 {
+            return Err("Stream dimensions must be non-zero");
+        }
         if width > self.info.max_width || height > self.info.max_height {
             return Err("Requested resolution exceeds sensor capabilities");
         }
@@ -289,6 +293,10 @@ impl CameraHal3Device {
     }
 
     pub fn set_zoom(&mut self, ratio: f32) {
+        // H19: clamp does not reject NaN; keep the old zoom on non-finite.
+        if !ratio.is_finite() {
+            return;
+        }
         self.controls.zoom_ratio = ratio.clamp(1.0, 10.0);
     }
 
@@ -300,21 +308,35 @@ impl CameraHal3Device {
         Ok(())
     }
 
-    /// Produce next frame from ISP pipeline
+    /// Produce next frame from ISP pipeline.
+    ///
+    /// H35 (simulation disclosure): with no sensor bound this fabricates a
+    /// monotonic frame counter and a synthetic `frame_counter * 33_333_333`
+    /// timestamp (~30 fps), unrelated to real capture time; `dmabuf_fd` is
+    /// the `-1` sentinel, meaning "no real DMA-BUF" (never `close()`d —
+    /// `Drop` skips negatives). Wire a real clock/buffer allocator before
+    /// trusting timestamps or fds downstream.
     pub fn produce_frame(&mut self) -> Result<CapturedFrame, &'static str> {
         if !self.is_streaming {
             return Err("Camera is not streaming");
         }
+        // H8: zero dimensions are never valid; u64 math avoids overflow
+        // (40000x30000x3 still overflows u32).
+        if self.stream_width == 0 || self.stream_height == 0 {
+            return Err("Stream dimensions must be non-zero");
+        }
 
         self.frame_counter += 1;
         let stride = self.stream_width;
+        // u64 math: 100000x100000x2 = 2e10 (wraps u32 to 2820130816).
+        let (w, h) = (self.stream_width as u64, self.stream_height as u64);
         let buffer_size = match self.stream_format {
             CameraPixelFormat::Nv12 | CameraPixelFormat::Yuv420Planar => {
-                (self.stream_width * self.stream_height * 3 / 2) as usize
+                (w * h * 3 / 2) as usize
             }
-            CameraPixelFormat::Yuyv => (self.stream_width * self.stream_height * 2) as usize,
-            CameraPixelFormat::JpegBlob => (self.stream_width * self.stream_height / 4) as usize,
-            CameraPixelFormat::RawSensor => (self.stream_width * self.stream_height * 2) as usize,
+            CameraPixelFormat::Yuyv => (w * h * 2) as usize,
+            CameraPixelFormat::JpegBlob => (w * h / 4) as usize,
+            CameraPixelFormat::RawSensor => (w * h * 2) as usize,
         };
 
         Ok(CapturedFrame {

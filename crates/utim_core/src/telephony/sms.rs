@@ -25,7 +25,15 @@ pub struct SmsMessage {
 
 /// Multipart SMS Reassembly Cache
 pub struct SmsReassembler {
-    pending_parts: Vec<(u16, u8, u8, String, String)>, // (ref, total, seq, sender, text)
+    pending_parts: Vec<(u16, u8, u8, String, String, u32)>, // (ref, total, seq, sender, text, tick)
+    tick: u32,
+}
+
+impl SmsReassembler {
+    /// Bound on retained incomplete parts (H11).
+    pub const MAX_PARTS: usize = 64;
+    /// Ticks after which an incomplete part is evicted.
+    pub const TIMEOUT_TICKS: u32 = 256;
 }
 
 impl Default for SmsReassembler {
@@ -38,6 +46,7 @@ impl SmsReassembler {
     pub fn new() -> Self {
         Self {
             pending_parts: Vec::with_capacity(16),
+            tick: 0,
         }
     }
 
@@ -52,34 +61,47 @@ impl SmsReassembler {
             return Some(msg);
         }
 
+        // H11: age out stale parts and bound the cache (network-controlled).
+        // Warmup: no eviction until enough ticks have elapsed; wrapping
+        // arithmetic would otherwise evict the first segment immediately.
+        self.tick = self.tick.wrapping_add(1);
+        if self.tick > Self::TIMEOUT_TICKS {
+            let cutoff = self.tick.wrapping_sub(Self::TIMEOUT_TICKS);
+            self.pending_parts.retain(|(_, _, _, _, _, t)| *t > cutoff);
+        }
+
         // Deduplication: prevent duplicate segments (retransmissions) from corrupting the sequence
-        let already_exists = self.pending_parts.iter().any(|(r, t, seq, s, _)| {
+        let already_exists = self.pending_parts.iter().any(|(r, t, seq, s, _, _)| {
             *r == concat_ref && *t == msg.concat_total && *seq == msg.concat_seq && s == &msg.sender
         });
         if !already_exists {
+            if self.pending_parts.len() >= Self::MAX_PARTS {
+                self.pending_parts.remove(0);
+            }
             self.pending_parts.push((
                 concat_ref,
                 msg.concat_total,
                 msg.concat_seq,
                 msg.sender.clone(),
                 msg.body,
+                self.tick,
             ));
         }
 
         // Check if all parts from 1 to concat_total are present for this (ref, sender)
-        let matching: Vec<&(u16, u8, u8, String, String)> = self
+        let matching: Vec<&(u16, u8, u8, String, String, u32)> = self
             .pending_parts
             .iter()
-            .filter(|(r, t, _, s, _)| *r == concat_ref && *t == msg.concat_total && s == &msg.sender)
+            .filter(|(r, t, _, s, _, _)| *r == concat_ref && *t == msg.concat_total && s == &msg.sender)
             .collect();
 
         let all_present = (1..=msg.concat_total).all(|needed_seq| {
-            matching.iter().any(|(_, _, seq, _, _)| *seq == needed_seq)
+            matching.iter().any(|(_, _, seq, _, _, _)| *seq == needed_seq)
         });
 
         if all_present && matching.len() >= msg.concat_total as usize {
             let mut sorted_parts = matching;
-            sorted_parts.sort_by_key(|(_, _, seq, _, _)| *seq);
+            sorted_parts.sort_by_key(|(_, _, seq, _, _, _)| *seq);
             let mut full_body = String::new();
             for part in &sorted_parts {
                 full_body.push_str(&part.4);
@@ -87,7 +109,7 @@ impl SmsReassembler {
 
             // Clean up cache for this message
             self.pending_parts
-                .retain(|(r, _, _, s, _)| !(*r == concat_ref && s == &msg.sender));
+                .retain(|(r, _, _, s, _, _)| !(*r == concat_ref && s == &msg.sender));
 
             Some(SmsMessage {
                 sender: msg.sender,
@@ -101,6 +123,11 @@ impl SmsReassembler {
         } else {
             None
         }
+    }
+
+    /// Number of retained incomplete parts (for tests/monitoring).
+    pub fn pending_count(&self) -> usize {
+        self.pending_parts.len()
     }
 }
 
@@ -159,13 +186,18 @@ pub fn decode_gsm7(septets: &[u8]) -> String {
     let mut i = 0;
     while i < septets.len() {
         let code = septets[i] & 0x7F;
-        if code == 0x1B && i + 1 < septets.len() {
+        if code == 0x1B {
+            // H33: trailing ESC has no extension; drop it (never emit raw U+001B).
+            if i + 1 >= septets.len() {
+                break;
+            }
             i += 1;
             let ext_code = septets[i] & 0x7F;
             if let Some(ch) = gsm_extension_to_char(ext_code) {
                 s.push(ch);
             } else {
-                s.push(' ');
+                // H33: undefined extension -> replacement char, not silent space.
+                s.push('\u{FFFD}');
             }
         } else {
             let ch = GSM_7BIT_TO_CHAR[code as usize];
@@ -277,8 +309,9 @@ pub fn encode_address_semi_octets(number: &str) -> (u8, Vec<u8>) {
 /// Decode semi-octets into a phone number or alphanumeric string
 pub fn decode_address_semi_octets(bcd: &[u8], num_digits: usize, type_of_address: u8) -> String {
     if (type_of_address & 0x70) == 0x50 {
-        // Alphanumeric Address (GSM 7-bit default alphabet per 3GPP TS 23.040 9.1.2.5)
-        let septet_count = (num_digits * 4) / 7;
+        // Alphanumeric Address (GSM 7-bit default alphabet per 3GPP TS 23.040 9.1.2.5):
+        // the length field counts characters, each one septet (H16).
+        let septet_count = num_digits;
         let septets = unpack_7bit(bcd, septet_count);
         let mut out = String::with_capacity(septet_count);
         for s in septets {
@@ -308,8 +341,9 @@ pub fn decode_address_semi_octets(bcd: &[u8], num_digits: usize, type_of_address
     out
 }
 
-/// Encode an SMS-SUBMIT PDU for transmission
-pub fn encode_sms_submit_pdu(recipient: &str, text: &str) -> Vec<u8> {
+/// Encode an SMS-SUBMIT PDU for transmission.
+/// H10: returns Err instead of truncating TP-UDL/TP-DA with `as u8`.
+pub fn encode_sms_submit_pdu(recipient: &str, text: &str) -> Result<Vec<u8>, &'static str> {
     let mut pdu = Vec::with_capacity(180);
 
     // 1. SMSC info length = 0 (use default SMSC from SIM)
@@ -328,6 +362,10 @@ pub fn encode_sms_submit_pdu(recipient: &str, text: &str) -> Vec<u8> {
         .filter(|c| c.is_ascii_digit())
         .map(|c| c as u8 - b'0')
         .collect();
+    // 3GPP: BCD address is 1..=20 digits (H10).
+    if digits.is_empty() || digits.len() > 20 {
+        return Err("recipient must be 1..=20 digits");
+    }
     pdu.push(digits.len() as u8);
     pdu.push(if is_intl { 0x91 } else { 0x81 });
     for chunk in digits.chunks(2) {
@@ -345,6 +383,10 @@ pub fn encode_sms_submit_pdu(recipient: &str, text: &str) -> Vec<u8> {
         pdu.push(0x00);
         // TP-VP = 0xA7 (Validity period ~24 hours)
         pdu.push(0xA7);
+        // H10: single SMS is <=160 septets; longer needs UDH segmentation.
+        if septets.len() > 160 {
+            return Err("message exceeds one SMS; UDH segmentation required");
+        }
         // TP-UDL (User Data Length in septets)
         pdu.push(septets.len() as u8);
         // TP-UD
@@ -358,20 +400,24 @@ pub fn encode_sms_submit_pdu(recipient: &str, text: &str) -> Vec<u8> {
             .encode_utf16()
             .flat_map(|u| u.to_be_bytes())
             .collect();
+        if ucs2_bytes.len() > 140 {
+            return Err("message exceeds one SMS; UDH segmentation required");
+        }
         // TP-UDL (User Data Length in bytes)
         pdu.push(ucs2_bytes.len() as u8);
         pdu.extend_from_slice(&ucs2_bytes);
     }
 
-    pdu
+    Ok(pdu)
 }
 
-/// Encode an SMS-DELIVER PDU (incoming network message)
+/// Encode an SMS-DELIVER PDU (incoming network message).
+/// H10/H34: validates lengths; selects 8-bit vs 16-bit concat IE by magnitude.
 pub fn encode_sms_deliver_pdu(
     sender: &str,
     text: &str,
     concat_info: Option<(u16, u8, u8)>, // (ref, total, seq)
-) -> Vec<u8> {
+) -> Result<Vec<u8>, &'static str> {
     let mut pdu = Vec::with_capacity(180);
 
     // 1. SMSC info length = 0
@@ -388,6 +434,9 @@ pub fn encode_sms_deliver_pdu(
         .filter(|c| c.is_ascii_digit())
         .map(|c| c as u8 - b'0')
         .collect();
+    if digits.is_empty() || digits.len() > 20 {
+        return Err("sender must be 1..=20 digits");
+    }
     pdu.push(digits.len() as u8);
     pdu.push(if is_intl { 0x91 } else { 0x81 });
     for chunk in digits.chunks(2) {
@@ -411,15 +460,43 @@ pub fn encode_sms_deliver_pdu(
     if is_7bit {
         let septets = gsm_septets.unwrap();
         if let Some((cref, total, seq)) = concat_info {
-            let udh = [0x05, 0x00, 0x03, (cref & 0xFF) as u8, total, seq];
-            // 6 header bytes = 48 bits, 1 fill bit = 49 bits = 7 septets
-            let header_septets = 7;
-            let udl = header_septets + septets.len();
-            pdu.push(udl as u8);
+            // H34: use 16-bit ref (IEI 0x08, 7-octet UDH) when ref > 255.
+            if cref > 0xFF {
+                let udh = [
+                    0x06,
+                    0x08,
+                    0x04,
+                    (cref >> 8) as u8,
+                    (cref & 0xFF) as u8,
+                    total,
+                    seq,
+                ];
+                // 7 header bytes = 56 bits, septet-aligned = 8 septets.
+                let header_septets: usize = 8;
+                let udl = header_septets
+                    .checked_add(septets.len())
+                    .filter(|&n| n <= 160)
+                    .ok_or("message exceeds one SMS; UDH segmentation required")?;
+                pdu.push(udl as u8);
+                let packed = pack_7bit_with_bit_offset(&septets, 56, &udh);
+                pdu.extend_from_slice(&packed);
+            } else {
+                let udh = [0x05, 0x00, 0x03, (cref & 0xFF) as u8, total, seq];
+                // 6 header bytes = 48 bits, 1 fill bit = 49 bits = 7 septets
+                let header_septets: usize = 7;
+                let udl = header_septets
+                    .checked_add(septets.len())
+                    .filter(|&n| n <= 160)
+                    .ok_or("message exceeds one SMS; UDH segmentation required")?;
+                pdu.push(udl as u8);
 
-            let packed = pack_7bit_with_bit_offset(&septets, 49, &udh);
-            pdu.extend_from_slice(&packed);
+                let packed = pack_7bit_with_bit_offset(&septets, 49, &udh);
+                pdu.extend_from_slice(&packed);
+            }
         } else {
+            if septets.len() > 160 {
+                return Err("message exceeds one SMS; UDH segmentation required");
+            }
             pdu.push(septets.len() as u8);
             let packed = pack_7bit(&septets);
             pdu.extend_from_slice(&packed);
@@ -430,18 +507,45 @@ pub fn encode_sms_deliver_pdu(
             .flat_map(|u| u.to_be_bytes())
             .collect();
         if let Some((cref, total, seq)) = concat_info {
-            let udh = [0x05, 0x00, 0x03, (cref & 0xFF) as u8, total, seq];
-            let udl = udh.len() + ucs2_bytes.len();
-            pdu.push(udl as u8);
-            pdu.extend_from_slice(&udh);
-            pdu.extend_from_slice(&ucs2_bytes);
+            if cref > 0xFF {
+                let udh = [
+                    0x06,
+                    0x08,
+                    0x04,
+                    (cref >> 8) as u8,
+                    (cref & 0xFF) as u8,
+                    total,
+                    seq,
+                ];
+                let udl = udh
+                    .len()
+                    .checked_add(ucs2_bytes.len())
+                    .filter(|&n| n <= 140)
+                    .ok_or("message exceeds one SMS; UDH segmentation required")?;
+                pdu.push(udl as u8);
+                pdu.extend_from_slice(&udh);
+                pdu.extend_from_slice(&ucs2_bytes);
+            } else {
+                let udh = [0x05, 0x00, 0x03, (cref & 0xFF) as u8, total, seq];
+                let udl = udh
+                    .len()
+                    .checked_add(ucs2_bytes.len())
+                    .filter(|&n| n <= 140)
+                    .ok_or("message exceeds one SMS; UDH segmentation required")?;
+                pdu.push(udl as u8);
+                pdu.extend_from_slice(&udh);
+                pdu.extend_from_slice(&ucs2_bytes);
+            }
         } else {
+            if ucs2_bytes.len() > 140 {
+                return Err("message exceeds one SMS; UDH segmentation required");
+            }
             pdu.push(ucs2_bytes.len() as u8);
             pdu.extend_from_slice(&ucs2_bytes);
         }
     }
 
-    pdu
+    Ok(pdu)
 }
 
 /// Parse an incoming SMS-DELIVER PDU
@@ -556,7 +660,18 @@ pub fn parse_sms_deliver_pdu(pdu: &[u8]) -> Result<SmsMessage, &'static str> {
                 let header_bits = header_bytes * 8;
                 let fill_bits = if header_bits.is_multiple_of(7) { 0 } else { 7 - (header_bits % 7) };
                 let header_septets = (header_bits + fill_bits) / 7;
-                let text_septets_count = udl.saturating_sub(header_septets);
+                // H7: UDL is network-controlled; a UDL smaller than the header
+                // is a truncated PDU (error), and a UDL larger than the octets
+                // present must be clamped (never read past the buffer).
+                if udl < header_septets {
+                    return Err("TP-UDL smaller than the User Data Header (truncated PDU)");
+                }
+                let avail_septets = user_data
+                    .len()
+                    .saturating_mul(8)
+                    .saturating_sub(header_bits + fill_bits)
+                    / 7;
+                let text_septets_count = (udl - header_septets).min(avail_septets);
                 let septets = unpack_7bit_from_bit_offset(user_data, header_bits + fill_bits, text_septets_count);
                 decode_gsm7(&septets)
             }

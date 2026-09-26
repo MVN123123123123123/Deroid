@@ -59,7 +59,13 @@ pub struct SensorInfo {
 /// Android Sensors HAL Bridge
 pub struct AndroidSensorsHal {
     pub sensors: Vec<SensorInfo>,
-    event_timestamp: u64,
+    // H37: one monotonic clock per sensor. A single shared counter made the
+    // accelerometer's implied period jump whenever a light/proximity event
+    // intervened, corrupting any client's sample-rate derivation.
+    accel_ts: u64,
+    gyro_ts: u64,
+    light_ts: u64,
+    prox_ts: u64,
 }
 
 impl Default for AndroidSensorsHal {
@@ -126,7 +132,10 @@ impl AndroidSensorsHal {
 
         Self {
             sensors,
-            event_timestamp: 0,
+            accel_ts: 0,
+            gyro_ts: 0,
+            light_ts: 0,
+            prox_ts: 0,
         }
     }
 
@@ -152,43 +161,58 @@ impl AndroidSensorsHal {
         Ok(())
     }
 
+    /// Gate helper: sensor must exist and be active (H13).
+    #[inline]
+    fn gate(&self, t: SensorType) -> Result<(), &'static str> {
+        self.sensors
+            .iter()
+            .find(|s| s.sensor_type == t)
+            .filter(|s| s.active)
+            .map(|_| ())
+            .ok_or("sensor not found or deactivated")
+    }
+
     /// Produce an accelerometer reading
-    pub fn produce_accelerometer_event(&mut self, x: f32, y: f32, z: f32) -> SensorEvent {
-        self.event_timestamp += 20_000_000; // 20 ms
-        SensorEvent {
+    pub fn produce_accelerometer_event(&mut self, x: f32, y: f32, z: f32) -> Result<SensorEvent, &'static str> {
+        self.gate(SensorType::Accelerometer)?;
+        self.accel_ts += 20_000_000; // 20 ms
+        Ok(SensorEvent {
             sensor_type: SensorType::Accelerometer,
-            timestamp_ns: self.event_timestamp,
+            timestamp_ns: self.accel_ts,
             data: SensorData::Acceleration { x, y, z },
-        }
+        })
     }
 
     /// Produce a light sensor reading
-    pub fn produce_light_event(&mut self, lux: f32) -> SensorEvent {
-        self.event_timestamp += 100_000_000;
-        SensorEvent {
+    pub fn produce_light_event(&mut self, lux: f32) -> Result<SensorEvent, &'static str> {
+        self.gate(SensorType::Light)?;
+        self.light_ts += 100_000_000;
+        Ok(SensorEvent {
             sensor_type: SensorType::Light,
-            timestamp_ns: self.event_timestamp,
+            timestamp_ns: self.light_ts,
             data: SensorData::Light { lux },
-        }
+        })
     }
 
     /// Produce a gyroscope angular velocity reading
-    pub fn produce_gyroscope_event(&mut self, x: f32, y: f32, z: f32) -> SensorEvent {
-        self.event_timestamp += 20_000_000; // 20 ms (50 Hz)
-        SensorEvent {
+    pub fn produce_gyroscope_event(&mut self, x: f32, y: f32, z: f32) -> Result<SensorEvent, &'static str> {
+        self.gate(SensorType::Gyroscope)?;
+        self.gyro_ts += 20_000_000; // 20 ms (50 Hz)
+        Ok(SensorEvent {
             sensor_type: SensorType::Gyroscope,
-            timestamp_ns: self.event_timestamp,
+            timestamp_ns: self.gyro_ts,
             data: SensorData::Gyroscope { x, y, z },
-        }
+        })
     }
 
     /// Produce a proximity distance reading
-    pub fn produce_proximity_event(&mut self, distance_cm: f32) -> SensorEvent {
-        self.event_timestamp += 100_000_000; // 100 ms (10 Hz)
-        SensorEvent {
+    pub fn produce_proximity_event(&mut self, distance_cm: f32) -> Result<SensorEvent, &'static str> {
+        self.gate(SensorType::Proximity)?;
+        self.prox_ts += 100_000_000; // 100 ms (10 Hz)
+        Ok(SensorEvent {
             sensor_type: SensorType::Proximity,
-            timestamp_ns: self.event_timestamp,
+            timestamp_ns: self.prox_ts,
             data: SensorData::Proximity { distance_cm },
-        }
+        })
     }
 }

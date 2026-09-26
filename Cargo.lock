@@ -6,17 +6,12 @@ version = 4
 name = "deb-systemd-helper"
 version = "0.1.0"
 dependencies = [
- "libc",
  "utim_core",
 ]
 
 [[package]]
 name = "deb-systemd-invoke"
 version = "0.1.0"
-dependencies = [
- "libc",
- "utim_core",
-]
 
 [[package]]
 name = "libc"
@@ -51,7 +46,6 @@ dependencies = [
 name = "utimctl"
 version = "0.1.0"
 dependencies = [
- "libc",
  "utim_core",
 ]
 

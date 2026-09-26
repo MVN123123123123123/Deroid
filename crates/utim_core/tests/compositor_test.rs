@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use utim_core::compositor::desktop::{parse_desktop_entry, DesktopApp, DesktopCatalogue};
 use utim_core::compositor::gestures::{
-    cubic_bezier_ease_out, GestureAction, GestureConfig, GestureEngine, RawTouchEvent, TouchPhase,
+    fast_out_slow_in, GestureAction, GestureConfig, GestureEngine, RawTouchEvent, TouchPhase,
 };
 use utim_core::compositor::ime::{ImeAction, VirtualKeyboard};
 use utim_core::compositor::launcher::{HotseatDock, WorkspaceGrid};
@@ -33,11 +33,11 @@ fn test_milestone_3_1_wayland_protocols_and_wire_framing() {
     let mut builder = WlMessageBuilder::new(1, 2);
     builder.put_u32(0xCAFE);
     builder.put_i32(-42);
-    builder.put_fixed(12.75);
+    builder.put_fixed(12.75).expect("finite fixed");
     builder.put_string("org.freedesktop.MobileWayland");
     builder.put_array(&[1, 2, 3, 4, 5]);
 
-    let wire = builder.build();
+    let wire = builder.build().expect("message fits u16");
     assert_eq!(wire.len() % 4, 0, "Wayland messages must be 4-byte aligned");
 
     let (msg, parsed_len) = WlMessage::parse(&wire).unwrap().unwrap();
@@ -103,7 +103,7 @@ fn test_milestone_3_1_hwc_multi_plane_presentation_and_performance() {
     );
 
     // Check Resident Memory RSS
-    let metrics = server.get_metrics();
+    let metrics = server.get_metrics().expect("metrics collection failed");
     let rss_mb = (metrics.resident_memory_bytes as f64) / (1024.0 * 1024.0);
     assert!(
         metrics.is_rss_within_target,
@@ -226,7 +226,7 @@ fn test_milestone_3_3_quickstep_gesture_navigation_and_recents() {
         GestureAction::Home { progress, .. } => assert_eq!(progress, 1.0),
         _ => panic!("Expected completed Home gesture"),
     }
-    assert_eq!(cubic_bezier_ease_out(1.0), 1.0);
+    assert_eq!(fast_out_slow_in(1.0), 1.0);
 
     // 2. Recents Carousel & Swipe-to-Kill Process Management
     let mut carousel = RecentsCarousel::new(1080.0, 2400.0);
@@ -258,11 +258,13 @@ fn test_milestone_3_3_quickstep_gesture_navigation_and_recents() {
     assert_eq!(kill_target, Some(5002));
 
     // Check 500ms grace period escalation to SIGKILL
-    let escalations = carousel.update_kill_lifecycle(Duration::from_millis(0));
+    let mut escalations = Vec::new();
+    carousel.update_kill_lifecycle(Duration::from_millis(0), &mut escalations);
     assert_eq!(escalations, vec![(5002, true)]);
 
     // 3. Clear All Button
-    let cleared = carousel.clear_all();
+    let mut cleared = Vec::new();
+    carousel.clear_all(&mut cleared);
     assert!(cleared.contains(&5001));
 
     // 4. Split-Screen Multitasking (50/50 Viewports)
@@ -293,10 +295,12 @@ fn test_milestone_3_4_systemui_status_bar_and_quick_settings() {
     }
     assert!(shade.is_open());
 
-    assert!(shade.toggle_tile(QuickTileKind::Bluetooth));
-    assert!(!shade.toggle_tile(QuickTileKind::Bluetooth)); // Toggles off
+    assert!(shade.toggle_tile(QuickTileKind::Bluetooth).unwrap());
+    assert!(!shade.toggle_tile(QuickTileKind::Bluetooth).unwrap()); // Toggles off
 
-    shade.set_brightness(80);
+    // Brightness sysfs is absent in tests: the failure must be reported.
+    assert!(shade.set_brightness(80).is_err());
+    // ...but the in-memory state still tracks the request.
     assert_eq!(shade.brightness_percent, 80);
     shade.set_volume(70);
     assert_eq!(shade.volume_percent, 70);
@@ -324,22 +328,29 @@ fn test_milestone_3_4_systemui_status_bar_and_quick_settings() {
 
 #[test]
 fn test_milestone_3_5_lock_screen_fingerprint_hal_and_ime() {
-    // 1. Lock Screen & Biometric Bridge
+    // 1. Lock Screen & Biometric Bridge: unbound HAL never authenticates,
+    // and a bound HAL with a PIN enrolled routes to PIN entry (no bypass).
     let mut lock = LockScreen::new(Some("1337"));
     assert!(lock.is_locked());
+    assert!(!lock.on_fingerprint_touch(1));
+    assert!(lock.is_locked());
 
-    // Instant sub-300ms Fingerprint unlock
+    lock.biometric_bridge.hal_bound = true;
     let t_auth_start = Instant::now();
-    let unlocked = lock.on_fingerprint_touch(1); // Enrolled finger 1
+    assert!(!lock.on_fingerprint_touch(1)); // enrolled, but PIN is required
     let auth_dur = t_auth_start.elapsed();
-
-    assert!(unlocked);
-    assert!(!lock.is_locked());
+    assert_eq!(lock.state, utim_core::compositor::lockscreen::LockState::PinEntry);
     assert!(
         auth_dur < Duration::from_millis(300),
-        "Biometric unlock must be < 300ms, got {:?}",
+        "Biometric check must be < 300ms, got {:?}",
         auth_dur
     );
+
+    // Bound HAL with no PIN enrolled unlocks directly.
+    let mut open = LockScreen::new(None);
+    open.biometric_bridge.hal_bound = true;
+    assert!(open.on_fingerprint_touch(1));
+    assert!(!open.is_locked());
 
     // 2. Virtual Keyboard IME & Viewport Push
     let mut ime = VirtualKeyboard::new(1080.0, 2400.0);
@@ -355,11 +366,11 @@ fn test_milestone_3_5_lock_screen_fingerprint_hal_and_ime() {
 
     // Typing keys
     let act_t = ime.handle_key_tap("t");
-    assert_eq!(act_t, ImeAction::CommitString("t".into()));
+    assert_eq!(act_t, ImeAction::CommitChar('t'));
 
     ime.handle_key_tap("SHIFT");
     let act_r = ime.handle_key_tap("r");
-    assert_eq!(act_r, ImeAction::CommitString("R".into()));
+    assert_eq!(act_r, ImeAction::CommitChar('R'));
 
     let act_bs = ime.handle_key_tap("BACKSPACE");
     assert_eq!(
@@ -378,13 +389,13 @@ fn test_milestone_3_5_lock_screen_fingerprint_hal_and_ime() {
 fn test_milestone_3_6_power_governor_and_oom_synchronization() {
     let mut power = UtimPowerSync::new(Path::new("/tmp/mock-utim-ctrl.sock"));
 
-    // 1. Display Sleep -> Triggers cgroup freezing and wakelock release
+    // No daemon socket in the test env: every power transition must report
+    // the failure instead of mocking success.
     assert!(power.is_display_on);
-    assert!(power.on_display_sleep().is_ok());
-    assert!(!power.is_display_on);
+    assert!(power.on_display_sleep().is_err());
+    assert!(!power.is_connected);
 
-    // 2. Display Wake -> Unfreezes cgroups in < 150us and acquires wakelock
-    assert!(power.on_display_wake().is_ok());
+    assert!(power.on_display_wake().is_err());
     assert!(power.is_display_on);
 
     // 3. Dynamic OOM Score Hierarchy
@@ -400,9 +411,8 @@ fn test_milestone_3_6_power_governor_and_oom_synchronization() {
 
     assert!(power
         .on_app_switched(fg_pid, &recents_pids, &inactive_pids)
-        .is_ok());
-    assert_eq!(power.active_foreground_pid, Some(2001));
-    assert_eq!(power.recents_pids, vec![2002, 2003]);
+        .is_err());
+    assert_eq!(power.active_foreground_pid, None);
 }
 
 #[test]

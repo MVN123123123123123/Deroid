@@ -1,7 +1,12 @@
 //! Camera HAL3 to /dev/v4l2loopback Bridge.
-//! Feeds ISP frames from Android Camera HAL3 directly into the V4L2 virtual video device node.
-//! Supports V4L2 ioctl negotiation, buffer queueing, and format conversion.
-//! Delivers seamless zero-copy frame access for Linux desktop applications (Firefox, Cheese, OBS).
+//! Feeds ISP frames from Android Camera HAL3 into the V4L2 virtual video
+//! device negotiation state machine.
+//!
+//! H28 (simulation disclosure): this type performs no I/O at all — no fd,
+//! no `VIDIOC_*` ioctl, no mmap, no poll. `device_path` is retained for
+//! diagnostics only and never opened; all methods are in-memory mutations
+//! of the negotiated format and buffer ring. Bind a real v4l2loopback fd
+//! before exposing this to desktop consumers.
 //! Conforms strictly to GEMINI.md systems discipline.
 
 use super::hal3::CapturedFrame;
@@ -42,7 +47,7 @@ pub struct V4l2Format {
 }
 
 /// V4L2 Buffer in Queue
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct V4l2Buffer {
     pub index: u32,
     pub bytesused: u32,
@@ -50,6 +55,10 @@ pub struct V4l2Buffer {
     pub sequence: u32,
     pub timestamp_ns: u64,
     pub queued: bool,
+    /// H27: set by `feed_hal_frame`, cleared by `dequeue_buffer`. A
+    /// legitimately empty (0-byte, EOF) frame is `ready` and dequeues;
+    /// a queued-but-never-fed slot is not and never strands the pool.
+    pub ready: bool,
 }
 
 /// V4L2 Loopback Virtual Device Bridge
@@ -109,20 +118,28 @@ impl V4l2LoopbackBridge {
         if self.is_streaming {
             return Err("Cannot change format while streaming");
         }
+        // H8: reject zero dimensions; u64 math avoids overflow.
+        if width == 0 || height == 0 {
+            return Err("Stream dimensions must be non-zero");
+        }
 
         let bytesperline = match pixelformat {
             V4L2_PIX_FMT_NV12 => width,
-            V4L2_PIX_FMT_YUYV => width * 2,
+            V4L2_PIX_FMT_YUYV => width.checked_mul(2).ok_or("dimensions overflow u32")?,
             V4L2_PIX_FMT_MJPEG => width,
             _ => return Err("Unsupported V4L2 pixel format"),
         };
 
-        let sizeimage = match pixelformat {
-            V4L2_PIX_FMT_NV12 => width * height * 3 / 2,
-            V4L2_PIX_FMT_YUYV => width * height * 2,
-            V4L2_PIX_FMT_MJPEG => width * height / 4,
+        let (w, h) = (width as u64, height as u64);
+        let sizeimage_u64 = match pixelformat {
+            V4L2_PIX_FMT_NV12 => w * h * 3 / 2,
+            V4L2_PIX_FMT_YUYV => w * h * 2,
+            V4L2_PIX_FMT_MJPEG => w * h / 4,
             _ => return Err("Unsupported V4L2 pixel format"),
         };
+        let sizeimage: u32 = sizeimage_u64
+            .try_into()
+            .map_err(|_| "frame size exceeds u32")?;
 
         self.format = V4l2Format {
             width,
@@ -154,6 +171,7 @@ impl V4l2LoopbackBridge {
                 sequence: 0,
                 timestamp_ns: 0,
                 queued: false,
+                ready: false,
             });
         }
         Ok(alloc_count)
@@ -170,22 +188,30 @@ impl V4l2LoopbackBridge {
         Ok(())
     }
 
-    /// ioctl VIDIOC_DQBUF: dequeue next available frame in strict FIFO sequence order
-    pub fn dequeue_buffer(&mut self) -> Result<V4l2Buffer, &'static str> {
+    /// ioctl VIDIOC_DQBUF: dequeue next available frame in strict FIFO sequence
+    /// order into caller-supplied `out`.
+    ///
+    /// H27: readiness is tracked separately from `bytesused`, so a legitimate
+    /// 0-byte frame (V4L2 EOF/stream-end event) dequeues instead of stranding
+    /// its slot forever; the old `bytesused > 0` predicate is gone. H29: the
+    /// descriptor is copied into `out` (plain scalar copy, no heap) instead
+    /// of returning a clone per frame.
+    pub fn dequeue_buffer(&mut self, out: &mut V4l2Buffer) -> Result<(), &'static str> {
         let best_idx = self
             .allocated_buffers
             .iter()
             .enumerate()
-            .filter(|(_, b)| b.queued && b.bytesused > 0)
+            .filter(|(_, b)| b.queued && b.ready)
             .min_by_key(|(_, b)| b.sequence)
             .map(|(idx, _)| idx)
             .ok_or("No queued buffer with data ready")?;
 
         let buf = &mut self.allocated_buffers[best_idx];
         buf.queued = false;
-        let out = buf.clone();
+        buf.ready = false;
+        *out = buf.clone();
         buf.bytesused = 0;
-        Ok(out)
+        Ok(())
     }
 
     /// ioctl VIDIOC_STREAMON
@@ -218,11 +244,30 @@ impl V4l2LoopbackBridge {
         if frame.width != self.format.width || frame.height != self.format.height {
             return Err("Frame resolution does not match negotiated V4L2 format");
         }
+        // H9: format, stride and size must all fit the negotiated sizeimage.
+        // bytesused is the length a consumer trusts, so an oversize frame
+        // would advertise an out-of-bounds read.
+        let expected_pix = match frame.format {
+            super::hal3::CameraPixelFormat::Nv12
+            | super::hal3::CameraPixelFormat::Yuv420Planar => V4L2_PIX_FMT_NV12,
+            super::hal3::CameraPixelFormat::Yuyv => V4L2_PIX_FMT_YUYV,
+            super::hal3::CameraPixelFormat::JpegBlob => V4L2_PIX_FMT_MJPEG,
+            super::hal3::CameraPixelFormat::RawSensor => V4L2_PIX_FMT_YUYV,
+        };
+        if expected_pix != self.format.pixelformat {
+            return Err("Frame pixel format does not match negotiated V4L2 format");
+        }
+        if frame.stride < self.format.bytesperline {
+            return Err("Frame stride is narrower than the negotiated bytesperline");
+        }
+        if frame.buffer_size > self.format.sizeimage as usize {
+            return Err("Frame buffer_size exceeds negotiated sizeimage");
+        }
 
         let buf = self
             .allocated_buffers
             .iter_mut()
-            .find(|b| b.queued && b.bytesused == 0)
+            .find(|b| b.queued && !b.ready)
             .ok_or("Buffer starvation: no empty queued buffer available")?;
 
         self.frame_sequence += 1;
@@ -231,6 +276,7 @@ impl V4l2LoopbackBridge {
         buf.bytesused = frame.buffer_size as u32;
         buf.sequence = self.frame_sequence;
         buf.timestamp_ns = frame.timestamp_ns;
+        buf.ready = true;
 
         Ok(buf.index)
     }

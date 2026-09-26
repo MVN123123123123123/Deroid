@@ -246,10 +246,47 @@ mod tests {
                 let x0 = (x.max(0.0) as usize).min(w);
                 let y1 = ((y + rh).max(0.0) as usize).min(h);
                 let x1 = ((x + rw).max(0.0) as usize).min(w);
+                if y0 >= y1 || x0 >= x1 {
+                    return 0;
+                }
+                // Compare against wallpaper *adjacent* to the region, not the
+                // fixed `0xFF000000` sentinel: `paint_frame` overwrites the
+                // whole canvas, so every pixel differs from the sentinel and
+                // the old predicate could never fail. Sampling outside the
+                // region means a uniform control (solid icon, search field)
+                // still reads high (control vs wallpaper), while uniform
+                // wallpaper reads ~0 (wallpaper vs wallpaper on the same row,
+                // gradient-tolerant) and a 1x1 region reads 0.
+                let cy = ((y + rh / 2.0).max(0.0) as usize).min(h - 1).clamp(y0, y1 - 1);
+                let cx_in = ((x + rw / 2.0).max(0.0) as usize).min(w - 1).clamp(x0, x1 - 1);
+                // Prefer a sample 10px left of the region on the same row;
+                // fall back to right/above/below when at an edge.
+                let mut bx: Option<usize> = None;
+                if x0 >= 10 {
+                    bx = Some(x0 - 10);
+                } else if x1 + 10 < w {
+                    bx = Some((x1 + 10).min(w - 1));
+                }
+                let bg = if let Some(bx) = bx {
+                    c.buf[cy * w + bx]
+                } else if y0 >= 10 {
+                    c.buf[(y0 - 10) * w + cx_in]
+                } else if y1 + 10 < h {
+                    c.buf[((y1 + 10).min(h - 1)) * w + cx_in]
+                } else {
+                    c.buf[cy * w + cx_in]
+                };
+                let br = ((bg >> 16) & 0xFF) as i32;
+                let bgg = ((bg >> 8) & 0xFF) as i32;
+                let bb = (bg & 0xFF) as i32;
                 let mut n = 0;
                 for py in y0..y1 {
                     for px in x0..x1 {
-                        if c.buf[py * w + px] != 0xFF000000 {
+                        let p = c.buf[py * w + px];
+                        let dr = (((p >> 16) & 0xFF) as i32 - br).abs();
+                        let dg = (((p >> 8) & 0xFF) as i32 - bgg).abs();
+                        let db = ((p & 0xFF) as i32 - bb).abs();
+                        if dr + dg + db > 12 {
                             n += 1;
                         }
                     }
@@ -275,7 +312,7 @@ mod tests {
                     l.clock_h,
                 ),
             ];
-            for i in 0..(l.grid_cols * l.max_rows.min(grid.len())) {
+            for i in 0..(l.grid_cols * l.max_rows).min(grid.len()) {
                 let icon_r = l.grid_icon(i);
                 regions.push((
                     format!("grid icon {i}"),
@@ -285,7 +322,7 @@ mod tests {
                     icon_r.h,
                 ));
             }
-            for s in 0..l.dock_slots {
+            for s in 0..l.dock_slots.min(dock.len()) {
                 let d = l.dock_icon_rect(s);
                 regions.push((format!("dock {s}"), d.x, d.y, d.w, d.h));
             }
@@ -309,8 +346,11 @@ mod tests {
             for (what, x, y, rw, rh) in regions {
                 let painted = ink(x, y, rw, rh);
                 let area = (rw * rh) as usize;
+                // 2% threshold with gradient tolerance: a real control (icon,
+                // text, pill border) differs significantly from its centre,
+                // while uniform wallpaper reads ~0 and a 1x1 region reads 0.
                 assert!(
-                    painted * 20 > area,
+                    painted * 50 > area,
                     "{name}: `{what}` is tappable but has no pixels under it ({painted}/{area})"
                 );
             }
@@ -401,6 +441,40 @@ mod tests {
             "paint_frame allocated {} times while composing a frame",
             after - before
         );
+
+        // The home state above is the cheapest of twelve: the keyboard frame
+        // alone allocates 26x/frame (`ch.to_string()` per key). Loop the
+        // states a user actually spends time in so the guard cannot pass on
+        // `home` while `keyboard`/`shade`/`drawer` allocate.
+        let mut keyboard_snap = snap.clone();
+        keyboard_snap.keyboard = true;
+        let mut shade_snap = snap.clone();
+        shade_snap.shade = true;
+        let mut drawer_snap = snap.clone();
+        drawer_snap.drawer_open = true;
+        drawer_snap.drawer_progress = 1.0;
+        let mut launch_snap = snap.clone();
+        launch_snap.launch_progress = 0.42;
+        launch_snap.launch_origin = Some((540.0, 980.0));
+        for (label, s) in [
+            ("keyboard", keyboard_snap),
+            ("shade", shade_snap),
+            ("drawer", drawer_snap),
+            ("launch", launch_snap),
+        ] {
+            c.draw(&s); // warm per-state caches outside the bracket
+            let before = allocations();
+            for _ in 0..3 {
+                c.draw(&s);
+            }
+            let after = allocations();
+            assert_eq!(
+                before,
+                after,
+                "paint_frame allocated {} times in state {label}",
+                after - before
+            );
+        }
 
         // Sanity check on the harness itself: a deliberate allocation has to be
         // seen, otherwise the assertion above would pass for the wrong reason.
@@ -655,16 +729,32 @@ mod tests {
         c.draw(&snap);
         let l = Layout::plain(w as f32, h as f32);
 
+        // Sheet background sampled once from a corner that no icon, search
+        // field or handle covers when the drawer is fully open: comparing
+        // each probe against this (instead of the fixed black sentinel the
+        // wallpaper overwrites) makes the test able to fail while still
+        // passing for uniform controls (solid icons, search field) that
+        // differ from the sheet.
+        let sheet_bg = c.buf[(h - 10) * w + (w - 10)];
+        let sbr = ((sheet_bg >> 16) & 0xFF) as i32;
+        let sbg = ((sheet_bg >> 8) & 0xFF) as i32;
+        let sbb = (sheet_bg & 0xFF) as i32;
         let painted = |x: f32, y: f32, rw: f32, rh: f32| -> usize {
             let y0 = (y.max(0.0) as usize).min(h);
             let x0 = (x.max(0.0) as usize).min(w);
             let y1 = ((y + rh).max(0.0) as usize).min(h);
             let x1 = ((x + rw).max(0.0) as usize).min(w);
+            if y0 >= y1 || x0 >= x1 {
+                return 0;
+            }
             let mut n = 0;
             for py in y0..y1 {
                 for px in x0..x1 {
-                    // The sheet itself is a different colour from the frame.
-                    if c.buf[py * w + px] != 0xFF000000 {
+                    let p = c.buf[py * w + px];
+                    let dr = (((p >> 16) & 0xFF) as i32 - sbr).abs();
+                    let dg = (((p >> 8) & 0xFF) as i32 - sbg).abs();
+                    let db = ((p & 0xFF) as i32 - sbb).abs();
+                    if dr + dg + db > 12 {
                         n += 1;
                     }
                 }
@@ -672,7 +762,7 @@ mod tests {
             n
         };
 
-        for i in 0..(l.grid_cols * l.drawer_rows.min(6)) {
+        for i in 0..(l.grid_cols * l.drawer_rows).min(snap.drawer.len()) {
             let cell = l.drawer_icon_cell(i);
             let got = painted(cell.center_x() - 8.0, cell.center_y() - 8.0, 16.0, 16.0);
             assert!(got > 0, "drawer cell {i} centre is empty");
@@ -701,6 +791,10 @@ mod tests {
     /// realistic home screen and fails if it cannot. Absolute timings are only
     /// meaningful for an optimised build.
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "needs --release: absolute timings are meaningless in debug"
+    )]
     fn full_frame_stays_inside_the_vsync_budget() {
         use std::time::Instant;
 
@@ -736,24 +830,113 @@ mod tests {
             keyboard: false, grid, drawer: Vec::new(), dock, active_app: None,
         };
         let mut c = Canvas::new(1080, 2400);
-        c.draw(&snap); // warm the caches
+        // Table-drive EVERY state, not just the cheapest. Timing only `home`
+        // is a guard that cannot fail in the states a user actually lives in
+        // (the audit measured drawer at 20.7 ms and shade at 15.7 ms while
+        // home fit the budget, and the test still "passed"). Each state is
+        // listed explicitly so a new state has to be added here on purpose.
+        let mut drawer_snap = snap.clone();
+        drawer_snap.drawer_open = true;
+        drawer_snap.drawer_progress = 1.0;
+        let mut drawer_mid = snap.clone();
+        drawer_mid.drawer_progress = 0.45;
+        let mut shade_snap = snap.clone();
+        shade_snap.shade = true;
+        let mut keyboard_snap = snap.clone();
+        keyboard_snap.keyboard = true;
+        let mut launch_snap = snap.clone();
+        launch_snap.launch_progress = 0.42;
+        launch_snap.launch_origin = Some((540.0, 980.0));
+        let mut selected = snap.clone();
+        selected.selected = Some("Phone");
+        let mut pressed = snap.clone();
+        pressed.selected = Some("Music");
+        pressed.pressed_icon = Some("Music");
+        pressed.press_scale = 0.88;
+        let mut search = snap.clone();
+        search.search_active = true;
+        search.search_query = "pho";
+        let mut swipe = snap.clone();
+        swipe.home_page = 1;
+        swipe.home_scroll = 90.0;
+        let mut lock = snap.clone();
+        lock.locked = true;
+        let mut app = snap.clone();
+        app.active_app = Some("Settings");
+        // Everything on at once: the worst realistic case.
+        let mut all = snap.clone();
+        all.selected = Some("Phone");
+        all.search_active = true;
+        all.search_query = "pho";
+        all.drawer_open = true;
+        all.drawer_progress = 1.0;
+        all.shade = true;
+        all.keyboard = true;
+        let states: Vec<(&str, Snapshot)> = vec![
+            ("home", snap),
+            ("home_selected", selected),
+            ("home_pressed", pressed),
+            ("search", search),
+            ("drawer_mid", drawer_mid),
+            ("drawer", drawer_snap),
+            ("page_swipe", swipe),
+            ("lockscreen", lock),
+            ("app", app),
+            ("shade", shade_snap),
+            ("keyboard", keyboard_snap),
+            ("launch", launch_snap),
+            ("all_combined", all),
+        ];
         const FRAMES: u32 = 10;
-        let start = Instant::now();
-        for _ in 0..FRAMES {
-            c.draw(&snap);
+        for (name, s) in &states {
+            c.draw(s); // warm the caches
+            let start = Instant::now();
+            for _ in 0..FRAMES {
+                c.draw(s);
+            }
+            let per = start.elapsed() / FRAMES;
+            eprintln!(
+                "{name} frame: {:?} ({} build)",
+                per,
+                if cfg!(debug_assertions) {
+                    "debug"
+                } else {
+                    "release"
+                }
+            );
+            // Two tiers, and the tier is a property of the state, not of
+            // what the frame happens to cost today:
+            //
+            //  * STEADY states (what the screen shows when the user is not
+            //    mid-gesture) must fit ONE 120 Hz period. This is the tier
+            //    that catches real regressions, and it is where every
+            //    overage found so far lived: drawer 20.7 ms, shade 15.0 ms
+            //    (a full-screen 0xEE scrim), launch 10.7 ms.
+            //  * TRANSIENT states are mid-animation frames that exist for
+            //    200-400 ms. `drawer_mid` additionally runs the frosted
+            //    blur, whose 3x3 in-place box is ~2.4 ms of the frame and is
+            //    at its algorithmic floor (9 reads + 9 stores per 9 pixels).
+            //    It gets two 120 Hz periods.
+            //
+            // Every state, transient included, must still fit ONE 60 Hz
+            // period: the plan's hard requirement is zero frame drops on
+            // 60/90/120/144 Hz panels, and 16.67 ms is the floor of that
+            // range. (In debug this test is `ignore`d; the verify scripts
+            // must run it with `--release`.)
+            let transient = matches!(*name, "drawer_mid" | "page_swipe" | "launch" | "all_combined");
+            let steady_budget_us: u128 = if transient { 16_667 } else { 8_000 };
+            assert!(
+                per.as_micros() < steady_budget_us,
+                "{name} frame takes {:?}, over its {}us budget",
+                per,
+                steady_budget_us
+            );
+            assert!(
+                per.as_micros() < 16_667,
+                "{name} frame takes {:?}, over the 60 Hz floor every state must meet",
+                per
+            );
         }
-        let per = start.elapsed() / FRAMES;
-        eprintln!("home frame: {:?} ({} build)", per, if cfg!(debug_assertions) { "debug" } else { "release" });
-        if cfg!(debug_assertions) {
-            return;
-        }
-        // 120 Hz is the panel's refresh rate: 8.3 ms. Leave headroom for the
-        // rest of the compositor.
-        assert!(
-            per.as_micros() < 8_000,
-            "a full home frame takes {:?}, over the 120 Hz budget",
-            per
-        );
     }
 
     #[test]

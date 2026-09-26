@@ -325,12 +325,12 @@ QEMU_CMD=(
     qemu-system-aarch64
     -M virt,gic-version=3
     -cpu cortex-a76
-    -smp 4
+    -smp 1
     -m 4096
     -kernel "${KERNEL_PATH}"
     -initrd "${INITRD_PATH}"
     -drive "file=${DRIVE_PATH},if=virtio,format=raw"
-    -append "console=ttyAMA0 root=/dev/vda rw init=/init loglevel=7 printk.devkmsg=on"
+    -append "console=ttyAMA0 root=/dev/vda rw init=/init loglevel=4 printk.devkmsg=on panic=-1"
     -pidfile "${PID_FILE}"
     "${DISPLAY_OPTS[@]}"
     "${NET_OPTS[@]}"
@@ -388,9 +388,15 @@ else
         echo "     Inside VM:      /var/log/terminal.log"
         echo "============================================================"
         exec "${QEMU_CMD[@]}" \
-            -chardev "stdio,id=char0,mux=on,logfile=${LOG_PATH}" \
-            -serial "chardev:char0"
+            -chardev "file,id=char0,path=${LOG_PATH}" \
+            -serial "chardev:char0" \
+            -monitor none
     else
-        exec "${QEMU_CMD[@]}" -serial mon:stdio
+        # --no-log: sink the console to /dev/null via a file chardev so PID 1
+        # never sees a pipe (EPIPE + panic=abort = kernel panic, B-17).
+        exec "${QEMU_CMD[@]}" \
+            -chardev "file,id=char0,path=/dev/null" \
+            -serial "chardev:char0" \
+            -monitor none
     fi
 fi

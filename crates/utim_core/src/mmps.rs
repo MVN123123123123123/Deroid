@@ -78,6 +78,9 @@ impl MemorySupervisor {
     }
 
     /// Determine memory pressure severity level.
+    /// NOTE (H6): read failures map to None (compat). Prefer
+    /// evaluate_pressure_level_strict which propagates the error so a
+    /// missing/unreadable PSI file is not mistaken for "no pressure".
     pub fn evaluate_pressure_level(&self) -> MemoryPressureLevel {
         match self.read_psi() {
             Ok(metrics) => {
@@ -95,6 +98,20 @@ impl MemorySupervisor {
         }
     }
 
+    /// Determine memory pressure severity level, propagating I/O/parse errors.
+    pub fn evaluate_pressure_level_strict(&self) -> io::Result<MemoryPressureLevel> {
+        let metrics = self.read_psi()?;
+        Ok(if metrics.full_avg10 > 25.0 || metrics.some_avg10 > 60.0 {
+            MemoryPressureLevel::Critical
+        } else if metrics.full_avg10 > 10.0 || metrics.some_avg10 > 30.0 {
+            MemoryPressureLevel::Medium
+        } else if metrics.some_avg10 > 10.0 {
+            MemoryPressureLevel::Low
+        } else {
+            MemoryPressureLevel::None
+        })
+    }
+
     /// Apply oom_score_adj to a target process.
     pub fn apply_oom_score_adj(pid: i32, score: i32) -> io::Result<()> {
         let path = format!("/proc/{}/oom_score_adj", pid);
@@ -109,22 +126,31 @@ impl MemorySupervisor {
 }
 
 pub fn parse_psi_output(content: &str) -> Option<MemoryPressureMetrics> {
+    parse_psi_output_strict(content).ok()
+}
+
+/// Strict PSI parser: requires a 'some' line; unparseable floats are errors.
+/// Returns Err instead of silent all-zeros (H6).
+pub fn parse_psi_output_strict(content: &str) -> Result<MemoryPressureMetrics, &'static str> {
     let mut some_avg10 = 0.0;
     let mut some_avg60 = 0.0;
     let mut some_avg300 = 0.0;
     let mut full_avg10 = 0.0;
     let mut full_avg60 = 0.0;
     let mut full_avg300 = 0.0;
+    let mut seen_some = false;
 
     for line in content.lines() {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("some ") {
+            seen_some = true;
             for token in rest.split_whitespace() {
                 if let Some((k, v)) = token.split_once('=') {
+                    let f: f64 = v.parse().map_err(|_| "bad PSI float")?;
                     match k {
-                        "avg10" => some_avg10 = v.parse().unwrap_or(0.0),
-                        "avg60" => some_avg60 = v.parse().unwrap_or(0.0),
-                        "avg300" => some_avg300 = v.parse().unwrap_or(0.0),
+                        "avg10" => some_avg10 = f,
+                        "avg60" => some_avg60 = f,
+                        "avg300" => some_avg300 = f,
                         _ => {}
                     }
                 }
@@ -132,10 +158,11 @@ pub fn parse_psi_output(content: &str) -> Option<MemoryPressureMetrics> {
         } else if let Some(rest) = trimmed.strip_prefix("full ") {
             for token in rest.split_whitespace() {
                 if let Some((k, v)) = token.split_once('=') {
+                    let f: f64 = v.parse().map_err(|_| "bad PSI float")?;
                     match k {
-                        "avg10" => full_avg10 = v.parse().unwrap_or(0.0),
-                        "avg60" => full_avg60 = v.parse().unwrap_or(0.0),
-                        "avg300" => full_avg300 = v.parse().unwrap_or(0.0),
+                        "avg10" => full_avg10 = f,
+                        "avg60" => full_avg60 = f,
+                        "avg300" => full_avg300 = f,
                         _ => {}
                     }
                 }
@@ -143,7 +170,11 @@ pub fn parse_psi_output(content: &str) -> Option<MemoryPressureMetrics> {
         }
     }
 
-    Some(MemoryPressureMetrics {
+    if !seen_some {
+        return Err("no 'some' line in PSI output");
+    }
+
+    Ok(MemoryPressureMetrics {
         some_avg10,
         some_avg60,
         some_avg300,

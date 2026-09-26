@@ -60,10 +60,10 @@ impl HalManager {
 
         for manifest_path in &candidates {
             if let Ok(content) = std::fs::read_to_string(manifest_path) {
-                if content.contains("format=\"aidl\"")
-                    || content.contains("<aidl>")
-                    || content.contains("composer3")
-                {
+                // H23: match only HAL format markers. A bare substring such
+                // as "composer3" also fires on comments in HIDL-era manifests
+                // and would misreport the interface mode.
+                if content.contains("format=\"aidl\"") || content.contains("<aidl>") {
                     found_aidl = true;
                 }
                 if content.contains("format=\"hidl\"") || content.contains("<hidl>") {
@@ -136,6 +136,14 @@ impl HalManager {
         let mut units = Vec::new();
 
         for (name, desc, candidate_bins) in hal_defs {
+            // H24: only synthesise a unit for a HAL that is actually present.
+            // Falling back to a candidate known not to exist would ship a
+            // dead ExecStart that dependents can order against.
+            let Some(chosen_bin) = candidate_bins.iter().find(|b| Path::new(b).exists())
+            else {
+                continue;
+            };
+
             let mut unit = SystemdUnit::new(
                 name.to_string(),
                 PathBuf::from(format!("/synthetic/{}", name)),
@@ -143,21 +151,17 @@ impl HalManager {
             unit.unit.description = desc.to_string();
             unit.unit.default_dependencies = false;
 
-            // Pick candidate binary or default placeholder
-            let chosen_bin = candidate_bins
-                .iter()
-                .find(|b| Path::new(b).exists())
-                .unwrap_or(&candidate_bins[0])
-                .to_string();
-
             let mut svc = ServiceSection {
                 service_type: ServiceType::Simple,
                 oom_score_adjust: Some(-700),
                 ..Default::default()
             };
-            if let Some(cmd) = ExecCommand::parse(&chosen_bin) {
-                svc.exec_start.push(cmd);
-            }
+            // Parse of a literal candidate path cannot fail, but never emit
+            // a unit with an empty ExecStart (fail-closed, not fail-open).
+            let Some(cmd) = ExecCommand::parse(chosen_bin) else {
+                continue;
+            };
+            svc.exec_start.push(cmd);
 
             unit.service = Some(svc);
             units.push(unit);
@@ -174,7 +178,10 @@ mod tests {
 
     #[test]
     fn test_vintf_detection() {
-        let temp_dir = std::env::temp_dir().join("utim_test_hal");
+        // H32: pid-suffixed temp dir; the fixed "utim_test_hal" name raced
+        // with concurrent cargo test invocations deleting it mid-test.
+        let temp_dir =
+            std::env::temp_dir().join(format!("utim_test_hal_{}", std::process::id()));
         let _ = fs::remove_dir_all(&temp_dir);
         let vintf_dir = temp_dir.join("etc/vintf");
         fs::create_dir_all(&vintf_dir).unwrap();
@@ -194,12 +201,14 @@ mod tests {
             HalInterfaceMode::ModernAidl
         );
 
+        // H24: no /vendor/bin/hw/* binaries exist in this container, so no
+        // synthetic units may be emitted (a dead ExecStart fallback is a bug,
+        // not a placeholder).
         let units = hal_mgr.create_synthetic_units();
-        assert_eq!(units.len(), 5);
-        assert_eq!(units[0].name, "android-hal-composer.service");
-        assert_eq!(
-            units[0].service.as_ref().unwrap().oom_score_adjust,
-            Some(-700)
+        assert!(
+            units.is_empty(),
+            "absent HALs must be skipped, got {:?}",
+            units.iter().map(|u| &u.name).collect::<Vec<_>>()
         );
 
         let _ = fs::remove_dir_all(&temp_dir);

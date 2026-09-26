@@ -121,7 +121,10 @@ process_file() {
             \#*) continue ;;
         esac
 
-        eval "set -- $line" 2>/dev/null || set -- $line
+        # Field-split without eval: package-supplied sysusers.d content must
+        # never be executed as shell (B-24). Quoting is not supported by the
+        # sysusers.d format for the fields we consume.
+        old_ifs=$IFS; IFS=' '; set -f; set -- $line; set +f; IFS=$old_ifs
         type="$1"
         name="$2"
         id="$3"

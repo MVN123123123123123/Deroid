@@ -68,14 +68,47 @@ impl Default for InputDeviceConfig {
 }
 
 impl InputDeviceConfig {
-    /// Parse IDC file contents from string slice
+    /// Parse a scalar IDC float, accepting a trivial `min:max` range form.
+    ///
+    /// H31: vendor files occasionally carry ranges (`key = 0.0:1.5`); a
+    /// scalar calibration key cannot consume a range, so the max endpoint
+    /// (the sensitivity-preserving bound) is used. Plain floats keep the
+    /// direct path.
+    fn parse_idc_float(val: &str) -> Option<f32> {
+        if let Ok(f) = val.parse::<f32>() {
+            return Some(f);
+        }
+        if let Some((_, hi)) = val.split_once(':') {
+            if let Ok(f) = hi.trim().parse::<f32>() {
+                return Some(f);
+            }
+        }
+        None
+    }
+
+    /// Parse IDC file contents from string slice.
+    ///
+    /// H31: trailing `#` comments are stripped before parsing
+    /// (`key = value # comment`); `[section]` headers are skipped; every
+    /// `key = value` pair — known or not — is retained verbatim in
+    /// `raw_properties`, and unknown keys cause no behavior change.
     pub fn parse(content: &str) -> Self {
         let mut config = Self::default();
         let mut properties = HashMap::new();
 
         for line in content.lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
+            // H31: strip trailing comments first; a full-line comment then
+            // yields an empty line and is skipped below.
+            let code = match line.find('#') {
+                Some(idx) => &line[..idx],
+                None => line,
+            };
+            let trimmed = code.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            // H31: section headers carry no `=` and affect no behavior.
+            if trimmed.starts_with('[') {
                 continue;
             }
 
@@ -105,12 +138,12 @@ impl InputDeviceConfig {
                         };
                     }
                     "touch.size.scale" => {
-                        if let Ok(f) = val.parse::<f32>() {
+                        if let Some(f) = Self::parse_idc_float(&val) {
                             config.size_scale = f;
                         }
                     }
                     "touch.size.bias" => {
-                        if let Ok(f) = val.parse::<f32>() {
+                        if let Some(f) = Self::parse_idc_float(&val) {
                             config.size_bias = f;
                         }
                     }
@@ -123,7 +156,7 @@ impl InputDeviceConfig {
                         };
                     }
                     "touch.pressure.scale" => {
-                        if let Ok(f) = val.parse::<f32>() {
+                        if let Some(f) = Self::parse_idc_float(&val) {
                             config.pressure_scale = f;
                         }
                     }
@@ -176,7 +209,14 @@ impl InputDeviceConfig {
         }
     }
 
-    /// Apply touch size calibration
+    /// Apply touch size calibration.
+    ///
+    /// H30 (upper clamp REJECTED): only a lower bound is applied. Unlike
+    /// pressure — normalized to 0.0..1.0 — size is a physical quantity
+    /// (vendor `touch.size.scale`/`bias` map raw sensor units to mm-scale
+    /// diameter/area), so legitimate values exceed 1.0 (e.g. 10 * 1.25 +
+    /// 2.0 = 14.5 must pass through). An upper clamp would corrupt geometric
+    /// calibration; only a negative result from a negative bias is floored.
     #[inline]
     pub fn calibrate_size(&self, raw_size: i32) -> f32 {
         match self.size_calibration {

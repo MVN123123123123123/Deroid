@@ -7,6 +7,7 @@
 //! next frame does not repeat the scan; callers drop the miss set with
 //! [`IconCache::invalidate_misses`] whenever the application set changes.
 
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -24,8 +25,18 @@ pub const ICON_MAX_EDGE: u32 = 64;
 pub fn icon_for_display(img: RgbaImage, edge: u32) -> RgbaImage {
     img.fit_within(edge.max(1))
 }
+/// Total decoded-pixel budget held by the cache; LRU eviction keeps the
+/// live set under this (P2). 64x64 RGBA tiles are 16 KiB, so this holds
+/// ~256 live icons.
+pub const ICON_CACHE_BUDGET: usize = 4 * 1024 * 1024;
+/// Icon sources with an edge larger than this are rejected before
+/// resampling: pixels that would only be averaged away must not spike
+/// frame-thread memory (P15).
+pub const ICON_MAX_SOURCE_EDGE: u32 = 256;
 /// Reject absurdly large icon files before handing them to the decoder.
-const MAX_ICON_FILE_BYTES: u64 = 4 * 1024 * 1024;
+/// Tied to the decoder's MAX_PIXELS (4M px): worst-case small-icon PNGs
+/// stay far below this (P16).
+const MAX_ICON_FILE_BYTES: u64 = 8 * 1024 * 1024;
 /// Dirent budget for a single resolution sweep (bounds worst-case scan cost).
 const SWEEP_BUDGET: usize = 65_536;
 /// Maximum directory depth visited (root -> theme -> size -> context -> file).
@@ -55,9 +66,28 @@ pub struct IconCache {
     roots: Vec<PathBuf>,
     preferred_theme: String,
     images: HashMap<String, Rc<RgbaImage>>,
+    /// Last-use tick per cached key for LRU eviction (P2).
+    used: RefCell<HashMap<String, u64>>,
     misses: HashSet<String>,
     /// Edge every decoded icon is resampled to on the way into the cache.
     display_edge: u32,
+    /// Monotonic clock for `used` ticks.
+    tick: Cell<u64>,
+    /// Sum of `width*height*4` over `images`, bounded by ICON_CACHE_BUDGET.
+    live_bytes: usize,
+}
+
+/// Deduplicate search roots preserving first-seen order: the default root
+/// list aliases the same directories via XDG_DATA_DIRS/HOME/pixmaps (P27).
+fn dedupe_roots(roots: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut seen = HashSet::with_capacity(roots.len());
+    let mut out = Vec::with_capacity(roots.len());
+    for r in roots {
+        if seen.insert(r.clone()) {
+            out.push(r);
+        }
+    }
+    out
 }
 
 impl Default for IconCache {
@@ -88,11 +118,14 @@ impl IconCache {
         }
         let preferred_theme = std::env::var("ICON_THEME").unwrap_or_default();
         IconCache {
-            roots,
+            roots: dedupe_roots(roots),
             preferred_theme,
             images: HashMap::new(),
+            used: RefCell::new(HashMap::new()),
             misses: HashSet::new(),
             display_edge: ICON_MAX_EDGE,
+            tick: Cell::new(0),
+            live_bytes: 0,
         }
     }
 
@@ -108,12 +141,30 @@ impl IconCache {
     /// Explicit roots (used by tests and by callers with a custom search path).
     pub fn with_roots(roots: Vec<PathBuf>, preferred_theme: &str) -> IconCache {
         IconCache {
-            roots,
+            roots: dedupe_roots(roots),
             preferred_theme: preferred_theme.to_string(),
             images: HashMap::new(),
+            used: RefCell::new(HashMap::new()),
             misses: HashSet::new(),
             display_edge: ICON_MAX_EDGE,
+            tick: Cell::new(0),
+            live_bytes: 0,
         }
+    }
+
+    /// Current decoded-pixel footprint; always <= budget + one entry.
+    pub fn live_bytes(&self) -> usize {
+        self.live_bytes
+    }
+
+    /// Number of cached icons.
+    pub fn len(&self) -> usize {
+        self.images.len()
+    }
+
+    /// True when no icons are cached.
+    pub fn is_empty(&self) -> bool {
+        self.images.is_empty()
     }
 
     /// True once `key` has been looked up, whether it resolved or not.
@@ -121,9 +172,13 @@ impl IconCache {
         self.images.contains_key(key) || self.misses.contains(key)
     }
 
-    /// Cached icon for `key`, if it resolved earlier.
+    /// Cached icon for `key`, if it resolved earlier. Records a use tick
+    /// so LRU eviction keeps hot icons (P2).
     pub fn get(&self, key: &str) -> Option<Rc<RgbaImage>> {
-        self.images.get(key).cloned()
+        let img = self.images.get(key).cloned()?;
+        self.tick.set(self.tick.get() + 1);
+        self.used.borrow_mut().insert(key.to_string(), self.tick.get());
+        Some(img)
     }
 
     /// Forget every recorded miss so the next [`Self::resolve_keys`] re-scans;
@@ -132,8 +187,49 @@ impl IconCache {
         self.misses.clear();
     }
 
+    /// Insert a decoded icon, evicting least-recently-used entries until
+    /// the cache is back under [`ICON_CACHE_BUDGET`] (P2). A single icon
+    /// larger than the whole budget still caches as the MRU entry and is
+    /// evicted by the next insert, so `live_bytes` may transiently exceed
+    /// the budget by one entry.
+    fn insert_image(&mut self, key: String, img: RgbaImage) {
+        fn img_bytes(img: &RgbaImage) -> usize {
+            img.width as usize * img.height as usize * 4
+        }
+        self.tick.set(self.tick.get() + 1);
+        let bytes = img_bytes(&img);
+        while self.live_bytes + bytes > ICON_CACHE_BUDGET && !self.images.is_empty() {
+            let lru = self
+                .used
+                .borrow()
+                .iter()
+                .min_by_key(|(_, &t)| t)
+                .map(|(k, _)| k.clone());
+            match lru {
+                Some(k) => {
+                    if let Some(old) = self.images.remove(&k) {
+                        self.live_bytes = self.live_bytes.saturating_sub(img_bytes(&old));
+                    }
+                    self.used.borrow_mut().remove(&k);
+                }
+                None => break,
+            }
+        }
+        if let Some(old) = self.images.insert(key.clone(), Rc::new(img)) {
+            self.live_bytes = self.live_bytes.saturating_sub(img_bytes(&old));
+        }
+        self.live_bytes += bytes;
+        self.used.borrow_mut().insert(key, self.tick.get());
+    }
+
     /// Resolve every not-yet-looked-up key with one directory sweep, then
     /// decode the winners. Keys holding a path separator are read directly.
+    ///
+    /// Decode cost note (P15): each call decodes at most one file per
+    /// pending key, each file is capped at [`MAX_ICON_FILE_BYTES`] and each
+    /// source at [`ICON_MAX_SOURCE_EDGE`]px per edge, so peak decode memory
+    /// stays bounded. Callers should still batch keys into as few calls as
+    /// possible (one per frame at most) rather than resolving per-tile.
     pub fn resolve_keys(&mut self, keys: &[String]) {
         let mut pending: Vec<usize> = Vec::new();
         for (i, key) in keys.iter().enumerate() {
@@ -143,7 +239,7 @@ impl IconCache {
             if key.contains('/') {
                 // Explicit path: read it now, never enter the sweep.
                 if let Some(img) = load_path(Path::new(key), self.display_edge) {
-                    self.images.insert(key.clone(), Rc::new(img));
+                    self.insert_image(key.clone(), img);
                 } else {
                     self.misses.insert(key.clone());
                 }
@@ -155,22 +251,42 @@ impl IconCache {
             return;
         }
 
-        let wanted: Vec<&str> = pending.iter().map(|&i| keys[i].as_str()).collect();
+        // Bucket wanted keys once (lowercased, suffix-stripped stem ->
+        // pending slots) so each dirent costs O(1) instead of O(keys) (P24).
+        let mut buckets: HashMap<Vec<u8>, Vec<usize>> = HashMap::with_capacity(pending.len());
+        for (slot, &idx) in pending.iter().enumerate() {
+            buckets
+                .entry(normalize_key(keys[idx].as_bytes()))
+                .or_default()
+                .push(slot);
+        }
         let mut best: Vec<Option<(i64, PathBuf)>> = (0..pending.len()).map(|_| None).collect();
         let mut budget = SWEEP_BUDGET;
         for root in &self.roots {
             if budget == 0 {
                 break;
             }
-            walk(root, 0, None, None, None, &wanted, &mut best, &mut budget, &self.preferred_theme);
+            walk(
+                root,
+                0,
+                None,
+                None,
+                None,
+                &buckets,
+                &mut best,
+                &mut budget,
+                &self.preferred_theme,
+            );
         }
+        // A budget-exhausted sweep proves nothing (P3).
+        let exhausted = budget == 0;
 
         for (slot, idx) in pending.iter().enumerate() {
             let key = &keys[*idx];
             match best[slot].take() {
                 Some((_, path)) => match load_path(&path, self.display_edge) {
                     Some(img) => {
-                        self.images.insert(key.clone(), Rc::new(img));
+                        self.insert_image(key.clone(), img);
                     }
                     None => {
                         // Corrupt candidate: remember so the sweep is not repeated.
@@ -178,7 +294,12 @@ impl IconCache {
                     }
                 },
                 None => {
-                    self.misses.insert(key.clone());
+                    // Record a miss only when the sweep actually completed;
+                    // on exhaustion the key stays unknown so the next call
+                    // retries instead of pinning a false miss.
+                    if !exhausted {
+                        self.misses.insert(key.clone());
+                    }
                 }
             }
         }
@@ -186,18 +307,68 @@ impl IconCache {
 }
 
 fn load_path(path: &Path, display_edge: u32) -> Option<RgbaImage> {
-    let meta = std::fs::metadata(path).ok()?;
-    if meta.len() > MAX_ICON_FILE_BYTES {
+    use std::io::Read;
+    // Single open + bounded take(): no metadata/read TOCTOU window, and at
+    // most MAX+1 bytes are ever pulled from disk (P16).
+    let file = std::fs::File::open(path).ok()?;
+    let mut limited = file.take(MAX_ICON_FILE_BYTES + 1);
+    let mut bytes = Vec::new();
+    limited.read_to_end(&mut bytes).ok()?;
+    if bytes.len() as u64 > MAX_ICON_FILE_BYTES {
         return None;
     }
-    let bytes = std::fs::read(path).ok()?;
+    let img = decode_png(&bytes)?;
+    // Drop the compressed bytes before resampling so peak memory is one
+    // buffer at a time, not both (P15).
+    drop(bytes);
+    // Reject oversized sources: icons cache at <=64px tiles, so decoding
+    // larger sources only burns frame-thread memory for pixels that get
+    // averaged away.
+    if img.width > ICON_MAX_SOURCE_EDGE || img.height > ICON_MAX_SOURCE_EDGE {
+        return None;
+    }
     // Resample once, here, to the size the layout draws: the render path then
     // blits 1:1 instead of filtering bilinear every frame.
-    decode_png(&bytes).map(|img| img.fit_within(display_edge.max(1)))
+    Some(img.fit_within(display_edge.max(1)))
 }
 
-/// Depth-first sweep of one root. `best` is indexed like `wanted`; each entry
-/// keeps the highest scoring candidate found so far.
+/// `true` when `path` (known to be a symlink) resolves to a directory.
+fn is_dir_link(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|m| m.is_dir())
+}
+
+#[cfg(unix)]
+fn file_name_bytes(name: &std::ffi::OsStr) -> &[u8] {
+    use std::os::unix::ffi::OsStrExt;
+    name.as_bytes()
+}
+
+#[cfg(not(unix))]
+fn file_name_bytes(name: &std::ffi::OsStr) -> &[u8] {
+    name.to_str().map(|s| s.as_bytes()).unwrap_or(&[])
+}
+
+/// ASCII `.png` suffix check (any case) on raw bytes, before any allocation.
+fn has_png_suffix(name: &[u8]) -> bool {
+    name.len() > 4 && name[name.len() - 4..].eq_ignore_ascii_case(b".png")
+}
+
+fn strip_png_suffix(name: &[u8]) -> &[u8] {
+    if has_png_suffix(name) {
+        &name[..name.len() - 4]
+    } else {
+        name
+    }
+}
+
+/// Lowercased, suffix-stripped bucket key for a lookup key.
+fn normalize_key(key: &[u8]) -> Vec<u8> {
+    strip_png_suffix(key).to_ascii_lowercase()
+}
+
+/// Depth-first sweep of one root. `best` is indexed like `pending`; each
+/// entry keeps the highest scoring candidate found so far. `wanted` maps
+/// lowercased, suffix-stripped stems to pending slots for O(1) lookup (P24).
 #[allow(clippy::too_many_arguments)]
 fn walk(
     dir: &Path,
@@ -205,7 +376,7 @@ fn walk(
     theme: Option<&str>,
     ctx: Option<&str>,
     size: Option<(u32, u32)>,
-    wanted: &[&str],
+    wanted: &HashMap<Vec<u8>, Vec<usize>>,
     best: &mut [Option<(i64, PathBuf)>],
     budget: &mut usize,
     preferred: &str,
@@ -222,52 +393,53 @@ fn walk(
             return;
         }
         *budget -= 1;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
         let file_type = match entry.file_type() {
             Ok(ft) => ft,
             Err(_) => continue,
         };
-        if file_type.is_dir() {
-            // `file_type` never follows links, so a symlinked directory arrives
-            // as a symlink (below) and is never descended into: a cyclic link
-            // can therefore never burn the sweep budget.
-            let (theme, ctx, size) = classify(name.as_ref(), depth, theme, ctx, size);
-            walk(&entry.path(), depth + 1, theme, ctx, size, wanted, best, budget, preferred);
+        // Single path() per entry; the file name borrows from it (P23).
+        let path = entry.path();
+        if file_type.is_dir() || (file_type.is_symlink() && is_dir_link(&path)) {
+            // Symlinked directories are followed: `file_type` never follows
+            // links, so the explicit metadata check above is the only thing
+            // that sees them. Cycles terminate via MAX_DEPTH plus the sweep
+            // budget (P14).
+            let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let (theme, ctx, size) = classify(name, depth, theme, ctx, size);
+            walk(&path, depth + 1, theme, ctx, size, wanted, best, budget, preferred);
             continue;
         }
-        if name.len() <= 4 {
+        let Some(name) = path.file_name() else {
+            continue;
+        };
+        let raw = file_name_bytes(name);
+        // ASCII suffix check before any allocation (P23).
+        if !has_png_suffix(raw) {
             continue;
         }
-        let lower = name.to_ascii_lowercase();
-        if !lower.ends_with(".png") {
+        let stem_lower = strip_png_suffix(raw).to_ascii_lowercase();
+        let Some(slots) = wanted.get(&stem_lower) else {
             continue;
-        }
-        let stem = &lower[..lower.len() - 4];
+        };
         if !file_type.is_file() {
             // Themes alias icons with symlinks; follow them, but only pay for
             // the stat when the name is one we are actually looking for.
-            if !wanted.iter().any(|key| icon_name_eq(stem, key)) {
-                continue;
-            }
-            let follows = std::fs::metadata(entry.path()).is_ok_and(|m| m.is_file());
-            if !follows {
+            if !std::fs::metadata(&path).is_ok_and(|m| m.is_file()) {
                 continue;
             }
         }
         let score = theme_rank(theme, preferred) + context_bonus(ctx) + size_score(size);
-        for (slot, key) in wanted.iter().enumerate() {
-            if !icon_name_eq(stem, key) {
-                continue;
-            }
+        for &slot in slots {
             let better = match &best[slot] {
                 None => true,
                 Some((s, p)) => {
-                    score > *s || (score == *s && entry.path() < *p)
+                    score > *s || (score == *s && path < *p)
                 }
             };
             if better {
-                best[slot] = Some((score, entry.path()));
+                best[slot] = Some((score, path.clone()));
             }
         }
     }
@@ -327,10 +499,12 @@ fn is_context(name: &str) -> bool {
     CONTEXTS.contains(&name)
 }
 
-/// Case-insensitive icon name comparison, ignoring a `.png` suffix on the key.
+/// Case-insensitive icon name comparison, ignoring a `.png` suffix (any
+/// case) on either side (P13). Thin wrapper over the byte helpers, kept
+/// for tests; the sweep itself compares bytes without allocating.
+#[cfg(test)]
 fn icon_name_eq(stem: &str, key: &str) -> bool {
-    let key = key.strip_suffix(".png").unwrap_or(key);
-    stem.as_bytes().eq_ignore_ascii_case(key.as_bytes())
+    strip_png_suffix(stem.as_bytes()).eq_ignore_ascii_case(strip_png_suffix(key.as_bytes()))
 }
 
 /// Theme tier dominates every other factor: the configured theme wins, then
@@ -498,7 +672,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn symlinked_candidates_are_resolved_without_link_chasing() {
+    fn symlinked_candidates_and_dirs_are_resolved_with_bounds() {
         use std::os::unix::fs::symlink;
 
         let tree = Tree::new("symlink");
@@ -508,8 +682,8 @@ mod tests {
         let apps = tree.path().join("icons/hicolor/64x64/apps");
         std::fs::create_dir_all(&apps).unwrap();
         symlink(tree.path().join("targets/real.png"), apps.join("linked.png")).unwrap();
-        // Directory links are never descended: a cycle must not cost anything,
-        // and a PNG reachable only through such a link stays unreachable.
+        // Directory links ARE descended now (P14): a cycle only burns
+        // MAX_DEPTH levels plus sweep budget, so the sweep terminates.
         symlink(
             tree.path().join("icons/hicolor/64x64"),
             tree.path().join("icons/hicolor/loop"),
@@ -526,9 +700,38 @@ mod tests {
         );
         assert!(cache.knows("linked"));
         assert!(
-            cache.get("secret").is_none(),
-            "directory symlinks are not swept"
+            cache.get("secret").is_some(),
+            "directory symlinks are followed within depth+budget guards"
         );
+    }
+
+    #[test]
+    fn lru_budget_evicts_oldest() {
+        let mut cache = IconCache::with_roots(vec![], "");
+        // 2 MiB each: two fit the 4 MiB budget, the third forces eviction.
+        let big = |v: u8| RgbaImage {
+            width: 1024,
+            height: 512,
+            pixels: vec![v; 1024 * 512 * 4],
+        };
+        cache.insert_image("a".into(), big(1));
+        cache.insert_image("b".into(), big(2));
+        assert!(cache.get("a").is_some(), "touch a so b is LRU");
+        cache.insert_image("c".into(), big(3));
+        assert!(cache.get("b").is_none(), "LRU entry evicted under budget");
+        assert!(cache.get("a").is_some());
+        assert!(cache.get("c").is_some());
+        assert!(
+            cache.live_bytes() <= ICON_CACHE_BUDGET + 1024 * 512 * 4,
+            "live set bounded by budget + one entry"
+        );
+    }
+
+    #[test]
+    fn duplicate_roots_are_deduped() {
+        let root = PathBuf::from("/tmp/utim_icons_dedupe");
+        let cache = IconCache::with_roots(vec![root.clone(), root.clone(), root], "");
+        assert_eq!(cache.roots.len(), 1);
     }
 
     #[test]
@@ -541,6 +744,7 @@ mod tests {
         assert!(is_context("apps") && is_context("legacy") && !is_context("hicolor"));
         assert!(icon_name_eq("phone", "phone"));
         assert!(icon_name_eq("phone", "phone.png"));
+        assert!(icon_name_eq("phone", "phone.PNG"));
         assert!(!icon_name_eq("phone", "phon"));
         // A 64x16 strip must not outscore the true 64x64 icon.
         assert!(size_score(Some((64, 64))) > size_score(Some((64, 16))));

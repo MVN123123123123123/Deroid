@@ -22,6 +22,8 @@
 //! All arithmetic is `f32`; hit-tests are inclusive of the exact same
 //! floating-point edges the renderer uses, so there is no rounding drift.
 
+use super::font;
+
 /// Horizontal page gutter, as a fraction of panel width.
 pub const PAGE_MARGIN: f32 = 0.030;
 /// Grid icon edge length, as a fraction of the grid column pitch.
@@ -83,8 +85,16 @@ impl Cell {
         x >= self.x && x <= self.x + self.w && y >= self.y && y <= self.y + self.h
     }
     #[inline]
+    pub fn center_x(&self) -> f32 {
+        self.x + self.w * 0.5
+    }
+    #[inline]
+    pub fn center_y(&self) -> f32 {
+        self.y + self.h * 0.5
+    }
+    #[inline]
     pub fn center(&self) -> (f32, f32) {
-        (self.x + self.w * 0.5, self.y + self.h * 0.5)
+        (self.center_x(), self.center_y())
     }
     /// Expand to a minimum touch target edge, keeping the center fixed.
     #[inline]
@@ -200,6 +210,8 @@ pub struct Layout {
     // Hotseat
     pub dock: Rect,
     pub dock_slots: usize,
+    /// Width of one hotseat slot, computed once: `dock.w / dock_slots`.
+    pub dock_pitch: f32,
     pub dock_icon: f32,
 
     // Gesture nav
@@ -215,6 +227,10 @@ pub struct Layout {
     pub drawer_rows: usize,
     pub drawer_icon: f32,
     pub drawer_label_scale: usize,
+    /// Whether the edit-mode action-chip band is reserved. `home_zone` only
+    /// reports `ActionChips` when this is set; otherwise the chip rects are
+    /// inert geometry overlapping the top of the grid band.
+    pub has_selection: bool,
 }
 
 /// Number of grid columns: 4 on phones, 5 or 6 on wide panels, matching
@@ -285,8 +301,9 @@ impl Layout {
         let col_pitch = w / grid_cols as f32;
         let icon_size = col_pitch * ICON_FRACTION;
         let label_scale = if h >= 1600.0 { 2 } else { 1 };
-        // Label line box: em height plus descender, plus the gaps around it.
-        let label_h = if label_scale == 2 { 30.0 } else { 15.0 } * 1.2;
+        // Label line box: em height plus descender, derived from the same
+        // type scale the renderer draws with, so geometry and type agree.
+        let label_h = font::em_px_at(label_scale, w as usize) * 1.2;
         let row_pitch = icon_size + icon_size * LABEL_GAP + label_h + icon_size * CELL_BOTTOM_GAP;
 
         // Hotseat and gesture nav are anchored to the bottom edge.
@@ -308,7 +325,8 @@ impl Layout {
             radius: dock_h * 0.36,
         };
         let dock_slots = if w >= 1000.0 { 5 } else { 4 };
-        let dock_icon = (dock.h * 0.56).min(dock_w_for(dock.w, dock_slots) * 0.58);
+        let dock_pitch = dock_w_for(dock.w, dock_slots);
+        let dock_icon = (dock.h * 0.56).min(dock_pitch * 0.58);
 
         // Workspace band: between the chips/search and the page dots.
         let grid_top = if has_selection {
@@ -320,7 +338,10 @@ impl Layout {
         let page_dots = Rect {
             x: w * 0.5 - w * 0.10,
             y: dock.y - h * 0.020 - dots_h,
-            w: w * 0.20,
+            // The renderer spaces dots by w/(n-1) with the first dot's left
+            // edge at dots.x, so the last dot's body extends one dot width
+            // past w*0.20; publish the strip that is actually drawn.
+            w: w * 0.20 + dots_h,
             h: dots_h,
             radius: dots_h * 0.5,
         };
@@ -378,6 +399,7 @@ impl Layout {
             page_dots,
             dock,
             dock_slots,
+            dock_pitch,
             dock_icon,
             nav_pill,
             drawer_status_h,
@@ -389,6 +411,7 @@ impl Layout {
             drawer_rows,
             drawer_icon: icon_size * 1.06,
             drawer_label_scale: label_scale,
+            has_selection,
         }
     }
 
@@ -437,8 +460,8 @@ impl Layout {
             x: col as f32 * self.col_pitch,
             y: self.drawer_grid_top + row as f32 * self.row_pitch,
             w: self.col_pitch,
-            h: self.icon_size * 1.06,
-            radius: self.icon_size * ICON_RADIUS * 1.06,
+            h: self.drawer_icon,
+            radius: self.drawer_icon * ICON_RADIUS,
         }
     }
 
@@ -457,11 +480,10 @@ impl Layout {
     /// Geometry of hotseat slot `index`.
     #[inline]
     pub fn dock_slot(&self, index: usize) -> Cell {
-        let pitch = self.dock.w / self.dock_slots as f32;
         Cell {
-            x: self.dock.x + index as f32 * pitch,
+            x: self.dock.x + index as f32 * self.dock_pitch,
             y: self.dock.y,
-            w: pitch,
+            w: self.dock_pitch,
             h: self.dock.h,
         }
     }
@@ -497,7 +519,10 @@ impl Layout {
         if self.search.contains(x, y) {
             return HomeZone::Search;
         }
-        if self.remove_chip.contains(x, y) || self.move_chip.contains(x, y) {
+        // The chip rects always exist as geometry, but they only cover live
+        // actions in edit mode; otherwise row 0 of the grid starts under
+        // them and must win.
+        if self.has_selection && (self.remove_chip.contains(x, y) || self.move_chip.contains(x, y)) {
             return HomeZone::ActionChips;
         }
         if y >= self.grid_top && y < self.grid_bottom {
@@ -523,6 +548,12 @@ impl Layout {
         scroll: f32,
         total_pages: usize,
     ) -> Option<(usize, usize)> {
+        if total_pages == 0 {
+            return None;
+        }
+        if !x.is_finite() || !y.is_finite() || !scroll.is_finite() {
+            return None;
+        }
         if y < self.grid_top || y >= self.grid_bottom || self.max_rows == 0 {
             return None;
         }
@@ -532,7 +563,7 @@ impl Layout {
         }
         let page_pitch = self.w;
         let page = (rel_x / page_pitch) as usize;
-        if total_pages > 0 && page >= total_pages {
+        if page >= total_pages {
             return None;
         }
         let col = ((rel_x - page as f32 * page_pitch) / self.col_pitch) as usize;
@@ -557,21 +588,39 @@ impl Layout {
 
     /// Hotseat slot index under `(x, y)`.
     pub fn home_dock_hit(&self, x: f32, y: f32) -> Option<usize> {
+        if !x.is_finite() || !y.is_finite() {
+            return None;
+        }
         if !self.dock.contains(x, y) {
             return None;
         }
-        let pitch = self.dock.w / self.dock_slots as f32;
-        let idx = ((x - self.dock.x) / pitch).min(self.dock_slots as f32 - 1.0);
+        let idx = ((x - self.dock.x) / self.dock_pitch).min(self.dock_slots as f32 - 1.0);
         Some(idx as usize)
     }
 
-    /// Page index under the page-indicator dots.
+    /// Page index under the page-indicator dots, using the same pitch the
+    /// renderer draws with: dots span the strip at `w/(n-1)`, first dot's
+    /// left edge at `page_dots.x`. An n-way split of the strip would leave
+    /// the last dot untappable and misattribute its neighbours.
     pub fn home_page_hit(&self, x: f32, y: f32, total_pages: usize) -> Option<usize> {
-        if total_pages == 0 || !self.page_dots.contains(x, y) {
+        if total_pages == 0 {
             return None;
         }
-        let t = (x - self.page_dots.x) / self.page_dots.w;
-        Some((t * total_pages as f32).min(total_pages as f32 - 1.0) as usize)
+        if !x.is_finite() || !y.is_finite() {
+            return None;
+        }
+        if x < self.page_dots.x || x > self.page_dots.x + self.page_dots.w {
+            return None;
+        }
+        if y < self.page_dots.y || y > self.page_dots.y + self.page_dots.h {
+            return None;
+        }
+        if total_pages == 1 {
+            return Some(0);
+        }
+        let pitch = self.page_dots.w / (total_pages as f32 - 1.0);
+        let t = ((x - self.page_dots.x) / pitch + 0.5).floor().max(0.0);
+        Some((t as usize).min(total_pages - 1))
     }
 
     /// Which drawer band contains `(x, y)`, where `drawer_y_offset` is the
@@ -593,7 +642,12 @@ impl Layout {
         if local_y < self.drawer_grid_top {
             return DrawerZone::Header;
         }
-        DrawerZone::Grid
+        // Bound the Grid band exactly where drawer_grid_hit stops accepting
+        // cells; past the bottom there is no cell under the touch.
+        if local_y < self.drawer_grid_bottom {
+            return DrawerZone::Grid;
+        }
+        DrawerZone::Empty
     }
 
     /// Which part of the drawer search field a touch landed on.
@@ -613,6 +667,9 @@ impl Layout {
 
     /// Drawer cell index under `(x, y)`.
     pub fn drawer_grid_hit(&self, drawer_y_offset: f32, x: f32, y: f32) -> Option<usize> {
+        if !drawer_y_offset.is_finite() || !x.is_finite() || !y.is_finite() {
+            return None;
+        }
         if x < 0.0 || x >= self.w || self.drawer_rows == 0 {
             return None;
         }
@@ -685,9 +742,31 @@ impl TileGrid {
             radius: self.tile.1 * 0.22,
         }
     }
-    /// Tile index under `(x, y)`, if any.
+    /// Tile index under `(x, y)`, if any. Closed form: the grid is uniform,
+    /// so the cell follows from division, with the gaps rejected explicitly.
     pub fn hit(&self, x: f32, y: f32) -> Option<usize> {
-        (0..(self.cols * self.rows)).find(|&i| self.cell(i).contains(x, y))
+        if !x.is_finite() || !y.is_finite() {
+            return None;
+        }
+        let pw = self.tile.0 + self.gap.0;
+        let ph = self.tile.1 + self.gap.1;
+        if pw <= 0.0 || ph <= 0.0 {
+            return None;
+        }
+        let dx = x - self.origin.0;
+        let dy = y - self.origin.1;
+        if dx < 0.0 || dy < 0.0 {
+            return None;
+        }
+        let col = (dx / pw) as usize;
+        let row = (dy / ph) as usize;
+        if col >= self.cols || row >= self.rows {
+            return None;
+        }
+        if dx - col as f32 * pw > self.tile.0 || dy - row as f32 * ph > self.tile.1 {
+            return None;
+        }
+        Some(row * self.cols + col)
     }
 }
 
@@ -780,10 +859,11 @@ impl Keyboard {
     /// Key at index `i` of row 1.
     #[inline]
     pub fn row1_at(&self, i: usize) -> Rect {
+        let pitch = self.row1_pitch();
         Rect {
-            x: self.row1.x + self.row1.w / KB_ROW1 as f32 * i as f32,
+            x: self.row1.x + pitch * i as f32,
             y: self.row1.y,
-            w: self.row1.w / KB_ROW1 as f32,
+            w: pitch,
             h: self.row1.h,
             radius: self.row1.radius,
         }
@@ -792,13 +872,26 @@ impl Keyboard {
     /// Key at index `i` of row 2.
     #[inline]
     pub fn row2_at(&self, i: usize) -> Rect {
+        let pitch = self.row2_pitch();
         Rect {
-            x: self.row2.x + self.row2.w / KB_ROW2 as f32 * i as f32,
+            x: self.row2.x + pitch * i as f32,
             y: self.row2.y,
-            w: self.row2.w / KB_ROW2 as f32,
+            w: pitch,
             h: self.row2.h,
             radius: self.row2.radius,
         }
+    }
+
+    /// Width of one row-1 key, hoisted so hit-testing divides once.
+    #[inline]
+    fn row1_pitch(&self) -> f32 {
+        self.row1.w / KB_ROW1 as f32
+    }
+
+    /// Width of one row-2 key, hoisted so hit-testing divides once.
+    #[inline]
+    fn row2_pitch(&self) -> f32 {
+        self.row2.w / KB_ROW2 as f32
     }
 
     /// Key under `(x, y)`, if the touch landed on the keyboard.
@@ -812,9 +905,10 @@ impl Keyboard {
         if self.row3_backspace.contains(x, y) {
             return Some(Key::Backspace);
         }
-        for r in self.row3_mid.iter() {
+        // The contains scan already yields the index; re-scanning for it
+        // would walk the row twice per touch.
+        for (i, r) in self.row3_mid.iter().enumerate() {
             if r.contains(x, y) {
-                let i = row3_index(self, x, y)?;
                 return Some(Key::Char(ROW3[i]));
             }
         }
@@ -827,13 +921,29 @@ impl Keyboard {
         if self.row4_space.contains(x, y) {
             return Some(Key::Space);
         }
+        let row1_pitch = self.row1_pitch();
         for (i, key) in ROW1.iter().enumerate() {
-            if self.row1_at(i).contains(x, y) {
+            let r = Rect {
+                x: self.row1.x + row1_pitch * i as f32,
+                y: self.row1.y,
+                w: row1_pitch,
+                h: self.row1.h,
+                radius: self.row1.radius,
+            };
+            if r.contains(x, y) {
                 return Some(Key::Char(*key));
             }
         }
+        let row2_pitch = self.row2_pitch();
         for (i, key) in ROW2.iter().enumerate() {
-            if self.row2_at(i).contains(x, y) {
+            let r = Rect {
+                x: self.row2.x + row2_pitch * i as f32,
+                y: self.row2.y,
+                w: row2_pitch,
+                h: self.row2.h,
+                radius: self.row2.radius,
+            };
+            if r.contains(x, y) {
                 return Some(Key::Char(*key));
             }
         }
@@ -849,16 +959,6 @@ const fn row3_dummy() -> Rect {
         h: 0.0,
         radius: 0.0,
     }
-}
-
-#[inline]
-fn row3_index(k: &Keyboard, x: f32, _y: f32) -> Option<usize> {
-    for (i, r) in k.row3_mid.iter().enumerate() {
-        if x >= r.x && x <= r.x + r.w {
-            return Some(i);
-        }
-    }
-    None
 }
 
 /// Row 1 key labels.
@@ -972,11 +1072,12 @@ impl AppLayout {
         }
     }
 
-    /// Trailing hit area of the active tab that closes it.
-    pub fn tab_close_zone(&self, index: usize, active: usize) -> Rect {
+    /// Trailing hit area of the tab that closes it. Only the active tab
+    /// carries the affordance (see `hit_tab_active`); the geometry itself is
+    /// per-tab.
+    pub fn tab_close_zone(&self, index: usize) -> Rect {
         let r = self.tab_rect(index);
         let w = (r.h * 0.55).min(r.w * 0.5);
-        let _ = active;
         Rect {
             x: r.x + r.w - w,
             y: r.y,
@@ -1028,7 +1129,7 @@ impl AppLayout {
     /// Terminal tab hit test that resolves the close affordance on the active
     /// tab, mirroring how the strip is drawn.
     pub fn hit_tab_active(&self, x: f32, y: f32, active: usize) -> Option<TabHit> {
-        if self.tab_count > 1 && self.tab_close_zone(active, active).contains(x, y) {
+        if self.tab_count > 1 && self.tab_close_zone(active).contains(x, y) {
             return Some(TabHit::Close(active));
         }
         self.hit_tab(x, y)
@@ -1252,6 +1353,48 @@ mod tests {
             assert_eq!(l.home_grid_hit(w * 0.5, below, 0.0), None, "{w}x{h}");
             assert_eq!(l.home_grid_hit(-1.0, l.grid_top, 0.0), None, "{w}x{h}");
             assert_eq!(l.home_grid_hit(l.w, l.grid_top, 0.0), None, "{w}x{h}");
+        }
+    }
+
+    #[test]
+    fn page_dots_hit_uses_renderer_pitch_and_rejects_garbage() {
+        for &(w, h) in PANELS {
+            let l = Layout::plain(w, h);
+            let cy = l.page_dots.center_y();
+            // Zero pages means nothing under the touch.
+            assert_eq!(l.home_page_hit(l.page_dots.center_x(), cy, 0), None, "{w}x{h}");
+            // NaN never resolves to a page.
+            assert_eq!(l.home_page_hit(f32::NAN, cy, 2), None, "{w}x{h}");
+            assert_eq!(l.home_page_hit(l.page_dots.center_x(), f32::NAN, 2), None, "{w}x{h}");
+            assert_eq!(l.home_grid_hit_paged(f32::NAN, l.grid_top + 1.0, 0.0, 2), None, "{w}x{h}");
+            assert_eq!(l.drawer_grid_hit(0.0, f32::NAN, f32::NAN), None, "{w}x{h}");
+            assert_eq!(l.home_grid_hit_paged(10.0, l.grid_top + 1.0, 0.0, 0), None, "{w}x{h}");
+            // Every drawn dot centre resolves to its own page, including the
+            // last dot, which an n-way bucket split leaves untappable.
+            for n in [2usize, 3, 5] {
+                let pitch = l.page_dots.w / (n as f32 - 1.0);
+                for p in 0..n {
+                    let x = l.page_dots.x + p as f32 * pitch;
+                    assert_eq!(l.home_page_hit(x, cy, n), Some(p), "{w}x{h} n={n} dot={p}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn home_zone_reports_chips_only_in_edit_mode_and_dock_pitch_is_single_sourced() {
+        for &(w, h) in PANELS {
+            let plain = Layout::new(w, h, false);
+            let sel = Layout::new(w, h, true);
+            // Without a selection the chip rects are inert: row 0 wins.
+            let (cx, cy) = (sel.remove_chip.center_x(), sel.remove_chip.center_y());
+            assert_eq!(plain.home_zone(cx, cy), HomeZone::Grid, "{w}x{h}");
+            assert_eq!(sel.home_zone(cx, cy), HomeZone::ActionChips, "{w}x{h}");
+            // The stored pitch is the single definition of a dock slot.
+            assert!((plain.dock_pitch - plain.dock.w / plain.dock_slots as f32).abs() < 0.001);
+            for s in 0..plain.dock_slots {
+                assert!((plain.dock_slot(s).w - plain.dock_pitch).abs() < 0.001, "{w}x{h} slot {s}");
+            }
         }
     }
 
@@ -1487,7 +1630,7 @@ mod tests {
             let r = a.tab_rect(i);
             let y = r.center_y();
             // The close affordance lives on the active tab's trailing edge.
-            let close = a.tab_close_zone(i, i);
+            let close = a.tab_close_zone(i);
             assert_eq!(
                 a.hit_tab_active(close.center_x(), y, i),
                 Some(TabHit::Close(i)),

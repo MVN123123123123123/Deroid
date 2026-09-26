@@ -119,13 +119,13 @@ fn test_milestone_5_2_active_stylus_evdev_to_wayland_tablet() {
         other => panic!("Expected Pressure, got {:?}", other),
     }
 
-    // 5. Tilt: ABS_TILT_X and ABS_TILT_Y
+    // 5. Tilt: ABS_TILT_X and ABS_TILT_Y (evdev 0.01deg units -> degrees)
     let ev_tilt = utim_core::compositor::input::LinuxInputEvent {
         time_sec: 0,
         time_usec: 0,
         type_: EV_ABS,
         code: ABS_TILT_X,
-        value: 25, // 25 degrees tilt
+        value: 2500, // 25.00 degrees tilt
     };
     assert_eq!(
         stylus.process_event(&ev_tilt),
@@ -215,7 +215,7 @@ fn test_milestone_5_3_sensors_hal_event_stream() {
         .expect("Set sampling period failed");
 
     // Produce Accelerometer Event
-    let ev_acc = hal.produce_accelerometer_event(0.1, 9.81, 0.2);
+    let ev_acc = hal.produce_accelerometer_event(0.1, 9.81, 0.2).unwrap();
     assert_eq!(ev_acc.sensor_type, SensorType::Accelerometer);
     match ev_acc.data {
         SensorData::Acceleration { x, y, z } => {
@@ -227,7 +227,7 @@ fn test_milestone_5_3_sensors_hal_event_stream() {
     }
 
     // Produce Light Event
-    let ev_light = hal.produce_light_event(450.0); // 450 lux
+    let ev_light = hal.produce_light_event(450.0).unwrap(); // 450 lux
     assert_eq!(ev_light.sensor_type, SensorType::Light);
     match ev_light.data {
         SensorData::Light { lux } => assert_eq!(lux, 450.0),
@@ -235,7 +235,7 @@ fn test_milestone_5_3_sensors_hal_event_stream() {
     }
 
     // Produce Gyroscope Event
-    let ev_gyro = hal.produce_gyroscope_event(0.05, -0.12, 0.85);
+    let ev_gyro = hal.produce_gyroscope_event(0.05, -0.12, 0.85).unwrap();
     assert_eq!(ev_gyro.sensor_type, SensorType::Gyroscope);
     match ev_gyro.data {
         SensorData::Gyroscope { x, y, z } => {
@@ -247,7 +247,7 @@ fn test_milestone_5_3_sensors_hal_event_stream() {
     }
 
     // Produce Proximity Event
-    let ev_prox = hal.produce_proximity_event(0.0); // 0.0 cm (ear next to screen)
+    let ev_prox = hal.produce_proximity_event(0.0).unwrap(); // 0.0 cm (ear next to screen)
     assert_eq!(ev_prox.sensor_type, SensorType::Proximity);
     match ev_prox.data {
         SensorData::Proximity { distance_cm } => assert_eq!(distance_cm, 0.0),
@@ -311,7 +311,7 @@ fn test_milestone_5_3_gnss_hal_and_nmea_generation() {
         vertical_accuracy_m: 5.0,
         timestamp_ms: 1711200000000,
     };
-    gnss.update_location(loc);
+    gnss.update_location(loc).expect("valid fix must be accepted");
     assert!(gnss.has_fix);
 
     // 3. Add Satellites in View

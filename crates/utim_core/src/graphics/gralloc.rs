@@ -123,6 +123,20 @@ fn dup_cloexec(fd: RawFd) -> Option<RawFd> {
     }
 }
 
+/// Fallible dup reporting the `fcntl` errno instead of degrading to `None`.
+/// Sentinel values (< 0, "no fd") pass through unchanged.
+fn dup_cloexec_result(fd: RawFd) -> Result<Option<RawFd>, std::io::Error> {
+    if fd < 0 {
+        return Ok(Some(fd));
+    }
+    let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if dup < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(Some(dup))
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct DmaBufBuffer {
     pub id: u64,
@@ -143,6 +157,9 @@ pub struct DmaBufBuffer {
 }
 
 impl Clone for DmaBufBuffer {
+    /// Best-effort clone: if `fcntl(F_DUPFD_CLOEXEC)` fails (e.g. `EMFILE`)
+    /// the fd degrades to `None` and the failure is unobservable. Prefer
+    /// [`DmaBufBuffer::try_clone`] on any path that feeds a real compositor.
     fn clone(&self) -> Self {
         Self {
             id: self.id,
@@ -165,6 +182,41 @@ impl Clone for DmaBufBuffer {
 }
 
 impl DmaBufBuffer {
+    /// Fallible clone: dups the dmabuf fd and fences via `fcntl` and reports
+    /// the errno instead of silently dropping the fd. Scalars, geometry and
+    /// the plane table are copied as-is.
+    pub fn try_clone(&self) -> Result<DmaBufBuffer, std::io::Error> {
+        let fd = match self.fd {
+            Some(f) => dup_cloexec_result(f)?,
+            None => None,
+        };
+        let acquire_fence = match self.acquire_fence {
+            Some(f) => dup_cloexec_result(f)?,
+            None => None,
+        };
+        let release_fence = match self.release_fence {
+            Some(f) => dup_cloexec_result(f)?,
+            None => None,
+        };
+        Ok(DmaBufBuffer {
+            id: self.id,
+            fd,
+            width: self.width,
+            height: self.height,
+            format: self.format,
+            usage: self.usage,
+            stride_pixels: self.stride_pixels,
+            byte_stride: self.byte_stride,
+            slice_height: self.slice_height,
+            total_size_bytes: self.total_size_bytes,
+            planes: self.planes.clone(),
+            is_ubwc: self.is_ubwc,
+            is_afbc: self.is_afbc,
+            acquire_fence,
+            release_fence,
+        })
+    }
+
     /// Format information as Wayland linux-dmabuf parameter tuple:
     /// (fourcc, modifier_hi, modifier_lo)
     pub fn wayland_dmabuf_params(&self) -> (u32, u32, u32) {
@@ -270,18 +322,33 @@ impl GrallocManager {
 
     /// Auto-detect Gralloc version from vendor manifest or existing binder HAL services.
     pub fn detect_version(manifest_content: Option<&str>) -> GrallocVersion {
+        // Attribute and <name> must belong to the *same* <hal> element, or
+        // any unrelated AIDL HAL hijacks the match. Versioned HIDL names are
+        // tested before the AIDL fallback because `allocator@2.0` also
+        // starts with `android.hardware.graphics.allocator`.
         if let Some(content) = manifest_content {
-            if content.contains("android.hardware.graphics.allocator") && content.contains("aidl") {
-                return GrallocVersion::AidlAllocator;
-            }
-            if content.contains("android.hardware.graphics.allocator@4.0") {
-                return GrallocVersion::Gralloc4_0;
-            }
-            if content.contains("android.hardware.graphics.allocator@3.0") {
-                return GrallocVersion::Gralloc3_0;
-            }
-            if content.contains("android.hardware.graphics.allocator@2.0") {
-                return GrallocVersion::Gralloc2_0;
+            for hal in content.split("<hal").skip(1) {
+                let elem = hal.split("</hal>").next().unwrap_or(hal);
+                let is_aidl =
+                    elem.contains("format=\"aidl\"") || elem.contains("format='aidl'");
+                let name = elem
+                    .split("<name>")
+                    .nth(1)
+                    .and_then(|n| n.split('<').next())
+                    .unwrap_or("")
+                    .trim();
+                if name.contains("android.hardware.graphics.allocator@4.0") {
+                    return GrallocVersion::Gralloc4_0;
+                }
+                if name.contains("android.hardware.graphics.allocator@3.0") {
+                    return GrallocVersion::Gralloc3_0;
+                }
+                if name.contains("android.hardware.graphics.allocator@2.0") {
+                    return GrallocVersion::Gralloc2_0;
+                }
+                if name.starts_with("android.hardware.graphics.allocator") && is_aidl {
+                    return GrallocVersion::AidlAllocator;
+                }
             }
         }
         // Fallback default for modern Treble GSI
@@ -585,19 +652,55 @@ impl GrallocManager {
 
         let bpp = format.bytes_per_pixel();
         let stride_alignment = if is_ubwc { 64 } else { 32 };
-        let calc_stride_pixels = stride_pixels
-            .unwrap_or_else(|| (width + stride_alignment - 1) & !(stride_alignment - 1));
-        let byte_stride = calc_stride_pixels * (bpp as u32);
+        // A caller-supplied stride must be usable by scanout: >= width and
+        // aligned. `Some(0)` or a narrow/unaligned stride is rejected instead
+        // of yielding a zero-length or corrupt buffer.
+        let calc_stride_pixels = match stride_pixels {
+            Some(s) if s >= width && s % stride_alignment == 0 => s,
+            Some(s) => return Err(GrallocError::InvalidDimensions(s, height)),
+            None => (width + stride_alignment - 1) & !(stride_alignment - 1),
+        };
+        let byte_stride = calc_stride_pixels
+            .checked_mul(bpp as u32)
+            .ok_or(GrallocError::InvalidDimensions(width, height))?;
         let slice_alignment = if is_ubwc { 32 } else { 16 };
         let slice_height = (height + slice_alignment - 1) & !(slice_alignment - 1);
 
+        // Share the plane layout with `allocate`: subsampled YUV carries a
+        // chroma plane, everything else is a single plane. The total is the
+        // sum of the planes so an imported NV12 buffer describes all of its
+        // bytes (previously the UV plane was omitted entirely).
         let mut planes = Vec::new();
-        let total_size_bytes = (byte_stride as usize) * (slice_height as usize);
-        planes.push(BufferPlane {
-            offset: 0,
-            stride_bytes: byte_stride,
-            size_bytes: total_size_bytes,
-        });
+        let mut off = 0usize;
+        match format {
+            PixelFormat::Nv12 | PixelFormat::Ycbcr420888 => {
+                let y_size = (calc_stride_pixels as usize) * (slice_height as usize);
+                planes.push(BufferPlane {
+                    offset: off as u64,
+                    stride_bytes: calc_stride_pixels,
+                    size_bytes: y_size,
+                });
+                off += y_size;
+                let uv_size =
+                    (calc_stride_pixels as usize) * ((slice_height as usize) / 2);
+                planes.push(BufferPlane {
+                    offset: off as u64,
+                    stride_bytes: calc_stride_pixels,
+                    size_bytes: uv_size,
+                });
+                off += uv_size;
+            }
+            _ => {
+                let main_size = (byte_stride as usize) * (slice_height as usize);
+                planes.push(BufferPlane {
+                    offset: 0,
+                    stride_bytes: byte_stride,
+                    size_bytes: main_size,
+                });
+                off = main_size;
+            }
+        }
+        let total_size_bytes = off;
 
         let id = self.next_buffer_id;
         self.next_buffer_id = self.next_buffer_id.wrapping_add(1);

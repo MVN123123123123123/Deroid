@@ -10,8 +10,13 @@ fn resolve_root_path(root: &str, rel_path: &str) -> PathBuf {
     let rel = rel_path.strip_prefix('/').unwrap_or(rel_path);
     if root.is_empty() || root == "/" {
         Path::new("/").join(rel)
-    } else {
+    } else if Path::new(root).is_absolute() {
         Path::new(root).join(rel)
+    } else {
+        // A stray relative value (e.g. a flag swallowed as `--root`'s
+        // argument) must never resolve writes into the process CWD.
+        eprintln!("deb-systemd-helper: --root must be an absolute path, got {root:?}");
+        process::exit(1);
     }
 }
 
@@ -48,9 +53,17 @@ fn main() {
         } else if let Some(stripped) = arg.strip_prefix("--root=") {
             root_dir = stripped.to_string();
         } else if arg == "--root" {
-            if i + 1 < args.len() {
-                i += 1;
-                root_dir = args[i].clone();
+            match args.get(i + 1) {
+                Some(v) if !v.starts_with('-') => {
+                    i += 1;
+                    root_dir = v.clone();
+                }
+                _ => {
+                    // A dangling `--root` (the ROOTOPT pattern with an empty
+                    // $CHROOT) must not swallow the action verb.
+                    eprintln!("deb-systemd-helper: --root requires a path argument");
+                    process::exit(1);
+                }
             }
         } else if !arg.starts_with("--") {
             clean_args.push(arg.as_str());
@@ -66,6 +79,15 @@ fn main() {
     let action = clean_args[0];
     let units = &clean_args[1..];
 
+    // The unit name becomes a path component; refuse anything that is not a
+    // plain unit file name so a --root tree can never be escaped.
+    for unit in units {
+        if let Err(e) = validate_unit_name(unit) {
+            eprintln!("deb-systemd-helper: {e}");
+            process::exit(1);
+        }
+    }
+
     if units.is_empty() && action != "purge" {
         eprintln!(
             "deb-systemd-helper: error: {} requires at least one unit name",
@@ -77,7 +99,10 @@ fn main() {
     match action {
         "enable" => {
             for unit in units {
-                enable_unit(&root_dir, unit, no_enable);
+                if let Err(e) = enable_unit(&root_dir, unit, no_enable) {
+                    eprintln!("deb-systemd-helper: enable {unit}: {e}");
+                    process::exit(1);
+                }
             }
             process::exit(0);
         }
@@ -107,13 +132,19 @@ fn main() {
         }
         "mask" => {
             for unit in units {
-                mask_unit(&root_dir, unit);
+                if let Err(e) = mask_unit(&root_dir, unit) {
+                    eprintln!("deb-systemd-helper: mask {unit}: {e}");
+                    process::exit(1);
+                }
             }
             process::exit(0);
         }
         "unmask" => {
             for unit in units {
-                unmask_unit(&root_dir, unit);
+                if let Err(e) = unmask_unit(&root_dir, unit) {
+                    eprintln!("deb-systemd-helper: unmask {unit}: {e}");
+                    process::exit(1);
+                }
             }
             process::exit(0);
         }
@@ -155,48 +186,74 @@ fn find_unit_path(root: &str, unit: &str) -> Option<(PathBuf, PathBuf)> {
     None
 }
 
-fn enable_unit(root: &str, unit: &str, no_enable: bool) {
+fn validate_unit_name(unit: &str) -> Result<(), String> {
+    let name = unit.rsplit('/').next().unwrap_or(unit);
+    if name != unit || name == "." || name == ".." || name.is_empty() {
+        return Err(format!("refusing unsafe unit name {unit:?}"));
+    }
+    if !name.ends_with(".service")
+        && !name.ends_with(".target")
+        && !name.ends_with(".socket")
+        && !name.ends_with(".timer")
+        && !name.ends_with(".mount")
+        && !name.ends_with(".slice")
+        && !name.ends_with(".path")
+        && !name.ends_with(".device")
+        && !name.ends_with(".swap")
+    {
+        return Err(format!("{unit:?} is not a valid unit name"));
+    }
+    Ok(())
+}
+
+fn enable_unit(root: &str, unit: &str, no_enable: bool) -> Result<(), String> {
     let enabled_dir = get_enabled_state_dir(root);
-    let _ = fs::create_dir_all(&enabled_dir);
+    fs::create_dir_all(&enabled_dir)
+        .map_err(|e| format!("cannot create {}: {e}", enabled_dir.display()))?;
 
-    let Some((source_path, target_path)) = find_unit_path(root, unit) else {
-        return;
-    };
+    let (source_path, target_path) =
+        find_unit_path(root, unit).ok_or_else(|| format!("unit file {unit} does not exist"))?;
 
-    if let Ok(content) = fs::read_to_string(&source_path) {
-        let parsed = utim_core::unit::parse_unit(unit, &source_path, &content);
+    let content = fs::read_to_string(&source_path)
+        .map_err(|e| format!("cannot read {}: {e}", source_path.display()))?;
+    let parsed = utim_core::unit::parse_unit(unit, &source_path, &content);
 
-        // Record enablement in state file
-        let state_file = enabled_dir.join(format!("{}.dsh-also", unit));
-        let _ = fs::write(&state_file, format!("{}\n", unit));
+    // Record enablement in state file
+    let state_file = enabled_dir.join(format!("{}.dsh-also", unit));
+    fs::write(&state_file, format!("{}\n", unit))
+        .map_err(|e| format!("cannot write {}: {e}", state_file.display()))?;
 
-        if !no_enable {
-            for target in &parsed.install.wanted_by {
-                let target_name = if target.contains('.') {
-                    target.clone()
-                } else {
-                    format!("{}.target", target)
-                };
-                let target_wants = get_etc_systemd(root).join(format!("{}.wants", target_name));
-                let _ = fs::create_dir_all(&target_wants);
-                let symlink_path = target_wants.join(unit);
-                let _ = fs::remove_file(&symlink_path);
-                let _ = std::os::unix::fs::symlink(&target_path, &symlink_path);
-            }
-            for target in &parsed.install.required_by {
-                let target_name = if target.contains('.') {
-                    target.clone()
-                } else {
-                    format!("{}.target", target)
-                };
-                let target_req = get_etc_systemd(root).join(format!("{}.requires", target_name));
-                let _ = fs::create_dir_all(&target_req);
-                let symlink_path = target_req.join(unit);
-                let _ = fs::remove_file(&symlink_path);
-                let _ = std::os::unix::fs::symlink(&target_path, &symlink_path);
-            }
+    if !no_enable {
+        for target in &parsed.install.wanted_by {
+            let target_name = if target.contains('.') {
+                target.clone()
+            } else {
+                format!("{}.target", target)
+            };
+            let target_wants = get_etc_systemd(root).join(format!("{}.wants", target_name));
+            fs::create_dir_all(&target_wants)
+                .map_err(|e| format!("cannot create {}: {e}", target_wants.display()))?;
+            let symlink_path = target_wants.join(unit);
+            let _ = fs::remove_file(&symlink_path);
+            std::os::unix::fs::symlink(&target_path, &symlink_path)
+                .map_err(|e| format!("cannot link {}: {e}", symlink_path.display()))?;
+        }
+        for target in &parsed.install.required_by {
+            let target_name = if target.contains('.') {
+                target.clone()
+            } else {
+                format!("{}.target", target)
+            };
+            let target_req = get_etc_systemd(root).join(format!("{}.requires", target_name));
+            fs::create_dir_all(&target_req)
+                .map_err(|e| format!("cannot create {}: {e}", target_req.display()))?;
+            let symlink_path = target_req.join(unit);
+            let _ = fs::remove_file(&symlink_path);
+            std::os::unix::fs::symlink(&target_path, &symlink_path)
+                .map_err(|e| format!("cannot link {}: {e}", symlink_path.display()))?;
         }
     }
+    Ok(())
 }
 
 fn disable_unit(root: &str, unit: &str) {
@@ -244,30 +301,57 @@ fn was_unit_enabled(root: &str, unit: &str) -> bool {
     state_file.exists()
 }
 
-fn mask_unit(root: &str, unit: &str) {
-    let masked_dir = get_masked_state_dir(root);
-    let _ = fs::create_dir_all(&masked_dir);
-    let mask_state = masked_dir.join(unit);
-    let _ = fs::write(&mask_state, "");
-
+fn mask_unit(root: &str, unit: &str) -> Result<(), String> {
     let etc_dir = get_etc_systemd(root);
-    let _ = fs::create_dir_all(&etc_dir);
+    fs::create_dir_all(&etc_dir).map_err(|e| format!("{}: {e}", etc_dir.display()))?;
     let link_target = etc_dir.join(unit);
-    let _ = fs::remove_file(&link_target);
-    let _ = std::os::unix::fs::symlink("/dev/null", &link_target);
+    // Never clobber a real file or directory: masking would delete an
+    // admin-authored unit with no backup.
+    match fs::symlink_metadata(&link_target) {
+        Ok(m) if m.file_type().is_symlink() => {
+            let _ = fs::remove_file(&link_target);
+        }
+        Ok(m) if m.is_dir() => {
+            return Err(format!(
+                "cannot mask {unit}: {} is a directory",
+                link_target.display()
+            ));
+        }
+        Ok(_) => {
+            return Err(format!(
+                "cannot mask {unit}: {} is a regular file; move it aside first",
+                link_target.display()
+            ));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("cannot clear {}: {e}", link_target.display())),
+    }
+    std::os::unix::fs::symlink("/dev/null", &link_target)
+        .map_err(|e| format!("cannot mask {unit}: {e}"))?;
+    let masked_dir = get_masked_state_dir(root);
+    fs::create_dir_all(&masked_dir).map_err(|e| format!("{}: {e}", masked_dir.display()))?;
+    fs::write(masked_dir.join(unit), "").map_err(|e| format!("cannot record mask state: {e}"))?;
+    Ok(())
 }
 
-fn unmask_unit(root: &str, unit: &str) {
+fn unmask_unit(root: &str, unit: &str) -> Result<(), String> {
     let masked_dir = get_masked_state_dir(root);
     let mask_state = masked_dir.join(unit);
     let _ = fs::remove_file(&mask_state);
 
     let etc_dir = get_etc_systemd(root);
     let link_target = etc_dir.join(unit);
-    if let Ok(dest) = fs::read_link(&link_target) {
-        if dest == Path::new("/dev/null") {
-            let _ = fs::remove_file(&link_target);
+    match fs::read_link(&link_target) {
+        Ok(dest) if dest == Path::new("/dev/null") => {
+            fs::remove_file(&link_target)
+                .map_err(|e| format!("cannot remove {}: {e}", link_target.display()))?;
+            Ok(())
         }
+        Ok(_) => Err(format!("{unit} is not masked")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(format!("{unit} is not masked"))
+        }
+        Err(e) => Err(format!("cannot inspect {}: {e}", link_target.display())),
     }
 }
 
@@ -311,7 +395,7 @@ mod tests {
         ).unwrap();
 
         let root_str = temp.to_str().unwrap();
-        enable_unit(root_str, "test.service", false);
+        enable_unit(root_str, "test.service", false).unwrap();
 
         let wants_link = temp.join("etc/systemd/system/multi-user.target.wants/test.service");
         assert!(
@@ -360,7 +444,7 @@ mod tests {
 
         let root_str = temp.to_str().unwrap();
         // Invoke enable with "bare" instead of "bare.service"
-        enable_unit(root_str, "bare", false);
+        enable_unit(root_str, "bare", false).unwrap();
 
         let wants_link = temp.join("etc/systemd/system/multi-user.target.wants/bare");
         assert!(
@@ -369,5 +453,63 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_enable_missing_unit_is_an_error() {
+        // S2: a missing unit must not exit 0 doing nothing.
+        let temp = std::env::temp_dir().join(format!("test_dsh_missing_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp);
+        fs::create_dir_all(&temp).unwrap();
+        let root_str = temp.to_str().unwrap();
+        let err = enable_unit(root_str, "no-such.service", false).unwrap_err();
+        assert!(err.contains("does not exist"), "{err}");
+        // No state file may be recorded for a unit that was never enabled.
+        assert!(
+            fs::read_dir(temp.join("var/lib/systemd/deb-systemd-helper-enabled"))
+                .map(|mut d| d.next().is_none())
+                .unwrap_or(true)
+        );
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_mask_directory_fails_without_state() {
+        // S12: masking a directory must fail and must not record mask state.
+        let temp = std::env::temp_dir().join(format!("test_dsh_maskdir_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp);
+        let etc_dir = temp.join("etc/systemd/system");
+        fs::create_dir_all(etc_dir.join("dirunit.service")).unwrap();
+        let root_str = temp.to_str().unwrap();
+        let err = mask_unit(root_str, "dirunit.service").unwrap_err();
+        assert!(err.contains("directory"), "{err}");
+        assert!(!temp
+            .join("var/lib/systemd/deb-systemd-helper-masked/dirunit.service")
+            .exists());
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_unmask_unmasked_is_an_error() {
+        // S12: unmasking a never-masked unit must not silently succeed.
+        let temp =
+            std::env::temp_dir().join(format!("test_dsh_unmask_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp);
+        fs::create_dir_all(&temp).unwrap();
+        let root_str = temp.to_str().unwrap();
+        assert!(unmask_unit(root_str, "plain.service").is_err());
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_validate_unit_name_rejects_escape() {
+        // S14: a --root tree must not be escapable through the unit name.
+        assert!(validate_unit_name("foo.service").is_ok());
+        assert!(validate_unit_name("foo.target").is_ok());
+        assert!(validate_unit_name("../../tmp/trav.service").is_err());
+        assert!(validate_unit_name("/abs.service").is_err());
+        assert!(validate_unit_name("..").is_err());
+        assert!(validate_unit_name("foo").is_err());
+        assert!(validate_unit_name("foo.txt").is_err());
     }
 }

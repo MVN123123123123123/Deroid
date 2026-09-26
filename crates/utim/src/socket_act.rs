@@ -117,22 +117,23 @@ impl SocketActivationManager {
     }
 
     /// Drop all sockets belonging to units no longer loaded (daemon-reload
-    /// pruning). Returns the closed FDs so the event loop can epoll-DEL them.
+    /// pruning). Returns the removed FDs WITHOUT closing: the caller must
+    /// EPOLL_CTL_DEL first, then close, otherwise the DEL operates on a
+    /// recycled fd number (P8/B8).
     pub fn prune_removed_units(
         &mut self,
         live_units: &std::collections::HashSet<String>,
     ) -> Vec<RawFd> {
-        let mut closed = Vec::new();
+        let mut removed = Vec::new();
         self.active_sockets.retain(|s| {
             if live_units.contains(&s.name) {
                 true
             } else {
-                closed.push(s.raw_fd);
-                unsafe { libc::close(s.raw_fd) };
+                removed.push(s.raw_fd);
                 false
             }
         });
-        closed
+        removed
     }
 }
 

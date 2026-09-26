@@ -141,15 +141,20 @@ impl AudioRouter {
         self.state.current_output = output;
         self.state.current_input = input;
 
-        hal.active_output_devices = vec![output];
-        hal.active_input_devices = vec![input];
+        // H29: fixed endpoint arrays; no vec![] on this event-driven path.
+        hal.active_output_devices[0] = output;
+        hal.num_active_outputs = 1;
+        hal.active_input_devices[0] = input;
+        hal.num_active_inputs = 1;
 
         // Apply route to all active streams in HAL
         for stream in hal.streams.iter_mut() {
             if stream.is_input {
-                stream.input_devices = vec![input];
+                stream.input_devices[0] = input;
+                stream.num_input_devices = 1;
             } else {
-                stream.output_devices = vec![output];
+                stream.output_devices[0] = output;
+                stream.num_output_devices = 1;
             }
         }
 

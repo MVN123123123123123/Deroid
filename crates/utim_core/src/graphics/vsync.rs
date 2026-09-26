@@ -161,13 +161,14 @@ impl VsyncController {
 
     /// Predict next VSYNC pulse given a current monotonic timestamp.
     pub fn next_vsync_timestamp(&self, now_ns: u64) -> u64 {
+        let period = self.config.period_ns.max(1);
         if self.last_vsync_ns == 0 || now_ns <= self.last_vsync_ns {
-            now_ns + self.config.period_ns
-        } else {
-            let elapsed = now_ns - self.last_vsync_ns;
-            let count = (elapsed / self.config.period_ns) + 1;
-            self.last_vsync_ns + (count * self.config.period_ns)
+            return now_ns.saturating_add(period);
         }
+        let elapsed = now_ns - self.last_vsync_ns;
+        let count = elapsed / period + 1;
+        self.last_vsync_ns
+            .saturating_add(count.saturating_mul(period))
     }
 }
 
@@ -244,7 +245,23 @@ impl VsyncPresentationValidator {
             if jitter > self.max_jitter_ns {
                 self.max_jitter_ns = jitter;
             }
-            self.total_jitter_ns += jitter;
+            self.total_jitter_ns = self.total_jitter_ns.saturating_add(jitter);
+
+            // A frame that arrives more than half a period from its slot was
+            // missed or double-presented; that is a missed vsync, not jitter.
+            // `MissedVsync` exists precisely for this case.
+            if jitter > expected / 2 {
+                return Err(VsyncError::MissedVsync {
+                    expected_ns: self.last_present_ns.saturating_add(expected),
+                    actual_ns: present_timestamp_ns,
+                    delta_ns: (present_timestamp_ns as i128)
+                        .saturating_sub(
+                            (self.last_present_ns.saturating_add(expected)) as i128,
+                        )
+                        .clamp(i64::MIN as i128, i64::MAX as i128)
+                        as i64,
+                });
+            }
         }
 
         self.last_present_ns = present_timestamp_ns;

@@ -1,6 +1,12 @@
 //! Android Radio Interface Layer (RIL) Client & Protocol Framing.
-//! Communicates with the vendor `rild` socket (/dev/socket/rild, /dev/socket/rild2)
-//! or AIDL IRadio HAL interface.
+//!
+//! H3 (transport disclosure): this module performs no socket I/O — there is
+//! no fd, no `connect(2)`, no read/write, no poll, no reconnect here.
+//! `RilClient` owns the framing (`serialize_*`), the 4-byte big-endian
+//! length-prefix parsing with a hard [`RilPacket::MAX_RIL_FRAME`] ceiling,
+//! and the bounded serial bookkeeping (`MAX_PENDING` + [`RilClient::evict_before`]
+//! deadline eviction). The caller owns the `/dev/socket/rild` transport and
+//! must drive `parse`/`create_request`/`handle_response` from its event loop.
 //! Adheres strictly to GEMINI.md: zero-copy packet parsing, bounded buffers,
 //! and minimal allocations.
 
@@ -60,6 +66,9 @@ pub const RESPONSE_UNSOLICITED: u32 = 1;
 pub const RIL_E_SUCCESS: u32 = 0;
 
 impl RilPacket {
+    /// Hard ceiling on a single RIL frame. Android's largest standard RIL
+    /// payload is < 4 KiB; 64 KiB bounds a malicious length prefix.
+    pub const MAX_RIL_FRAME: usize = 64 * 1024;
     /// Serialize a RIL request packet with a 4-byte big-endian length prefix
     pub fn serialize_request(serial: u32, request_id: u32, payload: &[u8]) -> Vec<u8> {
         let body_len = 8 + payload.len(); // request_id (4) + serial (4) + payload
@@ -100,6 +109,10 @@ impl RilPacket {
             return Ok(None);
         }
         let total_len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        // H3b: attacker-controlled length must be bounded.
+        if total_len > Self::MAX_RIL_FRAME {
+            return Err("RIL frame exceeds MAX_RIL_FRAME");
+        }
         if buf.len() < 4 + total_len {
             return Ok(None);
         }
@@ -151,7 +164,14 @@ impl RilPacket {
     }
 }
 
-/// Client handle for communicating with RILD
+/// Client handle for communicating with RILD.
+///
+/// Transport-less by design (see module docs): `socket_path` records which
+/// vendor socket this client is bound to, but opening/polling it is the
+/// caller's job. Outstanding requests are capped at [`Self::MAX_PENDING`]
+/// (oldest evicted first) and pruned by serial horizon via
+/// [`Self::evict_before`]; a lost response therefore cannot leak an entry
+/// per request for the life of the process.
 pub struct RilClient {
     pub slot_index: u32,
     pub socket_path: String,
@@ -161,6 +181,8 @@ pub struct RilClient {
 }
 
 impl RilClient {
+    /// Cap on outstanding RIL requests; oldest evicted on overflow.
+    pub const MAX_PENDING: usize = 64;
     pub fn new(slot_index: u32) -> Self {
         let socket_path = if slot_index == 0 {
             "/dev/socket/rild".to_string()
@@ -189,9 +211,20 @@ impl RilClient {
     /// Formats a request packet and tracks the serial token
     pub fn create_request(&mut self, request_id: u32, payload: &[u8]) -> (u32, Vec<u8>) {
         let serial = self.next_serial();
+        // H3c: bound pending_requests; evict oldest so a lost response
+        // cannot leak an entry per request for the life of PID 1.
+        if self.pending_requests.len() >= Self::MAX_PENDING {
+            self.pending_requests.remove(0);
+        }
         self.pending_requests.push((serial, request_id));
         let packet = RilPacket::serialize_request(serial, request_id, payload);
         (serial, packet)
+    }
+
+    /// Drop entries older than the given serial horizon (deadline eviction
+    /// helper for the event loop; serials increase monotonically).
+    pub fn evict_before(&mut self, min_serial: u32) {
+        self.pending_requests.retain(|(s, _)| *s >= min_serial);
     }
 
     /// Process a response and remove corresponding pending serial

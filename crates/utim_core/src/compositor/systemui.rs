@@ -4,7 +4,7 @@
 //! and org.freedesktop.Notifications D-Bus compliant notification center.
 
 use std::fs;
-use std::path::Path;
+use std::io::{self, Write};
 use std::time::Instant;
 
 use crate::compositor::launcher::{SpringConfig, SpringOscillator};
@@ -125,6 +125,10 @@ pub struct SystemUiShade {
 }
 
 impl SystemUiShade {
+    /// Hard cap: any client on org.freedesktop.Notifications could otherwise
+    /// grow the list (and its O(n) scans) without limit.
+    pub const MAX_NOTIFICATIONS: usize = 64;
+
     pub fn new(display_width: f32, display_height: f32) -> Self {
         let tiles = vec![
             QuickTile {
@@ -215,9 +219,10 @@ impl SystemUiShade {
         let clamped = progress.clamp(0.0, 1.0);
         self.pull_spring.current = clamped;
         self.pull_spring.target = clamped;
+        self.pull_spring.velocity = 0.0; // finger took over: drop stale velocity
     }
 
-    pub fn toggle_tile(&mut self, kind: QuickTileKind) -> bool {
+    pub fn toggle_tile(&mut self, kind: QuickTileKind) -> io::Result<bool> {
         let mut activated = false;
         let mut found = false;
         if let Some(tile) = self.tiles.iter_mut().find(|t| t.kind == kind) {
@@ -232,39 +237,78 @@ impl SystemUiShade {
         }
         if found {
             if kind == QuickTileKind::Torch {
-                self.sync_torch_sysfs(activated);
+                // A failed LED write must not masquerade as a working toggle.
+                self.sync_torch_sysfs(activated)?;
             }
-            return activated;
+            return Ok(activated);
         }
-        false
+        Ok(false)
     }
 
-    pub fn set_brightness(&mut self, percent: u8) {
+    pub fn set_brightness(&mut self, percent: u8) -> io::Result<()> {
         self.brightness_percent = percent.min(100);
-        self.sync_brightness_sysfs(self.brightness_percent);
+        self.sync_brightness_sysfs(self.brightness_percent)
     }
 
     pub fn set_volume(&mut self, percent: u8) {
         self.volume_percent = percent.min(100);
     }
 
-    fn sync_torch_sysfs(&self, active: bool) {
-        let path = Path::new(&self.torch_sysfs_path);
-        if path.exists() {
-            let val = if active { "255\n" } else { "0\n" };
-            let _ = fs::write(path, val);
-        }
+    fn sync_torch_sysfs(&self, active: bool) -> io::Result<()> {
+        let val: &[u8] = if active { b"255\n" } else { b"0\n" };
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&self.torch_sysfs_path)?;
+        f.write_all(val)
     }
 
-    fn sync_brightness_sysfs(&self, percent: u8) {
-        let path = Path::new(&self.backlight_sysfs_path);
-        if path.exists() {
-            let val = format!("{}\n", (percent as u32 * 255) / 100);
-            let _ = fs::write(path, val);
+    fn sync_brightness_sysfs(&self, percent: u8) -> io::Result<()> {
+        // Stack-formatted "0..255\n": no format! heap allocation on the
+        // per-drag-frame brightness path.
+        let v = (percent.min(100) as u32 * 255) / 100;
+        let mut buf = [0u8; 5];
+        let mut digits = [0u8; 3];
+        let mut n = 0usize;
+        if v == 0 {
+            digits[0] = b'0';
+            n = 1;
+        } else {
+            let mut x = v;
+            while x > 0 {
+                digits[n] = b'0' + (x % 10) as u8;
+                n += 1;
+                x /= 10;
+            }
         }
+        let mut len = 0usize;
+        for i in (0..n).rev() {
+            buf[len] = digits[i];
+            len += 1;
+        }
+        buf[len] = b'\n';
+        len += 1;
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&self.backlight_sysfs_path)?;
+        f.write_all(&buf[..len])
     }
 
     // --- org.freedesktop.Notifications implementation ---
+
+    /// Allocate the next notification id. Never returns 0 (the
+    /// `replaces_id == 0` "no replace" sentinel) and never panics at
+    /// `u32::MAX`: it wraps to 1 instead of overflowing.
+    fn alloc_notification_id(&mut self) -> u32 {
+        let id = if self.next_notification_id == 0 {
+            1
+        } else {
+            self.next_notification_id
+        };
+        self.next_notification_id = id.checked_add(1).filter(|v| *v != 0).unwrap_or(1);
+        id
+    }
 
     pub fn notify(
         &mut self,
@@ -278,9 +322,7 @@ impl SystemUiShade {
         let id = if replaces_id != 0 && self.notifications.iter().any(|n| n.id == replaces_id) {
             replaces_id
         } else {
-            let new_id = self.next_notification_id;
-            self.next_notification_id += 1;
-            new_id
+            self.alloc_notification_id()
         };
 
         let card = NotificationCard {
@@ -297,6 +339,9 @@ impl SystemUiShade {
         if let Some(pos) = self.notifications.iter().position(|n| n.id == id) {
             self.notifications[pos] = card;
         } else {
+            if self.notifications.len() >= Self::MAX_NOTIFICATIONS {
+                self.notifications.pop(); // evict the oldest
+            }
             self.notifications.insert(0, card);
         }
 
@@ -354,6 +399,13 @@ mod tests {
     #[test]
     fn test_quick_settings_tile_toggles() {
         let mut shade = SystemUiShade::new(1080.0, 2400.0);
+        // Point sysfs at temp files: toggles now report real I/O failures.
+        let dir = std::env::temp_dir().join(format!("utim-sysui-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        shade.torch_sysfs_path = dir.join("torch").to_string_lossy().into_owned();
+        shade.backlight_sysfs_path = dir.join("backlight").to_string_lossy().into_owned();
+        std::fs::write(&shade.torch_sysfs_path, b"0\n").unwrap();
+        std::fs::write(&shade.backlight_sysfs_path, b"0\n").unwrap();
         assert!(!shade.is_open());
 
         shade.open();
@@ -362,7 +414,7 @@ mod tests {
         }
         assert!(shade.is_open());
 
-        let torch_state = shade.toggle_tile(QuickTileKind::Torch);
+        let torch_state = shade.toggle_tile(QuickTileKind::Torch).unwrap();
         assert!(torch_state);
         let torch_tile = shade
             .tiles
@@ -370,9 +422,54 @@ mod tests {
             .find(|t| t.kind == QuickTileKind::Torch)
             .unwrap();
         assert!(torch_tile.is_active);
+        assert_eq!(std::fs::read(&shade.torch_sysfs_path).unwrap(), b"255\n");
 
-        shade.set_brightness(90);
+        shade.set_brightness(90).unwrap();
         assert_eq!(shade.brightness_percent, 90);
+        assert_eq!(
+            std::fs::read(&shade.backlight_sysfs_path).unwrap(),
+            b"229\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_sysfs_failures_are_reported_not_masked() {
+        let mut shade = SystemUiShade::new(1080.0, 2400.0);
+        shade.torch_sysfs_path = "/tmp/definitely-absent-utim-torch".into();
+        shade.backlight_sysfs_path = "/tmp/definitely-absent-utim-backlight".into();
+        assert!(shade.toggle_tile(QuickTileKind::Torch).is_err());
+        assert!(shade.set_brightness(100).is_err());
+        // Non-torch tiles touch no sysfs: still infallible-OK.
+        assert!(shade.toggle_tile(QuickTileKind::Bluetooth).is_ok());
+    }
+
+    #[test]
+    fn test_notification_cap_and_id_wrap() {
+        let mut shade = SystemUiShade::new(1080.0, 2400.0);
+        for i in 0..70 {
+            shade.notify(
+                format!("App{}", i),
+                0,
+                "icon".into(),
+                "S".into(),
+                "B".into(),
+                vec![],
+            );
+        }
+        assert_eq!(shade.notifications.len(), SystemUiShade::MAX_NOTIFICATIONS);
+        assert_eq!(
+            shade.status_bar.notification_count,
+            SystemUiShade::MAX_NOTIFICATIONS
+        );
+
+        // Id wrap: u32::MAX advances to 1, never 0 or panic.
+        shade.next_notification_id = u32::MAX;
+        let id = shade.notify("W".into(), 0, "i".into(), "S".into(), "B".into(), vec![]);
+        assert_eq!(id, u32::MAX);
+        assert_eq!(shade.next_notification_id, 1);
+        let id2 = shade.notify("W".into(), 0, "i".into(), "S".into(), "B".into(), vec![]);
+        assert_eq!(id2, 1);
     }
 
     #[test]

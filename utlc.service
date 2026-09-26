@@ -1,11 +1,10 @@
 [Unit]
 Description=Universal Treble Launcher and Compositor (UTLC)
 Documentation=man:utlc(1)
-After=android-hal-composer.service seatd.service
-Wants=android-hal-composer.service seatd.service
 
 [Service]
 Type=notify
+ExecStartPre=-/usr/bin/install -d -m 0700 /run/user/0
 ExecStart=/usr/bin/utlc --daemon
 Restart=always
 RestartSec=1
@@ -13,8 +12,6 @@ WatchdogSec=30
 OOMScoreAdjust=-900
 LimitNOFILE=65536
 LimitMEMLOCK=infinity
-RuntimeDirectory=user/0
-RuntimeDirectoryMode=0700
 Environment=WAYLAND_DISPLAY=wayland-0
 Environment=XDG_RUNTIME_DIR=/run/user/0
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -22,8 +19,8 @@ Environment=LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu:/lib/aarch64-linux-gnu:/u
 Environment=HOME=/root
 Environment=USER=root
 Environment=SHELL=/bin/bash
-StandardOutput=journal
-StandardError=journal
+StandardOutput=null
+StandardError=null
 
 [Install]
 WantedBy=graphical.target

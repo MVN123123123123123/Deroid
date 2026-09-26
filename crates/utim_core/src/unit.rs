@@ -329,23 +329,24 @@ pub fn parse_words(s: &str) -> Vec<String> {
 /// Parse a time duration from systemd format.
 /// Supports us/µs, ms, s/sec, min, h, d/day, w/week, bare seconds and
 /// fractional values ("1.5s"). "infinity"/"inf" map to Duration::MAX
-/// (never-expires); "0"/"no"/"" map to ZERO. Unparseable input is ZERO.
-pub fn parse_duration(s: &str) -> Duration {
+/// (never-expires); "0"/"no"/"" map to ZERO.
+/// Unparseable input returns None (see try_parse_duration); the legacy
+/// parse_duration logs a warning and falls back to 100ms so a typo like
+/// RestartSec=1ss cannot silently become the C4 fork-bomb ZERO.
+pub fn try_parse_duration(s: &str) -> Option<Duration> {
     let trimmed = s.trim();
-    if trimmed.is_empty()
-        || trimmed == "0"
-        || trimmed.eq_ignore_ascii_case("no")
-        || trimmed.eq_ignore_ascii_case("infinity")
-        || trimmed.eq_ignore_ascii_case("inf")
-    {
-        return Duration::ZERO;
+    if trimmed.is_empty() || trimmed == "0" || trimmed.eq_ignore_ascii_case("no") {
+        return Some(Duration::ZERO);
+    }
+    if trimmed.eq_ignore_ascii_case("infinity") || trimmed.eq_ignore_ascii_case("inf") {
+        return Some(Duration::MAX);
     }
 
     // Longest suffixes first so "ms"/"min" win over a bare trailing 's'/'m'.
     if let Some(val) = trimmed.strip_suffix("ms") {
         if let Ok(v) = val.trim().parse::<f64>() {
             if v >= 0.0 {
-                return Duration::from_secs_f64(v / 1000.0);
+                return Some(Duration::from_secs_f64(v / 1000.0));
             }
         }
     } else if let Some(val) = trimmed
@@ -355,13 +356,13 @@ pub fn parse_duration(s: &str) -> Duration {
     {
         if let Ok(v) = val.trim().parse::<f64>() {
             if v >= 0.0 {
-                return Duration::from_secs_f64(v / 1_000_000.0);
+                return Some(Duration::from_secs_f64(v / 1_000_000.0));
             }
         }
     } else if let Some(val) = trimmed.strip_suffix("min") {
         if let Ok(v) = val.trim().parse::<f64>() {
             if v >= 0.0 {
-                return Duration::from_secs_f64(v * 60.0);
+                return Some(Duration::from_secs_f64(v * 60.0));
             }
         }
         // "min" must precede the week/day arms only in suffix length; the
@@ -374,7 +375,7 @@ pub fn parse_duration(s: &str) -> Duration {
     {
         if let Ok(v) = val.trim().parse::<f64>() {
             if v >= 0.0 {
-                return Duration::from_secs_f64(v * 7.0 * 86400.0);
+                return Some(Duration::from_secs_f64(v * 7.0 * 86400.0));
             }
         }
     } else if let Some(val) = trimmed
@@ -384,7 +385,7 @@ pub fn parse_duration(s: &str) -> Duration {
     {
         if let Ok(v) = val.trim().parse::<f64>() {
             if v >= 0.0 {
-                return Duration::from_secs_f64(v * 86400.0);
+                return Some(Duration::from_secs_f64(v * 86400.0));
             }
         }
     } else if let Some(val) = trimmed
@@ -396,22 +397,35 @@ pub fn parse_duration(s: &str) -> Duration {
     {
         if let Ok(v) = val.trim().parse::<f64>() {
             if v >= 0.0 {
-                return Duration::from_secs_f64(v);
+                return Some(Duration::from_secs_f64(v));
             }
         }
     } else if let Some(val) = trimmed.strip_suffix('h') {
         if let Ok(v) = val.trim().parse::<f64>() {
             if v >= 0.0 {
-                return Duration::from_secs_f64(v * 3600.0);
+                return Some(Duration::from_secs_f64(v * 3600.0));
             }
         }
     } else if let Ok(v) = trimmed.parse::<f64>() {
         if v >= 0.0 {
-            return Duration::from_secs_f64(v);
+            return Some(Duration::from_secs_f64(v));
         }
     }
 
-    Duration::ZERO
+    None
+}
+
+pub fn parse_duration(s: &str) -> Duration {
+    match try_parse_duration(s) {
+        Some(d) => d,
+        None => {
+            eprintln!(
+                "[UTIM] Warning: invalid duration {:?}; using 100ms default",
+                s
+            );
+            Duration::from_millis(100)
+        }
+    }
 }
 
 /// Parse a raw systemd unit content into a `SystemdUnit`.
@@ -437,6 +451,11 @@ pub fn parse_unit(name: &str, path: &Path, content: &str) -> SystemdUnit {
             raw_lines.push(acc.clone());
             acc.clear();
         }
+    }
+    // P13: flush a trailing backslash-continued line so the final directive
+    // is not silently dropped.
+    if !acc.trim().is_empty() {
+        raw_lines.push(acc.clone());
     }
 
     for line in raw_lines {

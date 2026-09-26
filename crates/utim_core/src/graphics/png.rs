@@ -33,6 +33,12 @@ impl RgbaImage {
         if longest <= max_edge || self.width == 0 || self.height == 0 {
             return self;
         }
+        // A source block of 257x257 already saturates a u32 colour accumulator
+        // (65025 * 257 * 257 > u32::MAX), so the sums must be u64.
+        debug_assert!(
+            longest / max_edge.max(1) <= 257,
+            "block too large; widen the accumulator"
+        );
         let sw = self.width as usize;
         let sh = self.height as usize;
         let dw = ((self.width as u64 * max_edge as u64) / longest as u64).max(1) as usize;
@@ -45,26 +51,27 @@ impl RgbaImage {
             for dx in 0..dw {
                 let sx0 = dx * sw / dw;
                 let sx1 = ((dx + 1) * sw / dw).max(sx0 + 1);
-                let mut sr = 0u32;
-                let mut sg = 0u32;
-                let mut sb = 0u32;
-                let mut sa = 0u32;
+                let mut sr = 0u64;
+                let mut sg = 0u64;
+                let mut sb = 0u64;
+                let mut sa = 0u64;
                 for sy in sy0..sy1 {
                     let mut p = (sy * sw + sx0) * 4;
                     for _ in sx0..sx1 {
-                        let a = self.pixels[p + 3] as u32;
-                        sr += self.pixels[p] as u32 * a;
-                        sg += self.pixels[p + 1] as u32 * a;
-                        sb += self.pixels[p + 2] as u32 * a;
+                        let a = self.pixels[p + 3] as u64;
+                        sr += self.pixels[p] as u64 * a;
+                        sg += self.pixels[p + 1] as u64 * a;
+                        sb += self.pixels[p + 2] as u64 * a;
                         sa += a;
                         p += 4;
                     }
                 }
-                let n = ((sx1 - sx0) * (sy1 - sy0)) as u32;
+                let n = ((sx1 - sx0) * (sy1 - sy0)) as u64;
                 let o = (dy * dw + dx) * 4;
                 // Round-to-nearest unpremultiply; a fully transparent block
                 // (division by zero) falls back to zero instead of trapping.
-                let unpremul = |v: u32, d: u32| -> u8 {
+                // d >= 1 on every real block; checked ops keep it total.
+                let unpremul = |v: u64, d: u64| -> u8 {
                     v.checked_add(d / 2)
                         .and_then(|num| num.checked_div(d))
                         .unwrap_or(0) as u8
@@ -490,24 +497,53 @@ fn convert_pass(
 
 // --- CRC-32 (chunk integrity) and Adler-32 (zlib trailer) ---
 
+/// 16-entry nibble table: 64 bytes of .rodata, 2 lookups per byte instead of
+/// 8 shift/xor/mask rounds.
+const fn crc_nibble() -> [u32; 16] {
+    let mut t = [0u32; 16];
+    let mut i = 0;
+    while i < 16 {
+        let mut c = i as u32;
+        let mut k = 0;
+        while k < 4 {
+            c = if c & 1 != 0 {
+                0xEDB8_8320 ^ (c >> 1)
+            } else {
+                c >> 1
+            };
+            k += 1;
+        }
+        t[i] = c;
+        i += 1;
+    }
+    t
+}
+static CRC_NIB: [u32; 16] = crc_nibble();
+
 fn crc32(data: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;
     for &b in data {
         crc ^= b as u32;
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
-        }
+        crc = (crc >> 4) ^ CRC_NIB[(crc & 0xF) as usize];
+        crc = (crc >> 4) ^ CRC_NIB[(crc & 0xF) as usize];
     }
     !crc
 }
 
+/// NMAX = 5552 is the largest n for which 255*n*(n+1)/2 + 1 < 2^32, so `a`
+/// and `b` cannot overflow u32 between reductions and the `%` runs once per
+/// 5552-byte chunk instead of twice per byte.
 fn adler32(data: &[u8]) -> u32 {
-    let mut a = 1u32;
-    let mut b = 0u32;
-    for &byte in data {
-        a = (a + byte as u32) % 65_521;
-        b = (b + a) % 65_521;
+    const NMAX: usize = 5552;
+    const MOD: u32 = 65_521;
+    let (mut a, mut b) = (1u32, 0u32);
+    for chunk in data.chunks(NMAX) {
+        for &byte in chunk {
+            a += byte as u32;
+            b += a;
+        }
+        a %= MOD;
+        b %= MOD;
     }
     (b << 16) | a
 }

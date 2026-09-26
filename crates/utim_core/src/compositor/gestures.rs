@@ -6,12 +6,38 @@
 
 use std::time::{Duration, Instant};
 
-/// Standard Android animation curves
+/// Android FastOutSlowInInterpolator == cubicTo(0.4, 0.0, 0.2, 1.0).
+/// Solved by bisection on x(t); 20 iterations is < 0.01 px on a 1080 px screen.
+pub fn fast_out_slow_in(t: f32) -> f32 {
+    let x = t.clamp(0.0, 1.0);
+    if x <= 0.0 || x >= 1.0 {
+        return x;
+    }
+    let (mut lo, mut hi) = (0.0f32, 1.0f32);
+    for _ in 0..20 {
+        let m = (lo + hi) * 0.5;
+        let w = 1.0 - m;
+        let bx = 3.0 * w * w * m * 0.4 + 3.0 * w * m * m * 0.2 + m * m * m;
+        if bx < x {
+            lo = m;
+        } else {
+            hi = m;
+        }
+    }
+    let m = (lo + hi) * 0.5;
+    let w = 1.0 - m;
+    3.0 * w * m * m + m * m * m // y with c1y = 0, c2y = 1
+}
+
+/// Deprecated: a cubic polynomial (`1 - (1-t)^3`), not the bezier it
+/// documented, and off the real FastOutSlowIn by up to +0.34. Kept for
+/// compatibility; use [`fast_out_slow_in`] instead.
+#[deprecated(
+    since = "0.1.0",
+    note = "not a true cubic bezier; use fast_out_slow_in instead"
+)]
 pub fn cubic_bezier_ease_out(t: f32) -> f32 {
-    // Android FastOutSlowIn / EaseOut approximation: (0.2, 0.0, 0.0, 1.0)
-    let t = t.clamp(0.0, 1.0);
-    // Cubic polynomial ease-out: 1 - (1 - t)^3
-    1.0 - (1.0 - t).powi(3)
+    fast_out_slow_in(t)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,14 +106,17 @@ pub enum GestureAction {
 enum GestureState {
     Idle,
     TrackingBottom {
+        owner_id: i32,
         start_x: f32,
         start_y: f32,
         start_time: Instant,
         current_x: f32,
         current_y: f32,
         held_recents: bool,
+        last_scrub_x: f32,
     },
     TrackingEdge {
+        owner_id: i32,
         side: EdgeSide,
         start_x: f32,
         start_y: f32,
@@ -95,17 +124,32 @@ enum GestureState {
         current_y: f32,
     },
     TrackingTop {
+        owner_id: i32,
         start_x: f32,
         start_y: f32,
         current_x: f32,
         current_y: f32,
     },
     TrackingCenter {
+        owner_id: i32,
         start_x: f32,
         start_y: f32,
         current_x: f32,
         current_y: f32,
     },
+}
+
+impl GestureState {
+    /// Pointer that owns the in-flight gesture, if any.
+    fn owner_id(&self) -> Option<i32> {
+        match self {
+            GestureState::Idle => None,
+            GestureState::TrackingBottom { owner_id, .. }
+            | GestureState::TrackingEdge { owner_id, .. }
+            | GestureState::TrackingTop { owner_id, .. }
+            | GestureState::TrackingCenter { owner_id, .. } => Some(*owner_id),
+        }
+    }
 }
 
 /// Gesture Engine Configuration
@@ -152,14 +196,16 @@ impl GestureEngine {
     }
 
     pub fn classify_edge(&self, x: f32, y: f32) -> EdgeSide {
-        if y >= self.display_height - self.config.bottom_nav_height {
-            EdgeSide::Bottom
-        } else if y <= self.config.top_bar_height {
-            EdgeSide::Top
-        } else if x <= self.config.edge_zone_width {
+        // Edges win in the corners (Android's rule: corner beats bar), so a
+        // back gesture stays reachable from the bottom/top corners.
+        if x <= self.config.edge_zone_width {
             EdgeSide::Left
         } else if x >= self.display_width - self.config.edge_zone_width {
             EdgeSide::Right
+        } else if y >= self.display_height - self.config.bottom_nav_height {
+            EdgeSide::Bottom
+        } else if y <= self.config.top_bar_height {
+            EdgeSide::Top
         } else {
             EdgeSide::Center
         }
@@ -167,23 +213,44 @@ impl GestureEngine {
 
     /// Process raw touch event with sub-8ms latency response
     pub fn process_touch(&mut self, event: &RawTouchEvent) -> GestureAction {
+        // Single-pointer engine: Move/Up from a foreign pointer are ignored,
+        // and a second finger's Down never steals the in-flight gesture.
+        match (&self.state, event.phase) {
+            (GestureState::Idle, _) | (_, TouchPhase::Cancel) => {}
+            (_, TouchPhase::Down) => {
+                if let Some(owner) = self.state.owner_id() {
+                    if owner != event.touch_id {
+                        return GestureAction::None;
+                    }
+                }
+            }
+            (state, TouchPhase::Move | TouchPhase::Up)
+                if state.owner_id() != Some(event.touch_id) =>
+            {
+                return GestureAction::None; // not our finger
+            }
+            _ => {}
+        }
         match event.phase {
             TouchPhase::Down => {
                 let edge = self.classify_edge(event.x, event.y);
                 match edge {
                     EdgeSide::Bottom => {
                         self.state = GestureState::TrackingBottom {
+                            owner_id: event.touch_id,
                             start_x: event.x,
                             start_y: event.y,
                             start_time: event.timestamp,
                             current_x: event.x,
                             current_y: event.y,
                             held_recents: false,
+                            last_scrub_x: event.x,
                         };
                         GestureAction::None
                     }
                     EdgeSide::Left | EdgeSide::Right => {
                         self.state = GestureState::TrackingEdge {
+                            owner_id: event.touch_id,
                             side: edge,
                             start_x: event.x,
                             start_y: event.y,
@@ -194,6 +261,7 @@ impl GestureEngine {
                     }
                     EdgeSide::Top => {
                         self.state = GestureState::TrackingTop {
+                            owner_id: event.touch_id,
                             start_x: event.x,
                             start_y: event.y,
                             current_x: event.x,
@@ -203,6 +271,7 @@ impl GestureEngine {
                     }
                     EdgeSide::Center => {
                         self.state = GestureState::TrackingCenter {
+                            owner_id: event.touch_id,
                             start_x: event.x,
                             start_y: event.y,
                             current_x: event.x,
@@ -222,21 +291,37 @@ impl GestureEngine {
                         current_x,
                         current_y,
                         held_recents,
+                        last_scrub_x,
+                        ..
                     } => {
                         *current_x = event.x;
                         *current_y = event.y;
 
                         let dy = *start_y - event.y; // positive upward
                         let dx = event.x - *start_x;
-                        let elapsed = event.timestamp.duration_since(*start_time);
+                        let elapsed = event.timestamp.saturating_duration_since(*start_time);
 
-                        // Horizontal scrub along bottom bar
+                        // Horizontal scrub along bottom bar: one app shift per
+                        // scrub_threshold_x of additional travel (re-armed).
                         if dy.abs() < 30.0 && dx.abs() >= self.config.scrub_threshold_x {
-                            let shift = if dx > 0.0 { 1 } else { -1 };
-                            return GestureAction::BottomBarScrub {
-                                delta_x: dx,
-                                app_shift: shift,
-                            };
+                            let steps = (dx.abs() / self.config.scrub_threshold_x) as i32;
+                            let last = ((*last_scrub_x - *start_x).abs()
+                                / self.config.scrub_threshold_x)
+                                as i32;
+                            if steps > last {
+                                *last_scrub_x = event.x;
+                                let shift = if dx > 0.0 { 1 } else { -1 };
+                                return GestureAction::BottomBarScrub {
+                                    delta_x: dx,
+                                    app_shift: shift,
+                                };
+                            }
+                            return GestureAction::None;
+                        }
+
+                        // Swiping back down to the nav bar cancels Recents.
+                        if dy < self.config.home_threshold_y {
+                            *held_recents = false;
                         }
 
                         // Check swipe up and hold for Recents
@@ -280,6 +365,10 @@ impl GestureEngine {
                             _ => 0.0,
                         };
 
+                        // Outward jitter is not a back gesture.
+                        if dx <= 0.0 {
+                            return GestureAction::None;
+                        }
                         let progress = (dx / self.config.back_threshold_x).clamp(0.0, 1.0);
                         GestureAction::Back {
                             side: *side,
@@ -311,37 +400,60 @@ impl GestureEngine {
             }
 
             TouchPhase::Up => {
-                let action = match &self.state {
+                let action = match &mut self.state {
                     GestureState::TrackingBottom {
                         start_x,
                         start_y,
                         start_time,
                         held_recents,
+                        last_scrub_x,
                         ..
                     } => {
                         let dy = *start_y - event.y;
                         let dx = event.x - *start_x;
-                        let elapsed = event.timestamp.duration_since(*start_time);
+                        let elapsed = event.timestamp.saturating_duration_since(*start_time);
 
+                        // A still finger is a valid hold: evaluate the hold on
+                        // the release path too, not just on MOVE.
+                        if dy < self.config.home_threshold_y {
+                            *held_recents = false;
+                        }
                         if *held_recents {
                             GestureAction::Recents {
                                 progress: 1.0,
                                 trigger_haptic: false,
                             }
-                        } else if dy >= self.config.home_threshold_y
-                            && elapsed < self.config.recents_hold_time
-                        {
-                            // Quick swipe up -> Home
-                            GestureAction::Home {
-                                progress: 1.0,
-                                scale: 0.0,
-                                window_alpha: 0.0,
+                        } else if dy >= self.config.home_threshold_y {
+                            // Held long enough to have been Recents -> commit
+                            // Recents, else Home. Terminates on the same curve
+                            // the drag used (scale 0.6, alpha 0.7).
+                            if elapsed >= self.config.recents_hold_time {
+                                GestureAction::Recents {
+                                    progress: 1.0,
+                                    trigger_haptic: false,
+                                }
+                            } else {
+                                GestureAction::Home {
+                                    progress: 1.0,
+                                    scale: 0.6,
+                                    window_alpha: 0.7,
+                                }
                             }
-                        } else if dy.abs() < 30.0 && dx.abs() >= self.config.scrub_threshold_x {
-                            let shift = if dx > 0.0 { 1 } else { -1 };
-                            GestureAction::BottomBarScrub {
-                                delta_x: dx,
-                                app_shift: shift,
+                        } else if dy.abs() < 30.0 && dx.abs() >= self.config.scrub_threshold_x
+                        {
+                            // Commit only a step the MOVE path has not emitted.
+                            let steps = (dx.abs() / self.config.scrub_threshold_x) as i32;
+                            let last = ((*last_scrub_x - *start_x).abs()
+                                / self.config.scrub_threshold_x)
+                                as i32;
+                            if steps > last {
+                                let shift = if dx > 0.0 { 1 } else { -1 };
+                                GestureAction::BottomBarScrub {
+                                    delta_x: dx,
+                                    app_shift: shift,
+                                }
+                            } else {
+                                GestureAction::None
                             }
                         } else {
                             GestureAction::None
@@ -372,7 +484,9 @@ impl GestureEngine {
                         if dy >= 50.0 {
                             GestureAction::NotificationShade { progress: 1.0 }
                         } else {
-                            GestureAction::NotificationShade { progress: 0.0 }
+                            // A tap is not a drag: report nothing instead of
+                            // slamming an opening shade to 0.0.
+                            GestureAction::None
                         }
                     }
 
@@ -381,6 +495,7 @@ impl GestureEngine {
                         start_y,
                         current_x,
                         current_y,
+                        ..
                     } => {
                         let dx = *current_x - *start_x;
                         let dy = *current_y - *start_y;
@@ -413,10 +528,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_cubic_bezier_ease_out() {
-        assert_eq!(cubic_bezier_ease_out(0.0), 0.0);
-        assert_eq!(cubic_bezier_ease_out(1.0), 1.0);
-        assert!(cubic_bezier_ease_out(0.5) > 0.5); // Ease-out starts fast
+    fn test_fast_out_slow_in_matches_android_curve() {
+        assert_eq!(fast_out_slow_in(0.0), 0.0);
+        assert_eq!(fast_out_slow_in(1.0), 1.0);
+        // cubicTo(0.4, 0.0, 0.2, 1.0) reference point.
+        assert!((fast_out_slow_in(0.25) - 0.2366).abs() < 0.005);
+        // Monotone, no overshoot, no NaN.
+        let mut prev = 0.0f32;
+        let mut t = 0.0f32;
+        while t <= 1.0 {
+            let y = fast_out_slow_in(t);
+            assert!(y.is_finite() && (0.0..=1.0).contains(&y));
+            assert!(y >= prev);
+            prev = y;
+            t += 0.05;
+        }
     }
 
     #[test]

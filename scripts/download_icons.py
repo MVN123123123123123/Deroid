@@ -10,6 +10,8 @@ white emblems for adaptive squircles, and installs them to assets and rootfs.
 import os
 import shutil
 import subprocess
+import sys
+import tempfile
 import urllib.request
 
 ICONS = {
@@ -78,56 +80,80 @@ def main():
     rootfs_icons_dir = os.path.join(workspace_root, "build", "rootfs", "usr", "share", "icons", "hicolor", "64x64", "apps")
     rootfs_pixmaps_dir = os.path.join(workspace_root, "build", "rootfs", "usr", "share", "pixmaps")
 
-    os.makedirs(assets_icons_dir, exist_ok=True)
+    # NOTE: BASE_URL tracks the mutable 'develop' branch with no digest pin.
+    # A force-push or compromised upstream silently changes the baked icons.
+    # Prefer the vendored SVGs under assets/icons/svgs/; treat this fetch as
+    # best-effort and never publish a partially-rendered set.
+    print("[!] WARNING: fetching icons from unpinned 'develop' branch (no digest verification).",
+          file=sys.stderr)
+
+    if shutil.which("rsvg-convert") is None:
+        raise SystemExit("download_icons.py: rsvg-convert not found; cannot render icons")
+
     os.makedirs(assets_svgs_dir, exist_ok=True)
-    os.makedirs(rootfs_icons_dir, exist_ok=True)
-    os.makedirs(rootfs_pixmaps_dir, exist_ok=True)
 
-    tmp_dir = "/tmp/utlc_icons_tmp"
-    os.makedirs(tmp_dir, exist_ok=True)
+    tmp_dir = tempfile.mkdtemp(prefix="utlc_icons_tmp_")
+    stage_dir = tempfile.mkdtemp(prefix="utlc_icons_stage_")
+    # (staged png, [final destinations]) — published only after ALL icons render.
+    pending = []
+    # (svg cache path, svg text) — cached only after the icon renders OK.
+    cache_writes = []
+    try:
+        print("[*] Fetching and rendering Android 17 / Pixel launcher PNG icons...")
 
-    print("[*] Fetching and rendering Android 17 / Pixel launcher PNG icons...")
+        for key, (svg_filename, target_names) in ICONS.items():
+            svg_cache_path = os.path.join(assets_svgs_dir, svg_filename)
+            svg_data = None
+            fetched = None
 
-    for key, (svg_filename, target_names) in ICONS.items():
-        svg_cache_path = os.path.join(assets_svgs_dir, svg_filename)
-        svg_data = None
-
-        if os.path.exists(svg_cache_path):
-            with open(svg_cache_path, "r", encoding="utf-8") as f:
-                svg_data = f.read()
-        else:
-            url = BASE_URL + svg_filename
-            print(f"  [-] Downloading {key} ({svg_filename}) from {url}...")
-            try:
+            if os.path.exists(svg_cache_path):
+                with open(svg_cache_path, "r", encoding="utf-8") as f:
+                    svg_data = f.read()
+            else:
+                url = BASE_URL + svg_filename
+                print(f"  [-] Downloading {key} ({svg_filename}) from {url}...")
                 req = urllib.request.Request(url, headers={"User-Agent": "curl/7.68.0"})
-                with urllib.request.urlopen(req) as resp:
-                    svg_data = resp.read().decode("utf-8")
-                with open(svg_cache_path, "w", encoding="utf-8") as f:
-                    f.write(svg_data)
-            except Exception as e:
-                print(f"      [!] Failed to download {key}: {e}")
-                continue
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    fetched = resp.read().decode("utf-8")
+                svg_data = fetched
 
-        # Convert monochrome black stroke/fill to crisp white for launcher squircles
-        svg_styled = svg_data.replace('stroke="#000"', 'stroke="#FFFFFF"').replace('fill="#000"', 'fill="#FFFFFF"')
-        if "viewBox" not in svg_styled:
-            svg_styled = svg_styled.replace("<svg ", '<svg viewBox="0 0 192 192" ')
+            # Convert monochrome black stroke/fill to crisp white for launcher squircles
+            svg_styled = svg_data.replace('stroke="#000"', 'stroke="#FFFFFF"').replace('fill="#000"', 'fill="#FFFFFF"')
+            if "viewBox" not in svg_styled:
+                svg_styled = svg_styled.replace("<svg ", '<svg viewBox="0 0 192 192" ')
 
-        tmp_svg = os.path.join(tmp_dir, f"{key}.svg")
-        tmp_png = os.path.join(tmp_dir, f"{key}.png")
+            tmp_svg = os.path.join(tmp_dir, f"{key}.svg")
+            staged_png = os.path.join(stage_dir, f"{key}.png")
 
-        with open(tmp_svg, "w", encoding="utf-8") as f:
-            f.write(svg_styled)
+            with open(tmp_svg, "w", encoding="utf-8") as f:
+                f.write(svg_styled)
 
-        subprocess.run(["rsvg-convert", "-w", "64", "-h", "64", tmp_svg, "-o", tmp_png], check=True)
+            subprocess.run(["rsvg-convert", "-w", "64", "-h", "64", tmp_svg, "-o", staged_png], check=True)
 
-        for name in target_names:
-            dst_asset = os.path.join(assets_icons_dir, name)
-            dst_rootfs = os.path.join(rootfs_icons_dir, name)
-            dst_pixmap = os.path.join(rootfs_pixmaps_dir, name)
-            shutil.copyfile(tmp_png, dst_asset)
-            shutil.copyfile(tmp_png, dst_rootfs)
-            shutil.copyfile(tmp_png, dst_pixmap)
+            # Render succeeded: stage the PNG and remember the SVG cache write.
+            if fetched is not None:
+                cache_writes.append((svg_cache_path, fetched))
+            for name in target_names:
+                dst_asset = os.path.join(assets_icons_dir, name)
+                dst_rootfs = os.path.join(rootfs_icons_dir, name)
+                dst_pixmap = os.path.join(rootfs_pixmaps_dir, name)
+                pending.append((staged_png, [dst_asset, dst_rootfs, dst_pixmap]))
+
+        # All icons rendered: commit the SVG cache, then atomically publish
+        # each PNG (copy to .new + os.replace) so a failure never leaves a
+        # half-populated icon set behind.
+        for svg_cache_path, svg_text in cache_writes:
+            with open(svg_cache_path, "w", encoding="utf-8") as f:
+                f.write(svg_text)
+        for staged_png, dests in pending:
+            for dest in dests:
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                tmp_dest = dest + ".new"
+                shutil.copyfile(staged_png, tmp_dest)
+                os.replace(tmp_dest, dest)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        shutil.rmtree(stage_dir, ignore_errors=True)
 
     print(f"[+] Successfully installed Android 17 / Pixel icons to {assets_icons_dir} and rootfs!")
 

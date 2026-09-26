@@ -256,6 +256,11 @@ pub fn mount_vendor_partitions() -> io::Result<()> {
             if mounted_targets.contains(mnt) {
                 continue;
             }
+            // Honour the vendor's noauto: a partition marked noauto must be
+            // mounted on demand, never automatically at boot.
+            if entry.is_noauto() {
+                continue;
+            }
             if mnt == "/vendor"
                 || mnt == "/odm"
                 || mnt == "/product"

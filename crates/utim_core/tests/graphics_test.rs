@@ -92,7 +92,7 @@ fn test_hwc_plane_overflow_and_client_target_fallback() {
     hwc.register_display(config);
 
     let mut layers = Vec::new();
-    for i in 0..6 {
+    for i in 0..4 {
         let l = hwc.create_layer(0).unwrap();
         hwc.set_layer_z_order(0, l, i as u32).unwrap();
         hwc.set_layer_composition_type(0, l, CompositionType::Device)
@@ -100,22 +100,26 @@ fn test_hwc_plane_overflow_and_client_target_fallback() {
         hwc.set_layer_buffer(0, l, 3000 + (i as u64), None).unwrap();
         layers.push(l);
     }
+    // F11: layer count is bounded by max_overlay_planes+1; the 5th layer
+    // must be rejected instead of growing without bound.
+    assert!(hwc.create_layer(0).is_err());
 
-    // Validation must demote layers 2, 3, 4, 5 to Client composition
+    // Validation must demote layers 2, 3 to Client composition
     // because ClientTarget consumes 1 plane, leaving 3-1=2 planes for Device overlays.
     let (changed, has_client) = hwc.validate_display(0).unwrap();
-    assert_eq!(changed, 4); // 4 layers demoted (layers 2..5)
+    assert_eq!(changed, 2); // 2 layers demoted (layers 2..3)
     assert!(has_client);
 
     // Presenting without ClientTarget must fail
     let err = hwc.present_display(0).unwrap_err();
     assert_eq!(err, HwcError::NoClientTarget);
 
-    // Set ClientTarget and present
+    // Set ClientTarget and present (F5: target invalidates validation).
     hwc.set_client_target(0, 9999, None).unwrap();
+    let _ = hwc.validate_display(0).unwrap();
     let (present_fence, release_fences) = hwc.present_display(0).unwrap();
     assert!(present_fence.is_some());
-    assert_eq!(release_fences.len(), 6);
+    assert_eq!(release_fences.len(), 4);
 }
 
 #[test]

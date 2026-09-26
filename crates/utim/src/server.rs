@@ -37,18 +37,25 @@ impl ControlServer {
     #[allow(dead_code)]
     pub fn accept(&self) -> io::Result<UnixStream> {
         let (stream, _) = self.listener.accept()?;
-        stream.set_read_timeout(Some(std::time::Duration::from_secs(3)))?;
-        stream.set_write_timeout(Some(std::time::Duration::from_secs(3)))?;
+        stream.set_read_timeout(Some(std::time::Duration::from_millis(100)))?;
+        stream.set_write_timeout(Some(std::time::Duration::from_millis(100)))?;
         Ok(stream)
     }
 
     /// Accept a connection together with the kernel-verified peer credentials
     /// (SO_PEERCRED). Used to gate privileged verbs (reboot, poweroff,
     /// oom-score) to root.
+    /// NOTE (C7): the accepted stream is blocking with a short 100ms read
+    /// timeout so a silent client cannot stall PID 1's single-threaded epoll
+    /// loop for 3s. For full isolation, handle the connection in a
+    /// short-lived child instead of inline.
     pub fn accept_with_cred(&self) -> io::Result<(UnixStream, libc::ucred)> {
         let (stream, _) = self.listener.accept()?;
-        stream.set_read_timeout(Some(std::time::Duration::from_secs(3)))?;
-        stream.set_write_timeout(Some(std::time::Duration::from_secs(3)))?;
+        // Accepted streams lose O_NONBLOCK; keep blocking semantics but with
+        // a tight deadline (C7). 100ms is enough for a local client to send
+        // one line, but bounds the event-loop stall.
+        stream.set_read_timeout(Some(std::time::Duration::from_millis(100)))?;
+        stream.set_write_timeout(Some(std::time::Duration::from_millis(100)))?;
         let cred = peer_cred(&stream)?;
         Ok((stream, cred))
     }

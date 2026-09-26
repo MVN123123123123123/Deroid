@@ -13,6 +13,11 @@ pub struct AndroidService {
     pub oneshot: bool,
     pub critical: bool,
     pub onrestart: Vec<String>,
+    /// Directives that configure the service but have no dedicated field
+    /// (`socket`, `writepid`, `task`, `priority`, `nice`,
+    /// `oom_score_adjust`, `exec_start` continuations, ...), kept verbatim
+    /// so no configuration is silently lost.
+    pub extra: Vec<String>,
 }
 
 impl AndroidService {
@@ -29,6 +34,7 @@ impl AndroidService {
             oneshot: false,
             critical: false,
             onrestart: Vec::new(),
+            extra: Vec::new(),
         }
     }
 
@@ -75,9 +81,22 @@ impl AndroidService {
     }
 }
 
-/// Parse Android .rc init files.
-pub fn parse_android_rc(content: &str) -> Vec<AndroidService> {
+/// Parsed `.rc` plus the imports that were not expanded, so a caller can
+/// never mistake a partial discovery for a complete one.
+pub struct RcParse {
+    pub services: Vec<AndroidService>,
+    pub unresolved_imports: Vec<String>,
+}
+
+/// Parse Android .rc init files, recording (not dropping) `import`
+/// directives, `exec_start`/`socket` blocks and command-less services.
+///
+/// Expanding an `import` needs the caller's filesystem, so imports are
+/// returned in [`RcParse::unresolved_imports`] for the caller to recurse
+/// into rather than silently skipped.
+pub fn parse_android_rc_with_imports(content: &str) -> RcParse {
     let mut services = Vec::new();
+    let mut imports = Vec::new();
     let mut current_service: Option<AndroidService> = None;
 
     for line in content.lines() {
@@ -91,7 +110,22 @@ pub fn parse_android_rc(content: &str) -> Vec<AndroidService> {
             continue;
         }
 
-        if parts[0] == "service" {
+        if parts[0] == "import" {
+            // Recorded, not silently dropped. Expanding it needs the caller's
+            // filesystem, so the caller decides whether to recurse.
+            // Flush any open service first: an import is a top-level
+            // directive, not part of the preceding service block.
+            if let Some(svc) = current_service.take() {
+                services.push(svc);
+            }
+            if parts.len() < 2 {
+                eprintln!("android_rc: ignoring import with no path");
+            } else {
+                for p in &parts[1..] {
+                    imports.push(p.to_string());
+                }
+            }
+        } else if parts[0] == "service" {
             if let Some(svc) = current_service.take() {
                 services.push(svc);
             }
@@ -99,10 +133,13 @@ pub fn parse_android_rc(content: &str) -> Vec<AndroidService> {
                 let name = parts[1].to_string();
                 let command = parts[2..].iter().map(|s| s.to_string()).collect();
                 current_service = Some(AndroidService::new(name, command));
+            } else {
+                eprintln!(
+                    "android_rc: ignoring command-less service line: {trimmed:?}"
+                );
             }
         } else if let Some(ref mut svc) = current_service {
-            match parts[0] {
-                "class" => {
+            match parts[0] {                "class" => {
                     svc.class = parts[1..].iter().map(|s| s.to_string()).collect();
                 }
                 "user" => {
@@ -134,8 +171,21 @@ pub fn parse_android_rc(content: &str) -> Vec<AndroidService> {
                 "onrestart" if parts.len() >= 2 => {
                     svc.onrestart.push(parts[1..].join(" "));
                 }
-                _ => {
-                    // Ignore other rc directives like writepid, file, etc.
+                "exec_start" => {
+                    for p in &parts[1..] {
+                        if *p != "--" {
+                            svc.command.push(p.to_string());
+                        }
+                    }
+                    svc.extra.push(parts.join(" "));
+                }
+                "socket" | "writepid" | "file" | "task" | "priority" | "nice"
+                | "oom_score_adjust" | "rlimit" | "seclabel" | "write" | "mkdir"
+                | "exec" => {
+                    svc.extra.push(parts.join(" "));
+                }
+                other => {
+                    eprintln!("android_rc: ignoring directive {other:?} for {}", svc.name);
                 }
             }
         }
@@ -145,7 +195,15 @@ pub fn parse_android_rc(content: &str) -> Vec<AndroidService> {
         services.push(svc);
     }
 
-    services
+    RcParse {
+        services,
+        unresolved_imports: imports,
+    }
+}
+
+/// Parse Android .rc init files.
+pub fn parse_android_rc(content: &str) -> Vec<AndroidService> {
+    parse_android_rc_with_imports(content).services
 }
 
 #[cfg(test)]
@@ -188,5 +246,52 @@ service vendor.audio-hal /vendor/bin/hw/android.hardware.audio.service
         assert_eq!(services[1].name, "vendor.audio-hal");
         assert!(services[1].matches_subsystem("audio"));
         assert!(services[1].disabled);
+    }
+
+    #[test]
+    fn test_import_recorded_not_dropped() {
+        // S19: an import must never vanish into the previous service block;
+        // it is reported so the caller can recurse.
+        let rc = "service vendor.hwcomposer-2-1 /vendor/bin/hw/composer@2.1-service\n    user system\nimport /vendor/etc/init/hw/init.treble-qsi.rc\nservice vendor.audio-hal /vendor/bin/hw/audio.service\n    user audioserver\n";
+        let parsed = parse_android_rc_with_imports(rc);
+        assert_eq!(parsed.services.len(), 2);
+        assert_eq!(
+            parsed.unresolved_imports,
+            vec!["/vendor/etc/init/hw/init.treble-qsi.rc"]
+        );
+        // The import line left no residue in either service.
+        assert_eq!(parsed.services[0].command.len(), 1);
+    }
+
+    #[test]
+    fn test_exec_start_and_socket_recorded() {
+        // S19: exec_start extends the command (minus `--`), socket blocks are
+        // kept verbatim instead of discarded.
+        let rc = "service rild /vendor/bin/hw/rild\n    user radio\n    exec_start -- /system/bin/logwrapper /vendor/bin/hw/rild\n    socket rild stream 660 radio radio\n";
+        let parsed = parse_android_rc_with_imports(rc);
+        assert_eq!(parsed.services.len(), 1);
+        let svc = &parsed.services[0];
+        assert!(svc.command.contains(&"/system/bin/logwrapper".to_string()));
+        assert!(!svc.command.iter().any(|a| a == "--"));
+        assert!(svc.extra.iter().any(|e| e.starts_with("socket ")));
+    }
+
+    #[test]
+    fn test_command_less_service_is_dropped_with_diagnostic() {
+        // S19: a service line with no command yields no service (nothing to
+        // exec), but the drop is explicit rather than silent.
+        let rc = "service broken_no_command\nservice good /bin/true\n";
+        let parsed = parse_android_rc_with_imports(rc);
+        assert_eq!(parsed.services.len(), 1);
+        assert_eq!(parsed.services[0].name, "good");
+    }
+
+    #[test]
+    fn test_legacy_entry_still_returns_services_only() {
+        // The Vec-returning wrapper keeps its contract for existing callers.
+        let rc = "service vendor.audio-hal /vendor/bin/hw/audio.service\n    user audioserver\n";
+        let services = parse_android_rc(rc);
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0].user, "audioserver");
     }
 }

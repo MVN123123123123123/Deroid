@@ -90,7 +90,7 @@ impl GpuDetector {
         // 1. Check Qualcomm Adreno (/dev/kgsl-3d0)
         let kgsl_node = self.dev_root.join("kgsl-3d0");
         if kgsl_node.exists() {
-            let chip_model = self.read_adreno_chip_model();
+            let (chip_model, _mhz) = self.read_adreno_gpu();
             return GpuDeviceInfo {
                 architecture: GpuArchitecture::QualcommAdreno,
                 pipeline: GpuPipeline::TurnipZink,
@@ -186,21 +186,22 @@ impl GpuDetector {
         }
     }
 
-    fn read_adreno_chip_model(&self) -> Option<String> {
-        let candidates = [
-            self.sysfs_root.join("class/kgsl/kgsl-3d0/gpu_model"),
-            self.sysfs_root.join("class/kgsl/kgsl-3d0/devfreq/cur_freq"),
-        ];
-
-        for path in &candidates {
-            if let Ok(content) = fs::read_to_string(path) {
-                let trimmed = content.trim();
-                if !trimmed.is_empty() {
-                    return Some(trimmed.to_string());
-                }
-            }
-        }
-        Some("Qualcomm Adreno (KGSL)".into())
+    /// GPU name from sysfs, plus the current devfreq clock. `gpu_model` only
+    /// exists on newer kernels, so the clock is reported separately - never
+    /// as the model.
+    fn read_adreno_gpu(&self) -> (Option<String>, Option<u32>) {
+        let model = fs::read_to_string(self.sysfs_root.join("class/kgsl/kgsl-3d0/gpu_model"))
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let mhz = fs::read_to_string(
+            self.sysfs_root
+                .join("class/kgsl/kgsl-3d0/devfreq/cur_freq"),
+        )
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(|hz| (hz / 1_000_000) as u32);
+        (model, mhz)
     }
 
     /// Generate environment variables matching the selected GPU pipeline.

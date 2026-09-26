@@ -23,7 +23,7 @@ fn test_milestone_4_1_hal_versions_and_detection() {
     assert_eq!(hidl.version.binder_device(), "/dev/hwbinder");
     assert_eq!(
         hidl.version.service_name(),
-        "android.hardware.audio@7.0::IDevicesFactory"
+        "android.hardware.audio@7.1::IDevicesFactory"
     );
 
     let aidl = AndroidAudioHal::new(AudioHalVersion::AIDL_V1);
@@ -55,7 +55,7 @@ fn test_milestone_4_1_stream_creation_and_low_latency_buffer() {
         .open_output_stream(
             AudioStreamType::Music,
             config,
-            vec![AudioOutputDevice::Speaker],
+            &[AudioOutputDevice::Speaker],
         )
         .expect("Failed to open output stream");
 
@@ -165,7 +165,18 @@ fn test_milestone_4_1_spa_droid_node_lifecycle() {
 #[test]
 fn test_milestone_4_1_mpg_power_synchronization() {
     let mut hal = AndroidAudioHal::new(AudioHalVersion::AIDL_V1);
-    let mut mpg = MobilePowerGovernor::new();
+    // H17: acquire only records on real success, so use isolated sysfs.
+    let temp = std::env::temp_dir().join("utim_test_audio_wake");
+    let _ = std::fs::remove_dir_all(&temp);
+    let power = temp.join("power");
+    std::fs::create_dir_all(&power).unwrap();
+    std::fs::write(power.join("wake_lock"), "").unwrap();
+    std::fs::write(power.join("wake_unlock"), "").unwrap();
+    let mut mpg = MobilePowerGovernor::with_paths(
+        power,
+        temp.join("cgroup"),
+        temp.join("battery"),
+    );
     let mut pwr_mgr = AudioPowerManager::new();
 
     let config = AudioConfig::standard_mobile_output();

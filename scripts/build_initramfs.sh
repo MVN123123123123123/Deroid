@@ -23,6 +23,10 @@ fi
 RAMDISK_BUILD_DIR="${WORKSPACE_ROOT}/build/initramfs"
 ANDROID_RAMDISK="/opt/android-sdk/system-images/android-34/google_apis/arm64-v8a/ramdisk.img"
 ANDROID_VENDOR="/opt/android-sdk/system-images/android-34/google_apis/arm64-v8a/vendor.img"
+# Pinned supply-chain digests (B-2). Regenerate with sha256sum if the SDK
+# image is intentionally upgraded; never bypass with || true.
+ANDROID_RAMDISK_SHA256="5c4a40a87ea671396a683a30fde67a3e51c63a21d332a9c5a18ecf20c53e6185"
+ANDROID_VENDOR_SHA256="d5f44441eb7ced018ef09c09e25658bd9218d9633817f67d5b07d8f365876821"
 
 echo "============================================================"
 echo " Building Universal Treble Linux Initramfs for Android GKI"
@@ -35,6 +39,9 @@ mkdir -p "${RAMDISK_BUILD_DIR}"/{bin,dev,proc,sys,lib/modules,sysroot}
 
 # 1. Extract virtio kernel modules from Android emulator ramdisk
 if [[ -f "${ANDROID_RAMDISK}" ]]; then
+    echo "[*] Verifying ${ANDROID_RAMDISK} against pinned digest..."
+    echo "${ANDROID_RAMDISK_SHA256}  ${ANDROID_RAMDISK}" | sha256sum -c - \
+        || { echo "FATAL: ANDROID_RAMDISK digest mismatch" >&2; exit 1; }
     echo "[*] Extracting virtio kernel modules from ${ANDROID_RAMDISK}..."
     python3 -c '
 import subprocess, sys
@@ -67,10 +74,15 @@ while pos < len(data):
     if pos % 4 != 0:
         pos += (4 - (pos % 4))
 ' "${ANDROID_RAMDISK}" "${RAMDISK_BUILD_DIR}"
+else
+    echo "[!] WARNING: ${ANDROID_RAMDISK} not found; reusing cached modules from dist/modules/ (no new modules extracted)" >&2
 fi
 
 # 1b. Extract GPU & Display kernel modules from Android vendor partition
 if [[ -f "${ANDROID_VENDOR}" ]]; then
+    echo "[*] Verifying ${ANDROID_VENDOR} against pinned digest..."
+    echo "${ANDROID_VENDOR_SHA256}  ${ANDROID_VENDOR}" | sha256sum -c - \
+        || { echo "FATAL: ANDROID_VENDOR digest mismatch" >&2; exit 1; }
     echo "[*] Extracting GPU, DRM, and Network kernel modules from ${ANDROID_VENDOR}..."
     7z e -y "${ANDROID_VENDOR}" \
         lib/modules/virtio-gpu.ko \
@@ -79,7 +91,9 @@ if [[ -f "${ANDROID_VENDOR}" ]]; then
         lib/modules/failover.ko \
         lib/modules/net_failover.ko \
         lib/modules/virtio_net.ko \
-        "-o${RAMDISK_BUILD_DIR}/lib/modules" >/dev/null 2>&1 || true
+        "-o${RAMDISK_BUILD_DIR}/lib/modules" >/dev/null 2>&1
+else
+    echo "[!] WARNING: ${ANDROID_VENDOR} not found; reusing cached modules from dist/modules/ (no GPU/net modules extracted)" >&2
 fi
 
 # Cache extracted modules and populate fallbacks
@@ -107,6 +121,7 @@ cat << 'EOF' > "${RAMDISK_BUILD_DIR}/init.c"
 #include <arpa/inet.h>
 #include <net/if.h>
 #include <linux/route.h>
+#include <sys/reboot.h>
 #include <errno.h>
 
 static int load_module(const char *path) {
@@ -134,6 +149,39 @@ static void parse_cmdline_param(const char *key, char *out, size_t out_len) {
         }
         out[i] = '\0';
     }
+}
+
+// Whole-token cmdline test (B-1): substring search would match "ro" inside
+// "root=", so tokenize on whitespace and compare exactly.
+static int cmdline_has_token(const char *tok) {
+    int fd = open("/proc/cmdline", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    char buf[1024];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    buf[n] = '\0';
+    size_t tlen = strlen(tok);
+    char *p = buf;
+    while (*p) {
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+        if (!*p) break;
+        if (strncmp(p, tok, tlen) == 0 &&
+            (p[tlen] == ' ' || p[tlen] == '\t' || p[tlen] == '\n' ||
+             p[tlen] == '\r' || p[tlen] == '\0'))
+            return 1;
+        while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r') p++;
+    }
+    return 0;
+}
+
+// Fail loudly: reboot the machine instead of parking it in a silent
+// while(1) halt nobody can observe (B-14). _exit(70) is the backstop —
+// PID 1 exiting panics the kernel, which is still louder than a hang.
+static void fatal_reboot(void) {
+    sync();
+    reboot(RB_AUTOBOOT);
+    _exit(70);
 }
 
 int main(int argc, char *argv[]) {
@@ -220,11 +268,15 @@ int main(int argc, char *argv[]) {
         printf("[UTIM-BOOT] Configured network stack: eth0 (10.0.2.15/24) via gateway 10.0.2.2\n");
     }
 
-    // Parse root= and init= from kernel cmdline
+    // Parse root= and init= from kernel cmdline, and honour rw/ro (B-1):
+    // boot writable by default, "ro" forces a read-only mount.
     char root_dev[128] = "/dev/vda";
     char init_path[128] = "/init";
     parse_cmdline_param("root=", root_dev, sizeof(root_dev));
     parse_cmdline_param("init=", init_path, sizeof(init_path));
+    int root_rw = 1;
+    if (cmdline_has_token("ro")) root_rw = 0;
+    if (cmdline_has_token("rw")) root_rw = 1;
 
     const char *dev_name = strrchr(root_dev, '/');
     dev_name = dev_name ? dev_name + 1 : root_dev;
@@ -233,8 +285,10 @@ int main(int argc, char *argv[]) {
     char sys_path[256];
     snprintf(sys_path, sizeof(sys_path), "/sys/class/block/%s/dev", dev_name);
 
+    // Wait for the block device in sysfs, with a hard 1 s deadline (B-14).
+    // No full inotify watch: 10 x 100 ms keeps the TCG boot budget intact.
     int fd = -1;
-    for (int i = 0; i < 50; i++) {
+    for (int i = 0; i < 10; i++) {
         fd = open(sys_path, O_RDONLY);
         if (fd < 0) {
             snprintf(sys_path, sizeof(sys_path), "/sys/block/%s/dev", dev_name);
@@ -255,34 +309,43 @@ int main(int argc, char *argv[]) {
             mknod(root_dev, S_IFBLK | 0660, makedev(major, minor));
         }
     } else {
-        printf("[UTIM-BOOT] Warning: sysfs entry %s not found after 5s\n", sys_path);
+        printf("[UTIM-BOOT] Warning: sysfs entry %s not found after 1s deadline\n", sys_path);
     }
 
     mkdir("/sysroot", 0755);
-    if (mount(root_dev, "/sysroot", "ext4", MS_RDONLY, NULL) != 0) {
+    if (mount(root_dev, "/sysroot", "ext4", root_rw ? 0 : MS_RDONLY, NULL) != 0) {
         printf("[UTIM-BOOT] Fatal: Failed to mount %s on /sysroot (errno %d)\n", root_dev, errno);
-        printf("[UTIM-BOOT] Halting system.\n");
-        while (1) sleep(1);
+        printf("[UTIM-BOOT] Rebooting.\n");
+        fatal_reboot();
     }
-    printf("[UTIM-BOOT] Successfully mounted root device %s on /sysroot\n", root_dev);
+    printf("[UTIM-BOOT] Successfully mounted root device %s on /sysroot (%s)\n",
+           root_dev, root_rw ? "rw" : "ro");
 
-    // Ensure working DNS configuration in /sysroot/etc/resolv.conf
-    mkdir("/sysroot/etc", 0755);
-    unlink("/sysroot/etc/resolv.conf");
-    FILE *f_res = fopen("/sysroot/etc/resolv.conf", "w");
-    if (f_res) {
+    // Seed DNS/hosts only on a writable mount, and fail loudly (B-1).
+    if (root_rw) {
+        mkdir("/sysroot/etc", 0755);
+        unlink("/sysroot/etc/resolv.conf");
+        FILE *f_res = fopen("/sysroot/etc/resolv.conf", "w");
+        if (!f_res) {
+            printf("[UTIM-BOOT] FATAL: cannot write /sysroot/etc/resolv.conf (errno %d)\n", errno);
+            fatal_reboot();
+        }
         fprintf(f_res, "# Configured by UTIM Early Bootloader\n");
         fprintf(f_res, "nameserver 10.0.2.3\n");
         fprintf(f_res, "nameserver 8.8.8.8\n");
         fprintf(f_res, "nameserver 1.1.1.1\n");
         fclose(f_res);
-    }
 
-    FILE *f_hosts = fopen("/sysroot/etc/hosts", "w");
-    if (f_hosts) {
+        FILE *f_hosts = fopen("/sysroot/etc/hosts", "w");
+        if (!f_hosts) {
+            printf("[UTIM-BOOT] FATAL: cannot write /sysroot/etc/hosts (errno %d)\n", errno);
+            fatal_reboot();
+        }
         fprintf(f_hosts, "127.0.0.1\tlocalhost treble-gsi\n");
         fprintf(f_hosts, "::1\t\tlocalhost ip6-localhost ip6-loopback\n");
         fclose(f_hosts);
+    } else {
+        printf("[UTIM-BOOT] Root mounted read-only; skipping resolv.conf/hosts injection\n");
     }
 
     // Unmount early filesystems so UTIM PID 1 can mount them cleanly with proper flags
@@ -298,7 +361,7 @@ int main(int argc, char *argv[]) {
         rmdir("/oldroot");
     } else if (chdir("/sysroot") != 0 || chroot(".") != 0 || chdir("/") != 0) {
         printf("[UTIM-BOOT] Fatal: switch_root/chroot to /sysroot failed (errno %d)\n", errno);
-        while (1) sleep(1);
+        fatal_reboot();
     }
 
     printf("[UTIM-BOOT] Executing %s (UTIM PID 1)...\n", init_path);
@@ -315,17 +378,22 @@ int main(int argc, char *argv[]) {
     execve("/usr/bin/utim", new_argv, new_envp);
 
     printf("[UTIM-BOOT] Fatal: execve %s failed (errno %d)\n", init_path, errno);
-    while (1) sleep(1);
+    fatal_reboot();
     return 0;
 }
 EOF
 
-aarch64-linux-gnu-gcc -static -O2 "${RAMDISK_BUILD_DIR}/init.c" -o "${RAMDISK_BUILD_DIR}/init"
+aarch64-linux-gnu-gcc -static -Os -ffunction-sections -fdata-sections \
+    -fno-asynchronous-unwind-tables -Wl,--gc-sections -Wl,-s \
+    "${RAMDISK_BUILD_DIR}/init.c" -o "${RAMDISK_BUILD_DIR}/init"
 rm -f "${RAMDISK_BUILD_DIR}/init.c"
 
-# 3. Create CPIO archive
+# 3. Create CPIO archive (reproducible: fixed mtimes, sorted members)
 echo "[*] Packing initramfs CPIO archive..."
-(cd "${RAMDISK_BUILD_DIR}" && find . | cpio -H newc -o | gzip -9 > "${OUTPUT_INITRAMFS}")
+: "${SOURCE_DATE_EPOCH:=0}"
+find "${RAMDISK_BUILD_DIR}" -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
+(cd "${RAMDISK_BUILD_DIR}" && find . -print0 | LC_ALL=C sort -z \
+    | cpio --null -H newc -o --reproducible --quiet | gzip -9n > "${OUTPUT_INITRAMFS}")
 
 echo "[+] Successfully created initramfs: ${OUTPUT_INITRAMFS}"
 ls -lh "${OUTPUT_INITRAMFS}"

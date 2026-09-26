@@ -47,10 +47,35 @@ def main():
         return
 
     os.makedirs(os.path.dirname(rootfs_status), exist_ok=True)
-    with open(rootfs_status, "w", encoding="utf-8") as f:
-        f.write("\n\n".join(entries) + "\n")
+    # Merge with the existing status database instead of replacing it (B-9):
+    # base packages survive even when the archives cache is pruned (B-11).
+    # Already-present packages keep their existing stanza.
+    existing = ""
+    if os.path.exists(rootfs_status):
+        with open(rootfs_status, encoding="utf-8") as f:
+            existing = f.read()
+    existing_names = set()
+    for chunk in existing.split("\n\n"):
+        for line in chunk.splitlines():
+            if line.startswith("Package:"):
+                existing_names.add(line.split(":", 1)[1].strip())
+                break
+    fresh = [e for e in entries
+             if e.split("\n", 1)[0].split(":", 1)[1].strip() not in existing_names]
+    merged = existing.rstrip("\n")
+    if merged:
+        merged += "\n\n"
+    merged += "\n\n".join(fresh) + "\n" if fresh else ("\n" if merged else "")
+    if not merged.strip():
+        print(f"[*] No deb packages found to register in {rootfs_status}.")
+        return
+    # Atomic same-directory rename: a crash never leaves a truncated db.
+    tmp = rootfs_status + ".new"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(merged)
+    os.replace(tmp, rootfs_status)
 
-    print(f"[+] Successfully registered {len(entries)} packages in {rootfs_status}.")
+    print(f"[+] Successfully registered {len(fresh)} new packages in {rootfs_status}.")
 
 if __name__ == "__main__":
     main()

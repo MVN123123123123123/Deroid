@@ -27,9 +27,11 @@ impl WlHeader {
 
     pub fn to_bytes(&self) -> [u8; 8] {
         let mut buf = [0u8; 8];
-        buf[0..4].copy_from_slice(&self.object_id.to_ne_bytes());
-        buf[4..6].copy_from_slice(&self.opcode.to_ne_bytes());
-        buf[6..8].copy_from_slice(&self.length.to_ne_bytes());
+        // Wayland wire format is little-endian on all supported targets;
+        // never use native endian here (P17).
+        buf[0..4].copy_from_slice(&self.object_id.to_le_bytes());
+        buf[4..6].copy_from_slice(&self.opcode.to_le_bytes());
+        buf[6..8].copy_from_slice(&self.length.to_le_bytes());
         buf
     }
 
@@ -37,10 +39,18 @@ impl WlHeader {
         if bytes.len() < 8 {
             return None;
         }
-        let object_id = u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-        let opcode = u16::from_ne_bytes([bytes[4], bytes[5]]);
-        let length = u16::from_ne_bytes([bytes[6], bytes[7]]);
+        let object_id = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let opcode = u16::from_le_bytes([bytes[4], bytes[5]]);
+        let length = u16::from_le_bytes([bytes[6], bytes[7]]);
         if length < 8 {
+            return None;
+        }
+        // Wire length is always a multiple of 4; object id 0 is reserved
+        // (wl_display is 1) and never valid on the wire (P18).
+        if !length.is_multiple_of(4) {
+            return None;
+        }
+        if object_id == 0 {
             return None;
         }
         Some(Self {
@@ -68,6 +78,12 @@ impl<'a> WlMessage<'a> {
             None => return Err("Invalid Wayland header or length < 8"),
         };
         let total_len = header.length as usize;
+        if !total_len.is_multiple_of(4) {
+            return Err("Wayland message length not a multiple of 4");
+        }
+        if header.object_id == 0 {
+            return Err("Wayland object id 0 is reserved");
+        }
         if buf.len() < total_len {
             return Ok(None);
         }
@@ -77,7 +93,7 @@ impl<'a> WlMessage<'a> {
 
     pub fn read_u32(&self, offset: usize) -> Option<u32> {
         if offset + 4 <= self.payload.len() {
-            Some(u32::from_ne_bytes([
+            Some(u32::from_le_bytes([
                 self.payload[offset],
                 self.payload[offset + 1],
                 self.payload[offset + 2],
@@ -97,13 +113,15 @@ impl<'a> WlMessage<'a> {
         self.read_i32(offset).map(|v| (v as f32) / 256.0)
     }
 
-    /// Read null-terminated string padded to 4-byte boundary
+    /// Read null-terminated string padded to 4-byte boundary.
+    /// The payload length includes the trailing NUL; a string without a
+    /// terminating NUL is malformed and rejected (P19).
     pub fn read_string(&self, offset: usize) -> Option<(&'a str, usize)> {
         let len = self.read_u32(offset)? as usize;
-        let start = offset.checked_add(4)?;
         if len == 0 {
-            return Some(("", start));
+            return None;
         }
+        let start = offset.checked_add(4)?;
         let padded_len = len.checked_add(3)? & !3;
         let next_offset = start.checked_add(padded_len)?;
         if next_offset > self.payload.len() {
@@ -111,17 +129,25 @@ impl<'a> WlMessage<'a> {
         }
         let end = start.checked_add(len)?;
         let slice = &self.payload[start..end];
-        let trimmed = if slice.last() == Some(&0) {
-            &slice[..slice.len() - 1]
-        } else {
-            slice
-        };
-        let s = std::str::from_utf8(trimmed).ok()?;
+        // Require the trailing NUL; also reject interior NULs so the
+        // returned &str is exactly the wire string.
+        if slice.last() != Some(&0) {
+            return None;
+        }
+        let s = std::str::from_utf8(&slice[..slice.len() - 1]).ok()?;
+        if s.contains('\0') {
+            return None;
+        }
         Some((s, next_offset))
     }
 }
 
-/// Wayland Message Builder for serializing outgoing events
+/// Wayland Message Builder for serializing outgoing events.
+///
+/// Allocation note (P26): `build()` allocates the exact wire buffer once.
+/// Hot paths emitting many events should reuse a caller-owned buffer with
+/// [`WlMessageBuilder::build_into`] instead, which appends the framed
+/// message without allocating a fresh `Vec` per event.
 pub struct WlMessageBuilder {
     buf: Vec<u8>,
 }
@@ -131,25 +157,37 @@ impl WlMessageBuilder {
         let mut builder = Self {
             buf: Vec::with_capacity(64),
         };
-        builder.buf.extend_from_slice(&object_id.to_ne_bytes());
-        builder.buf.extend_from_slice(&opcode.to_ne_bytes());
-        builder.buf.extend_from_slice(&0u16.to_ne_bytes()); // placeholder for length
+        builder.buf.extend_from_slice(&object_id.to_le_bytes());
+        builder.buf.extend_from_slice(&opcode.to_le_bytes());
+        builder.buf.extend_from_slice(&0u16.to_le_bytes()); // placeholder for length
         builder
     }
 
     pub fn put_u32(&mut self, val: u32) -> &mut Self {
-        self.buf.extend_from_slice(&val.to_ne_bytes());
+        self.buf.extend_from_slice(&val.to_le_bytes());
         self
     }
 
     pub fn put_i32(&mut self, val: i32) -> &mut Self {
-        self.buf.extend_from_slice(&val.to_ne_bytes());
+        self.buf.extend_from_slice(&val.to_le_bytes());
         self
     }
 
-    pub fn put_fixed(&mut self, val: f32) -> &mut Self {
-        let fixed = (val * 256.0) as i32;
-        self.put_i32(fixed)
+    /// Append a Wayland 24.8 fixed-point value.
+    ///
+    /// Returns `Err` on NaN/inf (which previously saturated silently via
+    /// `as` casts, P25). Finite out-of-range values are clamped to the
+    /// exactly representable 24.8 span `[-8388608.0, 8388607.996]`.
+    pub fn put_fixed(&mut self, val: f32) -> Result<&mut Self, &'static str> {
+        if !val.is_finite() {
+            return Err("non-finite fixed-point value");
+        }
+        // i32::MAX / 256 = 8388607.99609375; clamp so the scaled value
+        // always fits i32 without `as`-cast saturation.
+        let clamped = val.clamp(-8_388_608.0, 8_388_607.996);
+        let fixed = (clamped * 256.0).round() as i32;
+        self.put_i32(fixed);
+        Ok(self)
     }
 
     pub fn put_string(&mut self, s: &str) -> &mut Self {
@@ -180,10 +218,24 @@ impl WlMessageBuilder {
         self
     }
 
-    pub fn build(mut self) -> Vec<u8> {
-        let total_len = self.buf.len() as u16;
-        self.buf[6..8].copy_from_slice(&total_len.to_ne_bytes());
-        self.buf
+    /// Frame the message and append it to a caller-owned buffer, patching
+    /// the 16-bit length field in place. Prefer this on hot paths to avoid
+    /// one `Vec` allocation per emitted event (P26).
+    pub fn build_into(mut self, out: &mut Vec<u8>) -> Result<(), &'static str> {
+        let total_len = u16::try_from(self.buf.len()).map_err(|_| "message exceeds u16 length")?;
+        self.buf[6..8].copy_from_slice(&total_len.to_le_bytes());
+        out.extend_from_slice(&self.buf);
+        Ok(())
+    }
+
+    /// Frame the message, returning the exact wire buffer.
+    /// Fails if the framed length does not fit the 16-bit wire field
+    /// instead of silently truncating (P4).
+    pub fn build(mut self) -> Result<Vec<u8>, &'static str> {
+        let total_len =
+            u16::try_from(self.buf.len()).map_err(|_| "message exceeds u16 length")?;
+        self.buf[6..8].copy_from_slice(&total_len.to_le_bytes());
+        Ok(self.buf)
     }
 }
 
@@ -418,9 +470,9 @@ mod tests {
     fn test_message_builder_and_parser() {
         let mut builder = WlMessageBuilder::new(100, 2);
         builder.put_u32(12345);
-        builder.put_fixed(2.5);
+        builder.put_fixed(2.5).expect("finite fixed");
         builder.put_string("org.freedesktop.wayland");
-        let wire = builder.build();
+        let wire = builder.build().expect("fits u16");
 
         assert_eq!(wire.len() % 4, 0);
 
@@ -434,6 +486,52 @@ mod tests {
 
         let (s, _) = msg.read_string(8).expect("String failed");
         assert_eq!(s, "org.freedesktop.wayland");
+    }
+
+    #[test]
+    fn test_builder_rejects_overflow_and_nonfinite() {
+        // Length overflow: force a buffer larger than u16::MAX.
+        let mut builder = WlMessageBuilder::new(1, 0);
+        builder.put_array(&vec![0u8; u16::MAX as usize]);
+        assert!(builder.build().is_err());
+
+        let mut b2 = WlMessageBuilder::new(1, 0);
+        assert!(b2.put_fixed(f32::NAN).is_err());
+        assert!(b2.put_fixed(f32::INFINITY).is_err());
+        // Clamp extremes instead of saturating.
+        b2.put_fixed(1e30).expect("clamped");
+        b2.put_fixed(-1e30).expect("clamped");
+        let wire = b2.build().expect("fits");
+        let (msg, _) = WlMessage::parse(&wire).unwrap().unwrap();
+        assert_eq!(msg.read_i32(0), Some(i32::MAX));
+        assert_eq!(msg.read_i32(4), Some(i32::MIN));
+    }
+
+    #[test]
+    fn test_parse_rejects_bad_length_and_zero_id() {
+        // Length not a multiple of 4.
+        let mut raw = vec![0u8; 12];
+        raw[0..4].copy_from_slice(&1u32.to_le_bytes());
+        raw[4..6].copy_from_slice(&0u16.to_le_bytes());
+        raw[6..8].copy_from_slice(&10u16.to_le_bytes());
+        assert!(WlMessage::parse(&raw).is_err());
+
+        // Object id 0.
+        let mut raw0 = vec![0u8; 8];
+        raw0[6..8].copy_from_slice(&8u16.to_le_bytes());
+        assert!(WlMessage::parse(&raw0).is_err());
+    }
+
+    #[test]
+    fn test_read_string_requires_nul() {
+        // Build a payload whose string lacks the trailing NUL.
+        let mut wire = vec![0u8; 8];
+        wire[0..4].copy_from_slice(&7u32.to_le_bytes());
+        wire[6..8].copy_from_slice(&16u16.to_le_bytes());
+        wire.extend_from_slice(&4u32.to_le_bytes());
+        wire.extend_from_slice(b"abcd"); // len claims 4, no NUL present
+        let (msg, _) = WlMessage::parse(&wire).unwrap().unwrap();
+        assert_eq!(msg.read_string(0), None);
     }
 
     #[test]

@@ -58,12 +58,14 @@ fn test_duration_parsing_edge_cases() {
     assert_eq!(parse_duration(""), Duration::ZERO);
     assert_eq!(parse_duration("0"), Duration::ZERO);
     assert_eq!(parse_duration("no"), Duration::ZERO);
-    assert_eq!(parse_duration("infinity"), Duration::ZERO);
-    assert_eq!(parse_duration("inf"), Duration::ZERO);
-    assert_eq!(parse_duration("INF"), Duration::ZERO);
-    assert_eq!(parse_duration("Infinity"), Duration::ZERO);
+    // "infinity" means never-expires (MAX); garbage falls back to 100ms
+    // so a typo cannot silently become the zero-backoff fork-bomb input.
+    assert_eq!(parse_duration("infinity"), Duration::MAX);
+    assert_eq!(parse_duration("inf"), Duration::MAX);
+    assert_eq!(parse_duration("INF"), Duration::MAX);
+    assert_eq!(parse_duration("Infinity"), Duration::MAX);
     assert_eq!(parse_duration("No"), Duration::ZERO);
-    assert_eq!(parse_duration("invalid_str"), Duration::ZERO);
+    assert_eq!(parse_duration("invalid_str"), Duration::from_millis(100));
 
     assert_eq!(parse_duration("100ms"), Duration::from_millis(100));
     assert_eq!(parse_duration("45s"), Duration::from_secs(45));
@@ -150,9 +152,11 @@ fn test_dag_self_loop_and_complex_cycles() {
         .any(|c| c.len() == 1 && c[0] == "self.service"));
     assert!(cycles.iter().any(|c| c.len() == 4));
 
-    // resolve_start_queue must break cycles and not hang or crash
+    // resolve_start_queue must break cycles and not hang or crash.
+    // B2: After= is ordering only, not a requirement, so an After-only
+    // chain is not pulled into the transaction.
     let queue = dag.resolve_start_queue("1.service");
-    assert_eq!(queue.len(), 4);
+    assert_eq!(queue.len(), 1);
 }
 
 #[test]

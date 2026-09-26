@@ -50,13 +50,18 @@ impl AudioPowerManager {
             .count();
 
         if is_playing && !self.wakelock_held {
-            // Acquire partial wake lock to keep audio DSP and DMA running with screen off
-            let _ = mpg.acquire_wake_lock(AUDIO_WAKELOCK_NAME);
-            self.wakelock_held = true;
+            // H17: only record the lock when acquire actually succeeded;
+            // otherwise the SoC may suspend mid-playback.
+            if mpg.acquire_wake_lock(AUDIO_WAKELOCK_NAME).is_ok() {
+                self.wakelock_held = true;
+            }
         } else if !is_playing && self.wakelock_held {
-            // All playback finished or paused -> release wake lock to allow SoC deep suspend
-            let _ = mpg.release_wake_lock(AUDIO_WAKELOCK_NAME);
-            self.wakelock_held = false;
+            // All playback finished or paused -> release wake lock to allow SoC deep suspend.
+            // On failure stay "held" so the next tick retries instead of
+            // leaking the kernel refcount with an untaken release.
+            if mpg.release_wake_lock(AUDIO_WAKELOCK_NAME).is_ok() {
+                self.wakelock_held = false;
+            }
         }
     }
 

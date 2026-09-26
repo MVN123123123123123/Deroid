@@ -118,12 +118,15 @@ impl SensorProxyService {
         if raw_orientation == self.candidate_orientation {
             self.candidate_sample_count += 1;
             if self.candidate_sample_count >= 3 {
-                self.current_orientation = raw_orientation;
                 self.candidate_sample_count = 0;
-                self.orientation_change_count += 1;
-                if self.auto_rotate_enabled {
-                    return Some(self.current_orientation);
+                // H12: when auto-rotate is off, do not mutate internal state
+                // at all, so enabling it later still produces a transition.
+                if !self.auto_rotate_enabled {
+                    return None;
                 }
+                self.current_orientation = raw_orientation;
+                self.orientation_change_count += 1;
+                return Some(self.current_orientation);
             }
         } else {
             self.candidate_orientation = raw_orientation;

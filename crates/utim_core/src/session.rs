@@ -168,7 +168,10 @@ pub fn drop_privileges(cmd: &mut Command) -> bool {
     // exactly where pre_exec runs, and only while still privileged.
     unsafe {
         cmd.pre_exec(|| {
-            libc::setgroups(SESSION_GROUPS.len(), SESSION_GROUPS.as_ptr());
+            if libc::setgroups(SESSION_GROUPS.len(), SESSION_GROUPS.as_ptr()) != 0 {
+                // Fail the spawn rather than exec with unknown groups.
+                return Err(std::io::Error::last_os_error());
+            }
             Ok(())
         });
     }
@@ -182,15 +185,25 @@ pub fn ensure_session_dirs() {
     if !is_root_process() {
         return;
     }
-    let _ = fs::create_dir_all(SESSION_HOME);
-    let _ = fs::create_dir_all(SESSION_RUNTIME_DIR);
-    if let Ok(c_home) = CString::new(SESSION_HOME) {
-        unsafe { libc::chown(c_home.as_ptr(), SESSION_UID, SESSION_GID) };
-    }
-    if let Ok(c_run) = CString::new(SESSION_RUNTIME_DIR) {
+    for (path, mode) in [(SESSION_HOME, 0o755u32), (SESSION_RUNTIME_DIR, 0o700)] {
+        if let Err(e) = fs::create_dir_all(path) {
+            eprintln!("session: create_dir_all({path}): {e}");
+            continue;
+        }
+        let Ok(c) = CString::new(path) else { continue };
         unsafe {
-            libc::chown(c_run.as_ptr(), SESSION_UID, SESSION_GID);
-            libc::chmod(c_run.as_ptr(), 0o777);
+            if libc::chown(c.as_ptr(), SESSION_UID, SESSION_GID) != 0 {
+                eprintln!(
+                    "session: chown({path}): {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            if libc::chmod(c.as_ptr(), mode) != 0 {
+                eprintln!(
+                    "session: chmod({path}): {}",
+                    std::io::Error::last_os_error()
+                );
+            }
         }
     }
 }
@@ -398,5 +411,14 @@ mod tests {
         let n = build_prompt(&mut dst, &long_name, &long_host, 1000);
         assert!(n <= dst.len());
         assert_eq!(n, dst.len());
+    }
+
+    #[test]
+    fn ensure_session_dirs_is_a_noop_when_unprivileged() {
+        // S16: the privileged branch (create/chown/chmod with diagnostics)
+        // cannot run in CI; pin the unprivileged branch to a silent return.
+        if !is_root_process() {
+            ensure_session_dirs();
+        }
     }
 }

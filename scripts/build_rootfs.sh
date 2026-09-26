@@ -13,6 +13,95 @@ DEBIAN_SUITE="sid"
 ROOTFS_DIR="${1:-${WORKSPACE_ROOT}/build/rootfs}"
 DRY_RUN="${DRY_RUN:-0}"
 
+shopt -s nullglob
+
+# Shared identity/host setup used by BOTH build branches (B-8): base
+# passwd/group/shadow, unprivileged user + canonical group membership,
+# sudoers, hostname, hosts, resolv.conf, and the /etc/fstab mount contract.
+configure_identity_and_network() {
+    local R="$1"
+
+    # Set up basic users and groups if not present
+    if [[ ! -f "${R}/etc/passwd" ]]; then
+        if [[ -f "${R}/usr/share/base-passwd/passwd.master" ]]; then
+            cp "${R}/usr/share/base-passwd/passwd.master" "${R}/etc/passwd"
+            cp "${R}/usr/share/base-passwd/group.master" "${R}/etc/group"
+        else
+            cat << 'EOF' > "${R}/etc/passwd"
+root:x:0:0:root:/root:/bin/bash
+daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin
+bin:x:2:2:bin:/bin:/usr/sbin/nologin
+EOF
+            cat << 'EOF' > "${R}/etc/group"
+root:x:0:
+daemon:x:1:
+bin:x:2:
+EOF
+        fi
+        cat << 'EOF' > "${R}/etc/shadow"
+root:*:19700:0:99999:7:::
+EOF
+        chmod 600 "${R}/etc/shadow"
+    fi
+
+    # Ensure unprivileged mobile userspace (UID 1000: user) exists
+    if ! grep -q "^user:" "${R}/etc/passwd" 2>/dev/null; then
+        echo "user:x:1000:1000:Universal Treble User:/home/user:/bin/bash" >> "${R}/etc/passwd"
+    fi
+    if ! grep -q "^user:" "${R}/etc/group" 2>/dev/null; then
+        echo "user:x:1000:" >> "${R}/etc/group"
+    fi
+    if ! grep -q "^user:" "${R}/etc/shadow" 2>/dev/null; then
+        echo "user:*:19700:0:99999:7:::" >> "${R}/etc/shadow"
+    fi
+    # Idempotent membership in canonical Debian groups (B-7): create with
+    # the real GID when absent, then add "user" exactly once.
+    for spec in audio:29 video:44 input:105 render:108 sudo:27 dialout:20 netdev:100 seat:102; do
+        g="${spec%%:*}"; want="${spec##*:}"
+        if ! grep -q "^${g}:" "${R}/etc/group" 2>/dev/null; then
+            echo "${g}:x:${want}:" >> "${R}/etc/group"
+        fi
+        if grep -q "^${g}:[^:]*:[^:]*:$" "${R}/etc/group"; then
+            sed -i "s/^\(${g}:[^:]*:[^:]*:\).*/\1user/" "${R}/etc/group"
+        elif ! grep -qE "^${g}:[^:]*:[^:]*:(.*[,])?user([,].*)?$" "${R}/etc/group"; then
+            sed -i "s/^\(${g}:[^:]*:[^:]*:.*\)$/\1,user/" "${R}/etc/group"
+        fi
+    done
+    mkdir -p "${R}/home/user" "${R}/run/user/1000" "${R}/run/user/0"
+    chmod 755 "${R}/home/user"
+    chmod 700 "${R}/run/user/1000"
+    # Least-privilege sudoers (B-22): utlc/utimctl/reboot only, never ALL.
+    mkdir -p "${R}/etc/sudoers.d"
+    printf 'user ALL=(ALL:ALL) NOPASSWD: /usr/bin/utlc, /usr/bin/utimctl, /usr/sbin/reboot\n' \
+        > "${R}/etc/sudoers.d/99-universal-treble"
+    chmod 0440 "${R}/etc/sudoers.d/99-universal-treble"
+
+    echo "treble-gsi" > "${R}/etc/hostname"
+    cat << 'EOF' > "${R}/etc/hosts"
+127.0.0.1 localhost
+127.0.1.1 treble-gsi
+::1 localhost ip6-localhost ip6-loopback
+EOF
+
+    cat << 'EOF' > "${R}/etc/resolv.conf"
+# Configured for QEMU & Universal Treble Linux
+nameserver 10.0.2.3
+nameserver 8.8.8.8
+nameserver 1.1.1.1
+EOF
+
+    # Documented mount contract (B-21). PID 1 mounts these itself; fstab
+    # exists for tooling (e.g. fstrim --listed-in) and documentation.
+    cat << 'EOF' > "${R}/etc/fstab"
+/dev/vda   /        ext4  defaults,noatime              0 1
+proc       /proc    proc  defaults,hidepid=2            0 0
+sysfs      /sys     sysfs defaults,nosuid,nodev,noexec  0 0
+devtmpfs   /dev     devtmpfs mode=0755,nosuid           0 0
+tmpfs      /tmp     tmpfs mode=1777,nosuid,nodev        0 0
+tmpfs      /run     tmpfs mode=0755,nosuid,nodev        0 0
+EOF
+}
+
 echo "============================================================"
 echo " Building Debian Sid ARM64 Rootfs for Universal Treble Linux"
 echo " Target Rootfs Directory: ${ROOTFS_DIR}"
@@ -47,72 +136,15 @@ if [[ "${DRY_RUN}" == "1" || "$(id -u)" != "0" ]]; then
             echo "[*] Bootstrapping Debian Sid ARM64 base packages via fakeroot..."
             rm -rf "${ROOTFS_DIR}"
             mkdir -p "${ROOTFS_DIR}"
-            fakeroot debootstrap --foreign --variant=minbase --arch="${TARGET_ARCH}" "${DEBIAN_SUITE}" "${ROOTFS_DIR}" "${DEBIAN_MIRROR}" || true
+            fakeroot debootstrap --foreign --variant=minbase --arch="${TARGET_ARCH}" "${DEBIAN_SUITE}" "${ROOTFS_DIR}" "${DEBIAN_MIRROR}" \
+                || { echo "FATAL: debootstrap ${DEBIAN_SUITE}/${TARGET_ARCH} failed" >&2; exit 1; }
         fi
+        [[ -x "${ROOTFS_DIR}/usr/bin/apt" ]] || { echo "FATAL: base system incomplete (no ${ROOTFS_DIR}/usr/bin/apt)" >&2; exit 1; }
     fi
 
-    # Set up basic users and groups if not present
-    if [[ ! -f "${ROOTFS_DIR}/etc/passwd" ]]; then
-        if [[ -f "${ROOTFS_DIR}/usr/share/base-passwd/passwd.master" ]]; then
-            cp "${ROOTFS_DIR}/usr/share/base-passwd/passwd.master" "${ROOTFS_DIR}/etc/passwd"
-            cp "${ROOTFS_DIR}/usr/share/base-passwd/group.master" "${ROOTFS_DIR}/etc/group"
-        else
-            cat << 'EOF' > "${ROOTFS_DIR}/etc/passwd"
-root:x:0:0:root:/root:/bin/bash
-daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin
-bin:x:2:2:bin:/bin:/usr/sbin/nologin
-EOF
-            cat << 'EOF' > "${ROOTFS_DIR}/etc/group"
-root:x:0:
-daemon:x:1:
-bin:x:2:
-EOF
-        fi
-        cat << 'EOF' > "${ROOTFS_DIR}/etc/shadow"
-root:*:19700:0:99999:7:::
-EOF
-        chmod 600 "${ROOTFS_DIR}/etc/shadow" 2>/dev/null || true
-    fi
-
-    # Ensure unprivileged mobile userspace (UID 1000: user) exists
-    if ! grep -q "^user:" "${ROOTFS_DIR}/etc/passwd" 2>/dev/null; then
-        echo "user:x:1000:1000:Universal Treble User:/home/user:/bin/bash" >> "${ROOTFS_DIR}/etc/passwd"
-    fi
-    if ! grep -q "^user:" "${ROOTFS_DIR}/etc/group" 2>/dev/null; then
-        echo "user:x:1000:" >> "${ROOTFS_DIR}/etc/group"
-    fi
-    if ! grep -q "^user:" "${ROOTFS_DIR}/etc/shadow" 2>/dev/null; then
-        echo "user:*:19700:0:99999:7:::" >> "${ROOTFS_DIR}/etc/shadow"
-    fi
-    for grp in audio video input render sudo dialout netdev seat; do
-        if grep -q "^${grp}:" "${ROOTFS_DIR}/etc/group" 2>/dev/null; then
-            sed -i "s/^${grp}:.*/&,user/" "${ROOTFS_DIR}/etc/group"
-            sed -i "s/:,user/:user/" "${ROOTFS_DIR}/etc/group"
-        else
-            echo "${grp}:x:999:user" >> "${ROOTFS_DIR}/etc/group"
-        fi
-    done
-    mkdir -p "${ROOTFS_DIR}/home/user" "${ROOTFS_DIR}/run/user/1000" "${ROOTFS_DIR}/run/user/0"
-    chmod 755 "${ROOTFS_DIR}/home/user"
-    chmod 700 "${ROOTFS_DIR}/run/user/1000"
-    mkdir -p "${ROOTFS_DIR}/etc/sudoers.d"
-    chmod 644 "${ROOTFS_DIR}/etc/sudoers.d/99-universal-treble" 2>/dev/null || true
-    echo "user ALL=(ALL:ALL) NOPASSWD: ALL" > "${ROOTFS_DIR}/etc/sudoers.d/99-universal-treble"
-    chmod 440 "${ROOTFS_DIR}/etc/sudoers.d/99-universal-treble" 2>/dev/null || true
-
-    echo "treble-gsi" > "${ROOTFS_DIR}/etc/hostname"
-    cat << 'EOF' > "${ROOTFS_DIR}/etc/hosts"
-127.0.0.1 localhost
-127.0.1.1 treble-gsi
-::1 localhost ip6-localhost ip6-loopback
-EOF
-
-    cat << 'EOF' > "${ROOTFS_DIR}/etc/resolv.conf"
-# Configured for QEMU & Universal Treble Linux
-nameserver 10.0.2.3
-nameserver 8.8.8.8
-nameserver 1.1.1.1
-EOF
+    # Identity, groups, hostname, resolver and fstab (shared with the
+    # privileged branch via configure_identity_and_network).
+    configure_identity_and_network "${ROOTFS_DIR}"
 
     mkdir -p "${ROOTFS_DIR}/etc/apt/preferences.d"
     mkdir -p "${ROOTFS_DIR}/etc/environment.d"
@@ -154,13 +186,8 @@ EOF
 
     ln -sfn "graphical.target" "${ROOTFS_DIR}/usr/lib/systemd/system/default.target"
 
-    # Copy essential aarch64 glibc libraries if cross-toolchain is available on host
-    if [[ -d "/usr/aarch64-linux-gnu/lib" ]]; then
-        echo "[*] Populating aarch64 glibc runtime into rootfs..."
-        cp -a /usr/aarch64-linux-gnu/lib/ld-linux-aarch64.so.1 "${ROOTFS_DIR}/lib/" || true
-        cp -a /usr/aarch64-linux-gnu/lib/libc.so.6 "${ROOTFS_DIR}/lib/" || true
-        cp -a /usr/aarch64-linux-gnu/lib/libgcc_s.so.1 "${ROOTFS_DIR}/lib/" || true
-    fi
+    # NOTE: no host glibc is ever copied into the image (B-5). Debootstrap
+    # provides the matched loader/libc; the merged-usr fixup below relocates it.
 
     # Configure Debian Sid sources.list
     cat << 'EOF' > "${ROOTFS_DIR}/etc/apt/sources.list"
@@ -175,7 +202,7 @@ Pin-Priority: -1
 EOF
 
     cat << 'EOF' > "${ROOTFS_DIR}/etc/apt/preferences.d/utim-pinning"
-Package: utim-init utim-init-dummy utlc libhybris* mesa-turnip* spa-droid*
+Package: utim-init-dummy utlc libhybris* mesa-*
 Pin: release o=UniversalTreble
 Pin-Priority: 1001
 EOF
@@ -224,7 +251,10 @@ EOF
         cp "${SCRIPT_DIR}/shims/systemd-sysusers" "${ROOTFS_DIR}/usr/bin/systemd-sysusers"
         cp "${SCRIPT_DIR}/shims/systemd-notify" "${ROOTFS_DIR}/usr/bin/systemd-notify"
         cp "${SCRIPT_DIR}/shims/systemd-escape" "${ROOTFS_DIR}/usr/bin/systemd-escape"
-        chmod 755 "${ROOTFS_DIR}/usr/bin/systemd-"*
+        shim_bins=("${ROOTFS_DIR}/usr/bin/systemd-"*)
+        if (( ${#shim_bins[@]} )); then
+            chmod 755 "${shim_bins[@]}"
+        fi
         if [[ -d "${ROOTFS_DIR}/bin" && ! -L "${ROOTFS_DIR}/bin" ]]; then
             ln -sf "/usr/bin/systemd-tmpfiles" "${ROOTFS_DIR}/bin/systemd-tmpfiles"
             ln -sf "/usr/bin/systemd-sysusers" "${ROOTFS_DIR}/bin/systemd-sysusers"
@@ -239,15 +269,16 @@ EOF
         ln -sf "/usr/lib/systemd/system/utlc.service" "${ROOTFS_DIR}/etc/systemd/system/graphical.target.wants/utlc.service"
     fi
 
-    # Install launcher icon assets
+    # Install launcher icon assets (rendered hicolor theme only; never the
+    # vendored third-party source SVGs).
     if [[ ! -d "${WORKSPACE_ROOT}/assets/icons" && -f "${SCRIPT_DIR}/download_icons.py" ]]; then
-        python3 "${SCRIPT_DIR}/download_icons.py" || true
+        python3 "${SCRIPT_DIR}/download_icons.py" || echo "[!] WARNING: icon download failed; continuing without launcher icons" >&2
     fi
-    if [[ -d "${WORKSPACE_ROOT}/assets/icons" ]]; then
-        mkdir -p "${ROOTFS_DIR}/usr/share"
-        cp -a "${WORKSPACE_ROOT}/assets/icons" "${ROOTFS_DIR}/usr/share/"
+    if [[ -d "${WORKSPACE_ROOT}/assets/icons/hicolor" ]]; then
+        mkdir -p "${ROOTFS_DIR}/usr/share/icons"
+        cp -a "${WORKSPACE_ROOT}/assets/icons/hicolor" "${ROOTFS_DIR}/usr/share/icons/"
         mkdir -p "${ROOTFS_DIR}/usr/share/pixmaps"
-        cp -a "${WORKSPACE_ROOT}/assets/icons/hicolor/64x64/apps/"*.png "${ROOTFS_DIR}/usr/share/pixmaps/" 2>/dev/null || true
+        cp -a "${WORKSPACE_ROOT}/assets/icons/hicolor/64x64/apps/"*.png "${ROOTFS_DIR}/usr/share/pixmaps/"
     fi
 
     # Copy deb packages and kernel modules
@@ -258,19 +289,28 @@ EOF
 
     # Populate dpkg status database with all base debs and UTIM packages
     if [[ -f "${SCRIPT_DIR}/populate_dpkg_status.py" ]]; then
-        python3 "${SCRIPT_DIR}/populate_dpkg_status.py" "${ROOTFS_DIR}" || true
+        python3 "${SCRIPT_DIR}/populate_dpkg_status.py" "${ROOTFS_DIR}"
     fi
 
-    # Generate initial graphics environment
-    mkdir -p "${ROOTFS_DIR}/etc/environment.d" "${ROOTFS_DIR}/run/utim"
-    if [[ -x "${WORKSPACE_ROOT}/target/debug/utim-graphics-check" ]]; then
-        "${WORKSPACE_ROOT}/target/debug/utim-graphics-check" --generate-env "${ROOTFS_DIR}/etc/environment.d/10-graphics.conf" || true
-    elif [[ -x "${WORKSPACE_ROOT}/target/release/utim-graphics-check" ]]; then
-        "${WORKSPACE_ROOT}/target/release/utim-graphics-check" --generate-env "${ROOTFS_DIR}/etc/environment.d/10-graphics.conf" || true
-    else
-        cargo run --bin utim-graphics-check -- --generate-env "${ROOTFS_DIR}/etc/environment.d/10-graphics.conf" || true
+    # Prune build-time weight that must not ship on the phone (B-11). This
+    # runs AFTER populate_dpkg_status.py, which reads the archives cache.
+    rm -rf "${ROOTFS_DIR}/var/lib/apt/lists"/* "${ROOTFS_DIR}/var/cache/apt/archives/"*.deb "${ROOTFS_DIR}/tmp/debs"
+    mkdir -p "${ROOTFS_DIR}/var/lib/apt/lists/partial" "${ROOTFS_DIR}/var/cache/apt/archives/partial"
+    rm -rf "${ROOTFS_DIR}/usr/share/doc" "${ROOTFS_DIR}/usr/share/man" "${ROOTFS_DIR}/usr/share/info"
+    if [[ -d "${ROOTFS_DIR}/usr/lib/aarch64-linux-gnu/gconv" ]]; then
+        find "${ROOTFS_DIR}/usr/lib/aarch64-linux-gnu/gconv" -name '*.so' \
+            ! -name 'ISO8859-1.so' ! -name 'UTF-16.so' ! -name 'UTF-32.so' \
+            ! -name 'ANSI_X3.4-1968.so' -delete
     fi
-    ln -sf "/etc/environment.d/10-graphics.conf" "${ROOTFS_DIR}/run/utim/graphics.env" || true
+
+    # Neutral graphics environment (B-6): the target GPU is probed at runtime
+    # by utim. Never bake the build host's pipeline into the image.
+    mkdir -p "${ROOTFS_DIR}/etc/environment.d" "${ROOTFS_DIR}/run/utim"
+    cat > "${ROOTFS_DIR}/etc/environment.d/10-graphics.conf" <<'EOF'
+# Universal Treble Linux - GPU pipeline is probed at runtime by utim.
+# Do not pin a build-host pipeline here.
+EOF
+    ln -sf "/etc/environment.d/10-graphics.conf" "${ROOTFS_DIR}/run/utim/graphics.env"
 
     # Generate ld.so.cache for dynamic library resolution
     if [[ -f "${ROOTFS_DIR}/sbin/ldconfig" ]] && command -v qemu-aarch64-static >/dev/null 2>&1; then
@@ -312,7 +352,7 @@ Pin-Priority: -1
 EOF
 
     cat << 'EOF' > "${ROOTFS_DIR}/etc/apt/preferences.d/utim-pinning"
-Package: utim-init utim-init-dummy utlc libhybris* mesa-turnip* spa-droid*
+Package: utim-init-dummy utlc libhybris* mesa-*
 Pin: release o=UniversalTreble
 Pin-Priority: 1001
 EOF
@@ -328,6 +368,10 @@ Dpkg::Options {
    "--force-confold";
 };
 EOF
+
+# Identity, groups, hostname, resolver and fstab (B-8): the privileged path
+# must produce the same accounts and host files as the non-root path.
+configure_identity_and_network "${ROOTFS_DIR}"
 
 echo "[*] Installing UTIM binaries, systemd shims, and graphics check tool..."
 cp "${WORKSPACE_ROOT}/target/aarch64-unknown-linux-gnu/release/utim" "${ROOTFS_DIR}/usr/bin/utim"
@@ -351,7 +395,10 @@ ln -sf "/usr/bin/utim" "${ROOTFS_DIR}/init"
         cp "${SCRIPT_DIR}/shims/systemd-sysusers" "${ROOTFS_DIR}/usr/bin/systemd-sysusers"
         cp "${SCRIPT_DIR}/shims/systemd-notify" "${ROOTFS_DIR}/usr/bin/systemd-notify"
         cp "${SCRIPT_DIR}/shims/systemd-escape" "${ROOTFS_DIR}/usr/bin/systemd-escape"
-        chmod 755 "${ROOTFS_DIR}/usr/bin/systemd-"*
+        shim_bins=("${ROOTFS_DIR}/usr/bin/systemd-"*)
+        if (( ${#shim_bins[@]} )); then
+            chmod 755 "${shim_bins[@]}"
+        fi
         if [[ -d "${ROOTFS_DIR}/bin" && ! -L "${ROOTFS_DIR}/bin" ]]; then
             ln -sf "/usr/bin/systemd-tmpfiles" "${ROOTFS_DIR}/bin/systemd-tmpfiles"
             ln -sf "/usr/bin/systemd-sysusers" "${ROOTFS_DIR}/bin/systemd-sysusers"
@@ -399,9 +446,13 @@ mkdir -p "${ROOTFS_DIR}/run/systemd/system"
 mkdir -p "${ROOTFS_DIR}/run/utim"
 mkdir -p "${ROOTFS_DIR}/etc/environment.d"
 
-# Generate initial graphics environment
-"${WORKSPACE_ROOT}/target/debug/utim-graphics-check" --generate-env "${ROOTFS_DIR}/etc/environment.d/10-graphics.conf" || true
-ln -sf "/etc/environment.d/10-graphics.conf" "${ROOTFS_DIR}/run/utim/graphics.env" || true
+# Neutral graphics environment (B-6): the target GPU is probed at runtime
+# by utim. Never bake the build host's pipeline into the image.
+cat > "${ROOTFS_DIR}/etc/environment.d/10-graphics.conf" <<'EOF'
+# Universal Treble Linux - GPU pipeline is probed at runtime by utim.
+# Do not pin a build-host pipeline here.
+EOF
+ln -sf "/etc/environment.d/10-graphics.conf" "${ROOTFS_DIR}/run/utim/graphics.env"
 
 echo "[*] Installing dummy package, Phase 2 graphics packages, and Phase 3 UTLC into rootfs..."
 mkdir -p "${ROOTFS_DIR}/tmp/debs"

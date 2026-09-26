@@ -9,8 +9,17 @@ use crate::compositor::launcher::{AppDrawer, HotseatDock, WorkspaceGrid};
 use crate::compositor::lockscreen::LockScreen;
 use crate::compositor::recents::RecentsCarousel;
 use crate::compositor::systemui::SystemUiShade;
-use crate::graphics::composer::{CompositionType, DisplayConfig, HwcComposer, Rect};
+use crate::graphics::composer::{CompositionType, DisplayConfig, HwcComposer, HwcError, Rect};
 use crate::graphics::vsync::{VsyncConfig, VsyncPresentationValidator};
+
+/// Lets `MobileScene::{prepare_frame, present_frame}` return the Copy-friendly
+/// `HwcError` while `WaylandServer` (which returns `Result<(), String>`)
+/// keeps compiling unchanged via `?`.
+impl From<HwcError> for String {
+    fn from(e: HwcError) -> String {
+        e.to_string()
+    }
+}
 
 /// Scene Graph Visual Plane Order
 pub mod plane_z_order {
@@ -52,14 +61,12 @@ pub struct MobileScene {
     pub active_app_buffer_fd: Option<i32>,
     pub hwc: HwcComposer,
     pub vsync_validator: VsyncPresentationValidator,
-    // HWC layer handles for multi-plane composition
+    // HWC layer handles for multi-plane composition. Only the layers
+    // prepare_frame programs are created; shade/IME/lock/dock compose via
+    // the ClientTarget until explicitly promoted (see try_init_hwc_layers).
     layer_grid: Option<u64>,
-    layer_dock: Option<u64>,
     layer_app: Option<u64>,
     layer_status: Option<u64>,
-    layer_shade: Option<u64>,
-    layer_ime: Option<u64>,
-    layer_lock: Option<u64>,
 }
 
 impl MobileScene {
@@ -92,68 +99,50 @@ impl MobileScene {
             hwc: hwc_composer,
             vsync_validator,
             layer_grid: None,
-            layer_dock: None,
             layer_app: None,
             layer_status: None,
-            layer_shade: None,
-            layer_ime: None,
-            layer_lock: None,
         };
 
         // Register display with HWC
         let display_cfg = DisplayConfig::standard_mobile(display_id, width, height, refresh_rate);
         scene.hwc.register_display(display_cfg);
 
-        // Allocate HWC hardware composition layers
-        scene.init_hwc_layers();
+        // Allocate HWC hardware composition layers; log and degrade if the
+        // composer rejects us rather than silently dropping planes.
+        if let Err(e) = scene.try_init_hwc_layers() {
+            eprintln!("[-] HWC layer init failed, degrading to client composition: {}", e);
+        }
         scene
     }
 
-    fn init_hwc_layers(&mut self) {
-        self.layer_grid = self.hwc.create_layer(self.display_id).ok();
-        self.layer_dock = self.hwc.create_layer(self.display_id).ok();
-        self.layer_app = self.hwc.create_layer(self.display_id).ok();
-        self.layer_status = self.hwc.create_layer(self.display_id).ok();
-        self.layer_shade = self.hwc.create_layer(self.display_id).ok();
-        self.layer_ime = self.hwc.create_layer(self.display_id).ok();
-        self.layer_lock = self.hwc.create_layer(self.display_id).ok();
+    /// Create only the layers `prepare_frame` actually programs. Unused
+    /// layers still consume z-slots and overlay-plane budget in
+    /// `validate_display` (max 4 planes): creating shade/IME/lock planes up
+    /// front demoted the status bar to client composition every frame. Those
+    /// surfaces compose via the ClientTarget until explicitly promoted.
+    fn try_init_hwc_layers(&mut self) -> Result<(), HwcError> {
+        self.layer_grid = Some(self.hwc.create_layer(self.display_id)?);
+        self.layer_app = Some(self.hwc.create_layer(self.display_id)?);
+        self.layer_status = Some(self.hwc.create_layer(self.display_id)?);
 
-        // Assign Z-orders
-        if let Some(l) = self.layer_grid {
-            let _ = self
-                .hwc
-                .set_layer_z_order(self.display_id, l, plane_z_order::WALLPAPER_GRID);
-        }
-        if let Some(l) = self.layer_dock {
-            let _ = self
-                .hwc
-                .set_layer_z_order(self.display_id, l, plane_z_order::HOTSEAT_DOCK);
-        }
-        if let Some(l) = self.layer_app {
-            let _ =
-                self.hwc
-                    .set_layer_z_order(self.display_id, l, plane_z_order::APPLICATION_SURFACE);
-        }
-        if let Some(l) = self.layer_status {
-            let _ = self
-                .hwc
-                .set_layer_z_order(self.display_id, l, plane_z_order::STATUS_BAR);
-        }
-        if let Some(l) = self.layer_shade {
-            let _ = self
-                .hwc
-                .set_layer_z_order(self.display_id, l, plane_z_order::SYSTEM_UI_SHADE);
-        }
-        if let Some(l) = self.layer_ime {
-            let _ = self
-                .hwc
-                .set_layer_z_order(self.display_id, l, plane_z_order::VIRTUAL_KEYBOARD);
-        }
-        if let Some(l) = self.layer_lock {
-            let _ = self
-                .hwc
-                .set_layer_z_order(self.display_id, l, plane_z_order::LOCK_SCREEN);
-        }
+        // Assign Z-orders; every failure propagates instead of compositing
+        // a plane at the wrong depth for the rest of the session.
+        self.hwc.set_layer_z_order(
+            self.display_id,
+            self.layer_grid.unwrap(),
+            plane_z_order::WALLPAPER_GRID,
+        )?;
+        self.hwc.set_layer_z_order(
+            self.display_id,
+            self.layer_app.unwrap(),
+            plane_z_order::APPLICATION_SURFACE,
+        )?;
+        self.hwc.set_layer_z_order(
+            self.display_id,
+            self.layer_status.unwrap(),
+            plane_z_order::STATUS_BAR,
+        )?;
+        Ok(())
     }
 
     /// Dispatch gesture event to scene state machine
@@ -209,8 +198,10 @@ impl MobileScene {
         }
     }
 
-    /// Update HWC multi-plane layer attributes and validate composition
-    pub fn prepare_frame(&mut self) -> Result<(), String> {
+    /// Update HWC multi-plane layer attributes and validate composition.
+    /// Returns the composer's `HwcError` directly: no heap `String` on the
+    /// 60-120 Hz frame path (the success path allocates nothing here).
+    pub fn prepare_frame(&mut self) -> Result<(), HwcError> {
         let w = self.width as i32;
         let h = self.height as i32;
 
@@ -223,13 +214,11 @@ impl MobileScene {
 
         // 1. Grid / Wallpaper Layer
         if let Some(l) = self.layer_grid {
-            let _ = self
-                .hwc
-                .set_layer_display_frame(self.display_id, l, full_rect);
-            let _ =
-                self.hwc
-                    .set_layer_composition_type(self.display_id, l, CompositionType::Device);
-            let _ = self.hwc.set_layer_buffer(self.display_id, l, 100, None);
+            self.hwc
+                .set_layer_display_frame(self.display_id, l, full_rect)?;
+            self.hwc
+                .set_layer_composition_type(self.display_id, l, CompositionType::Device)?;
+            self.hwc.set_layer_buffer(self.display_id, l, 100, None)?;
         }
 
         // 2. Application Layer (with IME viewport push if active)
@@ -241,21 +230,18 @@ impl MobileScene {
                 right: w,
                 bottom: h - push_y,
             };
-            let _ = self
-                .hwc
-                .set_layer_display_frame(self.display_id, l, app_rect);
+            self.hwc
+                .set_layer_display_frame(self.display_id, l, app_rect)?;
 
             let comp_type = match self.mode {
                 ShellMode::Application | ShellMode::SplitScreen => CompositionType::Device,
                 _ => CompositionType::Client,
             };
-            let _ = self
-                .hwc
-                .set_layer_composition_type(self.display_id, l, comp_type);
+            self.hwc
+                .set_layer_composition_type(self.display_id, l, comp_type)?;
             if let Some(fd) = self.active_app_buffer_fd {
-                let _ = self
-                    .hwc
-                    .set_layer_buffer(self.display_id, l, fd as u64, None);
+                self.hwc
+                    .set_layer_buffer(self.display_id, l, fd as u64, None)?;
             }
         }
 
@@ -267,26 +253,29 @@ impl MobileScene {
                 right: w,
                 bottom: self.system_ui.status_bar.height as i32,
             };
-            let _ = self
-                .hwc
-                .set_layer_display_frame(self.display_id, l, status_rect);
-            let _ =
-                self.hwc
-                    .set_layer_composition_type(self.display_id, l, CompositionType::Device);
-            let _ = self.hwc.set_layer_buffer(self.display_id, l, 200, None);
+            self.hwc
+                .set_layer_display_frame(self.display_id, l, status_rect)?;
+            self.hwc
+                .set_layer_composition_type(self.display_id, l, CompositionType::Device)?;
+            self.hwc.set_layer_buffer(self.display_id, l, 200, None)?;
         }
 
         // 4. Set ClientTarget fallback buffer
-        let _ = self.hwc.set_client_target(self.display_id, 9999, None);
+        self.hwc.set_client_target(self.display_id, 9999, None)?;
 
         // 5. Validate HWC composition
-        let (changed, _has_client) = self
-            .hwc
-            .validate_display(self.display_id)
-            .map_err(|e| format!("HWC validation failed: {:?}", e))?;
+        let (changed, has_client) = self.hwc.validate_display(self.display_id)?;
 
+        if has_client {
+            // Surface the demotion instead of silently accepting it: some
+            // plane fell back to GPU composition this frame.
+            eprintln!(
+                "[-] HWC demoted layer(s) to client composition on display {}",
+                self.display_id
+            );
+        }
         if changed > 0 {
-            let _ = self.hwc.accept_display_changes(self.display_id);
+            self.hwc.accept_display_changes(self.display_id)?;
         }
 
         Ok(())
@@ -297,17 +286,17 @@ impl MobileScene {
         &mut self,
         vsync_timestamp_ns: u64,
         present_timestamp_ns: u64,
-    ) -> Result<(), String> {
+    ) -> Result<(), HwcError> {
         // Validate tear-free timing
         self.vsync_validator
             .validate_frame_presentation(vsync_timestamp_ns, present_timestamp_ns)
-            .map_err(|e| format!("VSYNC tear validation error: {:?}", e))?;
+            .map_err(|e| HwcError::ValidationFailed(format!("{:?}", e)))?;
 
         // Present display via HWC
         let _fences = self
             .hwc
             .present_display(self.display_id)
-            .map_err(|e| format!("HWC presentation failed: {:?}", e))?;
+            .map_err(|e| HwcError::PresentationFailed(format!("{:?}", e)))?;
 
         Ok(())
     }
@@ -346,8 +335,8 @@ mod tests {
         // Home gesture returns to Launcher
         scene.apply_gesture_action(GestureAction::Home {
             progress: 1.0,
-            scale: 0.0,
-            window_alpha: 0.0,
+            scale: 0.6,
+            window_alpha: 0.7,
         });
         assert_eq!(scene.mode, ShellMode::Launcher);
 

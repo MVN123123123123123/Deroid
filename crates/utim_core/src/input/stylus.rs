@@ -141,14 +141,15 @@ impl StylusHandler {
                     })
                 }
                 ABS_TILT_X => {
-                    self.tilt_x = ev.value as f32;
+                    // evdev units are 0.01 degrees; Wayland tilt is degrees.
+                    self.tilt_x = (ev.value as f32 * 0.01).clamp(-90.0, 90.0);
                     Some(TabletEvent::Tilt {
                         tilt_x: self.tilt_x,
                         tilt_y: self.tilt_y,
                     })
                 }
                 ABS_TILT_Y => {
-                    self.tilt_y = ev.value as f32;
+                    self.tilt_y = (ev.value as f32 * 0.01).clamp(-90.0, 90.0);
                     Some(TabletEvent::Tilt {
                         tilt_x: self.tilt_x,
                         tilt_y: self.tilt_y,
@@ -229,7 +230,9 @@ impl StylusHandler {
         let dy = touch_y - self.cursor_y;
         let dist = (dx * dx + dy * dy).sqrt();
 
-        // If touch contact is within palm rejection radius of stylus position, suppress it
-        dist < self.palm_rejection_margin_px || self.is_down
+        // A palm is the broad contact away from the tip; keep the pen's own
+        // contact and reject touches at/inside the margin. Never gate on
+        // is_down (that would disable all multi-touch for every stroke).
+        dist <= self.palm_rejection_margin_px
     }
 }

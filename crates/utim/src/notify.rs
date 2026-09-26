@@ -47,8 +47,9 @@ impl NotifyServer {
             );
         }
 
-        // Set permissions so unprivileged services can write to notify socket
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o777));
+        // Socket must be writable by services but not world-executable/traversable
+        // beyond necessity: 0666 (rw for all) is enough. 0777 was overly broad.
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o666));
 
         Ok(Self { socket })
     }
@@ -58,12 +59,23 @@ impl NotifyServer {
     }
 
     /// Read incoming datagram messages with kernel-verified sender PID via SCM_CREDENTIALS.
-    pub fn recv_messages_with_sender(&self) -> Vec<(NotifyMessage, Option<i32>)> {
-        let mut messages = Vec::new();
+    /// Bounded drain (MAX_DRAIN): level-triggered epoll re-arms, so a flood
+    /// cannot spin PID 1 out of its event loop. Prefer the `_into` variant
+    /// to reuse a caller-owned buffer (no per-event allocation).
+    pub const MAX_DRAIN: usize = 64;
+
+    pub fn recv_messages_with_sender_into(
+        &self,
+        out: &mut Vec<(NotifyMessage, Option<i32>)>,
+    ) -> usize {
+        out.clear();
         let mut buf = [0u8; 4096];
         let mut cmsg_buf = [0u8; 128];
 
         loop {
+            if out.len() >= Self::MAX_DRAIN {
+                break;
+            }
             let mut iov = libc::iovec {
                 iov_base: buf.as_mut_ptr() as *mut libc::c_void,
                 iov_len: buf.len(),
@@ -81,6 +93,17 @@ impl NotifyServer {
                 let err = io::Error::last_os_error();
                 if err.kind() == io::ErrorKind::WouldBlock {
                     break;
+                }
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                // Surface real errors (EBADF etc.) without spinning; a
+                // best-effort stderr write can never panic PID 1.
+                {
+                    let e = format!("[UTIM] notify recvmsg: {}\n", err);
+                    unsafe {
+                        libc::write(2, e.as_ptr() as *const libc::c_void, e.len());
+                    }
                 }
                 break;
             }
@@ -106,10 +129,17 @@ impl NotifyServer {
                     }
                 }
 
-                messages.push((parsed, sender_pid));
+                out.push((parsed, sender_pid));
             }
         }
 
+        out.len()
+    }
+
+    /// Read incoming datagram messages with kernel-verified sender PID via SCM_CREDENTIALS.
+    pub fn recv_messages_with_sender(&self) -> Vec<(NotifyMessage, Option<i32>)> {
+        let mut messages = Vec::new();
+        self.recv_messages_with_sender_into(&mut messages);
         messages
     }
 

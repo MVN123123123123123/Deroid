@@ -144,6 +144,20 @@ fn dup_cloexec_i32(fd: i32) -> Option<i32> {
     }
 }
 
+/// Fallible fence dup reporting the `fcntl` errno instead of degrading to
+/// `None`. Sentinel values (< 0, "no fence") pass through unchanged.
+fn dup_cloexec_i32_result(fd: i32) -> Result<i32, std::io::Error> {
+    if fd < 0 {
+        return Ok(fd);
+    }
+    let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if dup < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(dup)
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub struct HwcLayer {
     pub id: u64,
@@ -161,6 +175,9 @@ pub struct HwcLayer {
 }
 
 impl Clone for HwcLayer {
+    /// Best-effort clone: if `fcntl(F_DUPFD_CLOEXEC)` fails (e.g. `EMFILE`)
+    /// the fence degrades to `None` and the failure is unobservable. Prefer
+    /// [`HwcLayer::try_clone`] on any path that feeds a real compositor.
     fn clone(&self) -> Self {
         Self {
             id: self.id,
@@ -211,6 +228,33 @@ impl HwcLayer {
             release_fence: None,
         }
     }
+
+    /// Fallible clone: dups fences via `fcntl` and reports the errno instead
+    /// of silently dropping the fd. Scalars and handles are copied as-is.
+    pub fn try_clone(&self) -> Result<Self, std::io::Error> {
+        let acquire_fence = match self.acquire_fence {
+            Some(f) => Some(dup_cloexec_i32_result(f)?),
+            None => None,
+        };
+        let release_fence = match self.release_fence {
+            Some(f) => Some(dup_cloexec_i32_result(f)?),
+            None => None,
+        };
+        Ok(Self {
+            id: self.id,
+            z_order: self.z_order,
+            transform: self.transform,
+            blend_mode: self.blend_mode,
+            source_crop: self.source_crop,
+            display_frame: self.display_frame,
+            plane_alpha: self.plane_alpha,
+            composition_type: self.composition_type,
+            requested_composition_type: self.requested_composition_type,
+            buffer_handle: self.buffer_handle,
+            acquire_fence,
+            release_fence,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -222,6 +266,7 @@ pub enum HwcError {
     ValidationFailed(String),
     PresentationFailed(String),
     NoClientTarget,
+    TooManyLayers(u32),
 }
 
 impl fmt::Display for HwcError {
@@ -237,6 +282,7 @@ impl fmt::Display for HwcError {
                 f,
                 "Client composition required but no ClientTarget buffer set"
             ),
+            HwcError::TooManyLayers(n) => write!(f, "Too many layers for display {}", n),
         }
     }
 }
@@ -286,14 +332,20 @@ impl ReleaseFences {
             .map(|(_, v)| v)
     }
 
-    pub fn insert(&mut self, key: u64, fence: Option<i32>) {
+    /// Returns `false` when the table already holds 32 entries and `key`
+    /// is new, so the caller can surface `TooManyLayers` instead of
+    /// silently dropping the fence.
+    pub fn insert(&mut self, key: u64, fence: Option<i32>) -> bool {
         if let Some(entry) = self.entries[..self.count].iter_mut().find(|(k, _)| *k == key) {
             entry.1 = fence;
-            return;
+            return true;
         }
         if self.count < 32 {
             self.entries[self.count] = (key, fence);
             self.count += 1;
+            true
+        } else {
+            false
         }
     }
 
@@ -320,6 +372,10 @@ pub struct HwcComposer {
     client_targets: HashMap<u32, (u64, Option<i32>)>, // display_id -> (buffer_handle, fence)
     next_layer_id: u64,
     validated: HashMap<u32, bool>,
+    /// Scratch reused across frames: `validate_display` runs on the frame
+    /// path, so it must not allocate per frame. `clear` + `extend` reuses
+    /// the backing store.
+    sorted_buf: Vec<(u64, u32)>,
 }
 
 impl HwcComposer {
@@ -331,6 +387,7 @@ impl HwcComposer {
             client_targets: HashMap::new(),
             next_layer_id: 1,
             validated: HashMap::new(),
+            sorted_buf: Vec::new(),
         }
     }
 
@@ -340,24 +397,40 @@ impl HwcComposer {
 
     /// Auto-detect Composer version from vendor manifest or existing system environment.
     pub fn detect_version_from_manifest(manifest_content: Option<&str>) -> HwcVersion {
+        // Attribute and <name> must belong to the *same* <hal> element, or
+        // any unrelated AIDL HAL hijacks the match. Versioned HIDL names are
+        // tested before the AIDL fallback because e.g. `composer@2.1` also
+        // starts with `android.hardware.graphics.composer`.
         if let Some(content) = manifest_content {
-            if content.contains("android.hardware.graphics.composer3")
-                || (content.contains("android.hardware.graphics.composer")
-                    && content.contains("aidl"))
-            {
-                return HwcVersion::AidlComposer3;
-            }
-            if content.contains("android.hardware.graphics.composer@2.4") {
-                return HwcVersion::Hwc2_4;
-            }
-            if content.contains("android.hardware.graphics.composer@2.3") {
-                return HwcVersion::Hwc2_3;
-            }
-            if content.contains("android.hardware.graphics.composer@2.2") {
-                return HwcVersion::Hwc2_2;
-            }
-            if content.contains("android.hardware.graphics.composer@2.1") {
-                return HwcVersion::Hwc2_1;
+            for hal in content.split("<hal").skip(1) {
+                // Only consider the current <hal>...</hal> element.
+                let elem = hal.split("</hal>").next().unwrap_or(hal);
+                let is_aidl =
+                    elem.contains("format=\"aidl\"") || elem.contains("format='aidl'");
+                let name = elem
+                    .split("<name>")
+                    .nth(1)
+                    .and_then(|n| n.split('<').next())
+                    .unwrap_or("")
+                    .trim();
+                if name.contains("android.hardware.graphics.composer@2.4") {
+                    return HwcVersion::Hwc2_4;
+                }
+                if name.contains("android.hardware.graphics.composer@2.3") {
+                    return HwcVersion::Hwc2_3;
+                }
+                if name.contains("android.hardware.graphics.composer@2.2") {
+                    return HwcVersion::Hwc2_2;
+                }
+                if name.contains("android.hardware.graphics.composer@2.1") {
+                    return HwcVersion::Hwc2_1;
+                }
+                if name.contains("android.hardware.graphics.composer3") {
+                    return HwcVersion::AidlComposer3;
+                }
+                if name.starts_with("android.hardware.graphics.composer") && is_aidl {
+                    return HwcVersion::AidlComposer3;
+                }
             }
         }
 
@@ -387,10 +460,24 @@ impl HwcComposer {
     }
 
     pub fn create_layer(&mut self, display_id: u32) -> Result<u64, HwcError> {
+        let max_planes = self
+            .displays
+            .get(&display_id)
+            .map(|c| c.max_overlay_planes)
+            .unwrap_or(4);
         let display_layers = self
             .layers
             .get_mut(&display_id)
             .ok_or(HwcError::DisplayNotFound(display_id))?;
+
+        // Bound the layer count by the display's plane budget (+1 for the
+        // ClientTarget) and by the `ReleaseFences` capacity (32), so the
+        // per-frame fence table cannot overflow silently. Without a cap an
+        // unbounded layer map would drop fences past 32 with no error.
+        let cap = max_planes.saturating_add(1).min(32);
+        if display_layers.len() >= cap {
+            return Err(HwcError::TooManyLayers(display_id));
+        }
 
         let layer_id = self.next_layer_id;
         self.next_layer_id = self.next_layer_id.wrapping_add(1);
@@ -445,6 +532,7 @@ impl HwcComposer {
         }
         layer.buffer_handle = Some(buffer_handle);
         layer.acquire_fence = acquire_fence;
+        self.validated.insert(display_id, false);
         Ok(())
     }
 
@@ -513,6 +601,7 @@ impl HwcComposer {
                 unsafe { libc::close(old_fence) };
             }
         }
+        self.validated.insert(display_id, false);
         Ok(())
     }
 
@@ -521,25 +610,28 @@ impl HwcComposer {
     /// Hardware constraint: When Client composition is used, ClientTarget itself consumes 1 hardware overlay plane.
     /// Returns: (number_of_changed_layers, has_client_composition)
     pub fn validate_display(&mut self, display_id: u32) -> Result<(usize, bool), HwcError> {
-        let display_config = self
+        // Borrow the config instead of cloning it per frame: this runs on
+        // the frame path (`WaylandServer::step_frame` -> `prepare_frame`).
+        let max_planes = self
             .displays
             .get(&display_id)
             .ok_or(HwcError::DisplayNotFound(display_id))?
-            .clone();
+            .max_overlay_planes;
 
         let display_layers = self
             .layers
             .get_mut(&display_id)
             .ok_or(HwcError::DisplayNotFound(display_id))?;
 
-        // Collect and sort layers by z_order ascending
-        let mut sorted_layer_ids: Vec<(u64, u32)> = display_layers
-            .iter()
-            .map(|(&id, l)| (id, l.z_order))
-            .collect();
-        sorted_layer_ids.sort_by_key(|&(_, z)| z);
-
-        let max_planes = display_config.max_overlay_planes;
+        // Reuse the scratch buffer across frames instead of allocating a
+        // fresh `Vec` per call (one alloc per frame on the hot path).
+        // Total order: ties broken by the monotonic layer id, never by
+        // `HashMap` iteration order (which is per-process random).
+        self.sorted_buf.clear();
+        self.sorted_buf
+            .extend(display_layers.iter().map(|(&id, l)| (id, l.z_order)));
+        self.sorted_buf
+            .sort_unstable_by_key(|&(id, z)| (z, id));
 
         // Check if any layer requested client or if total requested hardware layers exceeds max_planes
         let requested_client_count = display_layers
@@ -564,7 +656,19 @@ impl HwcComposer {
         let mut changed_count = 0;
         let mut has_client = false;
 
-        for (id, _) in sorted_layer_ids {
+        // Copy ids out of the scratch buffer first so the borrow of
+        // `self.sorted_buf` ends before `display_layers` is mutated below.
+        // The copy is stack-only (smallvec-style iteration over ids).
+        let n = self.sorted_buf.len();
+        // SAFETY: `n <= display_layers.len() <= 32` by `create_layer`'s cap,
+        // so a 32-entry stack array always fits.
+        let mut order = [0u64; 32];
+        let n = n.min(32);
+        for (i, &(id, _)) in self.sorted_buf.iter().enumerate().take(n) {
+            order[i] = id;
+        }
+
+        for &id in &order[..n] {
             let layer = display_layers.get_mut(&id).unwrap();
 
             if layer.requested_composition_type == CompositionType::Device {
@@ -647,7 +751,14 @@ impl HwcComposer {
             return Err(HwcError::NoClientTarget);
         }
 
-        // Close acquire fences since presentation consumes them
+        // Presentation consumes the acquire fences. The fences handed out here
+        // are mock (`-1` = immediately signalled); there is no real
+        // `sync_file` to wait on, so `present_display` performs no blocking
+        // synchronisation -- it polls for poll *errors* (EBADF/EINVAL) and
+        // propagates those, then closes. A production backend with real
+        // fences must replace this with a blocking wait (e.g. `poll(-1)` or
+        // `sync_file` wait) and return `PresentationFailed` on timeout/error
+        // instead of presenting an unfinished frame.
         for layer in display_layers.values_mut() {
             if let Some(acq) = layer.acquire_fence.take() {
                 if acq >= 0 {
@@ -656,10 +767,15 @@ impl HwcComposer {
                         events: libc::POLLIN,
                         revents: 0,
                     };
-                    unsafe {
-                        libc::poll(&mut pfd, 1, 0);
-                        libc::close(acq);
+                    let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
+                    if rc < 0 {
+                        let e = std::io::Error::last_os_error();
+                        unsafe { libc::close(acq) };
+                        return Err(HwcError::PresentationFailed(format!(
+                            "fence poll failed: {e}"
+                        )));
                     }
+                    unsafe { libc::close(acq) };
                 }
             }
         }
@@ -673,10 +789,15 @@ impl HwcComposer {
                         events: libc::POLLIN,
                         revents: 0,
                     };
-                    unsafe {
-                        libc::poll(&mut pfd, 1, 0);
-                        libc::close(acq);
+                    let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
+                    if rc < 0 {
+                        let e = std::io::Error::last_os_error();
+                        unsafe { libc::close(acq) };
+                        return Err(HwcError::PresentationFailed(format!(
+                            "client-target fence poll failed: {e}"
+                        )));
                     }
+                    unsafe { libc::close(acq) };
                 }
             }
         }
@@ -693,7 +814,11 @@ impl HwcComposer {
             }
             // Transfer ownership to release_fences; layer.release_fence is None to prevent double-close
             layer.release_fence = None;
-            release_fences.insert(id, Some(-1));
+            if !release_fences.insert(id, Some(-1)) {
+                return Err(HwcError::PresentationFailed(format!(
+                    "too many layers for release fences (display {display_id})"
+                )));
+            }
         }
 
         Ok((present_fence, release_fences))
@@ -826,8 +951,10 @@ mod tests {
             HwcError::NoClientTarget
         );
 
-        // Supply ClientTarget
+        // Supply ClientTarget (invalidates validation: a buffer swap needs
+        // re-validation per the HWC contract).
         hwc.set_client_target(0, 999, None).unwrap();
+        hwc.validate_display(0).expect("Re-validate after client target");
         let (present_fence, release_fences) = hwc.present_display(0).expect("Present with target");
         assert!(present_fence.is_some());
         assert_eq!(release_fences.len(), 3);
@@ -920,6 +1047,7 @@ mod tests {
         assert_eq!(changed, 2);
 
         hwc.set_client_target(0, 888, None).unwrap();
+        hwc.validate_display(0).expect("Re-validate after client target");
         let (present_fence, release_fences) = hwc.present_display(0).unwrap();
         assert!(present_fence.is_some());
         assert_eq!(release_fences.len(), 3);
@@ -942,6 +1070,7 @@ mod tests {
 
         let (target_fence, target_peer) = make_test_fence_pair();
         hwc.set_client_target(0, 777, Some(target_fence)).unwrap();
+        hwc.validate_display(0).unwrap();
 
         let _ = hwc
             .present_display(0)

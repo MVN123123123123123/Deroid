@@ -144,17 +144,17 @@ fn test_milestone_4_2_sms_pdu_encoding_and_concatenation() {
     let alpha_text = "ALPHANUM";
     let alpha_septets = encode_gsm7(alpha_text).unwrap();
     let alpha_packed = pack_7bit(&alpha_septets);
-    let decoded_alpha = decode_address_semi_octets(&alpha_packed, 14, 0xD0);
+    let decoded_alpha = decode_address_semi_octets(&alpha_packed, 8, 0xD0);
     assert_eq!(decoded_alpha, alpha_text);
 
     // 4. SMS-SUBMIT PDU encoding
-    let pdu_submit = encode_sms_submit_pdu("+1234567890", "Test message from UTIM GSI: €100");
+    let pdu_submit = encode_sms_submit_pdu("+1234567890", "Test message from UTIM GSI: €100").unwrap();
     assert!(!pdu_submit.is_empty());
 
     // 5. SMS-DELIVER PDU single-part roundtrip
     let orig_sender = "+15551234567";
     let orig_text = "Standard GSM delivery test: @world";
-    let deliver_pdu = encode_sms_deliver_pdu(orig_sender, orig_text, None);
+    let deliver_pdu = encode_sms_deliver_pdu(orig_sender, orig_text, None).unwrap();
     let parsed_msg = parse_sms_deliver_pdu(&deliver_pdu).expect("parse_sms_deliver_pdu failed");
     assert_eq!(parsed_msg.sender, orig_sender);
     assert_eq!(parsed_msg.body, orig_text);
@@ -163,8 +163,8 @@ fn test_milestone_4_2_sms_pdu_encoding_and_concatenation() {
 
     // 6. Multipart SMS with UDH Concatenation Roundtrip & Reassembly
     let mut reassembler = SmsReassembler::new();
-    let pdu_part1 = encode_sms_deliver_pdu(orig_sender, "First segment. ", Some((0x42, 2, 1)));
-    let pdu_part2 = encode_sms_deliver_pdu(orig_sender, "Second segment.", Some((0x42, 2, 2)));
+    let pdu_part1 = encode_sms_deliver_pdu(orig_sender, "First segment. ", Some((0x42, 2, 1))).unwrap();
+    let pdu_part2 = encode_sms_deliver_pdu(orig_sender, "Second segment.", Some((0x42, 2, 2))).unwrap();
 
     let msg1 = parse_sms_deliver_pdu(&pdu_part1).unwrap();
     let msg2 = parse_sms_deliver_pdu(&pdu_part2).unwrap();
@@ -308,7 +308,19 @@ fn test_milestone_4_2_dual_sim_and_telephony_slice_protection() {
 
 #[test]
 fn test_milestone_4_2_wake_from_deep_suspend() {
-    let mut mpg = MobilePowerGovernor::new();
+    use std::path::PathBuf;
+    // H17: acquire only records on real success, so use an isolated sysfs.
+    let temp = std::env::temp_dir().join("utim_test_telephony_wake");
+    let _ = std::fs::remove_dir_all(&temp);
+    let power: PathBuf = temp.join("power");
+    std::fs::create_dir_all(&power).unwrap();
+    std::fs::write(power.join("wake_lock"), "").unwrap();
+    std::fs::write(power.join("wake_unlock"), "").unwrap();
+    let mut mpg = MobilePowerGovernor::with_paths(
+        power,
+        temp.join("cgroup"),
+        temp.join("battery"),
+    );
     let mut wake_mgr = TelephonyWakeManager::new();
 
     assert!(!wake_mgr.wake_lock_active);

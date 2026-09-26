@@ -15,6 +15,9 @@ pub enum KeyboardLayout {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ImeAction {
     None,
+    /// Single-character commit: zero-allocation fast path for the common
+    /// ASCII case.
+    CommitChar(char),
     CommitString(String),
     DeleteSurroundingText {
         before_length: u32,
@@ -112,23 +115,45 @@ impl VirtualKeyboard {
                 after_length: 0,
             },
             "ENTER" => ImeAction::SendKey(28), // KEY_ENTER
-            "SPACE" => ImeAction::CommitString(" ".into()),
-            c if c.chars().count() == 1 => {
-                let ch = c.chars().next().unwrap();
-                let output = if self.is_shift_active || self.is_caps_lock {
-                    ch.to_uppercase().to_string()
-                } else {
-                    ch.to_lowercase().to_string()
-                };
+            "SPACE" => ImeAction::CommitChar(' '),
+            _ => {
+                // Single-char keys without double-scanning the string.
+                let mut it = key.chars();
+                match (it.next(), it.next()) {
+                    (Some(ch), None) => {
+                        let shifted = self.is_shift_active || self.is_caps_lock;
+                        // ASCII fast path: no allocation. Non-ASCII case
+                        // folding is the rare path and keeps the String form.
+                        let out = if ch.is_ascii_alphabetic() {
+                            if shifted {
+                                ch.to_ascii_uppercase()
+                            } else {
+                                ch.to_ascii_lowercase()
+                            }
+                        } else if ch.is_ascii() {
+                            ch
+                        } else {
+                            let s = if shifted {
+                                ch.to_uppercase().to_string()
+                            } else {
+                                ch.to_lowercase().to_string()
+                            };
+                            if self.is_shift_active && !self.is_caps_lock {
+                                self.is_shift_active = false;
+                            }
+                            return ImeAction::CommitString(s);
+                        };
 
-                // Single shift turns off after typing
-                if self.is_shift_active && !self.is_caps_lock {
-                    self.is_shift_active = false;
+                        // Single shift turns off after typing
+                        if self.is_shift_active && !self.is_caps_lock {
+                            self.is_shift_active = false;
+                        }
+
+                        ImeAction::CommitChar(out)
+                    }
+                    _ => ImeAction::None,
                 }
-
-                ImeAction::CommitString(output)
             }
-            _ => ImeAction::None,
         }
     }
 
@@ -168,18 +193,18 @@ mod tests {
 
         // Lowercase typing
         let act1 = ime.handle_key_tap("a");
-        assert_eq!(act1, ImeAction::CommitString("a".into()));
+        assert_eq!(act1, ImeAction::CommitChar('a'));
 
         // Shift then type
         ime.handle_key_tap("SHIFT");
         assert!(ime.is_shift_active);
         let act2 = ime.handle_key_tap("b");
-        assert_eq!(act2, ImeAction::CommitString("B".into()));
+        assert_eq!(act2, ImeAction::CommitChar('B'));
         assert!(!ime.is_shift_active); // Auto-reverted
 
         // Space and Backspace
         let act_space = ime.handle_key_tap("SPACE");
-        assert_eq!(act_space, ImeAction::CommitString(" ".into()));
+        assert_eq!(act_space, ImeAction::CommitChar(' '));
 
         let act_del = ime.handle_key_tap("BACKSPACE");
         assert_eq!(

@@ -30,6 +30,15 @@ pub struct SpringOscillator {
 }
 
 impl SpringOscillator {
+    /// Hard ceiling for one integration sub-step: 240 Hz keeps |lambda| < 1
+    /// for every spring config in the crate (measured divergence thresholds
+    /// are 0.060..0.081 s, so a single 1/60 s step is already marginal and
+    /// any stalled frame would explode without sub-stepping).
+    const MAX_STEP: f32 = 1.0 / 240.0;
+    /// Hard ceiling for the total simulated time per call: a suspend/resume
+    /// must not teleport the UI.
+    const MAX_TOTAL: f32 = 0.25;
+
     pub fn new(initial: f32, config: SpringConfig) -> Self {
         Self {
             current: initial,
@@ -39,23 +48,40 @@ impl SpringOscillator {
         }
     }
 
-    /// Step simulation by dt (seconds)
+    /// Step simulation by dt (seconds). Clamped and sub-stepped so no
+    /// caller can destabilise the spring: non-finite/non-positive dt is
+    /// ignored, dt is capped at MAX_TOTAL, and integration runs in MAX_STEP
+    /// slices with a NaN watchdog that parks the spring on its target.
     pub fn step(&mut self, dt: f32) {
+        if !dt.is_finite() || dt <= 0.0 {
+            return;
+        }
         if (self.current - self.target).abs() < 0.05 && self.velocity.abs() < 0.05 {
             self.current = self.target;
             self.velocity = 0.0;
             return;
         }
 
-        // F = -k * (x - target) - c * v
-        let displacement = self.current - self.target;
-        let spring_force = -self.config.stiffness * displacement;
-        let damping_force = -self.config.damping * self.velocity;
-        let total_force = spring_force + damping_force;
+        // F = -k * (x - target) - c * v (semi-implicit Euler, sub-stepped)
+        let mut remaining = dt.min(Self::MAX_TOTAL);
+        while remaining > 0.0 {
+            let h = remaining.min(Self::MAX_STEP);
+            remaining -= h;
+            let displacement = self.current - self.target;
+            let spring_force = -self.config.stiffness * displacement;
+            let damping_force = -self.config.damping * self.velocity;
+            let total_force = spring_force + damping_force;
 
-        let acceleration = total_force / self.config.mass;
-        self.velocity += acceleration * dt;
-        self.current += self.velocity * dt;
+            let acceleration = total_force / self.config.mass;
+            self.velocity += acceleration * h;
+            self.current += self.velocity * h;
+            if !self.current.is_finite() || !self.velocity.is_finite() {
+                // Never let NaN/inf into geometry: park on target.
+                self.current = self.target;
+                self.velocity = 0.0;
+                break;
+            }
+        }
     }
 
     pub fn is_settled(&self) -> bool {
@@ -85,6 +111,13 @@ pub struct WorkspaceGrid {
 
 impl WorkspaceGrid {
     pub fn new(cols: usize, rows: usize, num_pages: usize, page_width: f32) -> Self {
+        assert!(
+            num_pages >= 1 && cols >= 1 && rows >= 1,
+            "WorkspaceGrid needs >= 1 page/col/row (got {}/{}/{})",
+            num_pages,
+            cols,
+            rows
+        );
         Self {
             cols,
             rows,
@@ -128,7 +161,7 @@ impl WorkspaceGrid {
     /// Handle drag scroll delta (dragging with touch)
     pub fn on_drag(&mut self, delta_x: f32) {
         // Apply rubber-band resistance when overscrolling boundaries
-        let min_offset = -((self.num_pages - 1) as f32) * self.page_width;
+        let min_offset = -((self.num_pages.saturating_sub(1)) as f32) * self.page_width;
         let max_offset = 0.0;
 
         let cur = self.scroll_spring.current;
@@ -152,13 +185,13 @@ impl WorkspaceGrid {
 
         let target_page = if velocity_x < -300.0 {
             // Flick left (next page)
-            (self.current_page as i32 + 1).min(self.num_pages as i32 - 1)
+            (self.current_page as i32 + 1).min(self.num_pages.saturating_sub(1) as i32)
         } else if velocity_x > 300.0 {
             // Flick right (previous page)
             (self.current_page as i32 - 1).max(0)
         } else {
             // Snap to nearest page
-            approx_page.clamp(0, self.num_pages as i32 - 1)
+            approx_page.clamp(0, self.num_pages.saturating_sub(1) as i32)
         };
 
         self.set_page(target_page as usize);
@@ -168,7 +201,7 @@ impl WorkspaceGrid {
     pub fn update(&mut self, dt: f32) {
         self.scroll_spring.step(dt);
         let progress = -self.scroll_spring.current / self.page_width;
-        self.current_page = progress.round().clamp(0.0, (self.num_pages - 1) as f32) as usize;
+        self.current_page = progress.round().clamp(0.0, self.num_pages.saturating_sub(1) as f32) as usize;
     }
 
     /// Calculate bounding box for an item on the grid
@@ -278,6 +311,7 @@ impl AppDrawer {
         self.state = DrawerState::Dragging { progress: clamped };
         self.spring.current = clamped;
         self.spring.target = clamped;
+        self.spring.velocity = 0.0; // finger took over: drop stale fling velocity
     }
 
     pub fn on_release(&mut self, velocity_y: f32) {
@@ -292,11 +326,17 @@ impl AppDrawer {
     pub fn update(&mut self, dt: f32) {
         self.spring.step(dt);
         if self.spring.is_settled() {
-            if self.spring.target == 1.0 {
-                self.state = DrawerState::Open;
-            } else if self.spring.target == 0.0 {
-                self.state = DrawerState::Closed;
-            }
+            // Derive the resting state from the target with tolerance, so an
+            // interior target (left by set_drag_progress) can settle too.
+            // A half-open drawer is "open enough" to render; the renderer
+            // reads progress() (0.0-1.0) for the actual position.
+            self.state = if (self.spring.target - 1.0).abs() < f32::EPSILON {
+                DrawerState::Open
+            } else if self.spring.target <= 0.0 {
+                DrawerState::Closed
+            } else {
+                DrawerState::Open
+            };
         }
     }
 

@@ -80,17 +80,22 @@ impl SpaDroidNode {
                 AudioStreamType::Music
             };
 
+            // H29: endpoint arrays are Copy; snapshot before the &mut call.
             let stream_id = if self.direction == SpaDirection::Capture {
+                let devs = hal.active_input_devices;
+                let n = hal.num_active_inputs.min(devs.len());
                 hal.open_input_stream(
                     super::hal::AudioSource::Mic,
                     self.config,
-                    hal.active_input_devices.clone(),
+                    &devs[..n],
                 )?
             } else {
+                let devs = hal.active_output_devices;
+                let n = hal.num_active_outputs.min(devs.len());
                 hal.open_output_stream(
                     stream_type,
                     self.config,
-                    hal.active_output_devices.clone(),
+                    &devs[..n],
                 )?
             };
             self.hal_stream_id = Some(stream_id);
@@ -112,6 +117,11 @@ impl SpaDroidNode {
         pcm_data: &[u8],
         hal: &mut AndroidAudioHal,
     ) -> Result<usize, AudioError> {
+        // H18: guard divide-by-zero before any side effect (unlike
+        // AudioConfig::latency_ms, which substitutes a 0.0 sentinel).
+        if self.config.sample_rate == 0 {
+            return Err(AudioError::InvalidParameter("sample_rate must be non-zero"));
+        }
         if self.state != SpaNodeState::Running {
             self.start();
         }
@@ -133,6 +143,7 @@ impl SpaDroidNode {
         let frames = written / frame_size;
         self.frames_processed += frames as u64;
 
+        // sample_rate != 0 checked above; inf/NaN latency is unreachable.
         // Calculate processing latency: (buffer_frames / sample_rate) * 1000 ms
         self.last_latency_ms = (frames as f32 / self.config.sample_rate as f32) * 1000.0;
 
@@ -145,6 +156,10 @@ impl SpaDroidNode {
         pcm_buffer: &mut [u8],
         hal: &mut AndroidAudioHal,
     ) -> Result<usize, AudioError> {
+        // H18: guard divide-by-zero before any side effect.
+        if self.config.sample_rate == 0 {
+            return Err(AudioError::InvalidParameter("sample_rate must be non-zero"));
+        }
         if self.state != SpaNodeState::Running {
             self.start();
         }
@@ -165,6 +180,7 @@ impl SpaDroidNode {
         let read = hal.read_input(stream_id, pcm_buffer)?;
         let frames = read / frame_size;
         self.frames_processed += frames as u64;
+        // sample_rate != 0 checked above; inf/NaN latency is unreachable.
         self.last_latency_ms = (frames as f32 / self.config.sample_rate as f32) * 1000.0;
 
         Ok(read)

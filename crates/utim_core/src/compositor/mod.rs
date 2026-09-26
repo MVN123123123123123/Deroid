@@ -17,14 +17,19 @@ pub mod protocols;
 pub mod recents;
 pub mod scene;
 pub mod server;
+pub mod super_extreme;
 pub mod systemui;
 
 pub use desktop::{fuzzy_match, parse_desktop_entry, DesktopApp, DesktopCatalogue};
 pub use icons::{IconCache, ICON_MAX_EDGE};
 pub use gestures::{
-    cubic_bezier_ease_out, EdgeSide, GestureAction, GestureConfig, GestureEngine, RawTouchEvent,
-    TouchPhase,
+    EdgeSide, GestureAction, GestureConfig, GestureEngine, RawTouchEvent, TouchPhase,
+    fast_out_slow_in,
 };
+// Deprecated alias kept for compatibility (B31); allowing the use here so
+// downstream crates only warn when they actually call it.
+#[allow(deprecated)]
+pub use gestures::cubic_bezier_ease_out;
 pub use ime::{ImeAction, KeyboardLayout, VirtualKeyboard};
 pub use input::{InputDispatchResult, InputDispatcher, LinuxInputEvent};
 pub use launcher::{
@@ -39,6 +44,7 @@ pub use protocols::{
 pub use recents::{KillProgress, RecentsCard, RecentsCarousel, SplitScreenConfig};
 pub use scene::{plane_z_order, MobileScene, ShellMode};
 pub use server::{CompositorMetrics, WaylandServer};
+pub use super_extreme::{SuperExtremeScreen, SuperExtremeState, TtyKey, VolumeHud};
 pub use systemui::{
     CellularRat, NotificationCard, QuickTile, QuickTileKind, StatusBarState, SystemUiShade,
 };

@@ -242,10 +242,23 @@ fn main() {
                                 unsafe {
                                     libc::sync();
                                     if !test_mode {
-                                        libc::reboot(libc::RB_POWER_OFF);
+                                        // B1: a failed reboot must be loud and non-fatal;
+                                        // never exit PID 1 silently.
+                                        if libc::reboot(libc::RB_POWER_OFF) != 0 {
+                                            let e = std::io::Error::last_os_error();
+                                            supervisor.log_msg(&format!(
+                                                "reboot(RB_POWER_OFF) failed: {}; staying as PID 1",
+                                                e
+                                            ));
+                                        } else {
+                                            return;
+                                        }
+                                    } else {
+                                        return;
                                     }
                                 }
-                                return;
+                                // Fall through (do not return) when reboot failed
+                                // or in test mode handled above.
                             }
                             libc::SIGHUP => {
                                 supervisor
@@ -261,6 +274,8 @@ fn main() {
                                     .collect();
                                 for fd in supervisor.sockets.prune_removed_units(&live) {
                                     registered_sockets.remove(&fd);
+                                    // P8/B8: DEL before close so a recycled fd
+                                    // number is never un-registered.
                                     unsafe {
                                         libc::epoll_ctl(
                                             epoll_fd,
@@ -268,6 +283,7 @@ fn main() {
                                             fd,
                                             std::ptr::null_mut(),
                                         );
+                                        libc::close(fd);
                                     }
                                 }
                             }
@@ -281,8 +297,9 @@ fn main() {
                 } else if fd == notify_server.as_raw_fd() {
                     let msgs = notify_server.recv_messages_with_sender();
                     for (msg, sender_pid) in msgs {
-                        let pid = msg.mainpid.or(sender_pid);
-                        supervisor.handle_notify_message(&msg, pid);
+                        // C3: identity comes from SO_PASSCRED only; MAINPID
+                        // inside the payload is validated in handle_notify_message.
+                        supervisor.handle_notify_message(&msg, sender_pid);
                     }
                 } else if fd == control_server.as_raw_fd() {
                     match control_server.accept_with_cred() {
@@ -307,7 +324,9 @@ fn main() {
                 } else if let Some(active_sock) = supervisor.sockets.find_by_fd(fd).cloned() {
                     let svc_name = active_sock.service_name;
                     if let Some(node) = supervisor.dag.get(&svc_name) {
-                        if node.state != UnitState::Active && node.state != UnitState::Activating {
+                        // C5: Failed is terminal. A level-triggered readable
+                        // socket must not re-arm a dead unit (fork bomb).
+                        if node.state == UnitState::Inactive {
                             supervisor
                                 .log_msg(&format!("Socket activation triggered for {}", svc_name));
                             let _ = supervisor.start_unit(&svc_name);
@@ -367,13 +386,20 @@ fn handle_client_connection(
     search_paths: &[PathBuf],
     peer_uid: u32,
 ) {
+    // C7: bound the stall. Accepted stream already has a 100ms read timeout
+    // (server.rs); additionally cap the line at 4KiB here so a slow client
+    // cannot hold the single-threaded event loop. For full isolation, fork
+    // a short-lived handler instead of running inline.
     let Ok(stream_clone) = stream.try_clone() else {
         return;
     };
     use std::io::Read;
+    let _ = stream_clone.set_nonblocking(false);
     let reader = BufReader::new(stream_clone);
     let mut line = String::new();
-    let mut limited = reader.take(utim_core::ipc::MAX_IPC_LINE_BYTES);
+    // Take at most 4KiB for the request line (plus the global 64KiB IPC cap
+    // enforced inside deserialize); a longer line is rejected as invalid.
+    let mut limited = reader.take(4096);
 
     if limited.read_line(&mut line).is_err() || line.trim().is_empty() {
         return;
@@ -585,8 +611,24 @@ fn handle_client_connection(
             supervisor.shutdown_all_units();
             unsafe {
                 libc::sync();
-                libc::reboot(libc::RB_AUTOBOOT);
+                // B1: do not exit PID 1 when reboot fails.
+                if libc::reboot(libc::RB_AUTOBOOT) != 0 {
+                    let e = std::io::Error::last_os_error();
+                    supervisor.log_msg(&format!(
+                        "reboot(RB_AUTOBOOT) failed: {}; staying as PID 1",
+                        e
+                    ));
+                } else {
+                    return;
+                }
             }
+            // Reboot failed: answer already sent; stay in event loop.
+            // Fall through to the trailing write (harmless duplicate) is
+            // avoided by returning after handling below.
+            let _ = write_response(
+                &stream,
+                &IpcResponse::Err("reboot failed; PID 1 still running".to_string()),
+            );
             return;
         }
         IpcRequest::Poweroff => {
@@ -596,8 +638,21 @@ fn handle_client_connection(
             supervisor.shutdown_all_units();
             unsafe {
                 libc::sync();
-                libc::reboot(libc::RB_POWER_OFF);
+                // B1: do not exit PID 1 when poweroff fails.
+                if libc::reboot(libc::RB_POWER_OFF) != 0 {
+                    let e = std::io::Error::last_os_error();
+                    supervisor.log_msg(&format!(
+                        "reboot(RB_POWER_OFF) failed: {}; staying as PID 1",
+                        e
+                    ));
+                } else {
+                    return;
+                }
             }
+            let _ = write_response(
+                &stream,
+                &IpcResponse::Err("poweroff failed; PID 1 still running".to_string()),
+            );
             return;
         }
     };

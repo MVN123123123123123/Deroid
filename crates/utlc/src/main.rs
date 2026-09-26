@@ -21,12 +21,15 @@ use utim_core::compositor::ime::{ImeAction, VirtualKeyboard};
 use utim_core::compositor::input::{
     InputDispatchResult, InputDispatcher, LinuxInputEvent, KEY_1, KEY_2, KEY_3, KEY_4,
     KEY_BACKSPACE, KEY_C, KEY_D, KEY_ENTER, KEY_ESC, KEY_L, KEY_T, KEY_TAB, KEY_W,
+    KEY_VOLUMEDOWN, KEY_VOLUMEUP, KEY_POWER,
 };
-use utim_core::compositor::lockscreen::LockScreen;
-use utim_core::compositor::power_sync::UtimPowerSync;
+use utim_core::compositor::lockscreen::{LockScreen, LockState};
+use utim_core::compositor::power_sync::{PowerSaverMode, UtimPowerSync};
 use utim_core::compositor::protocols::{ProtocolRegistry, WaylandInterface};
 use utim_core::compositor::server::WaylandServer;
+use utim_core::compositor::super_extreme::{SuperExtremeScreen, SuperExtremeState};
 use utim_core::compositor::systemui::{QuickTileKind, SystemUiShade};
+use utim_core::graphics::font::{FontFamily, set_active_family};
 use utim_core::graphics::composer::{HwcComposer, HwcVersion};
 use utim_core::graphics::layout::{
     AppLayout, AppPanel, DrawerSearchHit, Key, Keyboard, Layout, ShadeLayout, ShadeZone, TabHit,
@@ -152,22 +155,169 @@ fn apply_app_icons(apps: &mut [ManagedApp], cache: &mut IconCache) {
     }
 }
 
-/// The app drawer's visible list, as an iterator.
+/// The `n`-th app the drawer is showing, or `None`. Allocates nothing.
 ///
 /// The drawer grid, the press feedback and the launch handler all need "the
-/// nth app the drawer is showing"; this is the single definition of that, and
-/// it allocates nothing.
-fn drawer_view<'a>(
-    apps: &'a [ManagedApp],
-    query: &str,
-) -> Box<dyn Iterator<Item = &'a ManagedApp> + 'a> {
+/// nth app the drawer is showing"; this is the single definition of that.
+/// Every call site only needs `.nth(idx)`, so no iterator (and no `Box`)
+/// is built at all.
+fn drawer_nth<'a>(apps: &'a [ManagedApp], query: &str, n: usize) -> Option<&'a ManagedApp> {
     if query.is_empty() {
-        return Box::new(apps.iter());
+        return apps.get(n);
     }
-    let q = query.to_lowercase();
-    Box::new(apps.iter().filter(move |a| {
-        a.name.to_lowercase().contains(&q) || a.id.to_lowercase().contains(&q)
-    }))
+    apps.iter()
+        .filter(|a| ci_contains(&a.name, query) || ci_contains(&a.id, query))
+        .nth(n)
+}
+
+/// Build the render descriptor for one app. A plain `fn` (not a closure)
+/// so the borrow flows straight through with no lifetime inference trap.
+fn drawer_item_of(a: &ManagedApp) -> AppGridItem<'_> {
+    AppGridItem {
+        id: &a.id,
+        name: &a.name,
+        color: a.color,
+        glyph: &a.glyph,
+        icon: a.icon.as_deref(),
+    }
+}
+
+/// ASCII-case-insensitive substring test. No allocation, no `to_lowercase`.
+fn ci_contains(hay: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let nlen = needle.len();
+    if nlen > hay.len() {
+        return false;
+    }
+    hay.as_bytes()
+        .windows(nlen)
+        .any(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
+/// Keep the Messages composer buffer bounded (sibling terminal buffers cap
+/// at 120 lines). Called at the top of every loop iteration so all push
+/// sites are covered by one trim.
+#[inline]
+fn trim_messages_list(v: &mut Vec<String>) {
+    if v.len() > 64 {
+        let n = v.len() - 64;
+        v.drain(0..n);
+    }
+}
+
+// epoll u64 dispatch tags: the fd occupies the low 32 bits, the kind the
+// high 32, so fd->kind dispatch is a single switch with no linear scan.
+const K_SIGNAL: u64 = 1 << 32;
+const K_LISTEN: u64 = 2 << 32;
+const K_INPUT: u64 = 3 << 32;
+const K_CLIENT: u64 = 4 << 32;
+#[inline]
+fn epoll_tag(fd: libc::c_int, kind: u64) -> u64 {
+    (fd as u32 as u64) | kind
+}
+#[inline]
+fn epoll_kind(u: u64) -> u64 {
+    u & 0xFFFF_FFFF_0000_0000
+}
+#[inline]
+fn epoll_fd_of(u: u64) -> libc::c_int {
+    (u & 0xFFFF_FFFF) as u32 as libc::c_int
+}
+
+/// Per-Wayland-client accumulation buffer: carries a partial message tail
+/// across read() boundaries so a fragmented message never desyncs the
+/// stream. Kept parallel to `server.client_streams` (same index).
+struct ClientState {
+    buf: [u8; 4096],
+    len: usize,
+    text_input_id: u32,
+}
+
+impl ClientState {
+    fn new() -> Self {
+        Self {
+            buf: [0u8; 4096],
+            len: 0,
+            text_input_id: 0,
+        }
+    }
+}
+
+/// Cap on concurrent Wayland clients (fd bound on a world-connectable socket).
+const MAX_CLIENTS: usize = 16;
+
+/// Open any /dev/input/event* nodes not already tracked. Shared by the
+/// startup scan and the one-shot inotify rescan (no polling).
+fn open_new_input_devices(
+    epoll_fd: libc::c_int,
+    input_fds: &mut Vec<libc::c_int>,
+    opened_paths: &mut Vec<PathBuf>,
+) {
+    let Ok(entries) = fs::read_dir("/dev/input") else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("event"))
+        {
+            if opened_paths.contains(&path) {
+                continue;
+            }
+            if let Ok(c_path) = std::ffi::CString::new(path.to_string_lossy().as_bytes()) {
+                let fd = unsafe {
+                    libc::open(
+                        c_path.as_ptr(),
+                        libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                    )
+                };
+                if fd >= 0 {
+                    if epoll_fd >= 0 {
+                        let mut in_ev = libc::epoll_event {
+                            events: libc::EPOLLIN as u32,
+                            u64: epoll_tag(fd, K_INPUT),
+                        };
+                        unsafe {
+                            libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, fd, &mut in_ev);
+                        }
+                    }
+                    input_fds.push(fd);
+                    opened_paths.push(path);
+                }
+            }
+        }
+    }
+}
+
+/// Re-resolve the 5 hotseat slots to indices into `all_managed_apps` plus
+/// the cached "Apps" icon. Runs only on catalogue change, never per frame.
+fn refresh_dock_cache(
+    all_managed_apps: &[ManagedApp],
+    icon_cache: &IconCache,
+    dock_index: &mut [Option<usize>; 5],
+    dock_apps_icon: &mut Option<Rc<RgbaImage>>,
+) {
+    const DOCK_NAMES: [&str; 5] = ["Phone", "Messages", "Apps", "Browser", "Camera"];
+    for (slot, name) in DOCK_NAMES.iter().enumerate() {
+        dock_index[slot] = all_managed_apps.iter().position(|a| a.name == *name);
+    }
+    *dock_apps_icon = icon_cache
+        .get("view-app-grid")
+        .or_else(|| icon_cache.get("apps"));
+}
+
+/// Set O_NONBLOCK on a raw fd via fcntl (no std wrapper exists for child pipes).
+fn set_fd_nonblocking(fd: libc::c_int) {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags >= 0 {
+        unsafe {
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
 }
 
 fn get_app_color(name_or_id: &str) -> u32 {
@@ -204,7 +354,6 @@ fn launch_desktop_app(exec_cmd: &str, socket_dir: &str) {
         eprintln!("[UTLC] Skipping desktop application launch: binary '{}' does not exist", prog);
         return;
     }
-    println!("[UTLC] Launching desktop application: '{}'", exec_cmd);
 
     let sess = utim_core::session::session();
     let is_root = utim_core::session::is_root_process();
@@ -235,12 +384,7 @@ fn launch_desktop_app(exec_cmd: &str, socket_dir: &str) {
 
     match cmd.spawn() {
         Ok(child) => {
-            println!(
-                "[UTLC] Spawned '{}' with PID {} (UID {})",
-                prog,
-                child.id(),
-                sess.uid()
-            );
+            let _ = child.id();
         }
         Err(e) => {
             eprintln!("[UTLC] Error spawning '{}': {}", prog, e);
@@ -458,7 +602,12 @@ fn run_daemon() {
     let socket_path = PathBuf::from(&socket_dir).join("wayland-0");
 
     let mut server = WaylandServer::new(&socket_path, 1080, 2400, 120.0, hwc);
-    server.power_sync.configure_self_oom_score();
+    if let Err(e) = server.power_sync.configure_self_oom_score() {
+        eprintln!(
+            "[-] OOM immunity not applied (needs CAP_SYS_RESOURCE): {}",
+            e
+        );
+    }
 
     if let Err(e) = server.bind_socket() {
         eprintln!(
@@ -537,7 +686,9 @@ fn run_daemon() {
             t_str,
             server.scene.mode == utim_core::compositor::scene::ShellMode::LockScreen,
         );
-        drm.flush();
+        if let Err(e) = drm.flush() {
+            eprintln!("[UTLC] DIRTYFB flush failed: {}", e);
+        }
     }
 
     // Signal systemd/UTIM via sd_notify if NOTIFY_SOCKET is present
@@ -560,25 +711,36 @@ fn run_daemon() {
         libc::sigprocmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut());
     }
     let sig_fd = unsafe { libc::signalfd(-1, &mask, libc::SFD_NONBLOCK | libc::SFD_CLOEXEC) };
+    if sig_fd < 0 {
+        eprintln!(
+            "[UTLC] signalfd failed: {}",
+            std::io::Error::last_os_error()
+        );
+        unsafe {
+            libc::signal(libc::SIGTERM, libc::SIG_DFL);
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+        }
+        return;
+    }
 
     let epoll_fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
-    if epoll_fd >= 0 && sig_fd >= 0 {
+    if epoll_fd >= 0 {
         let mut sig_ev = libc::epoll_event {
             events: libc::EPOLLIN as u32,
-            u64: sig_fd as u64,
+            u64: epoll_tag(sig_fd, K_SIGNAL),
         };
         unsafe {
             libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, sig_fd, &mut sig_ev);
         }
     }
 
-    use std::os::unix::io::AsRawFd;
+    use std::os::unix::io::{AsRawFd, FromRawFd};
     if let Some(ref listener) = server.listener {
         let listen_fd = listener.as_raw_fd();
         if epoll_fd >= 0 {
             let mut listen_ev = libc::epoll_event {
                 events: libc::EPOLLIN as u32,
-                u64: listen_fd as u64,
+                u64: epoll_tag(listen_fd, K_LISTEN),
             };
             unsafe {
                 libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, listen_fd, &mut listen_ev);
@@ -595,37 +757,30 @@ fn run_daemon() {
     let mut last_watchdog_ping = Instant::now();
 
     // Listen on input event devices (/dev/input/event*)
-    let mut input_fds = Vec::new();
+    let mut input_fds: Vec<libc::c_int> = Vec::new();
     let mut opened_paths: Vec<std::path::PathBuf> = Vec::new();
-    if let Ok(entries) = fs::read_dir("/dev/input") {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("event"))
-            {
-                if let Ok(c_path) = std::ffi::CString::new(path.to_string_lossy().as_bytes()) {
-                    let fd = unsafe {
-                        libc::open(
-                            c_path.as_ptr(),
-                            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
-                        )
-                    };
-                    if fd >= 0 {
-                        if epoll_fd >= 0 {
-                            let mut in_ev = libc::epoll_event {
-                                events: libc::EPOLLIN as u32,
-                                u64: fd as u64,
-                            };
-                            unsafe {
-                                libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, fd, &mut in_ev);
-                            }
-                        }
-                        input_fds.push(fd);
-                        opened_paths.push(path);
-                    }
-                }
+    open_new_input_devices(epoll_fd, &mut input_fds, &mut opened_paths);
+
+    // Watch /dev/input for hotplug instead of polling read_dir every second:
+    // a rescan runs exactly once per directory event (see the K_INPUT arm).
+    let inotify_fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+    if inotify_fd >= 0 {
+        if let Ok(c_dir) = std::ffi::CString::new("/dev/input") {
+            unsafe {
+                libc::inotify_add_watch(
+                    inotify_fd,
+                    c_dir.as_ptr(),
+                    libc::IN_CREATE | libc::IN_DELETE | libc::IN_MOVED_FROM | libc::IN_MOVED_TO,
+                );
+            }
+        }
+        if epoll_fd >= 0 {
+            let mut ino_ev = libc::epoll_event {
+                events: libc::EPOLLIN as u32,
+                u64: epoll_tag(inotify_fd, K_INPUT),
+            };
+            unsafe {
+                libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, inotify_fd, &mut ino_ev);
             }
         }
     }
@@ -648,7 +803,8 @@ fn run_daemon() {
     let mut quick_tiles_active = [true, true, true, false, true, false, false, false];
     let mut cursor_pos: Option<(usize, usize)> = None;
     let mut is_touching = false;
-    let mut last_input_rescan = Instant::now();
+    let mut power_saver_mode = PowerSaverMode::Off;
+    let mut super_extreme_state = SuperExtremeState::new();
 
     // Multi-page home screen and Android 17 / PixelUI App Drawer state
     let mut home_pages: Vec<Vec<String>> = vec![
@@ -719,11 +875,74 @@ fn run_daemon() {
     let mut last_frame = Instant::now();
     let frame_interval = Duration::from_millis(16);
 
+    // Hotseat slot -> index into all_managed_apps; rebuilt only when the
+    // catalogue signature changes (the per-frame dock find/Rc-clone is gone).
+    // NOTE: the per-frame item vecs themselves stay frame-local: hoisting a
+    // `Vec<&...>` across loop iterations is rejected by the borrow checker
+    // (the buffer's element lifetime would have to outlive owner mutations
+    // in the event phase), so reuse happens at the lookup level instead.
+    let mut dock_index: [Option<usize>; 5] = [None; 5];
+    let mut dock_apps_icon: Option<Rc<RgbaImage>> = None;
+    refresh_dock_cache(
+        &all_managed_apps,
+        &icon_cache,
+        &mut dock_index,
+        &mut dock_apps_icon,
+    );
+    // Per-client Wayland accumulation buffers, parallel to server.client_streams.
+    let mut client_states: Vec<ClientState> = Vec::new();
+    // epoll batch buffer, hoisted: re-zeroing 256 B every 16 ms is pure waste.
+    let mut events: [libc::epoll_event; 16] = unsafe { std::mem::zeroed() };
+
     println!("[+] UTLC daemon running successfully in persistent event loop.");
 
     while running {
-        let timeout_ms = 16;
-        let mut events: [libc::epoll_event; 16] = unsafe { std::mem::zeroed() };
+        // Authoritative active_tab_idx clamp: the input path below indexes
+        // terminal_tabs in ~8 places, so the invariant is enforced here,
+        // once, instead of implicitly at each shrink site.
+        if active_tab_idx >= terminal_tabs.len() {
+            active_tab_idx = terminal_tabs.len().saturating_sub(1);
+        }
+        trim_messages_list(&mut messages_list);
+
+        // Deadline-derived epoll timeout: sleep only the remainder of the
+        // 16 ms frame when something is animating; block indefinitely when
+        // idle. The idle timeout still honours the minute-boundary
+        // status-clock refresh and the systemd watchdog ping.
+        let elapsed = last_frame.elapsed();
+        let timeout_ms: libc::c_int = if elapsed >= frame_interval {
+            0
+        } else {
+            let need_frames = touch_ripple.is_some()
+                || app_launch_progress > 0.0
+                || !drawer_spring.is_at_rest()
+                || !page_scroll_spring.is_at_rest()
+                || !icon_bounce_spring.is_at_rest()
+                || terminal_tabs.iter().any(|t| t.is_running())
+                || (server.scene.lockscreen.is_locked()
+                    && server.start_time.elapsed() < Duration::from_secs(2));
+            if need_frames {
+                frame_interval
+                    .checked_sub(elapsed)
+                    .unwrap_or_default()
+                    .as_millis()
+                    .min(libc::c_int::MAX as u128)
+                    as libc::c_int
+            } else {
+                let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+                unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts) };
+                let secs_to_min = 60i64 - ts.tv_sec.rem_euclid(60);
+                let mut idle_ms = (secs_to_min as u128) * 1000 + 500;
+                if notify_dgram.is_some() {
+                    let remain = watchdog_interval
+                        .checked_sub(last_watchdog_ping.elapsed())
+                        .unwrap_or_default();
+                    idle_ms =
+                        idle_ms.min(remain.as_millis().min(libc::c_int::MAX as u128));
+                }
+                idle_ms.min(libc::c_int::MAX as u128) as libc::c_int
+            }
+        };
         let nfds = if epoll_fd >= 0 {
             unsafe { libc::epoll_wait(epoll_fd, events.as_mut_ptr(), 16, timeout_ms) }
         } else {
@@ -733,39 +952,99 @@ fn run_daemon() {
 
         if nfds > 0 {
             for ev in events.iter().take(nfds as usize) {
-                let fd = ev.u64 as libc::c_int;
-                if fd == sig_fd {
-                    println!("[*] UTLC received termination signal, shutting down...");
+                let kind = epoll_kind(ev.u64);
+                let fd = epoll_fd_of(ev.u64);
+                if kind == K_SIGNAL && fd == sig_fd {
+                    // Drain the signalfd, then shut down without running
+                    // another frame (the `!running` guard below skips it).
+                    let mut si: libc::signalfd_siginfo = unsafe { std::mem::zeroed() };
+                    while unsafe {
+                        libc::read(
+                            sig_fd,
+                            &mut si as *mut _ as *mut libc::c_void,
+                            std::mem::size_of::<libc::signalfd_siginfo>(),
+                        )
+                    } > 0
+                    {}
                     running = false;
-                    break;
-                } else if server
-                    .listener
-                    .as_ref()
-                    .is_some_and(|l| l.as_raw_fd() == fd)
-                {
+                    continue;
+                } else if kind == K_LISTEN {
                     if let Some(ref listener) = server.listener {
-                        while let Ok((client_stream, _)) = listener.accept() {
-                            let _ = client_stream.set_nonblocking(true);
+                        let listen_raw = listener.as_raw_fd();
+                        while server.client_streams.len() < MAX_CLIENTS {
+                            let mut raw: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+                            let mut len =
+                                std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+                            let cfd = unsafe {
+                                libc::accept4(
+                                    listen_raw,
+                                    &mut raw as *mut _ as *mut libc::sockaddr,
+                                    &mut len,
+                                    libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+                                )
+                            };
+                            if cfd < 0 {
+                                let e = unsafe { *libc::__errno_location() };
+                                if e == libc::EAGAIN || e == libc::EWOULDBLOCK {
+                                    break;
+                                }
+                                if e == libc::EMFILE || e == libc::ENFILE || e == libc::ENOMEM
+                                {
+                                    break;
+                                }
+                                if e == libc::ECONNABORTED || e == libc::EINTR {
+                                    continue;
+                                }
+                                break;
+                            }
                             if epoll_fd >= 0 {
-                                let c_fd = client_stream.as_raw_fd();
                                 let mut client_ev = libc::epoll_event {
-                                    events: (libc::EPOLLIN | libc::EPOLLHUP | libc::EPOLLERR)
+                                    events: (libc::EPOLLIN
+                                        | libc::EPOLLRDHUP
+                                        | libc::EPOLLHUP
+                                        | libc::EPOLLERR)
                                         as u32,
-                                    u64: c_fd as u64,
+                                    u64: epoll_tag(cfd, K_CLIENT),
                                 };
-                                unsafe {
+                                if unsafe {
                                     libc::epoll_ctl(
                                         epoll_fd,
                                         libc::EPOLL_CTL_ADD,
-                                        c_fd,
+                                        cfd,
                                         &mut client_ev,
-                                    );
+                                    )
+                                } < 0
+                                {
+                                    // Never retain an unregistered fd.
+                                    unsafe { libc::close(cfd) };
+                                    continue;
                                 }
                             }
-                            server.client_streams.push(client_stream);
+                            server.client_streams.push(unsafe {
+                                std::os::unix::net::UnixStream::from_raw_fd(cfd)
+                            });
+                            client_states.push(ClientState::new());
                         }
                     }
-                } else if input_fds.contains(&fd) {
+                } else if kind == K_INPUT {
+                    if fd == inotify_fd {
+                        // One-shot hotplug rescan: drain the inotify queue,
+                        // then open exactly the new nodes (no polling).
+                        let mut ibuf = [0u8; 512];
+                        loop {
+                            let n = unsafe {
+                                libc::read(
+                                    inotify_fd,
+                                    ibuf.as_mut_ptr() as *mut libc::c_void,
+                                    ibuf.len(),
+                                )
+                            };
+                            if n <= 0 {
+                                break;
+                            }
+                        }
+                        open_new_input_devices(epoll_fd, &mut input_fds, &mut opened_paths);
+                    } else if input_fds.contains(&fd) {
                     // Drain and decode Linux evdev events (virtio-tablet, virtio-keyboard, virtio-mouse)
                     let mut ev_buf = [0u8; 24 * 16];
                     let n = unsafe {
@@ -784,7 +1063,103 @@ fn run_daemon() {
                                 cursor_pos = Some((dispatcher.cursor_x as usize, dispatcher.cursor_y as usize));
                                 is_touching = dispatcher.is_touch_down;
 
-                                if server.scene.lockscreen.is_locked() {
+                                if power_saver_mode == PowerSaverMode::SuperExtreme {
+                                    let w = server.scene.width as f32;
+                                    let h = server.scene.height as f32;
+                                    match res {
+                                        InputDispatchResult::Touch(ref raw_touch) => {
+                                            if raw_touch.phase == TouchPhase::Down {
+                                                touch_drag_start = Some((raw_touch.x, raw_touch.y));
+                                            } else if raw_touch.phase == TouchPhase::Up {
+                                                if let Some((sx, sy)) = touch_drag_start.take() {
+                                                    if sy - raw_touch.y > 60.0 && (sx - raw_touch.x).abs() < 120.0 {
+                                                        super_extreme_state.on_swipe_up();
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        InputDispatchResult::Tap { x, y } => {
+                                            touch_ripple = Some((
+                                                x,
+                                                y,
+                                                ripple_start_radius(w),
+                                                1.0,
+                                            ));
+                                            if y <= h * 0.05 {
+                                                super_extreme_state.volume_hud.trigger(super_extreme_state.volume_hud.volume_percent);
+                                            } else {
+                                                let pin_hash = server.scene.lockscreen.pin_hash;
+                                                let pin_salt = server.scene.lockscreen.pin_salt;
+                                                super_extreme_state.handle_touch_tap(x, y, w, h, pin_hash, pin_salt);
+                                            }
+                                        }
+                                        InputDispatchResult::KeyPress {
+                                            code,
+                                            ch,
+                                            pressed,
+                                            ..
+                                        } => {
+                                            if code == KEY_POWER {
+                                                if pressed {
+                                                    super_extreme_state.on_power_button_press();
+                                                } else {
+                                                    super_extreme_state.on_power_button_release();
+                                                }
+                                            } else if code == KEY_VOLUMEUP && pressed {
+                                                super_extreme_state.volume_up();
+                                                let _ = server.scene.system_ui.set_volume(super_extreme_state.volume_hud.volume_percent);
+                                            } else if code == KEY_VOLUMEDOWN && pressed {
+                                                super_extreme_state.volume_down();
+                                                let _ = server.scene.system_ui.set_volume(super_extreme_state.volume_hud.volume_percent);
+                                            } else if code == KEY_ESC && pressed {
+                                                super_extreme_state.handle_back();
+                                            } else if code == KEY_BACKSPACE && pressed {
+                                                match super_extreme_state.active_screen {
+                                                    SuperExtremeScreen::Password => super_extreme_state.password_backspace(),
+                                                    SuperExtremeScreen::EmergencyDialer => { super_extreme_state.emergency_input.pop(); }
+                                                    SuperExtremeScreen::AppPhone => { super_extreme_state.phone_input.pop(); }
+                                                    _ => {}
+                                                }
+                                            } else if code == KEY_ENTER && pressed {
+                                                match super_extreme_state.active_screen {
+                                                    SuperExtremeScreen::Password => {
+                                                        super_extreme_state.submit_password(server.scene.lockscreen.pin_hash, server.scene.lockscreen.pin_salt);
+                                                    }
+                                                    SuperExtremeScreen::EmergencyDialer => {
+                                                        super_extreme_state.last_action_message = Some(format!("Emergency call placed: {}", super_extreme_state.emergency_input));
+                                                    }
+                                                    SuperExtremeScreen::AppPhone => {
+                                                        super_extreme_state.last_action_message = Some(format!("Calling {}", super_extreme_state.phone_input));
+                                                    }
+                                                    SuperExtremeScreen::CameraPreview => {
+                                                        super_extreme_state.snap_photo();
+                                                    }
+                                                    _ => {}
+                                                }
+                                            } else if pressed {
+                                                if let Some(c) = ch {
+                                                    match super_extreme_state.active_screen {
+                                                        SuperExtremeScreen::Password => {
+                                                            super_extreme_state.enter_password_char(c, server.scene.lockscreen.pin_hash, server.scene.lockscreen.pin_salt);
+                                                        }
+                                                        SuperExtremeScreen::EmergencyDialer => {
+                                                            if c.is_ascii_digit() && super_extreme_state.emergency_input.len() < 12 {
+                                                                super_extreme_state.emergency_input.push(c);
+                                                            }
+                                                        }
+                                                        SuperExtremeScreen::AppPhone => {
+                                                            if (c.is_ascii_digit() || c == '*' || c == '#') && super_extreme_state.phone_input.len() < 15 {
+                                                                super_extreme_state.phone_input.push(c);
+                                                            }
+                                                        }
+                                                        _ => {}
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                } else if server.scene.lockscreen.is_locked() {
                                     match res {
                                         InputDispatchResult::Touch(ref t) if t.phase == TouchPhase::Down => {
                                             server.scene.lockscreen.unlock();
@@ -831,13 +1206,13 @@ fn run_daemon() {
                                                             if let Some(idx) =
                                                                 l.drawer_grid_hit(off, raw_touch.x, raw_touch.y)
                                                             {
-                                                                // No intermediate Vec: the
-                                                                // drawer's filtered view is an
-                                                                // iterator, and this runs on
+                                                                // Allocation-free nth-app lookup on
                                                                 // every touch down.
-                                                                if let Some(app) = drawer_view(&all_managed_apps, &drawer_search)
-                                                                    .nth(idx)
-                                                                {
+                                                                if let Some(app) = drawer_nth(
+                                                                    &all_managed_apps,
+                                                                    &drawer_search,
+                                                                    idx,
+                                                                ) {
                                                                     press(
                                                                         &mut pressed_icon_id,
                                                                         app.id.clone(),
@@ -852,11 +1227,13 @@ fn run_daemon() {
                                                                 selected_home_icon.is_some(),
                                                             );
                                                             if let Some(idx) =
-                                                                l.home_grid_hit(
+                                                                l.home_grid_hit_paged(
                                                                     raw_touch.x,
                                                                     raw_touch.y,
                                                                     home_scroll_offset,
+                                                                    home_pages.len(),
                                                                 )
+                                                                .map(|(_, i)| i)
                                                             {
                                                                 if let Some(id) =
                                                                     home_pages.get(current_home_page).and_then(|p| p.get(idx))
@@ -1003,10 +1380,10 @@ fn run_daemon() {
                                                             // or on a decisive flick.
                                                             let flick = h * 0.12;
                                                             if !app_drawer_open {
-                                                                if drawer_progress > 0.5 || dy > flick {
+                                                                if dy > flick {
                                                                     app_drawer_open = true;
                                                                 }
-                                                            } else if drawer_progress < 0.5 || dy < -flick {
+                                                            } else if dy < -flick {
                                                                 app_drawer_open = false;
                                                                 drawer_search_active = false;
                                                                 drawer_search.clear();
@@ -1137,8 +1514,35 @@ fn run_daemon() {
                                                 match shade.zone(x, y) {
                                                     ShadeZone::Tiles(i) => {
                                                         if i < quick_tiles_active.len() {
-                                                            quick_tiles_active[i] =
-                                                                !quick_tiles_active[i];
+                                                            if i == 6 {
+                                                                 match power_saver_mode {
+                                                                    PowerSaverMode::Off => {
+                                                                        let _ = server.scene.system_ui.set_brightness(25);
+                                                                        let _ = server.power_sync.apply_normal_power_saver();
+                                                                        power_saver_mode = PowerSaverMode::Normal;
+                                                                        quick_tiles_active[6] = true;
+                                                                    }
+                                                                    PowerSaverMode::Normal => {
+                                                                        let _ = server.scene.system_ui.set_brightness(10);
+                                                                        let _ = server.power_sync.apply_super_extreme_power_saver();
+                                                                        power_saver_mode = PowerSaverMode::SuperExtreme;
+                                                                        set_active_family(FontFamily::Homemade);
+                                                                        super_extreme_state.enter_super_extreme();
+                                                                        quick_tiles_active[6] = true;
+                                                                        server.scene.system_ui.close();
+                                                                    }
+                                                                    PowerSaverMode::SuperExtreme => {
+                                                                        let _ = server.scene.system_ui.set_brightness(75);
+                                                                        let _ = server.power_sync.restore_normal_power_mode();
+                                                                        set_active_family(FontFamily::NotoSans);
+                                                                        power_saver_mode = PowerSaverMode::Off;
+                                                                        quick_tiles_active[6] = false;
+                                                                    }
+                                                                }
+                                                            } else {
+                                                                quick_tiles_active[i] =
+                                                                    !quick_tiles_active[i];
+                                                            }
                                                         }
                                                     }
                                                     // Tapping the dimmed backdrop above the
@@ -1155,8 +1559,9 @@ fn run_daemon() {
                                             {
                                                 // Virtual keyboard: the key under the
                                                 // finger comes from the same layout the
-                                                // keyboard is drawn from.
-                                                let handle_key_input = |key_str: &str,
+                                                // keyboard is drawn from. Takes the Key
+                                                // directly: no per-keystroke heap string.
+                                                let handle_key_input = |key: Key,
                                                                             active_app: &mut Option<String>,
                                                                             app_input: &mut String,
                                                                             app_input_focused: &mut bool,
@@ -1171,30 +1576,66 @@ fn run_daemon() {
                                                                             keyboard: &mut VirtualKeyboard,
                                                                             messages_list: &mut Vec<String>| {
                                                     if app_drawer_open && *drawer_search_active {
-                                                        match key_str {
-                                                            "BACKSPACE" => { drawer_search.pop(); }
-                                                            "ENTER" => {
+                                                        match key {
+                                                            Key::Backspace => { drawer_search.pop(); }
+                                                            Key::Enter => {
                                                                 *drawer_search_active = false;
                                                                 keyboard.deactivate();
                                                             }
-                                                            "SPACE" => {
+                                                            Key::Space => {
                                                                 if drawer_search.len() < 40 {
                                                                     drawer_search.push(' ');
                                                                 }
                                                             }
-                                                            ch => {
-                                                                let c = if keyboard.is_shift_active {
-                                                                    ch.chars().next().unwrap_or('?')
+                                                            Key::Char(c) => {
+                                                                let c_ascii = if keyboard.is_shift_active {
+                                                                    c
                                                                 } else {
-                                                                    ch.chars().next().unwrap_or('?').to_ascii_lowercase()
+                                                                    c.to_ascii_lowercase()
                                                                 };
                                                                 if drawer_search.len() < 40 {
-                                                                    drawer_search.push(c);
+                                                                    drawer_search.push(c_ascii);
                                                                 }
+                                                            }
+                                                            Key::Hide => {
+                                                                keyboard.deactivate();
+                                                                *drawer_search_active = false;
+                                                            }
+                                                            Key::Shift => {
+                                                                keyboard.is_shift_active =
+                                                                    !keyboard.is_shift_active;
                                                             }
                                                         }
                                                     } else {
-                                                        let act = keyboard.handle_key_tap(key_str);
+                                                        let act = match key {
+                                                            Key::Backspace => {
+                                                                keyboard.handle_key_tap("BACKSPACE")
+                                                            }
+                                                            Key::Enter => {
+                                                                keyboard.handle_key_tap("ENTER")
+                                                            }
+                                                            Key::Space => {
+                                                                keyboard.handle_key_tap("SPACE")
+                                                            }
+                                                            Key::Char(c) => {
+                                                                // Stack-encoded: handle_key_tap
+                                                                // gets a &str with zero heap.
+                                                                let mut b = [0u8; 4];
+                                                                let s: &str = c.encode_utf8(&mut b);
+                                                                keyboard.handle_key_tap(s)
+                                                            }
+                                                            Key::Hide => {
+                                                                keyboard.deactivate();
+                                                                *app_input_focused = false;
+                                                                *drawer_search_active = false;
+                                                                ImeAction::None
+                                                            }
+                                                            Key::Shift => {
+                                                                let _ = keyboard
+                                                                    .handle_key_tap("SHIFT");
+                                                                ImeAction::None
+                                                            }
+                                                        };
                                                         apply_ime_action(
                                                             act,
                                                             active_app,
@@ -1210,80 +1651,22 @@ fn run_daemon() {
                                                         );
                                                     }
                                                 };
-                                                match key {
-                                                    Key::Char(c) => handle_key_input(
-                                                        &c.to_string(),
-                                                        &mut active_app,
-                                                        &mut app_input,
-                                                        &mut app_input_focused,
-                                                        &mut search_active,
-                                                        &mut search_query,
-                                                        &mut drawer_search,
-                                                        &mut drawer_search_active,
-                                                        app_drawer_open,
-                                                        &mut terminal_tabs,
-                                                        &mut active_tab_idx,
-                                                        &mut next_tab_id,
-                                                        &mut server.scene.keyboard,
-                                                        &mut messages_list,
-                                                    ),
-                                                    Key::Space => handle_key_input(
-                                                        "SPACE",
-                                                        &mut active_app,
-                                                        &mut app_input,
-                                                        &mut app_input_focused,
-                                                        &mut search_active,
-                                                        &mut search_query,
-                                                        &mut drawer_search,
-                                                        &mut drawer_search_active,
-                                                        app_drawer_open,
-                                                        &mut terminal_tabs,
-                                                        &mut active_tab_idx,
-                                                        &mut next_tab_id,
-                                                        &mut server.scene.keyboard,
-                                                        &mut messages_list,
-                                                    ),
-                                                    Key::Enter => handle_key_input(
-                                                        "ENTER",
-                                                        &mut active_app,
-                                                        &mut app_input,
-                                                        &mut app_input_focused,
-                                                        &mut search_active,
-                                                        &mut search_query,
-                                                        &mut drawer_search,
-                                                        &mut drawer_search_active,
-                                                        app_drawer_open,
-                                                        &mut terminal_tabs,
-                                                        &mut active_tab_idx,
-                                                        &mut next_tab_id,
-                                                        &mut server.scene.keyboard,
-                                                        &mut messages_list,
-                                                    ),
-                                                    Key::Backspace => handle_key_input(
-                                                        "BACKSPACE",
-                                                        &mut active_app,
-                                                        &mut app_input,
-                                                        &mut app_input_focused,
-                                                        &mut search_active,
-                                                        &mut search_query,
-                                                        &mut drawer_search,
-                                                        &mut drawer_search_active,
-                                                        app_drawer_open,
-                                                        &mut terminal_tabs,
-                                                        &mut active_tab_idx,
-                                                        &mut next_tab_id,
-                                                        &mut server.scene.keyboard,
-                                                        &mut messages_list,
-                                                    ),
-                                                    Key::Hide => {
-                                                        server.scene.keyboard.deactivate();
-                                                        app_input_focused = false;
-                                                        drawer_search_active = false;
-                                                    }
-                                                    Key::Shift => {
-                                                        let _ = server.scene.keyboard.handle_key_tap("SHIFT");
-                                                    }
-                                                }
+                                                handle_key_input(
+                                                    key,
+                                                    &mut active_app,
+                                                    &mut app_input,
+                                                    &mut app_input_focused,
+                                                    &mut search_active,
+                                                    &mut search_query,
+                                                    &mut drawer_search,
+                                                    &mut drawer_search_active,
+                                                    app_drawer_open,
+                                                    &mut terminal_tabs,
+                                                    &mut active_tab_idx,
+                                                    &mut next_tab_id,
+                                                    &mut server.scene.keyboard,
+                                                    &mut messages_list,
+                                                );
                                             } else if server.scene.keyboard.is_active {
                                                 // Tapped outside keyboard while keyboard was active
                                                 if active_app.is_some() {
@@ -1326,7 +1709,8 @@ fn run_daemon() {
                                                     }
                                                 } else if app_drawer_open {
                                                     let drawer_y_offset = (1.0 - drawer_progress.clamp(0.0, 1.0)) * h;
-                                                    match Layout::plain(w, h).drawer_search_hit(drawer_y_offset, x, y) {
+                                                    let drawer_l = Layout::plain(w, h);
+                                                    match drawer_l.drawer_search_hit(drawer_y_offset, x, y) {
                                                         DrawerSearchHit::Clear => {
                                                             drawer_search.clear();
                                                         }
@@ -1334,14 +1718,12 @@ fn run_daemon() {
                                                             drawer_search_active = true;
                                                         }
                                                         DrawerSearchHit::None => {
-                                                            let drawer_l = Layout::plain(w, h);
                                                             if let Some(idx) = drawer_l.drawer_grid_hit(drawer_y_offset, x, y) {
-                                                                if let Some(target_app) = drawer_view(
+                                                                if let Some(target_app) = drawer_nth(
                                                                     &all_managed_apps,
                                                                     &drawer_search,
-                                                                )
-                                                                .nth(idx)
-                                                                {
+                                                                    idx,
+                                                                ) {
                                                                     let cell = drawer_l.drawer_icon_cell(idx);
                                                                     app_launch_origin = Some((
                                                                         cell.center_x(),
@@ -1372,8 +1754,8 @@ fn run_daemon() {
                                                                     }
                                                                 }
                                                             } else if y < drawer_y_offset
-                                                                || Layout::plain(w, h).drawer_handle.contains(x, y - drawer_y_offset)
-                                                                || Layout::plain(w, h).nav_pill.contains(x, y)
+                                                                || drawer_l.drawer_handle.contains(x, y - drawer_y_offset)
+                                                                || drawer_l.nav_pill.contains(x, y)
                                                             {
                                                                 app_drawer_open = false;
                                                                 drawer_search_active = false;
@@ -1390,7 +1772,8 @@ fn run_daemon() {
                                                     if home_l.search.contains(x, y) {
                                                         // Tap on search bar keeps focus
                                                     } else if let Some(idx) =
-                                                        home_l.home_grid_hit(x, y, home_scroll_offset)
+                                                        home_l.home_grid_hit_paged(x, y, home_scroll_offset, home_pages.len())
+                                                            .map(|(_, i)| i)
                                                     {
                                                         // Search results replace the page
                                                         // contents, so the two views share
@@ -1403,7 +1786,11 @@ fn run_daemon() {
                                                                 })
                                                                 .nth(idx)
                                                         } else {
-                                                            drawer_view(&all_managed_apps, search_query.as_str()).nth(idx)
+                                                            drawer_nth(
+                                                                &all_managed_apps,
+                                                                search_query.as_str(),
+                                                                idx,
+                                                            )
                                                         };
                                                         if let Some(target_app) = target {
                                                             let cell = home_l.grid_icon(idx);
@@ -1520,7 +1907,7 @@ fn run_daemon() {
                                                     drawer_search_active = false;
                                                     server.scene.keyboard.deactivate();
                                                 } else {
-                                                    match Layout::plain(w, h).drawer_search_hit(drawer_y_offset, x, y) {
+                                                    match drawer_l.drawer_search_hit(drawer_y_offset, x, y) {
                                                         DrawerSearchHit::Clear => {
                                                             drawer_search.clear();
                                                         }
@@ -1529,7 +1916,7 @@ fn run_daemon() {
                                                             server.scene.keyboard.activate();
                                                         }
                                                         DrawerSearchHit::None => {
-                                                            if Layout::plain(w, h).nav_pill.contains(x, y) {
+                                                            if drawer_l.nav_pill.contains(x, y) {
                                                                 // Bottom pill: close drawer
                                                                 app_drawer_open = false;
                                                                 drawer_search_active = false;
@@ -1538,12 +1925,11 @@ fn run_daemon() {
                                                             } else if let Some(idx) =
                                                                 drawer_l.drawer_grid_hit(drawer_y_offset, x, y)
                                                             {
-                                                                if let Some(target_app) = drawer_view(
+                                                                if let Some(target_app) = drawer_nth(
                                                                     &all_managed_apps,
                                                                     &drawer_search,
-                                                                )
-                                                                .nth(idx)
-                                                                {
+                                                                    idx,
+                                                                ) {
                                                                     let cell = drawer_l.drawer_icon_cell(idx);
                                                                     app_launch_origin = Some((
                                                                         cell.center_x(),
@@ -1597,7 +1983,6 @@ fn run_daemon() {
                                                             if let Some(ref sel_id) = selected_home_icon {
                                                                 if let Some(pos) = home_pages[current_home_page].iter().position(|id| id == sel_id) {
                                                                     home_pages[current_home_page].remove(pos);
-                                                                    println!("[UTLC] Removed app '{}' from Home Page {}", sel_id, current_home_page + 1);
                                                                 }
                                                             }
                                                             selected_home_icon = None;
@@ -1618,7 +2003,6 @@ fn run_daemon() {
                                                                     home_scroll_offset = -(w * 0.45);
                                                                 }
                                                                 current_home_page = target_page;
-                                                                println!("[UTLC] Moved app '{}' to Home Page {}", sel_id, current_home_page + 1);
                                                             }
                                                         }
                                                     }
@@ -1650,7 +2034,6 @@ fn run_daemon() {
                                                                 home_pages.push(Vec::new());
                                                             }
                                                             home_pages[target_page].push(sel_id.clone());
-                                                            println!("[UTLC] Moved app '{}' to Home Page {}", sel_id, target_page + 1);
                                                         }
                                                     }
                                                     if target_page != current_home_page {
@@ -1710,19 +2093,19 @@ fn run_daemon() {
                                                     server.scene.keyboard.deactivate();
                                                     server.scene.system_ui.close();
                                                 } else if let Some(idx) =
-                                                    home_l.home_grid_hit(x, y, home_scroll_offset)
+                                                    home_l.home_grid_hit_paged(x, y, home_scroll_offset, home_pages.len())
+                                                        .map(|(_, i)| i)
                                                 {
                                                     let cell = home_l.grid_icon(idx);
                                                     let cx = cell.center_x() + home_scroll_offset;
                                                     let cy = cell.center_y();
 
                                                     if search_active && !search_query.is_empty() {
-                                                        if let Some(target_app) = drawer_view(
+                                                        if let Some(target_app) = drawer_nth(
                                                             &all_managed_apps,
                                                             search_query.as_str(),
-                                                        )
-                                                        .nth(idx)
-                                                        {
+                                                            idx,
+                                                        ) {
                                                             app_launch_origin = Some((cx, cy));
                                                             app_launch_progress = 0.01;
                                                             app_launch_color = target_app.color;
@@ -1743,7 +2126,6 @@ fn run_daemon() {
                                                             home_pages[current_home_page].remove(old_pos);
                                                             let insert_pos = idx.min(home_pages[current_home_page].len());
                                                             home_pages[current_home_page].insert(insert_pos, sel_id.clone());
-                                                            println!("[UTLC] Moved app '{}' from slot {} to slot {}", sel_id, old_pos, insert_pos);
                                                         }
                                                     } else {
                                                         let page_app_ids = &home_pages[current_home_page];
@@ -1783,7 +2165,23 @@ fn run_daemon() {
                                             repeat,
                                             ctrl,
                                         } => {
-                                            if pressed {
+                                            if code == KEY_POWER {
+                                                if pressed {
+                                                    super_extreme_state.on_power_button_press();
+                                                } else {
+                                                    super_extreme_state.on_power_button_release();
+                                                }
+                                            } else if code == KEY_VOLUMEUP && pressed {
+                                                let cur = server.scene.system_ui.volume_percent;
+                                                let next = cur.saturating_add(10).min(100);
+                                                let _ = server.scene.system_ui.set_volume(next);
+                                                super_extreme_state.volume_hud.trigger(next);
+                                            } else if code == KEY_VOLUMEDOWN && pressed {
+                                                let cur = server.scene.system_ui.volume_percent;
+                                                let next = cur.saturating_sub(10);
+                                                let _ = server.scene.system_ui.set_volume(next);
+                                                super_extreme_state.volume_hud.trigger(next);
+                                            } else if pressed {
                                                 if ctrl {
                                                     if code == KEY_C {
                                                         if active_app.as_deref() == Some("Terminal") {
@@ -1955,17 +2353,39 @@ fn run_daemon() {
                                                 ripple_start_radius(w) * 1.2,
                                                 1.0,
                                             ));
-                                            if app_drawer_open {
+                                            if server.scene.system_ui.is_open() {
+                                                let shade = ShadeLayout::new(w, h);
+                                                if let ShadeZone::Tiles(6) = shade.zone(x, y) {
+                                                    let _ = server.scene.system_ui.set_brightness(10);
+                                                    let _ = server.power_sync.apply_super_extreme_power_saver();
+                                                    power_saver_mode = PowerSaverMode::SuperExtreme;
+                                                    set_active_family(FontFamily::Homemade);
+                                                    super_extreme_state.enter_super_extreme();
+                                                    quick_tiles_active[6] = true;
+                                                    server.scene.system_ui.close();
+                                                }
+                                            } else if app_drawer_open {
                                                 let drawer_y_offset = (1.0 - drawer_progress.clamp(0.0, 1.0)) * h;
                                                 if let Some(idx) =
                                                     Layout::plain(w, h).drawer_grid_hit(drawer_y_offset, x, y)
                                                 {
-                                                    if let Some(target_app) =
-                                                        drawer_view(&all_managed_apps, &drawer_search).nth(idx)
-                                                    {
-                                                        if !home_pages[current_home_page].contains(&target_app.id) {
-                                                            home_pages[current_home_page].push(target_app.id.clone());
-                                                            println!("[UTLC] Pinned '{}' to Home Page {}", target_app.name, current_home_page + 1);
+                                                    if let Some(target_app) = drawer_nth(
+                                                        &all_managed_apps,
+                                                        &drawer_search,
+                                                        idx,
+                                                    ) {
+                                                        // Cap pins at the visible grid capacity;
+                                                        // overflow would be unreachable dead state.
+                                                        let _pl = Layout::plain(w, h);
+                                                        let max_slots =
+                                                            _pl.grid_cols * _pl.max_rows;
+                                                        if home_pages[current_home_page].len()
+                                                            < max_slots
+                                                            && !home_pages[current_home_page]
+                                                                .contains(&target_app.id)
+                                                        {
+                                                            home_pages[current_home_page]
+                                                                .push(target_app.id.clone());
                                                         }
                                                         app_drawer_open = false;
                                                         drawer_search_active = false;
@@ -1976,12 +2396,12 @@ fn run_daemon() {
                                                 if let Some(idx) = Layout::new(
                                                     w, h, selected_home_icon.is_some(),
                                                 )
-                                                .home_grid_hit(x, y, home_scroll_offset)
+                                                .home_grid_hit_paged(x, y, home_scroll_offset, home_pages.len())
+                                                .map(|(_, i)| i)
                                                 {
                                                     let page_app_ids = &home_pages[current_home_page];
                                                     if let Some(app_id) = page_app_ids.get(idx) {
                                                         selected_home_icon = Some(app_id.clone());
-                                                        println!("[UTLC] Selected app '{}' on Home Page {} for edit mode", app_id, current_home_page + 1);
                                                     }
                                                 }
                                             }
@@ -2024,41 +2444,99 @@ fn run_daemon() {
                             }
                         }
                     }
+                    } else {
+                        // Stale input fd: unregister so it stops waking us.
+                        if epoll_fd >= 0 {
+                            unsafe {
+                                libc::epoll_ctl(
+                                    epoll_fd,
+                                    libc::EPOLL_CTL_DEL,
+                                    fd,
+                                    std::ptr::null_mut(),
+                                );
+                            }
+                        }
+                    }
                 } else {
                     // Servicing connected client stream events (read/drain or close)
                     use std::io::Read;
-                    let mut buf = [0u8; 1024];
                     let mut closed = false;
                     let mut stream_idx = None;
-                    for (idx, stream) in server.client_streams.iter_mut().enumerate() {
+                    for (idx, stream) in server.client_streams.iter().enumerate() {
                         if stream.as_raw_fd() == fd {
                             stream_idx = Some(idx);
-                            if (ev.events & (libc::EPOLLHUP | libc::EPOLLERR) as u32) != 0 {
-                                closed = true;
-                            } else {
-                                match stream.read(&mut buf) {
-                                    Ok(0) => closed = true,
+                            break;
+                        }
+                    }
+                    if let Some(idx) = stream_idx {
+                        if idx >= client_states.len()
+                            || (ev.events
+                                & (libc::EPOLLRDHUP | libc::EPOLLHUP | libc::EPOLLERR) as u32)
+                                != 0
+                        {
+                            closed = true;
+                        } else {
+                            // Drain loop: bounded reads per wake so a chatty
+                            // client catches up without starving the frame.
+                            let mut reads = 0;
+                            let mut drained = false;
+                            while !drained && reads < 8 {
+                                reads += 1;
+                                let st = &mut client_states[idx];
+                                if st.len >= st.buf.len() {
+                                    // Overlong/garbage tail: drop, never resync-guess.
+                                    closed = true;
+                                    break;
+                                }
+                                let stream = &mut server.client_streams[idx];
+                                match stream.read(&mut st.buf[st.len..]) {
+                                    Ok(0) => {
+                                        closed = true;
+                                        drained = true;
+                                    }
                                     Ok(n) => {
-                                        let mut slice = &buf[..n];
-                                        while let Ok(Some((msg, len))) = utim_core::compositor::protocols::WlMessage::parse(slice) {
+                                        let end = st.len + n;
+                                        let mut off = 0;
+                                        while let Ok(Some((msg, mlen))) =
+                                            utim_core::compositor::protocols::WlMessage::parse(
+                                                &st.buf[off..end],
+                                            )
+                                        {
                                             // zwp_text_input_v3 requests:
                                             // opcode 1: enable -> activate virtual keyboard
-                                            // opcode 2: disable -> deactivate virtual keyboard
-                                            if msg.header.opcode == 1 {
-                                                server.scene.keyboard.activate();
-                                                app_input_focused = true;
-                                            } else if msg.header.opcode == 2 {
-                                                server.scene.keyboard.deactivate();
-                                                app_input_focused = false;
+                                            // opcode 2: disable -> deactivate virtual keyboard.
+                                            // Gated on the bound object once known
+                                            // (text_input_id == 0 preserves the
+                                            // legacy opcode-only behaviour).
+                                            if st.text_input_id == 0
+                                                || msg.header.object_id == st.text_input_id
+                                            {
+                                                if msg.header.opcode == 1 {
+                                                    server.scene.keyboard.activate();
+                                                    app_input_focused = true;
+                                                } else if msg.header.opcode == 2 {
+                                                    server.scene.keyboard.deactivate();
+                                                    app_input_focused = false;
+                                                }
                                             }
-                                            slice = &slice[len..];
+                                            off += mlen;
                                         }
+                                        // Carry the partial tail for the next read.
+                                        let tail = end - off;
+                                        st.buf.copy_within(off..end, 0);
+                                        st.len = tail;
                                     }
-                                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                                    Err(_) => closed = true,
+                                    Err(ref e)
+                                        if e.kind() == std::io::ErrorKind::WouldBlock =>
+                                    {
+                                        drained = true;
+                                    }
+                                    Err(_) => {
+                                        closed = true;
+                                        drained = true;
+                                    }
                                 }
                             }
-                            break;
                         }
                     }
                     if closed {
@@ -2074,6 +2552,9 @@ fn run_daemon() {
                                 }
                             }
                             server.client_streams.swap_remove(idx);
+                            if idx < client_states.len() {
+                                client_states.swap_remove(idx);
+                            }
                         }
                     } else if stream_idx.is_none() && epoll_fd >= 0 {
                         unsafe {
@@ -2089,59 +2570,57 @@ fn run_daemon() {
             }
         }
 
-        // Drain asynchronous terminal command output streams for all tabs
+        // Shutdown skips the whole frame tail: no terminal drain, no
+        // rescan, no raster and no DIRTYFB after the signal.
+        if !running {
+            break;
+        }
+
+        // Drain asynchronous terminal command output streams for all tabs,
+        // bounded per frame so one chatty child cannot stall the compositor.
         for tab in &mut terminal_tabs {
-            while let Ok(line) = tab.rx.try_recv() {
-                push_terminal_line(&mut tab.lines, &line);
+            let mut budget = 64usize;
+            while budget > 0 {
+                match tab.rx.try_recv() {
+                    Ok(line) => {
+                        push_terminal_line(&mut tab.lines, &line);
+                        budget -= 1;
+                    }
+                    Err(_) => break,
+                }
             }
             if tab.lines.len() > 120 {
                 tab.lines.drain(0..tab.lines.len() - 120);
             }
         }
 
-        // Periodic check for newly registered input event devices
-        if last_input_rescan.elapsed() >= Duration::from_secs(1) {
-            last_input_rescan = Instant::now();
-            if let Ok(entries) = fs::read_dir("/dev/input") {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .is_some_and(|n| n.starts_with("event"))
-                    {
-                        if opened_paths.contains(&path) {
-                            continue;
-                        }
-                        if let Ok(c_path) = std::ffi::CString::new(path.to_string_lossy().as_bytes()) {
-                            let fd = unsafe {
-                                libc::open(
-                                    c_path.as_ptr(),
-                                    libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
-                                )
-                            };
-                            if fd >= 0 {
-                                if epoll_fd >= 0 {
-                                    let mut in_ev = libc::epoll_event {
-                                        events: libc::EPOLLIN as u32,
-                                        u64: fd as u64,
-                                    };
-                                    unsafe {
-                                        libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, fd, &mut in_ev);
-                                    }
-                                }
-                                input_fds.push(fd);
-                                opened_paths.push(path);
-                            }
-                        }
-                    }
-                }
+        // .desktop catalogue rescan, headless-safe (outside any drm gate):
+        // rebuild only when the application-set signature changed, so the
+        // steady-state cost is one scan + one cheap fingerprint per 2 s and
+        // the icon re-resolve runs only on real change.
+        if last_catalogue_scan.elapsed() >= catalogue_scan_interval {
+            last_catalogue_scan = Instant::now();
+            desktop_catalogue.scan_system_directories();
+            let fresh = build_all_apps(&desktop_catalogue);
+            let sig = app_set_signature(&fresh);
+            if sig != icon_app_sig {
+                icon_app_sig = sig;
+                icon_cache.invalidate_misses();
+                all_managed_apps = fresh;
+                apply_app_icons(&mut all_managed_apps, &mut icon_cache);
+                refresh_dock_cache(
+                    &all_managed_apps,
+                    &icon_cache,
+                    &mut dock_index,
+                    &mut dock_apps_icon,
+                );
             }
         }
 
         // Vsync frame presentation step
-        if last_frame.elapsed() >= frame_interval {
-            let dt = last_frame.elapsed().as_secs_f32();
+        let frame_elapsed = last_frame.elapsed();
+        if frame_elapsed >= frame_interval {
+            let dt = frame_elapsed.as_secs_f32();
             last_frame = Instant::now();
             let _ = server.step_frame(dt);
 
@@ -2222,28 +2701,17 @@ fn run_daemon() {
                     })
                     .collect();
 
-                if last_catalogue_scan.elapsed() >= catalogue_scan_interval {
-                    last_catalogue_scan = Instant::now();
-                    desktop_catalogue.scan_system_directories();
-                    all_managed_apps = build_all_apps(&desktop_catalogue);
-                    let sig = app_set_signature(&all_managed_apps);
-                    if sig != icon_app_sig {
-                        // The set changed: previously missing icons may exist now.
-                        icon_app_sig = sig;
-                        icon_cache.invalidate_misses();
-                    }
-                    apply_app_icons(&mut all_managed_apps, &mut icon_cache);
-                }
-
                 // 1. Grid apps on the current home screen page
-                let current_page_app_ids = &home_pages[current_home_page];
                 let home_screen_apps: Vec<&ManagedApp> = if search_active && !search_query.is_empty() {
-                    let q = search_query.to_lowercase();
                     all_managed_apps
                         .iter()
-                        .filter(|a| a.name.to_lowercase().contains(&q) || a.id.to_lowercase().contains(&q))
+                        .filter(|a| {
+                            ci_contains(&a.name, &search_query)
+                                || ci_contains(&a.id, &search_query)
+                        })
                         .collect()
                 } else {
+                    let current_page_app_ids = &home_pages[current_home_page];
                     current_page_app_ids
                         .iter()
                         .filter_map(|id| all_managed_apps.iter().find(|a| a.id == *id))
@@ -2261,44 +2729,49 @@ fn run_daemon() {
                     })
                     .collect();
 
-                // 2. Drawer apps (full catalogue for the PixelUI App Drawer)
-                let drawer_visible_apps: Vec<&ManagedApp> = if !drawer_search.is_empty() {
-                    let q = drawer_search.to_lowercase();
-                    all_managed_apps
-                        .iter()
-                        .filter(|a| a.name.to_lowercase().contains(&q) || a.id.to_lowercase().contains(&q))
-                        .collect()
-                } else {
-                    all_managed_apps.iter().collect()
-                };
+                // 2. Drawer apps (full catalogue for the PixelUI App Drawer),
+                // skipped entirely while the drawer is closed and off-screen.
+                let drawer_items: Vec<AppGridItem> =
+                    if app_drawer_open || drawer_spring.value > 0.0 {
+                        if !drawer_search.is_empty() {
+                            all_managed_apps
+                                .iter()
+                                .filter(|a| {
+                                    ci_contains(&a.name, &drawer_search)
+                                        || ci_contains(&a.id, &drawer_search)
+                                })
+                                .map(drawer_item_of)
+                                .collect()
+                        } else {
+                            all_managed_apps.iter().map(drawer_item_of).collect()
+                        }
+                    } else {
+                        Vec::new()
+                    };
 
-                let drawer_items: Vec<AppGridItem> = drawer_visible_apps
-                    .iter()
-                    .map(|a| AppGridItem {
-                        id: &a.id,
-                        name: &a.name,
-                        color: a.color,
-                        glyph: &a.glyph,
-                        icon: a.icon.as_deref(),
-                    })
-                    .collect();
-
-                // Hotseat: same five slots as the hit-test table, real icons included.
-                const DOCK_NAMES: [&str; 5] = ["Phone", "Messages", "Apps", "Browser", "Camera"];
-                let apps_dock_icon = icon_cache.get("view-app-grid").or_else(|| icon_cache.get("apps"));
+                // Hotseat: same five slots as the hit-test table. Slot
+                // resolution is cached across catalogue rescans (dock_index);
+                // only the small item vec is rebuilt, with no find/Rc-clone.
+                const DOCK_NAMES: [&str; 5] =
+                    ["Phone", "Messages", "Apps", "Browser", "Camera"];
                 let dock_items: Vec<AppGridItem> = DOCK_NAMES
                     .iter()
-                    .map(|name| {
-                        let entry = all_managed_apps.iter().find(|a| a.name == *name);
+                    .enumerate()
+                    .map(|(slot, name)| {
+                        let entry = dock_index[slot].and_then(|i| all_managed_apps.get(i));
                         let icon = entry.and_then(|a| a.icon.as_deref()).or_else(|| {
                             if *name == "Apps" {
-                                apps_dock_icon.as_deref()
+                                dock_apps_icon.as_deref()
                             } else {
                                 None
                             }
                         });
                         AppGridItem {
-                            id: entry.map(|a| a.id.as_str()).unwrap_or(if *name == "Apps" { "apps" } else { name }),
+                            id: entry.map(|a| a.id.as_str()).unwrap_or(if *name == "Apps" {
+                                "apps"
+                            } else {
+                                name
+                            }),
                             name,
                             color: entry.map(|a| a.color).unwrap_or(0xFF475569),
                             glyph: entry.map(|a| a.glyph.as_str()).unwrap_or(":"),
@@ -2306,6 +2779,30 @@ fn run_daemon() {
                         }
                     })
                     .collect();
+
+                // Super Extreme and Power Management state updates
+                super_extreme_state.check_power_button_hold();
+                if super_extreme_state.request_exit_to_normal {
+                    super_extreme_state.request_exit_to_normal = false;
+                    let _ = server.scene.system_ui.set_brightness(75);
+                    let _ = server.power_sync.restore_normal_power_mode();
+                    set_active_family(FontFamily::NotoSans);
+                    power_saver_mode = PowerSaverMode::Off;
+                    quick_tiles_active[6] = false;
+                }
+                if super_extreme_state.request_reboot {
+                    super_extreme_state.request_reboot = false;
+                    let _ = std::process::Command::new("reboot").spawn();
+                }
+                if super_extreme_state.request_poweroff {
+                    super_extreme_state.request_poweroff = false;
+                    let _ = std::process::Command::new("poweroff").spawn();
+                }
+                if power_saver_mode == PowerSaverMode::SuperExtreme
+                    && super_extreme_state.active_screen == SuperExtremeScreen::CameraPreview
+                {
+                    super_extreme_state.camera_preview.update_preview();
+                }
 
                 let drm_state = DrmInteractiveState {
                     time_str: t_str,
@@ -2345,14 +2842,26 @@ fn run_daemon() {
                     pressed_icon_id: pressed_icon_id.as_deref(),
                     icon_press_scale: icon_bounce_spring.value,
                     palette: shell_palette,
+                    power_saver_mode,
+                    super_extreme_state: if power_saver_mode == PowerSaverMode::SuperExtreme || super_extreme_state.volume_hud.is_visible() {
+                        Some(&super_extreme_state)
+                    } else {
+                        None
+                    },
                 };
-                drm.render_interactive_ui(&drm_state);
-                drm.flush();
+                // Unconditional flush() marks the whole 10.4 MB framebuffer
+                // dirty 60x/s; only flush when the damage hash proves a repaint.
+                if drm.render_interactive_ui(&drm_state) {
+                    if let Err(e) = drm.flush() {
+                        eprintln!("[UTLC] DIRTYFB flush failed: {}", e);
+                    }
+                }
             }
         }
 
         // Auto-transition to Launcher home screen after initial boot presentation
-        if server.scene.lockscreen.is_locked()
+        if power_saver_mode != PowerSaverMode::SuperExtreme
+            && server.scene.lockscreen.is_locked()
             && server.start_time.elapsed() >= Duration::from_secs(2)
         {
             server.scene.lockscreen.unlock();
@@ -2377,6 +2886,11 @@ fn run_daemon() {
     if epoll_fd >= 0 {
         unsafe {
             libc::close(epoll_fd);
+        }
+    }
+    if inotify_fd >= 0 {
+        unsafe {
+            libc::close(inotify_fd);
         }
     }
     if sig_fd >= 0 {
@@ -2405,8 +2919,8 @@ fn format_current_time(buf: &mut [u8; 5]) -> &str {
     let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
     unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts) };
     let total_secs = ts.tv_sec;
-    let hours = ((total_secs / 3600) % 24) as u8;
-    let mins = ((total_secs / 60) % 60) as u8;
+    let hours = (total_secs / 3600).rem_euclid(24) as u8;
+    let mins = (total_secs / 60).rem_euclid(60) as u8;
     buf[0] = b'0' + (hours / 10);
     buf[1] = b'0' + (hours % 10);
     buf[2] = b':';
@@ -2563,10 +3077,19 @@ fn handle_terminal_enter(
         let mut guard = tab.active_stdin.lock().unwrap();
         if let Some(ref mut stdin) = *guard {
             use std::io::Write;
-            let _ = stdin.write_all(tab.input.as_bytes());
-            let _ = stdin.write_all(b"\n");
-            let _ = stdin.flush();
-            true
+            // Non-blocking pipe (set at spawn): a write can never stall the
+            // UI thread. WouldBlock means the child is not keeping up, so
+            // this line is dropped instead of blocking on it.
+            let r1 = stdin.write(tab.input.as_bytes());
+            let r2 = r1.and_then(|_| stdin.write(b"\n"));
+            match r2 {
+                Ok(_) => true,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    tab.input.clear();
+                    true
+                }
+                Err(_) => false,
+            }
         } else {
             false
         }
@@ -2642,10 +3165,24 @@ fn apply_ime_action(
     messages_list: &mut Vec<String>,
 ) {
     match act {
+        ImeAction::CommitChar(c) => {
+            if active_app.as_deref() == Some("Terminal") {
+                if let Some(tab) = terminal_tabs.get_mut(*active_tab_idx) {
+                    tab.input.push(c);
+                }
+            } else if *search_active {
+                if search_query.len() + c.len_utf8() <= 60 {
+                    search_query.push(c);
+                }
+            } else if active_app.is_some() && *app_input_focused && app_input.len() + c.len_utf8() <= 120
+            {
+                app_input.push(c);
+            }
+        }
         ImeAction::CommitString(s) => {
             if active_app.as_deref() == Some("Terminal") {
-                if !terminal_tabs.is_empty() {
-                    terminal_tabs[*active_tab_idx].input.push_str(&s);
+                if let Some(tab) = terminal_tabs.get_mut(*active_tab_idx) {
+                    tab.input.push_str(&s);
                 }
             } else if *search_active {
                 if search_query.len() + s.len() <= 60 {
@@ -2657,8 +3194,8 @@ fn apply_ime_action(
         }
         ImeAction::DeleteSurroundingText { .. } => {
             if active_app.as_deref() == Some("Terminal") {
-                if !terminal_tabs.is_empty() {
-                    terminal_tabs[*active_tab_idx].input.pop();
+                if let Some(tab) = terminal_tabs.get_mut(*active_tab_idx) {
+                    tab.input.pop();
                 }
             } else if *search_active {
                 search_query.pop();
@@ -2851,6 +3388,8 @@ fn run_command_process(
             let my_pid = child.id();
             active_child_pid.store(my_pid, std::sync::atomic::Ordering::SeqCst);
             if let Some(stdin) = child.stdin.take() {
+                use std::os::unix::io::AsRawFd;
+                set_fd_nonblocking(stdin.as_raw_fd());
                 *active_stdin.lock().unwrap() = Some(stdin);
             }
             let tx_err = tx.clone();
@@ -3231,7 +3770,7 @@ fn run_benchmarks(json: bool) -> bool {
     let socket_path = PathBuf::from(format!("/tmp/utlc-bench-{}.sock", std::process::id()));
     let mut server = WaylandServer::new(&socket_path, 1080, 2400, 120.0, hwc);
 
-    let metrics = server.get_metrics();
+    let metrics = server.get_metrics().expect("metrics collection failed");
     let rss_mb = (metrics.resident_memory_bytes as f64) / (1024.0 * 1024.0);
     let boot_ms = metrics.boot_to_launcher_duration.as_secs_f64() * 1000.0;
     let touch_ms = metrics.touch_processing_latency.as_secs_f64() * 1000.0;
@@ -3358,6 +3897,13 @@ fn test_gestures(json: bool) -> bool {
     });
     let recents_ok =
         matches!(recents_act, GestureAction::Recents { trigger_haptic, .. } if trigger_haptic);
+    engine.process_touch(&RawTouchEvent {
+        touch_id: 2,
+        phase: TouchPhase::Up,
+        x: 540.0,
+        y: 2200.0,
+        timestamp: t0 + Duration::from_millis(210),
+    });
 
     // 3. Back gesture (edge swipe)
     engine.process_touch(&RawTouchEvent {
@@ -3428,7 +3974,12 @@ fn test_desktop(json: bool) -> bool {
 
 fn test_systemui(json: bool) -> bool {
     let mut shade = SystemUiShade::new(1080.0, 2400.0);
-    let torch_ok = shade.toggle_tile(QuickTileKind::Torch);
+    // Sysfs is absent in the self-test env: the torch toggle must report
+    // the failure, and Bluetooth (no sysfs) still toggles.
+    let torch_err = shade.toggle_tile(QuickTileKind::Torch).is_err();
+    let bt_ok = shade
+        .toggle_tile(QuickTileKind::Bluetooth)
+        .unwrap_or(false);
     let notif_id = shade.notify(
         "App".into(),
         0,
@@ -3439,11 +3990,11 @@ fn test_systemui(json: bool) -> bool {
     );
     let notif_ok = notif_id > 0 && shade.notifications.len() == 1;
 
-    let all_ok = torch_ok && notif_ok;
+    let all_ok = torch_err && bt_ok && notif_ok;
     if json {
         println!(
-            r#"{{"torch_toggle_ok":{},"notification_ok":{},"all_passed":{}}}"#,
-            torch_ok, notif_ok, all_ok
+            r#"{{"torch_toggle_reports_sysfs_error":{},"bluetooth_toggle_ok":{},"notification_ok":{},"all_passed":{}}}"#,
+            torch_err, bt_ok, notif_ok, all_ok
         );
     } else {
         println!(
@@ -3455,23 +4006,38 @@ fn test_systemui(json: bool) -> bool {
 }
 
 fn test_lockscreen(json: bool) -> bool {
+    // Unbound HAL: fingerprint never authenticates.
     let mut lockscreen = LockScreen::new(Some("1234"));
-    let fp_ok = lockscreen.on_fingerprint_touch(1);
-    let auth_ok = !lockscreen.is_locked()
-        && lockscreen.biometric_bridge.last_auth_duration < Duration::from_millis(300);
+    let rejected = !lockscreen.on_fingerprint_touch(1) && lockscreen.is_locked();
 
+    // Bound HAL with a PIN enrolled: routes to PIN entry, no bypass.
+    lockscreen.biometric_bridge.hal_bound = true;
+    let gated = !lockscreen.on_fingerprint_touch(1)
+        && lockscreen.state == LockState::PinEntry;
+
+    // Bound HAL with no PIN: sub-300ms direct unlock.
+    let mut open = LockScreen::new(None);
+    open.biometric_bridge.hal_bound = true;
+    let t_auth_start = Instant::now();
+    let fp_ok = open.on_fingerprint_touch(1);
+    let auth_dur = t_auth_start.elapsed();
+    let auth_ok = fp_ok
+        && !open.is_locked()
+        && auth_dur < Duration::from_millis(300);
+
+    let all_ok = rejected && gated && auth_ok;
     if json {
         println!(
-            r#"{{"fingerprint_unlock_ok":{},"sub_300ms":{}}}"#,
-            fp_ok, auth_ok
+            r#"{{"unbound_rejected":{},"pin_gated":{},"fingerprint_unlock_ok":{},"sub_300ms":{}}}"#,
+            rejected, gated, fp_ok, auth_ok
         );
     } else {
         println!(
             "[*] Lock Screen & Fingerprint HAL Bridge (< 300ms): {}",
-            if auth_ok { "PASSED" } else { "FAILED" }
+            if all_ok { "PASSED" } else { "FAILED" }
         );
     }
-    auth_ok
+    all_ok
 }
 
 fn test_ime(json: bool) -> bool {
@@ -3482,7 +4048,7 @@ fn test_ime(json: bool) -> bool {
     }
     let push_ok = (ime.window_viewport_push_y() - 320.0).abs() < 1.0;
     let act = ime.handle_key_tap("k");
-    let key_ok = matches!(act, ImeAction::CommitString(s) if s == "k");
+    let key_ok = matches!(act, ImeAction::CommitChar('k'));
 
     let all_ok = push_ok && key_ok;
     if json {
@@ -3500,20 +4066,32 @@ fn test_ime(json: bool) -> bool {
 }
 
 fn test_power_sync(json: bool) -> bool {
+    // No daemon socket in the self-test env: every transition must report
+    // the failure instead of mocking success.
     let mut power = UtimPowerSync::new(Path::new("/tmp/mock-utim.sock"));
-    let sleep_ok = power.on_display_sleep().is_ok();
-    let wake_ok = power.on_display_wake().is_ok();
-    let oom_ok = power.on_app_switched(101, &[102], &[103]).is_ok();
+    let sleep_err = power.on_display_sleep().is_err();
+    let wake_err = power.on_display_wake().is_err();
+    let oom_err = power.on_app_switched(101, &[102], &[103]).is_err();
 
-    let all_ok = sleep_ok && wake_ok && oom_ok;
+    // Verify SuperExtreme Recovery state transitions
+    let mut sex = SuperExtremeState::new();
+    let init_lock = sex.active_screen == SuperExtremeScreen::Lock;
+    sex.volume_up();
+    let vol_up_ok = sex.volume_hud.volume_percent == 60 && sex.volume_hud.is_visible();
+    sex.on_swipe_up();
+    let pass_screen = sex.active_screen == SuperExtremeScreen::Password;
+    let unlocked = sex.submit_password(None, 0);
+    let home_screen = sex.active_screen == SuperExtremeScreen::Home;
+
+    let all_ok = sleep_err && wake_err && oom_err && init_lock && vol_up_ok && pass_screen && unlocked && home_screen;
     if json {
         println!(
-            r#"{{"sleep_ok":{},"wake_ok":{},"oom_ok":{},"all_passed":{}}}"#,
-            sleep_ok, wake_ok, oom_ok, all_ok
+            r#"{{"sleep_reports_error":{},"wake_reports_error":{},"oom_reports_error":{},"super_extreme_ok":{},"all_passed":{}}}"#,
+            sleep_err, wake_err, oom_err, home_screen, all_ok
         );
     } else {
         println!(
-            "[*] UTIM Power & OOM Synchronization: {}",
+            "[*] UTIM Power, Normal/SuperExtreme Modes & Recovery Shell: {}",
             if all_ok { "PASSED" } else { "FAILED" }
         );
     }
@@ -3873,7 +4451,7 @@ mod tests {
 
         // Build opcode 1: zwp_text_input_v3.enable
         let builder_enable = WlMessageBuilder::new(42, 1);
-        let wire_enable = builder_enable.build();
+        let wire_enable = builder_enable.build().expect("message fits u16");
 
         let (msg_enable, len) = utim_core::compositor::protocols::WlMessage::parse(&wire_enable).unwrap().unwrap();
         assert_eq!(len, wire_enable.len());
@@ -3884,7 +4462,7 @@ mod tests {
 
         // Build opcode 2: zwp_text_input_v3.disable
         let builder_disable = WlMessageBuilder::new(42, 2);
-        let wire_disable = builder_disable.build();
+        let wire_disable = builder_disable.build().expect("message fits u16");
 
         let (msg_disable, _) = utim_core::compositor::protocols::WlMessage::parse(&wire_disable).unwrap().unwrap();
         if msg_disable.header.opcode == 2 {
@@ -4300,5 +4878,79 @@ mod tests {
 
         let w_full = utim_core::graphics::text_width("Universal Treble", scale);
         assert!(w_full > 0);
+    }
+
+    #[test]
+    fn test_power_saver_modes_and_super_extreme_recovery_shell() {
+        let mut sex = SuperExtremeState::new();
+        assert_eq!(sex.active_screen, SuperExtremeScreen::Lock);
+
+        // 1. Volume HUD adjustment
+        sex.volume_up();
+        assert_eq!(sex.volume_hud.volume_percent, 60);
+        assert!(sex.volume_hud.is_visible());
+        let bar = sex.volume_hud.format_bar(30);
+        assert!(bar.starts_with("VOL ["));
+        assert!(bar.contains("60%"));
+
+        sex.volume_down();
+        assert_eq!(sex.volume_hud.volume_percent, 50);
+
+        // 2. Lock screen actions: Emergency dialer
+        let (w, h) = (360.0f32, 640.0f32);
+        assert!(sex.handle_touch_tap(w * 0.20, h * 0.84, w, h, None, 0));
+        assert_eq!(sex.active_screen, SuperExtremeScreen::EmergencyDialer);
+        sex.handle_back();
+        assert_eq!(sex.active_screen, SuperExtremeScreen::Lock);
+
+        // 3. Lock screen camera preview & snapshot
+        assert!(sex.handle_touch_tap(w * 0.70, h * 0.84, w, h, None, 0));
+        assert_eq!(sex.active_screen, SuperExtremeScreen::CameraPreview);
+        sex.camera_preview.update_preview();
+        let photo = sex.snap_photo();
+        assert!(photo.is_some());
+        sex.handle_back();
+        assert_eq!(sex.active_screen, SuperExtremeScreen::Lock);
+
+        // 4. Swipe up to unlock -> Password screen
+        sex.on_swipe_up();
+        assert_eq!(sex.active_screen, SuperExtremeScreen::Password);
+
+        // 5. Password entry and submit
+        let unlocked = sex.enter_password_char('1', None, 0);
+        assert!(unlocked);
+        assert_eq!(sex.active_screen, SuperExtremeScreen::Home);
+
+        // 6. Launch apps from home screen (0..3)
+        sex.launch_home_app(0);
+        assert_eq!(sex.active_screen, SuperExtremeScreen::AppAlarm);
+        sex.handle_back();
+        assert_eq!(sex.active_screen, SuperExtremeScreen::Home);
+
+        sex.launch_home_app(1);
+        assert_eq!(sex.active_screen, SuperExtremeScreen::AppPhone);
+        sex.handle_back();
+        assert_eq!(sex.active_screen, SuperExtremeScreen::Home);
+
+        sex.launch_home_app(2);
+        assert_eq!(sex.active_screen, SuperExtremeScreen::AppSms);
+        sex.handle_back();
+        assert_eq!(sex.active_screen, SuperExtremeScreen::Home);
+
+        sex.launch_home_app(3);
+        assert_eq!(sex.active_screen, SuperExtremeScreen::AppSettings);
+        assert!(sex.handle_touch_tap(w * 0.50, h * 0.55, w, h, None, 0));
+        assert!(sex.request_exit_to_normal);
+
+        // 7. Power button hold triggers Recovery Power Menu
+        sex.active_screen = SuperExtremeScreen::Home;
+        sex.on_power_button_press();
+        sex.power_press_start = Some(std::time::Instant::now() - std::time::Duration::from_millis(1100));
+        assert!(sex.check_power_button_hold());
+        assert_eq!(sex.active_screen, SuperExtremeScreen::PowerMenu);
+
+        // Option 0: Return to normal mode
+        assert!(sex.handle_touch_tap(w * 0.50, h * 0.34, w, h, None, 0));
+        assert!(sex.request_exit_to_normal);
     }
 }

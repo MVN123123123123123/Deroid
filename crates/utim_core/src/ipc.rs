@@ -35,23 +35,43 @@ pub enum IpcRequest {
 }
 
 impl IpcRequest {
+    /// Reject bytes that would corrupt the line framing. Unit/slice names are
+    /// filenames; neither a space nor a newline is legal in one.
+    fn check_field(kind: &str, v: &str) -> String {
+        assert!(!v.is_empty(), "{kind}: empty field");
+        assert!(v.len() <= 255, "{kind}: field too long ({} bytes)", v.len());
+        assert!(
+            !v.contains(['\n', '\r', ' ']),
+            "{kind}: illegal byte in {v:?}"
+        );
+        v.to_string()
+    }
+
     pub fn serialize(&self) -> String {
         match self {
-            IpcRequest::Start(u) => format!("START {}\n", u),
-            IpcRequest::Stop(u) => format!("STOP {}\n", u),
-            IpcRequest::Restart(u) => format!("RESTART {}\n", u),
-            IpcRequest::Reload(u) => format!("RELOAD {}\n", u),
-            IpcRequest::Status(u) => format!("STATUS {}\n", u),
+            IpcRequest::Start(u) => format!("START {}\n", Self::check_field("unit", u)),
+            IpcRequest::Stop(u) => format!("STOP {}\n", Self::check_field("unit", u)),
+            IpcRequest::Restart(u) => format!("RESTART {}\n", Self::check_field("unit", u)),
+            IpcRequest::Reload(u) => format!("RELOAD {}\n", Self::check_field("unit", u)),
+            IpcRequest::Status(u) => format!("STATUS {}\n", Self::check_field("unit", u)),
             IpcRequest::ListUnits => "LIST_UNITS\n".to_string(),
             IpcRequest::DaemonReload => "DAEMON_RELOAD\n".to_string(),
-            IpcRequest::Enable(u) => format!("ENABLE {}\n", u),
-            IpcRequest::Disable(u) => format!("DISABLE {}\n", u),
-            IpcRequest::IsActive(u) => format!("IS_ACTIVE {}\n", u),
-            IpcRequest::IsEnabled(u) => format!("IS_ENABLED {}\n", u),
-            IpcRequest::FreezeCgroup(s) => format!("FREEZE_CGROUP {}\n", s),
-            IpcRequest::UnfreezeCgroup(s) => format!("UNFREEZE_CGROUP {}\n", s),
-            IpcRequest::AcquireWakeLock(n) => format!("ACQUIRE_WAKELOCK {}\n", n),
-            IpcRequest::ReleaseWakeLock(n) => format!("RELEASE_WAKELOCK {}\n", n),
+            IpcRequest::Enable(u) => format!("ENABLE {}\n", Self::check_field("unit", u)),
+            IpcRequest::Disable(u) => format!("DISABLE {}\n", Self::check_field("unit", u)),
+            IpcRequest::IsActive(u) => format!("IS_ACTIVE {}\n", Self::check_field("unit", u)),
+            IpcRequest::IsEnabled(u) => format!("IS_ENABLED {}\n", Self::check_field("unit", u)),
+            IpcRequest::FreezeCgroup(s) => {
+                format!("FREEZE_CGROUP {}\n", Self::check_field("slice", s))
+            }
+            IpcRequest::UnfreezeCgroup(s) => {
+                format!("UNFREEZE_CGROUP {}\n", Self::check_field("slice", s))
+            }
+            IpcRequest::AcquireWakeLock(n) => {
+                format!("ACQUIRE_WAKELOCK {}\n", Self::check_field("wakelock", n))
+            }
+            IpcRequest::ReleaseWakeLock(n) => {
+                format!("RELEASE_WAKELOCK {}\n", Self::check_field("wakelock", n))
+            }
             IpcRequest::SetOomScore(pid, score) => format!("SET_OOM_SCORE {} {}\n", pid, score),
             IpcRequest::AnalyzeTime => "ANALYZE_TIME\n".to_string(),
             IpcRequest::Reboot => "REBOOT\n".to_string(),
@@ -130,6 +150,11 @@ pub enum IpcResponse {
 }
 
 impl IpcResponse {
+    /// Field separator and record terminator must not survive into a field.
+    fn esc(s: &str) -> String {
+        s.replace(['|', '\n', '\r'], " ")
+    }
+
     pub fn serialize(&self) -> String {
         match self {
             IpcResponse::Ok(msg) => format!("OK {}\n", msg),
@@ -144,18 +169,24 @@ impl IpcResponse {
                 let pid_str = pid
                     .map(|p| p.to_string())
                     .unwrap_or_else(|| "-1".to_string());
-                let escaped_desc = description.replace('|', " ");
-                let escaped_details = details.replace('\n', "\\n");
                 format!(
                     "STATUS {}|{}|{}|{}|{}\n",
-                    name, state, pid_str, escaped_desc, escaped_details
+                    Self::esc(name),
+                    Self::esc(state),
+                    pid_str,
+                    Self::esc(description),
+                    Self::esc(details)
                 )
             }
             IpcResponse::UnitList(units) => {
                 let mut out = String::from("UNITS_BEGIN\n");
                 for (name, state, desc) in units {
-                    let escaped_desc = desc.replace(['|', '\n'], " ");
-                    out.push_str(&format!("{}|{}|{}\n", name, state, escaped_desc));
+                    out.push_str(&format!(
+                        "{}|{}|{}\n",
+                        Self::esc(name),
+                        Self::esc(state),
+                        Self::esc(desc)
+                    ));
                 }
                 out.push_str("UNITS_END\n");
                 out
@@ -212,8 +243,12 @@ impl IpcResponse {
             }
         } else if trimmed == "UNITS_BEGIN" {
             let mut list = Vec::new();
+            let mut complete = false;
             loop {
                 if list.len() >= MAX_IPC_UNITS {
+                    eprintln!(
+                        "utimctl: unit list exceeds MAX_IPC_UNITS={MAX_IPC_UNITS}; truncated"
+                    );
                     break;
                 }
                 line.clear();
@@ -221,19 +256,25 @@ impl IpcResponse {
                 let n = limited.read_line(&mut line)?;
                 if n == 0 {
                     break;
-                }
+                } // EOF: incomplete
                 let item = line.trim();
                 if item == "UNITS_END" {
+                    complete = true;
                     break;
                 }
                 let parts: Vec<&str> = item.splitn(3, '|').collect();
-                if parts.len() >= 3 {
-                    list.push((
-                        parts[0].to_string(),
-                        parts[1].to_string(),
-                        parts[2].to_string(),
-                    ));
+                match parts.as_slice() {
+                    [name, state, desc] => {
+                        list.push(((*name).into(), (*state).into(), (*desc).into()))
+                    }
+                    _ => eprintln!("utimctl: skipping unparsable unit row: {item:?}"),
                 }
+            }
+            if !complete {
+                return Ok(Some(IpcResponse::Err(format!(
+                    "unit list truncated after {} entries (no UNITS_END marker)",
+                    list.len()
+                ))));
             }
             return Ok(Some(IpcResponse::UnitList(list)));
         } else if let Some(rest) = trimmed.strip_prefix("TIME ") {
@@ -303,12 +344,130 @@ mod tests {
             state: "active".to_string(),
             pid: Some(42),
             description: "OpenSSH Server".to_string(),
-            details: "Loaded: /lib/systemd/system/ssh.service\nMain PID: 42".to_string(),
+            details: "Loaded: /lib/systemd/system/ssh.service Main PID: 42".to_string(),
         };
 
         let serialized = resp.serialize();
         let mut reader = std::io::Cursor::new(serialized);
         let parsed = IpcResponse::deserialize(&mut reader).unwrap().unwrap();
         assert_eq!(resp, parsed);
+    }
+
+    #[test]
+    fn test_status_details_newline_is_flattened_not_framed() {
+        // S9: every field uses one escaper; a newline in details becomes a
+        // space rather than a record break or a lossy backslash sequence.
+        let resp = IpcResponse::Status {
+            name: "ssh.service".to_string(),
+            state: "active".to_string(),
+            pid: Some(42),
+            description: "OpenSSH Server".to_string(),
+            details: "line one\nline two".to_string(),
+        };
+        let serialized = resp.serialize();
+        assert_eq!(serialized.lines().count(), 1);
+        let mut reader = std::io::Cursor::new(serialized);
+        let parsed = IpcResponse::deserialize(&mut reader).unwrap().unwrap();
+        match parsed {
+            IpcResponse::Status { details, .. } => {
+                assert_eq!(details, "line one line two");
+            }
+            other => panic!("expected Status, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_status_pipe_in_name_does_not_shift_fields() {
+        // S9: a `|` in a unit name is escaped so the positional parser still
+        // sees exactly five fields.
+        let resp = IpcResponse::Status {
+            name: "a|b.service".to_string(),
+            state: "active".to_string(),
+            pid: None,
+            description: "desc".to_string(),
+            details: String::new(),
+        };
+        let serialized = resp.serialize();
+        assert_eq!(serialized.lines().count(), 1);
+        let mut reader = std::io::Cursor::new(serialized);
+        let parsed = IpcResponse::deserialize(&mut reader).unwrap().unwrap();
+        match parsed {
+            IpcResponse::Status { name, state, .. } => {
+                assert_eq!(name, "a b.service");
+                assert_eq!(state, "active");
+            }
+            other => panic!("expected Status, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "illegal byte")]
+    fn test_request_space_in_unit_panics_loudly() {
+        // S6: a space would silently retarget the unit server-side; panic
+        // (abort in the shipped profile) instead of operating on the wrong unit.
+        let _ = IpcRequest::Start("a b.service".to_string()).serialize();
+    }
+
+    #[test]
+    #[should_panic(expected = "illegal byte")]
+    fn test_request_newline_in_unit_panics_loudly() {
+        // S6: a newline would silently discard the remainder of the record.
+        let _ = IpcRequest::Start("a.service\nb.service".to_string()).serialize();
+    }
+
+    #[test]
+    #[should_panic(expected = "empty field")]
+    fn test_request_empty_unit_panics_loudly() {
+        let _ = IpcRequest::Stop(String::new()).serialize();
+    }
+
+    #[test]
+    #[should_panic(expected = "too long")]
+    fn test_request_overlong_unit_panics_loudly() {
+        let _ = IpcRequest::Status("x".repeat(256)).serialize();
+    }
+
+    #[test]
+    fn test_unit_list_eof_without_terminator_is_an_error() {
+        // S8: EOF before UNITS_END must not be reported as a whole list.
+        let raw = "UNITS_BEGIN\na.service|active|Desc A\nb.service|active|Desc B\n";
+        let mut reader = std::io::Cursor::new(raw);
+        let parsed = IpcResponse::deserialize(&mut reader).unwrap().unwrap();
+        match parsed {
+            IpcResponse::Err(msg) => assert!(msg.contains("no UNITS_END marker"), "{msg}"),
+            other => panic!("expected Err, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_unit_list_malformed_row_skipped_but_terminated_list_ok() {
+        // S8: a garbage row is reported on stderr and skipped; a terminated
+        // list still parses.
+        let raw = "UNITS_BEGIN\na.service|active|Desc A\nGARBAGE-NO-PIPES\nb.service|inactive|Desc B\nUNITS_END\n";
+        let mut reader = std::io::Cursor::new(raw);
+        let parsed = IpcResponse::deserialize(&mut reader).unwrap().unwrap();
+        match parsed {
+            IpcResponse::UnitList(units) => {
+                assert_eq!(units.len(), 2);
+                assert_eq!(units[0].0, "a.service");
+                assert_eq!(units[1].0, "b.service");
+            }
+            other => panic!("expected UnitList, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_unit_list_at_cap_without_terminator_is_an_error() {
+        // S8: hitting MAX_IPC_UNITS without UNITS_END is truncation, not success.
+        let mut raw = String::from("UNITS_BEGIN\n");
+        for i in 0..MAX_IPC_UNITS {
+            raw.push_str(&format!("u{i}.service|active|d\n"));
+        }
+        let mut reader = std::io::Cursor::new(raw);
+        let parsed = IpcResponse::deserialize(&mut reader).unwrap().unwrap();
+        match parsed {
+            IpcResponse::Err(msg) => assert!(msg.contains("truncated"), "{msg}"),
+            other => panic!("expected Err, got {other:?}"),
+        }
     }
 }

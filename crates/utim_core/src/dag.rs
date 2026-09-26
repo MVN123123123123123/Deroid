@@ -127,7 +127,8 @@ impl UnitDag {
                     }
                 }
                 for (other_name, other_node) in &self.dag.nodes {
-                    if other_node.unit.unit.before.contains(&v.to_string()) {
+                    // P1: zero-alloc borrowed comparison (no String alloc).
+                    if other_node.unit.unit.before.iter().any(|b| b == v) {
                         neighbors_set.insert(other_name.clone());
                     }
                 }
@@ -194,15 +195,16 @@ impl UnitDag {
             queue.push_back(target_unit.to_string());
         }
 
-        // Collect all transitive requirements and ordering dependencies
+        // Collect all transitive requirements (Requires/Wants/BindsTo).
+        // NOTE (B2): After=/Before= are ordering only, not requirements, and
+        // must not pull unrelated units into the transaction (ordering edges
+        // are built below).
         while let Some(curr) = queue.pop_front() {
             if let Some(node) = self.nodes.get(&curr) {
                 let mut deps = Vec::new();
                 deps.extend(node.unit.unit.requires.iter().cloned());
                 deps.extend(node.unit.unit.wants.iter().cloned());
                 deps.extend(node.unit.unit.binds_to.iter().cloned());
-                deps.extend(node.unit.unit.after.iter().cloned());
-                deps.extend(node.unit.unit.before.iter().cloned());
 
                 for dep in deps {
                     if self.nodes.contains_key(&dep) && needed.insert(dep.clone()) {
@@ -283,10 +285,9 @@ impl UnitDag {
     }
 
     /// Check which pending units have all their ordering constraints satisfied.
-    /// `After=` deps count as satisfied when Active, or when Failed/Inactive
-    /// for oneshot services that already ran (RemainAfterExit-style success).
-    /// A `Before=X` edge only gates X on units that are themselves part of
-    /// the pending transaction; unrelated inactive units never block.
+    /// After= deps count as satisfied when Active, Failed (non-required), or
+    /// Inactive-and-not-pending (condition-skipped, C6). Before= only gates
+    /// while the predecessor is pending.
     pub fn ready_to_spawn(&self, pending: &[String]) -> Vec<String> {
         let pending_set: HashSet<&String> = pending.iter().collect();
         let mut spawnable = Vec::new();
@@ -309,6 +310,15 @@ impl UnitDag {
                             let required = node.unit.unit.requires.iter().any(|r| r == after)
                                 || node.unit.unit.binds_to.iter().any(|b| b == after);
                             return !required;
+                        }
+                        // C6: a condition-skipped dep is Inactive AND removed
+                        // from pending: it can never change again, so it must
+                        // not block dependents (else one failed condition
+                        // wedges the whole boot).
+                        if dep_node.state == UnitState::Inactive
+                            && !pending_set.contains(after)
+                        {
+                            return true;
                         }
                         false
                     } else {

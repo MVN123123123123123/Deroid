@@ -184,8 +184,8 @@ header "6. Meticulous Obvious Bug & Regression Checks"
 
 # Bug Check A: Memory / File Descriptor leak check in Gralloc DMA-BUF allocation
 echo "[*] Checking for DMA-BUF file descriptor leaks..."
-FD_TEST_RESULT=$(cargo test --test graphics_test test_gralloc_linear_and_compressed_allocations -- --nocapture 2>&1)
-if echo "${FD_TEST_RESULT}" | grep -q "test result: ok"; then
+if FD_TEST_RESULT=$(cargo test --test graphics_test test_gralloc_linear_and_compressed_allocations -- --nocapture 2>&1); then :; else fail "DMA-BUF buffer test command failed"; FD_TEST_RESULT=""; fi
+if echo "${FD_TEST_RESULT}" | grep -qE "test result: ok\. [1-9][0-9]* passed"; then
     pass "No file descriptor leaks during DMA-BUF allocation and export"
 else
     fail "DMA-BUF buffer test failed"
@@ -193,7 +193,7 @@ fi
 
 # Bug Check B: Refresh Rate Jitter & Monotonicity
 echo "[*] Checking VSYNC refresh rate jitter (60Hz, 90Hz, 120Hz, 144Hz)..."
-VSYNC_DIAG_OUTPUT=$("${WORKSPACE_ROOT}/target/debug/utim-graphics-check" --json)
+if VSYNC_DIAG_OUTPUT=$("${WORKSPACE_ROOT}/target/debug/utim-graphics-check" --json); then :; else fail "VSYNC diagnostic tool invocation failed"; VSYNC_DIAG_OUTPUT=""; fi
 if echo "${VSYNC_DIAG_OUTPUT}" | grep -q '"all_passed":true'; then
     pass "All standard refresh rates (60, 90, 120, 144 Hz) verified tear-free"
 else
@@ -202,8 +202,8 @@ fi
 
 # Bug Check C: Multi-plane hardware layer exhaustion and demotion
 echo "[*] Checking HWC multi-plane layer overflow handling..."
-HWC_PLANE_TEST=$(cargo test --test graphics_test test_hwc_plane_overflow_and_client_target_fallback -- --nocapture 2>&1)
-if echo "${HWC_PLANE_TEST}" | grep -q "test result: ok"; then
+if HWC_PLANE_TEST=$(cargo test --test graphics_test test_hwc_plane_overflow_and_client_target_fallback -- --nocapture 2>&1); then :; else fail "HWC plane overflow test command failed"; HWC_PLANE_TEST=""; fi
+if echo "${HWC_PLANE_TEST}" | grep -qE "test result: ok\. [1-9][0-9]* passed"; then
     pass "HWC plane overflow gracefully demotes layers to ClientTarget"
 else
     fail "HWC plane overflow test failed"
@@ -235,8 +235,8 @@ rm -f "${TMP_ENV}"
 
 # Bug Check F: DMA-BUF Safe Clone FD Isolation & Double-Close Prevention
 echo "[*] Checking DMA-BUF clone file descriptor isolation..."
-CLONE_TEST=$(cargo test --lib test_dmabuf_clone_fd_isolation -- --nocapture 2>&1)
-if echo "${CLONE_TEST}" | grep -q "test result: ok"; then
+if CLONE_TEST=$(cargo test --lib test_dmabuf_clone_fd_isolation -- --nocapture 2>&1); then :; else fail "DMA-BUF Clone FD isolation test command failed"; CLONE_TEST=""; fi
+if echo "${CLONE_TEST}" | grep -qE "test result: ok\. [1-9][0-9]* passed"; then
     pass "DMA-BUF Clone duplicates file descriptors via F_DUPFD_CLOEXEC (no aliasing / double-close)"
 else
     fail "DMA-BUF Clone FD isolation test failed"
@@ -244,8 +244,8 @@ fi
 
 # Bug Check G: HWC Fence Lifecycle and Presentation Consumption
 echo "[*] Checking HWC fence lifecycle and clean fd closing..."
-FENCE_TEST=$(cargo test --lib test_hwc_fence_lifecycle_and_clean_drop -- --nocapture 2>&1)
-if echo "${FENCE_TEST}" | grep -q "test result: ok"; then
+if FENCE_TEST=$(cargo test --lib test_hwc_fence_lifecycle_and_clean_drop -- --nocapture 2>&1); then :; else fail "HWC fence lifecycle test command failed"; FENCE_TEST=""; fi
+if echo "${FENCE_TEST}" | grep -qE "test result: ok\. [1-9][0-9]* passed"; then
     pass "HWC acquire/release fences properly consumed and closed without fd leaks"
 else
     fail "HWC fence lifecycle test failed"
@@ -253,8 +253,8 @@ fi
 
 # Bug Check H: Qualcomm UBWC NV12 4-Plane Format Verification
 echo "[*] Checking Qualcomm UBWC NV12 4-plane allocation..."
-UBWC_NV12_TEST=$(cargo test --lib test_gralloc_allocate_ubwc_nv12_4planes -- --nocapture 2>&1)
-if echo "${UBWC_NV12_TEST}" | grep -q "test result: ok"; then
+if UBWC_NV12_TEST=$(cargo test --lib test_gralloc_allocate_ubwc_nv12_4planes -- --nocapture 2>&1); then :; else fail "Qualcomm UBWC NV12 4-plane test command failed"; UBWC_NV12_TEST=""; fi
+if echo "${UBWC_NV12_TEST}" | grep -qE "test result: ok\. [1-9][0-9]* passed"; then
     pass "Qualcomm UBWC NV12 correctly allocates 4 planes (Y + Y meta + UV + UV meta)"
 else
     fail "Qualcomm UBWC NV12 4-plane test failed"
@@ -262,8 +262,8 @@ fi
 
 # Bug Check I: Turnip KGSL TU_DEBUG Environment Verification
 echo "[*] Checking Turnip KGSL TU_DEBUG environment configuration..."
-GPU_TEST=$(cargo test --test graphics_test test_gpu_detection_and_environment_profiles -- --nocapture 2>&1)
-if echo "${GPU_TEST}" | grep -q "test result: ok"; then
+if GPU_TEST=$(cargo test --test graphics_test test_gpu_detection_and_environment_profiles -- --nocapture 2>&1); then :; else fail "GPU environment profile test command failed"; GPU_TEST=""; fi
+if echo "${GPU_TEST}" | grep -qE "test result: ok\. [1-9][0-9]* passed"; then
     pass "GPU environment defines TU_DEBUG=kgsl and HYBRIS_EGLPLATFORM=hwcomposer"
 else
     fail "GPU environment profile test failed"
@@ -271,8 +271,8 @@ fi
 
 # Bug Check J: ELF Non-Power-of-Two and Empty PT_LOAD Rejection
 echo "[*] Checking ELF non-power-of-two and empty LOAD segment rejection..."
-ELF_EDGE_TEST=$(cargo test --lib test_elf_align -- --nocapture 2>&1)
-if echo "${ELF_EDGE_TEST}" | grep -q "test result: ok"; then
+if ELF_EDGE_TEST=$(cargo test --lib test_elf_align -- --nocapture 2>&1); then :; else fail "ELF edge case validation test command failed"; ELF_EDGE_TEST=""; fi
+if echo "${ELF_EDGE_TEST}" | grep -qE "test result: ok\. [1-9][0-9]* passed"; then
     pass "ELF validator correctly rejects non-power-of-two p_align and empty PT_LOAD binaries"
 else
     fail "ELF edge case validation test failed"
@@ -280,7 +280,7 @@ fi
 
 # Bug Check K: utim-graphics-check CLI Flag Parsing Robustness
 echo "[*] Checking utim-graphics-check CLI flags..."
-CLI_JSON_OUT=$("${WORKSPACE_ROOT}/target/debug/utim-graphics-check" --check-elf "${AARCH64_RELEASE}/utim" --json)
+if CLI_JSON_OUT=$("${WORKSPACE_ROOT}/target/debug/utim-graphics-check" --check-elf "${AARCH64_RELEASE}/utim" --json); then :; else fail "CLI utim-graphics-check invocation failed"; CLI_JSON_OUT=""; fi
 if echo "${CLI_JSON_OUT}" | grep -q '"is_64k_compatible":true'; then
     pass "CLI utim-graphics-check --check-elf <target> --json properly formats and validates 64K ELF"
 else
@@ -289,8 +289,8 @@ fi
 
 # Bug Check L: Gralloc DMA-BUF Import & Foreign Descriptor Ownership
 echo "[*] Checking Gralloc DMA-BUF import and descriptor ownership..."
-IMPORT_TEST=$(cargo test --lib test_gralloc_import_dmabuf -- --nocapture 2>&1)
-if echo "${IMPORT_TEST}" | grep -q "test result: ok"; then
+if IMPORT_TEST=$(cargo test --lib test_gralloc_import_dmabuf -- --nocapture 2>&1); then :; else fail "DMA-BUF import test command failed"; IMPORT_TEST=""; fi
+if echo "${IMPORT_TEST}" | grep -qE "test result: ok\. [1-9][0-9]* passed"; then
     pass "DMA-BUF import safely duplicates foreign file descriptors without aliasing"
 else
     fail "DMA-BUF import test failed"
@@ -298,8 +298,8 @@ fi
 
 # Bug Check M: HWC Cursor & Hardware Overlay Plane Exhaustion Prevention
 echo "[*] Checking HWC cursor and multi-plane hardware overlay capacity..."
-CURSOR_TEST=$(cargo test --lib test_hwc_cursor_and_device_plane_overflow -- --nocapture 2>&1)
-if echo "${CURSOR_TEST}" | grep -q "test result: ok"; then
+if CURSOR_TEST=$(cargo test --lib test_hwc_cursor_and_device_plane_overflow -- --nocapture 2>&1); then :; else fail "HWC cursor plane test command failed"; CURSOR_TEST=""; fi
+if echo "${CURSOR_TEST}" | grep -qE "test result: ok\. [1-9][0-9]* passed"; then
     pass "HWC accounts for cursor/hardware planes to prevent display controller overlay exhaustion"
 else
     fail "HWC cursor plane test failed"
@@ -307,8 +307,8 @@ fi
 
 # Bug Check N: HWC ClientTarget Acquire Fence Consumption
 echo "[*] Checking HWC ClientTarget acquire fence lifecycle..."
-TARGET_FENCE_TEST=$(cargo test --lib test_hwc_client_target_fence_consumed_on_presentation -- --nocapture 2>&1)
-if echo "${TARGET_FENCE_TEST}" | grep -q "test result: ok"; then
+if TARGET_FENCE_TEST=$(cargo test --lib test_hwc_client_target_fence_consumed_on_presentation -- --nocapture 2>&1); then :; else fail "ClientTarget acquire fence test command failed"; TARGET_FENCE_TEST=""; fi
+if echo "${TARGET_FENCE_TEST}" | grep -qE "test result: ok\. [1-9][0-9]* passed"; then
     pass "ClientTarget acquire fence properly consumed and closed on presentation without fd leaks"
 else
     fail "ClientTarget acquire fence test failed"
@@ -316,8 +316,8 @@ fi
 
 # Bug Check O: VSYNC Extreme Skew Overflow & Monotonicity Violation Detection
 echo "[*] Checking VSYNC extreme skew 128-bit calculation and monotonicity..."
-VSYNC_SKEW_TEST=$(cargo test --lib test_vsync_large_timestamp_skew_and_monotonicity -- --nocapture 2>&1)
-if echo "${VSYNC_SKEW_TEST}" | grep -q "test result: ok"; then
+if VSYNC_SKEW_TEST=$(cargo test --lib test_vsync_large_timestamp_skew_and_monotonicity -- --nocapture 2>&1); then :; else fail "VSYNC timing skew and monotonicity test command failed"; VSYNC_SKEW_TEST=""; fi
+if echo "${VSYNC_SKEW_TEST}" | grep -qE "test result: ok\. [1-9][0-9]* passed"; then
     pass "VSYNC timing validator rejects large skews without integer truncation and rejects out-of-order frames"
 else
     fail "VSYNC timing skew and monotonicity test failed"
@@ -325,8 +325,8 @@ fi
 
 # Bug Check P: Gralloc Conflicting/Incompatible Compression Rejection
 echo "[*] Checking Gralloc conflicting and incompatible compression rejection..."
-COMPRESS_TEST=$(cargo test --lib test_gralloc_conflicting_and_incompatible_compression -- --nocapture 2>&1)
-if echo "${COMPRESS_TEST}" | grep -q "test result: ok"; then
+if COMPRESS_TEST=$(cargo test --lib test_gralloc_conflicting_and_incompatible_compression -- --nocapture 2>&1); then :; else fail "Gralloc compression conflict test command failed"; COMPRESS_TEST=""; fi
+if echo "${COMPRESS_TEST}" | grep -qE "test result: ok\. [1-9][0-9]* passed"; then
     pass "Gralloc rejects conflicting UBWC+AFBC flags and incompatible format compression"
 else
     fail "Gralloc compression conflict test failed"
@@ -334,11 +334,20 @@ fi
 
 # Bug Check Q: Samsung Exynos GPU Pipeline Detection
 echo "[*] Checking Samsung Exynos (Xclipse) GPU pipeline detection..."
-EXYNOS_TEST=$(cargo test --lib test_exynos_detection -- --nocapture 2>&1)
-if echo "${EXYNOS_TEST}" | grep -q "test result: ok"; then
+if EXYNOS_TEST=$(cargo test --lib test_exynos_detection -- --nocapture 2>&1); then :; else fail "Samsung Exynos GPU detection test command failed"; EXYNOS_TEST=""; fi
+if echo "${EXYNOS_TEST}" | grep -qE "test result: ok\. [1-9][0-9]* passed"; then
     pass "Samsung Exynos GPUs properly identified and assigned libhybris-egl pipeline"
 else
     fail "Samsung Exynos GPU detection test failed"
+fi
+
+# Bug Check R: Release-mode screenshot path (optimised build, no debug-only behaviour)
+echo "[*] Checking release-mode screenshot capture path..."
+if SCREENSHOT_TEST=$(cargo test --release -p utim_core --lib screenshot -- --nocapture 2>&1); then :; else fail "Screenshot release test command failed"; SCREENSHOT_TEST=""; fi
+if echo "${SCREENSHOT_TEST}" | grep -qE "test result: ok\. [1-9][0-9]* passed"; then
+    pass "Screenshot capture path verified in release mode (utim_core)"
+else
+    fail "Screenshot release-mode test failed"
 fi
 
 # ------------------------------------------------------------------------------
