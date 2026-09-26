@@ -265,9 +265,22 @@ WantedBy=multi-user.target
         .expect("Failed to execute deb-systemd-helper");
     assert!(status.success(), "enable should succeed");
 
-    // Verify symlink created in etc/systemd/system/multi-user.target.wants/
+    // Verify symlink created in etc/systemd/system/multi-user.target.wants/.
+    //
+    // `enable` writes an absolute link to the unit inside the root, so the
+    // link dangles from the host's point of view; the link itself, not its
+    // target, is what this asserts.
     let symlink = chroot.join("etc/systemd/system/multi-user.target.wants/test-helper.service");
-    assert!(symlink.exists(), "wants symlink should exist");
+    assert!(
+        fs::symlink_metadata(&symlink).is_ok(),
+        "wants symlink should exist"
+    );
+    let target = fs::read_link(&symlink).expect("wants entry should be a symlink");
+    assert_eq!(
+        target,
+        Path::new("/usr/lib/systemd/system/test-helper.service"),
+        "wants link should point at the unit"
+    );
 
     // Verify state file created in var/lib/systemd/deb-systemd-helper-enabled/
     let state_file =

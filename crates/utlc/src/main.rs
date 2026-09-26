@@ -111,6 +111,24 @@ fn app_set_signature(apps: &[ManagedApp]) -> String {
 /// Resolve every app's `icon_keys` through one batched icon-theme sweep and
 /// attach the decoded bitmap; apps whose keys do not resolve keep the
 /// first-letter glyph fallback.
+/// Decode icon size, in pixels, for the panel the shell is drawing on.
+///
+/// Cached icons are pre-scaled to this edge so the render path can blit them
+/// 1:1 instead of resampling every frame.
+fn icon_edge_px() -> u32 {
+    // Filled in once the panel size is known; the shell boots at 1080x2400 and
+    // the value is refreshed on every mode change.
+    ICON_EDGE_PX.with(|c| *c.borrow())
+}
+
+thread_local! {
+    static ICON_EDGE_PX: std::cell::RefCell<u32> = const { std::cell::RefCell::new(121) };
+}
+
+fn set_icon_edge_px(edge: u32) {
+    ICON_EDGE_PX.with(|c| *c.borrow_mut() = edge);
+}
+
 fn apply_app_icons(apps: &mut [ManagedApp], cache: &mut IconCache) {
     let mut pending: Vec<String> = Vec::new();
     for app in apps.iter() {
@@ -670,6 +688,13 @@ fn run_daemon() {
     let mut icon_bounce_spring = SpringSimulation::new(1.0, 1.0, SpringConfig::icon_bounce());
     let mut pressed_icon_id: Option<String> = None;
 
+    // Icons are decoded and resampled once, at the size the layout draws.
+    set_icon_edge_px(
+        Layout::plain(server.scene.width as f32, server.scene.height as f32)
+            .icon_size
+            .ceil() as u32,
+    );
+
     let mut desktop_catalogue = DesktopCatalogue::new();
     desktop_catalogue.scan_system_directories();
     let mut all_managed_apps = build_all_apps(&desktop_catalogue);
@@ -678,6 +703,7 @@ fn run_daemon() {
 
     // Icon resolution: one sweep per batch of new keys, then served from cache.
     let mut icon_cache = IconCache::new();
+    icon_cache.set_display_edge(icon_edge_px());
     let mut icon_app_sig = app_set_signature(&all_managed_apps);
     apply_app_icons(&mut all_managed_apps, &mut icon_cache);
 

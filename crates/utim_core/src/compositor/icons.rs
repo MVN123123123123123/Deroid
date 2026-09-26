@@ -15,6 +15,15 @@ use crate::graphics::png::{decode_png, RgbaImage};
 
 /// Longest edge kept for a cached icon; the renderer scales it into its tile.
 pub const ICON_MAX_EDGE: u32 = 64;
+
+/// Re-scale a decoded icon to the shell's display size.
+///
+/// Icons are cached at exactly the size the layout draws them, so the render
+/// path can blit 1:1 instead of resampling bilinear on every frame. Called
+/// when an icon enters the cache, never on the hot path.
+pub fn icon_for_display(img: RgbaImage, edge: u32) -> RgbaImage {
+    img.fit_within(edge.max(1))
+}
 /// Reject absurdly large icon files before handing them to the decoder.
 const MAX_ICON_FILE_BYTES: u64 = 4 * 1024 * 1024;
 /// Dirent budget for a single resolution sweep (bounds worst-case scan cost).
@@ -47,6 +56,8 @@ pub struct IconCache {
     preferred_theme: String,
     images: HashMap<String, Rc<RgbaImage>>,
     misses: HashSet<String>,
+    /// Edge every decoded icon is resampled to on the way into the cache.
+    display_edge: u32,
 }
 
 impl Default for IconCache {
@@ -81,7 +92,17 @@ impl IconCache {
             preferred_theme,
             images: HashMap::new(),
             misses: HashSet::new(),
+            display_edge: ICON_MAX_EDGE,
         }
+    }
+
+    /// Set the edge cached icons are resampled to.
+    ///
+    /// The renderer blits 1:1 when the source matches the destination, so
+    /// giving the cache the layout's icon size removes resampling from the
+    /// frame path entirely.
+    pub fn set_display_edge(&mut self, edge: u32) {
+        self.display_edge = edge.max(1);
     }
 
     /// Explicit roots (used by tests and by callers with a custom search path).
@@ -91,6 +112,7 @@ impl IconCache {
             preferred_theme: preferred_theme.to_string(),
             images: HashMap::new(),
             misses: HashSet::new(),
+            display_edge: ICON_MAX_EDGE,
         }
     }
 
@@ -120,7 +142,7 @@ impl IconCache {
             }
             if key.contains('/') {
                 // Explicit path: read it now, never enter the sweep.
-                if let Some(img) = load_path(Path::new(key)) {
+                if let Some(img) = load_path(Path::new(key), self.display_edge) {
                     self.images.insert(key.clone(), Rc::new(img));
                 } else {
                     self.misses.insert(key.clone());
@@ -146,7 +168,7 @@ impl IconCache {
         for (slot, idx) in pending.iter().enumerate() {
             let key = &keys[*idx];
             match best[slot].take() {
-                Some((_, path)) => match load_path(&path) {
+                Some((_, path)) => match load_path(&path, self.display_edge) {
                     Some(img) => {
                         self.images.insert(key.clone(), Rc::new(img));
                     }
@@ -163,13 +185,15 @@ impl IconCache {
     }
 }
 
-fn load_path(path: &Path) -> Option<RgbaImage> {
+fn load_path(path: &Path, display_edge: u32) -> Option<RgbaImage> {
     let meta = std::fs::metadata(path).ok()?;
     if meta.len() > MAX_ICON_FILE_BYTES {
         return None;
     }
     let bytes = std::fs::read(path).ok()?;
-    decode_png(&bytes).map(|img| img.fit_within(ICON_MAX_EDGE))
+    // Resample once, here, to the size the layout draws: the render path then
+    // blits 1:1 instead of filtering bilinear every frame.
+    decode_png(&bytes).map(|img| img.fit_within(display_edge.max(1)))
 }
 
 /// Depth-first sweep of one root. `best` is indexed like `wanted`; each entry

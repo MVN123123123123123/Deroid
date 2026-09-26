@@ -109,7 +109,7 @@ impl Canvas {
     /// Run the production draw code over this canvas.
     pub fn draw(&mut self, snap: &Snapshot) {
         let state = snap.state();
-        super::drm_kms::paint_frame(&mut self.buf, self.w, self.w, self.h, &state);
+        crate::graphics::drm_kms::paint_frame(&mut self.buf, self.w, self.w, self.h, &state);
     }
 
     pub fn to_ppm(&self) -> Vec<u8> {
@@ -124,20 +124,23 @@ impl Canvas {
     }
 }
 
-/// A tiny 1x1 transparent icon so the grid exercises the bitmap path.
+/// A synthetic icon so the grid exercises the bitmap path.
 pub fn stub_icon(colour: [u8; 3]) -> RgbaImage {
-    let mut pixels = Vec::with_capacity(64 * 64 * 4);
-    for y in 0..64 {
-        for x in 0..64 {
-            let inside = (4..60).contains(&x) && (4..60).contains(&y);
-            let ring = (4..9).contains(&x) || (55..60).contains(&x);
-            let v = if !inside {
-                0
-            } else if ring {
-                255
-            } else {
-                ((x * 4) % 200) as u8
-            };
+    stub_icon_sized(colour, 64)
+}
+
+/// [`stub_icon`] at an explicit edge, rounded corners and a gradient.
+pub fn stub_icon_sized(colour: [u8; 3], edge: u32) -> RgbaImage {
+    let edge = edge.max(8);
+    let inset = (edge / 16).max(1);
+    let ring = (edge / 8).max(1);
+    let mut pixels = Vec::with_capacity((edge * edge * 4) as usize);
+    for y in 0..edge {
+        for x in 0..edge {
+            let inside = (inset..edge - inset).contains(&x) && (inset..edge - inset).contains(&y);
+            let border = !((inset + ring)..edge - inset - ring).contains(&x)
+                || !((inset + ring)..edge - inset - ring).contains(&y);
+            let v = if border { 255 } else { ((x * 251) / edge.max(1)) as u8 };
             pixels.push(if inside { colour[0] } else { v });
             pixels.push(if inside { colour[1] } else { v });
             pixels.push(if inside { colour[2] } else { v });
@@ -145,8 +148,8 @@ pub fn stub_icon(colour: [u8; 3]) -> RgbaImage {
         }
     }
     RgbaImage {
-        width: 64,
-        height: 64,
+        width: edge,
+        height: edge,
         pixels,
     }
 }
@@ -375,6 +378,68 @@ mod tests {
         assert!(
             painted(hd.center_x() - 8.0, hd.center_y() - 2.0, 16.0, 4.0) > 0,
             "drawer handle is empty"
+        );
+    }
+
+    /// Whole-frame budget guard.
+    ///
+    /// The launcher's frame is drawn on the CPU into a mapped DRM buffer, so
+    /// a full repaint has to fit in the vsync period. This renders the busiest
+    /// realistic home screen and fails if it cannot. Absolute timings are only
+    /// meaningful for an optimised build.
+    #[test]
+    fn full_frame_stays_inside_the_vsync_budget() {
+        use std::time::Instant;
+
+        let icon = stub_icon_sized([80, 160, 240], 121);
+        let names = [
+            "Phone", "Messages", "Camera", "Maps", "Music", "Store", "Notes", "Files", "Clock",
+            "Calc", "Mail", "Pod",
+        ];
+        let grid: Vec<AppGridItem> = names
+            .iter()
+            .map(|n| AppGridItem {
+                id: *n,
+                name: n,
+                color: 0xFF2563EB,
+                glyph: "A",
+                icon: Some(&icon),
+            })
+            .collect();
+        let dock: Vec<AppGridItem> = ["Phone", "Messages", "Apps", "Browser", "Camera"]
+            .iter()
+            .map(|n| AppGridItem {
+                id: *n,
+                name: n,
+                color: 0xFF10B981,
+                glyph: "A",
+                icon: Some(&icon),
+            })
+            .collect();
+        let snap = Snapshot {
+            w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 0.0,
+            drawer_open: false, launch_progress: 0.0, launch_origin: None, press_scale: 1.0,
+            home_page: 0, home_scroll: 0.0, selected: None, search_query: "", search_active: false,
+            keyboard: false, grid, drawer: Vec::new(), dock, active_app: None,
+        };
+        let mut c = Canvas::new(1080, 2400);
+        c.draw(&snap); // warm the caches
+        const FRAMES: u32 = 10;
+        let start = Instant::now();
+        for _ in 0..FRAMES {
+            c.draw(&snap);
+        }
+        let per = start.elapsed() / FRAMES;
+        eprintln!("home frame: {:?} ({} build)", per, if cfg!(debug_assertions) { "debug" } else { "release" });
+        if cfg!(debug_assertions) {
+            return;
+        }
+        // 120 Hz is the panel's refresh rate: 8.3 ms. Leave headroom for the
+        // rest of the compositor.
+        assert!(
+            per.as_micros() < 8_000,
+            "a full home frame takes {:?}, over the 120 Hz budget",
+            per
         );
     }
 

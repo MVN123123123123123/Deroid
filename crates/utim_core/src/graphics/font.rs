@@ -425,6 +425,65 @@ mod tests {
         assert!(adv > 0.0);
     }
 
+    /// The text engine must stay inside the shell's frame budget. This
+    /// measures a realistic screen of type (labels, a header, a body block)
+    /// rather than one glyph, so a regression in the rasteriser shows up here
+    /// instead of as dropped frames on the device.
+    #[test]
+    fn rasteriser_stays_inside_the_frame_budget() {
+        let (w, h) = (1080usize, 600usize);
+        let mut buf = vec![0xFF000000u32; w * h];
+        let lines = [
+            ("All Applications", 2usize, FontWeight::Bold),
+            ("Settings", 1, FontWeight::Medium),
+            ("Tap to search apps, web and settings", 1, FontWeight::Regular),
+            ("The quick brown fox jumps over the lazy dog", 1, FontWeight::Regular),
+            ("10:34", 3, FontWeight::Medium),
+        ];
+        // Warm up so the measurement is not dominated by first-touch faults.
+        for (text, scale, weight) in lines {
+            draw_run(&mut buf, w, w, h, 10.0, 10.0, text, 0xFFFFFFFF, em_px(scale), weight);
+        }
+        let start = std::time::Instant::now();
+        const FRAMES: u32 = 20;
+        for _ in 0..FRAMES {
+            for (i, (text, scale, weight)) in lines.iter().enumerate() {
+                draw_run(
+                    &mut buf,
+                    w,
+                    w,
+                    h,
+                    10.0,
+                    10.0 + i as f32 * 60.0,
+                    text,
+                    0xFFFFFFFF,
+                    em_px(*scale),
+                    *weight,
+                );
+            }
+        }
+        let per_frame = start.elapsed() / FRAMES;
+        eprintln!(
+            "type: {:?} per frame ({} lines, build {})",
+            per_frame,
+            lines.len(),
+            if cfg!(debug_assertions) { "debug" } else { "release" }
+        );
+        // Absolute timings only mean something for an optimised build; a debug
+        // build of the same code is ~6x slower and is used for correctness.
+        if cfg!(debug_assertions) {
+            return;
+        }
+        // 60 fps leaves 16.6ms; a full launcher screen has well under 200
+        // glyphs, so a quarter of the budget is a generous ceiling that still
+        // catches an order-of-magnitude regression.
+        assert!(
+            per_frame.as_micros() < 4_000,
+            "text rasteriser too slow: {:?} per frame",
+            per_frame
+        );
+    }
+
     /// Dev aid: dump a type specimen so the outlines can be eyeballed.
     /// Enabled with UTLC_FONT_SPECIMEN=/path/to.ppm cargo test -p utim_core font
     #[test]

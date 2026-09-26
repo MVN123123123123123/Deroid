@@ -18,12 +18,17 @@ pub use composer::{
     Rect, Transform,
 };
 pub use drm_kms::{
-    AppGridItem, DrmInteractiveState, DrmKmsDevice, TerminalTabInfo,
-    DrawerSearchHit, HomeActionHit, LauncherLayout, TerminalTabHit,
-    FontWeight, MaterialYouPalette, SpringConfig, SpringSimulation,
-    apply_frosted_blur, apply_frosted_blur_region, apply_overscroll_resistance,
-    format_apps_count, text_width,
+    AppGridItem, DrmInteractiveState, DrmKmsDevice, FontWeight, MaterialYouPalette,
+    SpringConfig, SpringSimulation, TerminalTabInfo, apply_frosted_blur,
+    apply_frosted_blur_region, apply_overscroll_resistance, format_apps_count, paint_frame,
+    text_width, text_width_at,
 };
+pub use font::{FontWeight as FontWeightAxis, em_px, measure};
+pub use layout::{
+    AppLayout, AppPanel, DrawerSearchHit, DrawerZone, HomeZone, Key, Keyboard, Layout,
+    ShadeLayout, ShadeZone, TabHit, grid_cols_for,
+};
+pub use layout::Rect as LayoutRect;
 pub use png::{decode_png, RgbaImage};
 pub use elf_align::{
     inspect_elf_bytes, inspect_elf_file, verify_64k_alignment, ElfAlignmentReport,

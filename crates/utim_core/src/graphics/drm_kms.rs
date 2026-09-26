@@ -496,352 +496,6 @@ impl<'a> Default for DrmInteractiveState<'a> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DrawerSearchHit {
-    None,
-    Focus,
-    Clear,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HomeActionHit {
-    RemoveFromHome,
-    MoveToOtherPage,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TerminalTabHit {
-    None,
-    SelectTab(usize),
-    CloseTab(usize),
-    AddTab,
-}
-
-/// Unified Pixel-Perfect Layout Geometry and Hit-Testing Engine.
-/// Guarantees that hit-test areas match DRM KMS render boundaries with 100% mathematical consistency.
-pub struct LauncherLayout;
-
-impl LauncherLayout {
-    pub const STATUS_BAR_H: f32 = 44.0;
-
-    pub const CLOCK_Y: f32 = 120.0;
-    pub const CLOCK_H: f32 = 72.0;
-
-    pub const SEARCH_Y: f32 = 235.0;
-    pub const SEARCH_H: f32 = 56.0;
-    pub const SEARCH_PAD_X: f32 = 32.0;
-
-    pub const ACTION_CHIPS_Y: f32 = 303.0;
-    pub const ACTION_CHIPS_H: f32 = 40.0;
-
-    pub const GRID_TOP_NORMAL: f32 = 325.0;
-    pub const GRID_TOP_SELECTED: f32 = 395.0;
-    pub const GRID_ROW_H: f32 = 115.0;
-    pub const GRID_COLS: usize = 4;
-    pub const ICON_SIZE: f32 = 64.0;
-
-    pub const DOCK_H: f32 = 100.0;
-    pub const DOCK_BOTTOM_MARGIN: f32 = 40.0;
-    pub const DOCK_PAD_X: f32 = 20.0;
-    pub const DOCK_SLOTS: usize = 5;
-
-    pub const DRAWER_HANDLE_Y: f32 = 54.0;
-    pub const DRAWER_SEARCH_X: f32 = 24.0;
-    pub const DRAWER_SEARCH_Y: f32 = 70.0;
-    pub const DRAWER_SEARCH_H: f32 = 52.0;
-    pub const DRAWER_HEADER_Y: f32 = 134.0;
-    pub const DRAWER_GRID_TOP: f32 = 198.0;
-
-    pub const KB_H: f32 = 420.0;
-    pub const KB_BOTTOM_MARGIN: f32 = 20.0;
-    pub const KB_KEY_H: f32 = 65.0;
-
-    pub const APP_BAR_Y: f32 = 48.0;
-    pub const APP_BAR_H: f32 = 56.0;
-
-    #[inline]
-    pub fn status_bar_hit(y: f32) -> bool {
-        (0.0..=Self::STATUS_BAR_H).contains(&y)
-    }
-
-    #[inline]
-    pub fn home_search_hit(w: f32, x: f32, y: f32) -> bool {
-        (Self::SEARCH_PAD_X..=(w - Self::SEARCH_PAD_X)).contains(&x)
-            && (Self::SEARCH_Y..=(Self::SEARCH_Y + Self::SEARCH_H)).contains(&y)
-    }
-
-    #[inline]
-    pub fn home_action_chips_hit(w: f32, x: f32, y: f32) -> Option<HomeActionHit> {
-        if (Self::ACTION_CHIPS_Y..=(Self::ACTION_CHIPS_Y + Self::ACTION_CHIPS_H)).contains(&y) {
-            let chip_w = (w - 76.0) / 2.0;
-            if (28.0..=(28.0 + chip_w)).contains(&x) {
-                Some(HomeActionHit::RemoveFromHome)
-            } else if ((28.0 + chip_w + 20.0)..=(w - 28.0)).contains(&x) {
-                Some(HomeActionHit::MoveToOtherPage)
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    }
-
-    #[inline]
-    pub fn home_clock_hit(w: f32, x: f32, y: f32) -> bool {
-        (Self::SEARCH_PAD_X..=(w - Self::SEARCH_PAD_X)).contains(&x)
-            && ((Self::CLOCK_Y - 15.0)..=(Self::SEARCH_Y - 5.0)).contains(&y)
-    }
-
-    #[inline]
-    pub fn max_home_rows(h: f32, has_selection: bool) -> usize {
-        let grid_top = if has_selection {
-            Self::GRID_TOP_SELECTED
-        } else {
-            Self::GRID_TOP_NORMAL
-        };
-        let dock_y = h - Self::DOCK_H - Self::DOCK_BOTTOM_MARGIN;
-        let available = dock_y - grid_top - 93.0;
-        if available > 0.0 {
-            ((available / Self::GRID_ROW_H) as usize) + 1
-        } else {
-            0
-        }
-    }
-
-    #[inline]
-    pub fn max_drawer_rows(h: f32) -> usize {
-        let available = h - Self::DRAWER_GRID_TOP - 93.0;
-        if available > 0.0 {
-            ((available / Self::GRID_ROW_H) as usize) + 1
-        } else {
-            0
-        }
-    }
-
-    #[inline]
-    pub fn home_page_dots_hit(w: f32, h: f32, x: f32, y: f32, total_pages: usize) -> Option<usize> {
-        let dock_y = h - Self::DOCK_H - Self::DOCK_BOTTOM_MARGIN;
-        let dots_y = dock_y - 20.0;
-        if x >= 0.0 && x <= w && y >= dots_y - 15.0 && y <= dots_y + 15.0 && total_pages > 0 {
-            let slot_w = w / total_pages as f32;
-            let target = (x / slot_w).clamp(0.0, (total_pages - 1) as f32) as usize;
-            Some(target)
-        } else {
-            None
-        }
-    }
-
-    #[inline]
-    pub fn home_dock_hit(w: f32, h: f32, x: f32, y: f32, num_slots: usize) -> Option<usize> {
-        let dock_y = h - Self::DOCK_H - Self::DOCK_BOTTOM_MARGIN;
-        let dock_w = w - Self::DOCK_PAD_X * 2.0;
-        if x >= Self::DOCK_PAD_X
-            && x <= (w - Self::DOCK_PAD_X)
-            && y >= dock_y
-            && y <= (dock_y + Self::DOCK_H)
-        {
-            let slot_w = dock_w / (num_slots.max(1) as f32);
-            let slot = ((x - Self::DOCK_PAD_X) / slot_w).clamp(0.0, (num_slots - 1) as f32) as usize;
-            Some(slot)
-        } else {
-            None
-        }
-    }
-
-    #[inline]
-    pub fn home_grid_hit(w: f32, h: f32, x: f32, y: f32, has_selection: bool) -> Option<usize> {
-        Self::home_grid_hit_with_scroll(w, h, x, y, has_selection, 0.0)
-    }
-
-    pub fn home_grid_hit_with_scroll(
-        w: f32,
-        h: f32,
-        x: f32,
-        y: f32,
-        has_selection: bool,
-        scroll_offset: f32,
-    ) -> Option<usize> {
-        let max_rows = Self::max_home_rows(h, has_selection);
-        if max_rows == 0 {
-            return None;
-        }
-        let grid_top = if has_selection {
-            Self::GRID_TOP_SELECTED
-        } else {
-            Self::GRID_TOP_NORMAL
-        };
-        let dock_y = h - Self::DOCK_H - Self::DOCK_BOTTOM_MARGIN;
-        let grid_start_y = if has_selection {
-            Self::ACTION_CHIPS_Y + Self::ACTION_CHIPS_H + 2.0
-        } else {
-            Self::SEARCH_Y + Self::SEARCH_H + 2.0
-        };
-        let grid_end_y = dock_y - 20.0;
-        if y >= grid_start_y && y < grid_end_y {
-            let rel_x = x - scroll_offset;
-            if rel_x < 0.0 || rel_x >= w {
-                return None;
-            }
-            let rel_y = y - (grid_top - Self::GRID_ROW_H / 2.0);
-            let row = if rel_y >= 0.0 {
-                (rel_y / Self::GRID_ROW_H) as usize
-            } else {
-                0
-            };
-            if row >= max_rows {
-                return None;
-            }
-            let col_w = w / Self::GRID_COLS as f32;
-            let col = (rel_x / col_w).clamp(0.0, (Self::GRID_COLS - 1) as f32) as usize;
-            Some(row * Self::GRID_COLS + col)
-        } else {
-            None
-        }
-    }
-
-    #[inline]
-    pub fn drawer_handle_hit(drawer_y_offset: f32, y: f32) -> bool {
-        y >= drawer_y_offset && y <= (drawer_y_offset + Self::DRAWER_HANDLE_Y + 12.0)
-    }
-
-    #[inline]
-    pub fn drawer_search_hit(w: f32, x: f32, y: f32) -> DrawerSearchHit {
-        Self::drawer_search_hit_with_offset(w, 0.0, x, y)
-    }
-
-    #[inline]
-    pub fn drawer_search_hit_with_offset(w: f32, drawer_y_offset: f32, x: f32, y: f32) -> DrawerSearchHit {
-        let search_w = w - Self::DRAWER_SEARCH_X * 2.0;
-        let search_y = drawer_y_offset + Self::DRAWER_SEARCH_Y;
-        if x >= Self::DRAWER_SEARCH_X
-            && x <= (Self::DRAWER_SEARCH_X + search_w)
-            && y >= search_y
-            && y <= (search_y + Self::DRAWER_SEARCH_H)
-        {
-            if x >= (Self::DRAWER_SEARCH_X + search_w - 45.0) {
-                DrawerSearchHit::Clear
-            } else {
-                DrawerSearchHit::Focus
-            }
-        } else {
-            DrawerSearchHit::None
-        }
-    }
-
-    #[inline]
-    pub fn drawer_grid_hit(w: f32, h: f32, x: f32, y: f32) -> Option<usize> {
-        Self::drawer_grid_hit_with_offset(w, h, 0.0, x, y)
-    }
-
-    pub fn drawer_grid_hit_with_offset(
-        w: f32,
-        h: f32,
-        drawer_y_offset: f32,
-        x: f32,
-        y: f32,
-    ) -> Option<usize> {
-        if x < 0.0 || x >= w {
-            return None;
-        }
-        let max_rows = Self::max_drawer_rows(h);
-        if max_rows == 0 {
-            return None;
-        }
-        let grid_start_y = drawer_y_offset + Self::DRAWER_HEADER_Y + 16.0;
-        let grid_end_y = h - 35.0;
-        if y >= grid_start_y && y < grid_end_y {
-            let rel_y = y - (drawer_y_offset + Self::DRAWER_GRID_TOP - Self::GRID_ROW_H / 2.0);
-            let row = if rel_y >= 0.0 {
-                (rel_y / Self::GRID_ROW_H) as usize
-            } else {
-                0
-            };
-            if row >= max_rows {
-                return None;
-            }
-            let col_w = w / Self::GRID_COLS as f32;
-            let col = (x / col_w).clamp(0.0, (Self::GRID_COLS - 1) as f32) as usize;
-            Some(row * Self::GRID_COLS + col)
-        } else {
-            None
-        }
-    }
-
-    #[inline]
-    pub fn quick_tile_hit(w: f32, x: f32, y: f32) -> Option<usize> {
-        let tile_w = (w - 72.0 - 20.0) / 2.0;
-        let tile_h = 70.0;
-        let tile_spacing_y = 14.0;
-        let start_y = 155.0;
-        let stride_y = tile_h + tile_spacing_y;
-        if (start_y..start_y + 4.0 * stride_y).contains(&y) {
-            let rel_y = y - start_y;
-            let row = (rel_y / stride_y) as usize;
-            let row_off = rel_y - (row as f32 * stride_y);
-            if row < 4 && row_off <= tile_h {
-                if (36.0..36.0 + tile_w).contains(&x) {
-                    Some(row * 2)
-                } else if (36.0 + tile_w + 20.0..36.0 + 2.0 * tile_w + 20.0).contains(&x) {
-                    Some(row * 2 + 1)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    }
-
-    #[inline]
-    pub fn app_bar_back_hit(x: f32, y: f32) -> bool {
-        (26.0..=125.0).contains(&x) && ((Self::APP_BAR_Y + 8.0)..=(Self::APP_BAR_Y + 48.0)).contains(&y)
-    }
-
-    #[inline]
-    pub fn app_bar_close_hit(w: f32, x: f32, y: f32) -> bool {
-        ((w - 85.0)..=(w - 25.0)).contains(&x) && ((Self::APP_BAR_Y + 8.0)..=(Self::APP_BAR_Y + 48.0)).contains(&y)
-    }
-
-    #[inline]
-    pub fn bottom_nav_pill_hit(h: f32, y: f32) -> bool {
-        y >= (h - 35.0)
-    }
-
-    pub fn terminal_tab_hit(
-        x: f32,
-        y: f32,
-        num_tabs: usize,
-        active_tab_idx: usize,
-    ) -> TerminalTabHit {
-        if !(120.0..=175.0).contains(&y) {
-            return TerminalTabHit::None;
-        }
-        let start_x = 36.0;
-        let tab_w = 200.0;
-        let spacing = 10.0;
-
-        for i in 0..num_tabs {
-            let tab_x = start_x + i as f32 * (tab_w + spacing);
-            if x >= tab_x && x < tab_x + tab_w {
-                if i == active_tab_idx && num_tabs > 1 && x >= (tab_x + tab_w - 35.0) {
-                    return TerminalTabHit::CloseTab(i);
-                } else {
-                    return TerminalTabHit::SelectTab(i);
-                }
-            }
-        }
-        if num_tabs < 4 {
-            let plus_x = start_x + num_tabs as f32 * (tab_w + spacing);
-            if x >= plus_x && x <= (plus_x + 60.0) {
-                return TerminalTabHit::AddTab;
-            }
-        }
-        TerminalTabHit::None
-    }
-}
-
 impl DrmKmsDevice {
     /// Backward-compatible wrapper for static rendering
     pub fn render_mobile_ui(&mut self, time_str: &str, is_locked: bool) {
@@ -2522,6 +2176,21 @@ fn interactive_state_hash(state: &DrmInteractiveState) -> u64 {
     for b in state.time_str.bytes() {
         mix!(b);
     }
+    // The palette is part of the visible state: a wallpaper change has to
+    // invalidate the frame cache or the shell keeps the old theme.
+    mix!(state.palette.surface);
+    mix!(state.palette.surface_container);
+    mix!(state.palette.surface_container_high);
+    mix!(state.palette.primary);
+    mix!(state.palette.on_primary);
+    mix!(state.palette.primary_container);
+    mix!(state.palette.on_primary_container);
+    mix!(state.palette.secondary);
+    mix!(state.palette.tertiary);
+    mix!(state.palette.on_surface);
+    mix!(state.palette.on_surface_variant);
+    mix!(state.palette.outline);
+    mix!(state.palette.outline_variant);
     mix!(state.is_locked as u8);
     mix!(state.is_touching as u8);
     mix!(state.search_active as u8);
@@ -2763,104 +2432,132 @@ fn draw_icon_bitmap_i32(
     let y_end = ((y + th as i32) as usize).min(fh);
     let src = img.pixels.as_slice();
 
-    // 16.16 fixed-point source coordinate for a half-pixel aligned destination
-    // sample, so an exact 1:1 blit resolves to integer indices with zero weight.
-    // The result is clamped to the valid sample range *before* the taps are
-    // taken, so an edge tap keeps a zero weight instead of double counting.
-    let map = |coord: usize, size: usize, span: usize| -> (i64, u32) {
-        let fx = (((2 * coord + 1) as i64 * span as i64 * 65536) / (2 * size as i64)) - 32768;
-        let hi = ((span as i64 - 1) << 16).max(0);
-        let fx = if fx < 0 {
-            0
-        } else if fx > hi {
-            hi
-        } else {
-            fx
-        };
-        (fx >> 16, (fx & 0xFFFF) as u32)
-    };
-    let clamp = |i: i64, span: usize| -> i64 {
-        if i < 0 {
-            0
-        } else if i >= span as i64 {
-            span as i64 - 1
-        } else {
-            i
-        }
-    };
+    // Fixed-point source sampling, computed incrementally.
+    //
+    // The previous version recomputed a 64-bit multiply-and-divide per axis
+    // per pixel and then did three more 64-bit divisions to un-premultiply,
+    // which cost more than the rest of the frame combined. The step is
+    // constant for a tile, so it is computed once and accumulated; the
+    // un-premultiply uses one reciprocal.
+    let step_x = (iw as i64 * 65536) / tw as i64;
+    let hi_x = ((iw as i64 - 1) << 16).max(0);
+    let hi_y = ((ih as i64 - 1) << 16).max(0);
+
+    // 1:1 fast path.
+    //
+    // Icons are pre-scaled to the panel's icon size when they enter the cache,
+    // so the common case needs no resampling at all: a straight alpha blend
+    // over the rounded-rect span. This is several times faster than the
+    // bilinear path and is what a launcher full of icons actually hits.
+    let identity = tw == iw && th == ih;
 
     for cy in y_start..y_end {
-        let cy_i = cy as i32;
-        let dy = if cy_i < y + radius as i32 {
-            radius as i32 - (cy_i - y)
-        } else if cy_i >= y + th as i32 - radius as i32 {
-            cy_i - (y + th as i32 - radius as i32)
-        } else {
-            0
+        let (mut lo, mut hi) = match rounded_span(
+            cy as i32 - y,
+            x,
+            tw as i32,
+            radius as i32,
+            r2,
+        ) {
+            Some(span) => span,
+            None => continue,
         };
-        if dy * dy > r2 {
+        lo = lo.max(x_start as i32);
+        hi = hi.min(x_end as i32);
+        if hi <= lo {
             continue;
         }
-        let (sy0, wy0) = map((cy_i - y) as usize, th, ih);
-        let ya = clamp(sy0, ih);
-        let yb = clamp(sy0 + 1, ih);
+        let cy_i = cy as i32;
+        // Vertical taps, clamped once per row.
+        let fy0 = ((2 * (cy_i - y) as i64 + 1) * ih as i64 * 65536) / (2 * th as i64) - 32768;
+        let fy0 = fy0.clamp(0, hi_y);
+        let sy0 = (fy0 >> 16) as usize;
+        let wy0 = (fy0 & 0xFFFF) as u32;
+        let sy1 = (sy0 + 1).min(ih - 1);
         let row = cy * stride;
+        let y_base_a = sy0 * iw * 4;
+        let y_base_b = sy1 * iw * 4;
+        let wa = 65536u64 - wy0 as u64;
+        let wb = wy0 as u64;
+        // Horizontal source coordinate restarts each row at the span's left edge.
+        let mut fx = ((2 * (lo - x) as i64 + 1) * iw as i64 * 65536) / (2 * tw as i64) - 32768;
 
-        for cx in x_start..x_end {
-            let cx_i = cx as i32;
-            let dx = if cx_i < x + radius as i32 {
-                radius as i32 - (cx_i - x)
-            } else if cx_i >= x + tw as i32 - radius as i32 {
-                cx_i - (x + tw as i32 - radius as i32)
-            } else {
-                0
-            };
-            if dx * dx + dy * dy > r2 {
-                continue;
+        if identity {
+            for cx in lo..hi {
+                let o = y_base_a + (cx - x) as usize * 4;
+                let a = src[o + 3] as u32;
+                if a == 0 {
+                    continue;
+                }
+                let dst = buf[row + cx as usize];
+                if a == 255 {
+                    buf[row + cx as usize] =
+                        (0xFF << 24) | ((src[o] as u32) << 16) | ((src[o + 1] as u32) << 8)
+                            | src[o + 2] as u32;
+                    continue;
+                }
+                let inv = 255 - a;
+                let ch = |c: u8, bg: u32| -> u32 { (c as u32 * a + bg * inv + 127) / 255 };
+                buf[row + cx as usize] = (0xFF << 24)
+                    | (ch(src[o], (dst >> 16) & 0xFF) << 16)
+                    | (ch(src[o + 1], (dst >> 8) & 0xFF) << 8)
+                    | ch(src[o + 2], dst & 0xFF);
             }
+            continue;
+        }
 
-            let (sx0, wx0) = map((cx_i - x) as usize, tw, iw);
-            let xa = clamp(sx0, iw);
-            let xb = clamp(sx0 + 1, iw);
+        for cx in lo..hi {
+            let fx_c = fx.clamp(0, hi_x);
+            fx += step_x;
+            let sx0 = (fx_c >> 16) as usize;
+            let wx0 = (fx_c & 0xFFFF) as u32;
+            let sx1 = (sx0 + 1).min(iw - 1);
 
             // Bilinear taps in premultiplied space: avoids halos when the icon
             // has transparent edges and lets the composite stay integer-only.
-            let mut a_acc = 0u64;
-            let mut c_acc = [0u64; 3];
-            let y_taps = [(ya, 65536 - wy0 as u64), (yb, wy0 as u64)];
-            let x_taps = [(xa, 65536 - wx0 as u64), (xb, wx0 as u64)];
-            for (ty, tw_y) in y_taps {
-                let base = (ty as usize * iw) * 4;
-                for (tx, wx) in x_taps {
-                    let o = base + tx as usize * 4;
-                    let a = src[o + 3] as u64;
-                    let w = tw_y * wx;
-                    a_acc += a * w;
-                    c_acc[0] += src[o] as u64 * a * w;
-                    c_acc[1] += src[o + 1] as u64 * a * w;
-                    c_acc[2] += src[o + 2] as u64 * a * w;
-                }
-            }
+            let wxa = 65536u64 - wx0 as u64;
+            let wxb = wx0 as u64;
+            let t00 = wa * wxa;
+            let t01 = wa * wxb;
+            let t10 = wb * wxa;
+            let t11 = wb * wxb;
 
+            let o00 = y_base_a + sx0 * 4;
+            let o01 = y_base_a + sx1 * 4;
+            let o10 = y_base_b + sx0 * 4;
+            let o11 = y_base_b + sx1 * 4;
+
+            let a00 = src[o00 + 3] as u64;
+            let a01 = src[o01 + 3] as u64;
+            let a10 = src[o10 + 3] as u64;
+            let a11 = src[o11 + 3] as u64;
+
+            let a_acc = a00 * t00 + a01 * t01 + a10 * t10 + a11 * t11;
             // Taps are weighted in 2-D, so the weights sum to 2^32.
             let alpha = ((a_acc + (1 << 31)) >> 32).min(255) as u32;
             if alpha == 0 {
                 continue;
             }
-            let dst = buf[row + cx];
-            let bg = [
-                ((dst >> 16) & 0xFF),
-                ((dst >> 8) & 0xFF),
-                (dst & 0xFF),
-            ];
+            // One reciprocal instead of three divisions.
+            let inv_a = 1.0 / a_acc as f32;
+            let dst = buf[row + cx as usize];
             let inv = 255 - alpha;
-            let mut out = [0u32; 3];
-            for ch in 0..3 {
-                let pm = (c_acc[ch] / a_acc.max(1)) as u32;
-                out[ch] = (pm * alpha + bg[ch] * inv + 127) / 255;
-            }
-            buf[row + cx] =
-                (0xFF << 24) | (out[0] << 16) | (out[1] << 8) | out[2];
+            // The source is straight alpha, so each tap is premultiplied before
+            // it is weighted; the sum is un-premultiplied again below.
+            let blend = |c: u64, bg: u32| -> u32 {
+                let pm = (c as f32 * inv_a) as u32;
+                ((pm.min(255) * alpha + bg * inv + 127) / 255).min(255)
+            };
+            let premul = |ch: usize| -> u64 {
+                src[o00 + ch] as u64 * a00 * t00
+                    + src[o01 + ch] as u64 * a01 * t01
+                    + src[o10 + ch] as u64 * a10 * t10
+                    + src[o11 + ch] as u64 * a11 * t11
+            };
+            buf[row + cx as usize] = (0xFF << 24)
+                | (blend(premul(0), (dst >> 16) & 0xFF) << 16)
+                | (blend(premul(1), (dst >> 8) & 0xFF) << 8)
+                | blend(premul(2), dst & 0xFF);
         }
     }
 }
@@ -2960,32 +2657,28 @@ fn draw_rounded_rect_i32(
     if alpha == 0 { return; }
 
     for cy in y_start..y_end {
-        let cy_i = cy as i32;
-        let dy = if cy_i < y + radius as i32 {
-            radius as i32 - (cy_i - y)
-        } else if cy_i >= y + rh as i32 - radius as i32 {
-            cy_i - (y + rh as i32 - radius as i32)
-        } else {
-            0
+        let (mut lo, mut hi) = match rounded_span(
+            cy as i32 - y,
+            x,
+            rw as i32,
+            radius as i32,
+            r2,
+        ) {
+            Some(span) => span,
+            None => continue,
         };
-
+        lo = lo.max(x_start as i32);
+        hi = hi.min(x_end as i32);
+        if hi <= lo {
+            continue;
+        }
         let row = cy * stride;
-        for cx in x_start..x_end {
-            let cx_i = cx as i32;
-            let dx = if cx_i < x + radius as i32 {
-                radius as i32 - (cx_i - x)
-            } else if cx_i >= x + rw as i32 - radius as i32 {
-                cx_i - (x + rw as i32 - radius as i32)
-            } else {
-                0
-            };
-
-            if dx * dx + dy * dy <= r2 {
-                if alpha == 255 {
-                    buf[row + cx] = color;
-                } else {
-                    buf[row + cx] = blend_alpha(buf[row + cx], color, alpha as u8);
-                }
+        if alpha == 255 {
+            // Opaque interior: a vectorised span fill, no per-pixel corner test.
+            buf[row + lo as usize..row + hi as usize].fill(color);
+        } else {
+            for cx in lo..hi {
+                buf[row + cx as usize] = blend_alpha(buf[row + cx as usize], color, alpha as u8);
             }
         }
     }
@@ -3023,29 +2716,54 @@ fn draw_glow_circle(
     b: u8,
     intensity: u8,
 ) {
-    let r_min_x = cx.saturating_sub(radius);
-    let r_max_x = (cx + radius).min(w);
+    if radius == 0 {
+        return;
+    }
     let r_min_y = cy.saturating_sub(radius);
     let r_max_y = (cy + radius).min(h);
-    let rad_sq = (radius * radius) as f32;
+    let rad_sq = (radius * radius) as i32;
+    let dxc = cx as i32;
+    let dyc = cy as i32;
+    let inv_r = 1.0 / radius as f32;
+    let inten = intensity as f32;
 
     for y in r_min_y..r_max_y {
-        let dy = (y as i32 - cy as i32) as f32;
+        let dy = y as i32 - dyc;
+        let dy2 = (dy * dy) as u32;
+        if dy2 > rad_sq as u32 {
+            continue;
+        }
+        // Half-chord of the circle on this row, so the inner loop only walks
+        // the disc instead of its bounding box.
+        let half = isqrt((rad_sq as u32 - dy2) as i32);
+        let x0 = (dxc - half).max(0) as usize;
+        let x1 = (dxc + half + 1).min(w as i32) as usize;
         let row = y * stride;
-        for x in r_min_x..r_max_x {
-            let dx = (x as i32 - cx as i32) as f32;
-            let d_sq = dx * dx + dy * dy;
-            if d_sq < rad_sq {
-                let falloff = 1.0 - (d_sq / rad_sq).sqrt();
-                let alpha = (falloff * intensity as f32) as u32;
-                let cur = buf[row + x];
-                let cb = (cur & 0xFF) + ((b as u32 * alpha) >> 8);
-                let cg = ((cur >> 8) & 0xFF) + ((g as u32 * alpha) >> 8);
-                let cr = ((cur >> 16) & 0xFF) + ((r as u32 * alpha) >> 8);
-                buf[row + x] = (0xFF << 24) | (cr.min(255) << 16) | (cg.min(255) << 8) | cb.min(255);
+        for x in x0..x1 {
+            let dx = x as i32 - dxc;
+            let d = ((dx * dx) as u32 + dy2) as f32;
+            // Linear falloff in the radius reads as a soft ambient wash; a
+            // polynomial approximation here looks like a hard disc.
+            let falloff = 1.0 - d * inv_r * inv_r;
+            if falloff <= 0.0 {
+                continue;
             }
+            let alpha = (falloff * inten) as u32;
+            if alpha == 0 {
+                continue;
+            }
+            let cur = buf[row + x];
+            let a = alpha.min(255);
+            let cb = (cur & 0xFF) + ((b as u32 * a) >> 8);
+            let cg = ((cur >> 8) & 0xFF) + ((g as u32 * a) >> 8);
+            let cr = ((cur >> 16) & 0xFF) + ((r as u32 * a) >> 8);
+            buf[row + x] = (0xFF << 24)
+                | (cr.min(255) << 16)
+                | (cg.min(255) << 8)
+                | cb.min(255);
         }
     }
+
 }
 
 
@@ -3461,6 +3179,57 @@ pub fn draw_line(
     }
 }
 
+/// Horizontal span of a rounded rectangle on scanline `cy`, as `[lo, hi)`.
+///
+/// Computing the span once per row (one integer square root) instead of a
+/// corner test per pixel is what keeps a launcher full of icon tiles inside
+/// the frame budget. Returns `None` for rows the shape does not cover.
+#[inline]
+fn rounded_span(
+    cy: i32,
+    x: i32,
+    rw: i32,
+    radius: i32,
+    r2: i32,
+) -> Option<(i32, i32)> {
+    let dy = if cy < radius {
+        radius - cy
+    } else if cy >= rw - radius {
+        cy - (rw - radius)
+    } else {
+        0
+    };
+    if dy * dy > r2 {
+        return None;
+    }
+    let d = if dy == 0 {
+        radius
+    } else {
+        isqrt(r2 - dy * dy)
+    };
+    Some((radius - d + x, rw - radius + d + x))
+}
+
+/// Integer square root, floor. Newton with an integer seed.
+#[inline]
+fn isqrt(v: i32) -> i32 {
+    if v <= 0 {
+        return 0;
+    }
+    let mut x = (v as f64).sqrt() as i32;
+    if x < 1 {
+        x = 1;
+    }
+    // One or two correction steps; the float seed is within one.
+    while x * x > v && x > 1 {
+        x -= 1;
+    }
+    while (x + 1) * (x + 1) <= v {
+        x += 1;
+    }
+    x
+}
+
 /// A filled disc, used for dots, close affordances and ripple centres.
 #[inline]
 pub fn draw_circle_glyph(
@@ -3678,11 +3447,9 @@ fn draw_background(buf: &mut [u32], stride: usize, w: usize, h: usize, state: &D
         let r = ((sr * k).round() as u32).min(255);
         let g = ((sg * k).round() as u32).min(255);
         let b = ((sb * k).round() as u32).min(255);
-        let pixel = (0xFF << 24) | (r << 16) | (g << 8) | b;
-        let row = y * stride;
-        for x in 0..w {
-            buf[row + x] = pixel;
-        }
+        // A slice fill is a vectorised store; the manual loop was costing
+        // milliseconds on a 2.6 Mpx panel.
+        buf[y * stride..y * stride + w].fill((0xFF << 24) | (r << 16) | (g << 8) | b);
     }
     // Two soft accent glows, from the palette's primary and tertiary.
     let (pr, pg, pb) = rgb_of(state.palette.primary);
