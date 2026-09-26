@@ -700,6 +700,14 @@ fn run_daemon() {
     let mut app_launch_color: u32 = 0xFF2563EB;
     let mut touch_ripple: Option<(f32, f32, f32, f32)> = None;
     let mut touch_drag_start: Option<(f32, f32)> = None;
+    // True while a horizontal workspace drag is in flight, so release can
+    // settle to the nearest page instead of treating it as a tap.
+    let mut page_drag = false;
+    let mut page_drag_velocity = 0.0f32;
+    // Set for the rest of this input event once a drag has paged the workspace,
+    // so the gesture engine's swipe fallback does not page a second time.
+    let mut page_drag_seen = false;
+    let mut last_move = Instant::now();
     let mut drawer_spring = SpringSimulation::new(0.0, 0.0, SpringConfig::drawer());
     let mut page_scroll_spring = SpringSimulation::new(0.0, 0.0, SpringConfig::page_swipe());
     let mut app_launch_spring = SpringSimulation::new(0.0, 0.0, SpringConfig::app_launch());
@@ -787,6 +795,10 @@ fn run_daemon() {
                         while offset + LinuxInputEvent::SIZE <= total_bytes {
                             if let Some(ev) = LinuxInputEvent::from_raw_bytes(&ev_buf[offset..offset + LinuxInputEvent::SIZE]) {
                                 let res = dispatcher.process_event(&ev);
+                                // One input event, one gesture verdict.
+                                if dispatcher.is_touch_down {
+                                    page_drag_seen = false;
+                                }
                                 cursor_pos = Some((dispatcher.cursor_x as usize, dispatcher.cursor_y as usize));
                                 is_touching = dispatcher.is_touch_down;
 
@@ -882,29 +894,78 @@ fn run_daemon() {
                                                         }
                                                     }
                                                 }
-                                                TouchPhase::Move => {
-                                                    if active_app.is_none()
+                                TouchPhase::Move => {
+                                    let move_dt = {
+                                        let now = Instant::now();
+                                        let d = now.duration_since(last_move).as_secs_f32();
+                                        last_move = now;
+                                        d
+                                    };
+                                    if active_app.is_none()
                                                         && !server.scene.system_ui.is_open()
                                                         && !server.scene.keyboard.is_active
                                                     {
+                                                        let w = server.scene.width as f32;
                                                         let h = server.scene.height as f32;
-                                                        if let Some((_, sy)) = touch_drag_start {
+                                                        if let Some((sx, sy)) = touch_drag_start {
                                                             let dy = sy - raw_touch.y;
-                                                            // Drag span is the drawer's own
-                                                            // height, so the sheet tracks the
-                                                            // finger one-to-one.
-                                                            let drawer_l = Layout::plain(server.scene.width as f32, h);
-                                                            let drag_span = (h - drawer_l.drawer_handle.y)
-                                                                .max(100.0);
+                                                            let dx = sx - raw_touch.x;
                                                             let slop = h * 0.004;
-                                                            if !app_drawer_open && dy > slop {
-                                                                drawer_progress =
-                                                                    (dy / drag_span).clamp(0.0, 1.0);
-                                                                drawer_spring.value = drawer_progress;
-                                                                drawer_spring.velocity = 0.0;
-                                                            } else if app_drawer_open && dy < -slop {
-                                                                drawer_progress =
-                                                                    (1.0 + dy / drag_span).clamp(0.0, 1.0);
+                                                            if !app_drawer_open {
+                                                                if dy > slop {
+                                                                    // Drawer drag: the sheet
+                                                                    // tracks the finger 1:1.
+                                                                    let drawer_l =
+                                                                        Layout::plain(w, h);
+                                                                    let drag_span = (h
+                                                                        - drawer_l.drawer_handle.y)
+                                                                        .max(100.0);
+                                                                    page_drag = false;
+                                                                    drawer_progress =
+                                                                        (dy / drag_span).clamp(0.0, 1.0);
+                                                                    drawer_spring.value = drawer_progress;
+                                                                    drawer_spring.velocity = 0.0;
+                                                                } else if dx.abs() > slop && dx.abs() > dy {
+                                                                    // Horizontal workspace drag:
+                                                                    // the strip follows the finger,
+                                                                    // with the overscroll curve
+                                                                    // damping past the first and
+                                                                    // last page.
+                                                                    page_drag = true;
+                                                                    page_drag_seen = true;
+                                                                    let last =
+                                                                        home_pages.len().saturating_sub(1) as f32;
+                                                                    let target = home_scroll_offset + dx;
+                                                                    if target > 0.0 && current_home_page == 0 {
+                                                                        home_scroll_offset =
+                                                                            apply_overscroll_resistance(target, w);
+                                                                    } else if target < -last * w
+                                                                        && current_home_page as f32 >= last
+                                                                    {
+                                                                        home_scroll_offset = -last * w
+                                                                            + apply_overscroll_resistance(
+                                                                                target + last * w,
+                                                                                w,
+                                                                            );
+                                                                    } else {
+                                                                        home_scroll_offset = target;
+                                                                    }
+                                                                    // px/s toward the next page.
+                                                                    page_drag_velocity =
+                                                                        -dx / move_dt.max(1e-4);
+                                                                    page_scroll_spring.value = home_scroll_offset;
+                                                                    page_scroll_spring.velocity = 0.0;
+                                                                }
+                                                            } else if dy < -slop {
+                                                                // Drawer is up: drag it back down.
+                                                                let drawer_l = Layout::plain(w, h);
+                                                                let drag_span = (h
+                                                                    - drawer_l.drawer_handle.y)
+                                                                    .max(100.0);
+                                                                page_drag = false;
+                                                                drawer_progress = (1.0
+                                                                    + dy / drag_span)
+                                                                    .clamp(0.0, 1.0);
                                                                 drawer_spring.value = drawer_progress;
                                                                 drawer_spring.velocity = 0.0;
                                                             }
@@ -912,9 +973,46 @@ fn run_daemon() {
                                                     }
                                                 }
                                                 TouchPhase::Up | TouchPhase::Cancel => {
+                                                    // Set when this release ends a page
+                                                    // drag, so the gesture engine still
+                                                    // sees the event but the tap is
+                                                    // suppressed.
+                                                    let mut was_page_drag = false;
                                                     if let Some((_, sy)) = touch_drag_start.take() {
                                                         let dy = sy - raw_touch.y;
-                                                        if active_app.is_none()
+                                                        if page_drag {
+                                                            // Settle to whichever page the
+                                                            // strip is nearest, biased by the
+                                                            // release velocity, then hand the
+                                                            // spring that velocity so the
+                                                            // motion carries momentum.
+                                                            let w = server.scene.width as f32;
+                                                            let last = home_pages.len().saturating_sub(1);
+                                                            let offset = home_scroll_offset;
+                                                            let frac = -offset / w;
+                                                            let biased = frac
+                                                                + (page_drag_velocity / w) * 0.12;
+                                                            let target = biased.round().clamp(
+                                                                0.0,
+                                                                last as f32,
+                                                            ) as usize;
+                                                            current_home_page = target;
+                                                            home_scroll_offset = 0.0;
+                                                            page_scroll_spring.value = offset;
+                                                            page_scroll_spring.velocity = page_drag_velocity;
+                                                            page_scroll_spring.set_target(0.0);
+                                                            page_drag = false;
+                                                            page_drag_velocity = 0.0;
+                                                            // A dragged workspace is never a
+                                                            // tap, so the release must not
+                                                            // also activate whatever it
+                                                            // dragged over.
+                                                            icon_bounce_spring.set_target(1.0);
+                                                            pressed_icon_id = None;
+                                                            was_page_drag = true;
+                                                        }
+                                                        if !was_page_drag
+                                                            && active_app.is_none()
                                                             && !server.scene.system_ui.is_open()
                                                             && !server.scene.keyboard.is_active
                                                         {
@@ -998,50 +1096,43 @@ fn run_daemon() {
                                                         && !server.scene.system_ui.is_open()
                                                         && !server.scene.keyboard.is_active =>
                                                 {
+                                                    // Vertical swipes only: horizontal
+                                                    // paging is driven by the drag
+                                                    // handler above, which follows the
+                                                    // finger and settles with a spring.
                                                     if app_drawer_open {
                                                         if delta_y > 45.0 {
-                                                            // Swiped down in App Drawer -> close drawer
                                                             app_drawer_open = false;
                                                             drawer_search_active = false;
                                                             drawer_search.clear();
                                                         }
                                                     } else if delta_y < -45.0 {
-                                                        // Swiped up on home screen -> open App Drawer!
                                                         app_drawer_open = true;
                                                         selected_home_icon = None;
-                                                    } else if delta_x < -45.0 {
-                                                        // Swiped left -> next page
-                                                        if current_home_page + 1 < home_pages.len() {
-                                                            current_home_page += 1;
-                                                            home_scroll_offset = server.scene.width as f32 * 0.45;
-                                                            page_scroll_spring.value = home_scroll_offset;
-                                                            page_scroll_spring.velocity = -250.0;
-                                                            page_scroll_spring.set_target(0.0);
+                                                    } else if delta_x.abs() > 45.0 && !page_drag_seen {
+                                                        // No pointer events reached us
+                                                        // (synthetic or coalesced), so
+                                                        // fall back to a single flick.
+                                                        let w = server.scene.width as f32;
+                                                        let last = home_pages.len().saturating_sub(1);
+                                                        let dir = if delta_x < 0.0 { 1i64 } else { -1i64 };
+                                                        let next = (current_home_page as i64 + dir)
+                                                            .clamp(0, last as i64) as usize;
+                                                        if next != current_home_page {
+                                                            current_home_page = next;
                                                             selected_home_icon = None;
-                                                            println!("[UTLC] Swiped left to Home Page {}", current_home_page + 1);
-                                                        } else {
-                                                            let resisted = apply_overscroll_resistance(delta_x, server.scene.width as f32);
-                                                            page_scroll_spring.value = resisted;
-                                                            page_scroll_spring.velocity = 120.0;
-                                                            page_scroll_spring.set_target(0.0);
-                                                            home_scroll_offset = resisted;
-                                                        }
-                                                    } else if delta_x > 45.0 {
-                                                        // Swiped right -> prev page
-                                                        if current_home_page > 0 {
-                                                            current_home_page -= 1;
-                                                            home_scroll_offset = -(server.scene.width as f32 * 0.45);
+                                                            home_scroll_offset = -dir as f32 * w * 0.45;
                                                             page_scroll_spring.value = home_scroll_offset;
-                                                            page_scroll_spring.velocity = 250.0;
+                                                            page_scroll_spring.velocity = -dir as f32 * 250.0;
                                                             page_scroll_spring.set_target(0.0);
-                                                            selected_home_icon = None;
-                                                            println!("[UTLC] Swiped right to Home Page {}", current_home_page + 1);
                                                         } else {
-                                                            let resisted = apply_overscroll_resistance(delta_x, server.scene.width as f32);
-                                                            page_scroll_spring.value = resisted;
-                                                            page_scroll_spring.velocity = -120.0;
-                                                            page_scroll_spring.set_target(0.0);
+                                                            // At a boundary: rubber-band.
+                                                            let resisted = apply_overscroll_resistance(delta_x, w);
                                                             home_scroll_offset = resisted;
+                                                            page_scroll_spring.value = resisted;
+                                                            page_scroll_spring.velocity = 120.0
+                                                                * if delta_x < 0.0 { -1.0 } else { 1.0 };
+                                                            page_scroll_spring.set_target(0.0);
                                                         }
                                                     }
                                                 }
@@ -1052,7 +1143,12 @@ fn run_daemon() {
                                             let w = server.scene.width as f32;
                                             let h = server.scene.height as f32;
                                             // Trigger tactile touch ripple on every tap
-                                            touch_ripple = Some((x, y, 12.0, 0.7));
+                                            touch_ripple = Some((
+                                                x,
+                                                y,
+                                                ripple_start_radius(w),
+                                                1.0,
+                                            ));
 
                                             if server.scene.system_ui.is_open() {
                                                 let shade = ShadeLayout::new(w, h);
@@ -1867,7 +1963,12 @@ fn run_daemon() {
                                         InputDispatchResult::LongPress { x, y } => {
                                             let w = server.scene.width as f32;
                                             let h = server.scene.height as f32;
-                                            touch_ripple = Some((x, y, 18.0, 0.9));
+                                            touch_ripple = Some((
+                                                x,
+                                                y,
+                                                ripple_start_radius(w) * 1.2,
+                                                1.0,
+                                            ));
                                             if app_drawer_open {
                                                 let drawer_y_offset = (1.0 - drawer_progress.clamp(0.0, 1.0)) * h;
                                                 if let Some(idx) =
@@ -2106,11 +2207,13 @@ fn run_daemon() {
                 }
             }
 
-            // Ripple: a Material You touch ripple that expands and fades on a
-            // time constant rather than a frame count.
+            // Ripple: the Material 3 state layer expands and fades together.
+            // The radius starts at the touch point's 48dp target and grows
+            // past it, the alpha falls on the same clock, and both are time
+            // constants so the feel is identical at 60 and 120 Hz.
             if let Some((_, _, ref mut r, ref mut a)) = touch_ripple {
-                *r += dt * 140.0;
-                *a -= dt * 3.0;
+                *r += dt * RIPPLE_GROW;
+                *a -= dt * RIPPLE_FADE;
                 if *a <= 0.0 {
                     touch_ripple = None;
                 }
@@ -2300,6 +2403,16 @@ fn run_daemon() {
 /// Launcher3 use a 0.92-style press bounce; the spring then rebounds past 1.0
 /// on release.
 const PRESS_SCALE: f32 = 0.90;
+
+/// Ripple growth and fade rates, in px/s and per second.
+const RIPPLE_GROW: f32 = 900.0;
+const RIPPLE_FADE: f32 = 2.2;
+
+/// A ripple starts at the Material 3 minimum touch target, so it always
+/// covers the affordance the finger actually hit.
+fn ripple_start_radius(panel_w: f32) -> f32 {
+    (panel_w.min(2400.0) * 0.048).max(12.0) * 0.5
+}
 
 fn format_current_time(buf: &mut [u8; 5]) -> &str {
     let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
@@ -4049,26 +4162,33 @@ mod tests {
         }
         assert!(scroll_offset < 10.0, "Scroll offset should spring-decay quickly to rest");
 
-        // Touch ripple radius expansion and alpha fade
-        let mut ripple = Some((500.0, 600.0, 12.0, 0.7));
+        // Material ripple: the state layer grows and fades on time constants.
+        let mut ripple = Some((500.0, 600.0, ripple_start_radius(1080.0), 1.0));
         for _ in 0..10 {
             if let Some((_, _, ref mut r, ref mut a)) = ripple {
-                *r += dt * 140.0;
-                *a -= dt * 3.0;
+                *r += dt * RIPPLE_GROW;
+                *a -= dt * RIPPLE_FADE;
                 if *a <= 0.0 {
                     ripple = None;
                 }
             }
         }
         let (_, _, r, a) = ripple.expect("Ripple should still be active at 160ms");
-        assert!(r > 30.0, "Ripple radius should expand over time");
-        assert!(a < 0.35, "Ripple alpha should decay towards zero");
+        assert!(r > 100.0, "Ripple radius should expand over time: {}", r);
+        assert!(a > 0.5 && a < 0.75, "Ripple alpha should decay gently: {}", a);
+        // The start radius covers a 48dp touch target.
+        assert!(
+            ripple_start_radius(1080.0) * 2.0 >= 1080.0 * 0.048,
+            "ripple must start at the minimum touch target"
+        );
+        let start = ripple_start_radius(360.0);
+        assert!(start > 8.0, "a small panel still gets a visible ripple");
 
         // After additional frames, ripple fades completely to None
-        for _ in 0..15 {
+        for _ in 0..30 {
             if let Some((_, _, ref mut r, ref mut a)) = ripple {
-                *r += dt * 140.0;
-                *a -= dt * 3.0;
+                *r += dt * RIPPLE_GROW;
+                *a -= dt * RIPPLE_FADE;
                 if *a <= 0.0 {
                     ripple = None;
                 }

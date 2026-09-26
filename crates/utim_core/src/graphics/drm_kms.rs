@@ -2055,44 +2055,42 @@ pub fn paint_frame(buf: &mut [u32], stride: usize, w: usize, h: usize, state: &D
         let _ = k_text_h;
     }
 
-    // 11. Interactive Touch Ripple / Cursor Pointer
+    // 11. Pointer, drawn above every surface.
     if let Some((cx, cy)) = state.cursor_pos {
+        let l = Layout::plain(w as f32, h as f32);
         if state.is_touching {
-            // Vibrant glowing ripple when touching or clicking
-            let (pr, pg, pb) = (
-                ((state.palette.primary >> 16) & 0xFF) as u8,
-                ((state.palette.primary >> 8) & 0xFF) as u8,
-                (state.palette.primary & 0xFF) as u8,
+            // Pressed: a filled dot in the accent colour.
+            draw_circle_glyph(
+                buf, stride, w, h, cx as f32, cy as f32, l.w * 0.008,
+                state.palette.primary,
             );
-            draw_glow_circle(buf, stride, w, h, cx, cy, 26, pr, pg, pb, 50);
-            draw_rounded_rect(buf, stride, w, h, cx.saturating_sub(8), cy.saturating_sub(8), 16, 16, 8, state.palette.primary);
         } else {
-            // Sleek, modern subtle pointer dot for cursor hovering
-            draw_rounded_rect(buf, stride, w, h, cx.saturating_sub(5), cy.saturating_sub(5), 10, 10, 5, 0xAAFFFFFF);
-            draw_rounded_rect(buf, stride, w, h, cx.saturating_sub(2), cy.saturating_sub(2), 4, 4, 2, state.palette.primary);
+            // Hovering: a ring, so it never hides what it points at.
+            let r = l.w * 0.006;
+            draw_circle_glyph(
+                buf, stride, w, h, cx as f32, cy as f32, r,
+                (0xAA << 24) | (state.palette.on_surface & 0x00FF_FFFF),
+            );
+            draw_circle_glyph(
+                buf, stride, w, h, cx as f32, cy as f32, r * 0.42, state.palette.primary,
+            );
         }
     }
 
-    // 12. Tactile Touch Ripple Animation (Lawnchair 17 / Material You touch feedback)
+    // 12. Material You touch ripple.
+    //
+    // The state layer of Material 3: a translucent circle in the on-surface
+    // colour that expands from the touch point and fades out. `radius` grows
+    // on a time constant and `alpha` falls with it, which is what makes it
+    // read as a ripple rather than a blinking dot.
     if let Some((rx, ry, radius, alpha)) = state.touch_ripple {
         if alpha > 0.01 && radius > 1.0 {
-            let r_int = radius as usize;
-            let alpha_u8 = (alpha * 255.0).clamp(0.0, 255.0) as u8;
-            let (pr, pg, pb) = (
-                ((state.palette.primary >> 16) & 0xFF) as u8,
-                ((state.palette.primary >> 8) & 0xFF) as u8,
-                (state.palette.primary & 0xFF) as u8,
-            );
-            draw_glow_circle(buf, stride, w, h, rx as usize, ry as usize, r_int, pr, pg, pb, alpha_u8 / 2);
-            let ripple_color = ((alpha_u8 as u32) << 24) | (state.palette.primary & 0x00FFFFFF);
-            draw_rounded_rect_i32(
-                buf, stride, w, h,
-                (rx - radius) as i32,
-                (ry - radius) as i32,
-                r_int * 2,
-                r_int * 2,
-                r_int,
-                ripple_color,
+            let a = (alpha * 0.32).clamp(0.0, 1.0);
+            let layer = ((a * 255.0) as u32) << 24 | (state.palette.on_surface & 0x00FF_FFFF);
+            // Ring border plus a soft interior, both on the same state layer.
+            draw_circle_glyph(buf, stride, w, h, rx, ry, radius, layer);
+            draw_circle_glyph(
+                buf, stride, w, h, rx, ry, radius * 0.86, layer,
             );
         }
     }
