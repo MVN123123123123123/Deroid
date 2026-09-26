@@ -15,6 +15,7 @@ pub mod mmps;
 pub mod mpg;
 pub mod ring_buffer;
 pub mod sensors;
+pub mod session;
 pub mod telephony;
 pub mod unit;
 

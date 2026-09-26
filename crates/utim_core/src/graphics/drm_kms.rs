@@ -426,6 +426,9 @@ pub struct DrmInteractiveState<'a> {
     pub active_app: Option<&'a str>,
     pub terminal_lines: &'a [String],
     pub terminal_input: &'a str,
+    /// Prompt prefix for the active line, resolved from the real session
+    /// identity (see [`crate::session`]) so the caret offset stays correct.
+    pub terminal_prompt: &'a str,
     pub terminal_running: bool,
     pub terminal_tabs: &'a [TerminalTabInfo<'a>],
     pub terminal_active_tab: usize,
@@ -468,6 +471,7 @@ impl<'a> Default for DrmInteractiveState<'a> {
             active_app: None,
             terminal_lines: &[],
             terminal_input: "",
+            terminal_prompt: crate::session::session().prompt(),
             terminal_running: false,
             terminal_tabs: &[],
             terminal_active_tab: 0,
@@ -907,10 +911,12 @@ pub fn paint_frame(buf: &mut [u32], stride: usize, w: usize, h: usize, state: &D
                 if state.terminal_running {
                     draw_text(buf, stride, w, h, 36, line_y as usize, "[running... (Ctrl+C to stop)]", 0xFFF59E0B, 3);
                 } else {
-                    const PROMPT: &str = "root@treble-gsi:~# ";
-                    let prompt_w = super::font::measure(PROMPT, term_em);
+                    // The prompt describes the identity the commands run as
+                    // (root is dropped to the unprivileged session account).
+                    let prompt = state.terminal_prompt;
+                    let prompt_w = super::font::measure(prompt, term_em);
                     let baseline = line_y + term_em * 0.30;
-                    draw_text(buf, stride, w, h, 36, baseline as usize, PROMPT, 0xFF10B981, 3);
+                    draw_text(buf, stride, w, h, 36, baseline as usize, prompt, 0xFF10B981, 3);
                     // The typed line is clipped to the content card, and the
                     // caret tracks the real measured advance.
                     let input_x = 36.0 + prompt_w;
@@ -2226,6 +2232,9 @@ fn interactive_state_hash(state: &DrmInteractiveState) -> u64 {
         None => mix!(0),
     }
     for b in state.terminal_input.bytes() {
+        mix!(b);
+    }
+    for b in state.terminal_prompt.bytes() {
         mix!(b);
     }
     mix!(state.terminal_running as u8);

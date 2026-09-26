@@ -206,26 +206,17 @@ fn launch_desktop_app(exec_cmd: &str, socket_dir: &str) {
     }
     println!("[UTLC] Launching desktop application: '{}'", exec_cmd);
 
-    let is_root = unsafe { libc::geteuid() == 0 };
-    let (target_home, target_user, app_socket_dir) = if is_root {
-        let _ = std::fs::create_dir_all("/home/user");
-        let _ = std::fs::create_dir_all("/run/user/1000");
-        unsafe {
-            if let Ok(c_home) = std::ffi::CString::new("/home/user") {
-                libc::chown(c_home.as_ptr(), 1000, 1000);
-            }
-            if let Ok(c_run_u) = std::ffi::CString::new("/run/user/1000") {
-                libc::chown(c_run_u.as_ptr(), 1000, 1000);
-                libc::chmod(c_run_u.as_ptr(), 0o777);
-            }
-        }
-        ("/home/user", "user", "/run/user/1000")
+    let sess = utim_core::session::session();
+    let is_root = utim_core::session::is_root_process();
+    if is_root {
+        utim_core::session::ensure_session_dirs();
+    }
+    // Only root owns the compositor socket location; an unprivileged caller
+    // already lives in its own runtime dir.
+    let app_socket_dir = if is_root {
+        utim_core::session::SESSION_RUNTIME_DIR
     } else {
-        (
-            "/home/user",
-            "user",
-            socket_dir,
-        )
+        socket_dir
     };
 
     let mut cmd = std::process::Command::new(prog);
@@ -234,22 +225,13 @@ fn launch_desktop_app(exec_cmd: &str, socket_dir: &str) {
         .env("XDG_RUNTIME_DIR", app_socket_dir)
         .env("GDK_BACKEND", "wayland")
         .env("MOZ_ENABLE_WAYLAND", "1")
-        .env("HOME", target_home)
-        .env("USER", target_user)
-        .env("LOGNAME", target_user)
+        .env("HOME", sess.home())
+        .env("USER", sess.name())
+        .env("LOGNAME", sess.name())
         .env("SHELL", "/bin/bash")
         .env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
 
-    if is_root {
-        cmd.uid(1000).gid(1000);
-        unsafe {
-            cmd.pre_exec(|| {
-                let groups = [1000 as libc::gid_t, 24, 27, 29, 44, 105, 107];
-                libc::setgroups(groups.len(), groups.as_ptr());
-                Ok(())
-            });
-        }
-    }
+    utim_core::session::drop_privileges(&mut cmd);
 
     match cmd.spawn() {
         Ok(child) => {
@@ -257,7 +239,7 @@ fn launch_desktop_app(exec_cmd: &str, socket_dir: &str) {
                 "[UTLC] Spawned '{}' with PID {} (UID {})",
                 prog,
                 child.id(),
-                if is_root { 1000 } else { unsafe { libc::getuid() } }
+                sess.uid()
             );
         }
         Err(e) => {
@@ -1808,7 +1790,11 @@ fn run_daemon() {
                                                             let tab = &mut terminal_tabs[active_tab_idx];
                                                             tab.cleanup_child();
                                                             let display_cmd = if tab.input.is_empty() { "^C" } else { &format!("{}^C", tab.input) };
-                                                            let full_line = format!("root@treble-gsi:~# {}", display_cmd);
+                                                            let full_line = format!(
+                                                                "{}{}",
+                                                                utim_core::session::session().prompt(),
+                                                                display_cmd
+                                                            );
                                                             push_terminal_line(&mut tab.lines, &full_line);
                                                             log_terminal_output(&full_line);
                                                             tab.input.clear();
@@ -2338,6 +2324,7 @@ fn run_daemon() {
                     messages_list: &messages_list,
                     terminal_lines: &active_tab.lines,
                     terminal_input: &active_tab.input,
+                    terminal_prompt: utim_core::session::session().prompt(),
                     terminal_running: active_tab.is_running(),
                     terminal_tabs: &tab_infos,
                     terminal_active_tab: active_tab_idx,
@@ -2816,23 +2803,11 @@ fn run_command_process(
     let has_real_shell = Path::new("/bin/bash").exists() || Path::new("/bin/sh").exists();
     let mut executed_real = false;
     if has_real_shell {
-        let is_root = unsafe { libc::geteuid() == 0 };
-        let (target_home, target_user) = if is_root {
-            let _ = std::fs::create_dir_all("/home/user");
-            let _ = std::fs::create_dir_all("/run/user/1000");
-            unsafe {
-                if let Ok(c_home) = std::ffi::CString::new("/home/user") {
-                    libc::chown(c_home.as_ptr(), 1000, 1000);
-                }
-                if let Ok(c_run_u) = std::ffi::CString::new("/run/user/1000") {
-                    libc::chown(c_run_u.as_ptr(), 1000, 1000);
-                    libc::chmod(c_run_u.as_ptr(), 0o777);
-                }
-            }
-            ("/home/user", "user")
-        } else {
-            ("/home/user", "user")
-        };
+        let sess = utim_core::session::session();
+        let is_root = utim_core::session::is_root_process();
+        if is_root {
+            utim_core::session::ensure_session_dirs();
+        }
 
         let shell = if Path::new("/bin/bash").exists() { "/bin/bash" } else { "/bin/sh" };
         let mut cmd_obj = std::process::Command::new(shell);
@@ -2841,36 +2816,32 @@ fn run_command_process(
             .arg(cmd)
             .env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
             .env("LD_LIBRARY_PATH", "/usr/lib/aarch64-linux-gnu:/lib/aarch64-linux-gnu:/usr/lib:/lib")
-            .env("HOME", target_home)
-            .env("USER", target_user)
-            .env("LOGNAME", target_user)
+            .env("HOME", sess.home())
+            .env("USER", sess.name())
+            .env("LOGNAME", sess.name())
             .env("SHELL", shell)
             .env("TERM", "linux")
             .env("DEBIAN_FRONTEND", "noninteractive")
-            .env("XDG_RUNTIME_DIR", "/run/user/1000")
+            .env("XDG_RUNTIME_DIR", utim_core::session::SESSION_RUNTIME_DIR)
             .env("COLUMNS", "54")
             .env("LINES", "25")
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .stdin(std::process::Stdio::piped());
 
-        if is_root {
-            cmd_obj.uid(1000).gid(1000);
-            if std::path::Path::new(target_home).exists() {
-                cmd_obj.current_dir(target_home);
-            }
+        utim_core::session::drop_privileges(&mut cmd_obj);
+        // The `~` in the prompt is only truthful if the shell starts in the
+        // session home, privileged or not.
+        if std::path::Path::new(sess.home()).exists() {
+            cmd_obj.current_dir(sess.home());
         }
 
         unsafe {
-            cmd_obj.pre_exec(move || {
+            cmd_obj.pre_exec(|| {
                 let mut mask: libc::sigset_t = std::mem::zeroed();
                 libc::sigemptyset(&mut mask);
                 libc::sigprocmask(libc::SIG_SETMASK, &mask, std::ptr::null_mut());
                 libc::setpgid(0, 0);
-                if is_root {
-                    let groups = [1000 as libc::gid_t, 24, 27, 29, 44, 105, 107];
-                    libc::setgroups(groups.len(), groups.as_ptr());
-                }
                 Ok(())
             });
         }
@@ -2936,13 +2907,18 @@ fn run_command_process(
         };
 
         if bin_path.exists() {
+            let sess = utim_core::session::session();
+            if utim_core::session::is_root_process() {
+                utim_core::session::ensure_session_dirs();
+            }
             let mut cmd_obj = std::process::Command::new(&bin_path);
             cmd_obj
                 .args(&parts[1..])
                 .env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
                 .env("LD_LIBRARY_PATH", "/usr/lib/aarch64-linux-gnu:/lib/aarch64-linux-gnu:/usr/lib:/lib")
-                .env("HOME", "/root")
-                .env("USER", "root")
+                .env("HOME", sess.home())
+                .env("USER", sess.name())
+                .env("LOGNAME", sess.name())
                 .env("SHELL", "/bin/bash")
                 .env("TERM", "linux")
                 .env("DEBIAN_FRONTEND", "noninteractive")
@@ -2959,6 +2935,13 @@ fn run_command_process(
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .stdin(std::process::Stdio::piped());
+            // Same identity as the bash path above, so a direct binary does not
+            // silently regain root just because no shell was available.
+            if utim_core::session::drop_privileges(&mut cmd_obj)
+                && std::path::Path::new(sess.home()).exists()
+            {
+                cmd_obj.current_dir(sess.home());
+            }
             unsafe {
                 cmd_obj.pre_exec(|| {
                     let mut mask: libc::sigset_t = std::mem::zeroed();
@@ -3009,7 +2992,10 @@ fn run_command_process(
         if !executed_real {
             match bin_name {
                 "uname" => {
-                    let _ = tx.send("Linux treble-gsi 6.1.23-android14-4-00257 aarch64 GNU/Linux".into());
+                    let _ = tx.send(format!(
+                        "Linux {} 6.1.23-android14-4-00257 aarch64 GNU/Linux",
+                        utim_core::session::session().host()
+                    ));
                 }
                 "uptime" => {
                     let uptime_str = fs::read_to_string("/proc/uptime").unwrap_or_else(|_| "0.0 0.0".into());
@@ -3019,7 +3005,7 @@ fn run_command_process(
                     let _ = tx.send(format!("up {:02}:{:02}, 1 user, load avg: 0.02, 0.01, 0.00", hours, mins));
                 }
                 "whoami" => {
-                    let _ = tx.send("root".into());
+                    let _ = tx.send(utim_core::session::session().name().to_string());
                 }
                 "date" => {
                     let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
@@ -3074,7 +3060,7 @@ fn execute_terminal_command(
     tab_id: usize,
 ) -> TerminalAction {
     let cmd = terminal_input.trim().to_string();
-    let prompt_line = format!("root@treble-gsi:~# {}", cmd);
+    let prompt_line = format!("{}{}", utim_core::session::session().prompt(), cmd);
     push_terminal_line(terminal_lines, &prompt_line);
     log_terminal_output(&prompt_line);
     terminal_input.clear();
@@ -3571,7 +3557,10 @@ mod tests {
         assert_eq!(res, TerminalAction::Continue);
         assert!(input.is_empty());
         assert!(lines.len() >= 2);
-        assert_eq!(lines[0], "root@treble-gsi:~# uname -a");
+        assert_eq!(
+            lines[0],
+            format!("{}uname -a", utim_core::session::session().prompt())
+        );
         assert!(lines[1].contains("Linux"));
 
         input = "exit".to_string();
@@ -3605,7 +3594,15 @@ mod tests {
             push_terminal_line(&mut tabs[1].lines, &line);
         }
         assert!(tabs[1].lines.len() >= 2);
-        assert!(tabs[1].lines[1] == "root" || tabs[1].lines[1] == "linux");
+        // `whoami` must agree with the identity the prompt advertises: never
+        // "root" while the session runs unprivileged.
+        let sess = utim_core::session::session();
+        assert!(!tabs[1].lines[1].is_empty());
+        if sess.is_root() {
+            assert_eq!(tabs[1].lines[1], "root");
+        } else {
+            assert_ne!(tabs[1].lines[1], "root");
+        }
 
         // Wait for whoami process to finish
         for _ in 0..50 {
