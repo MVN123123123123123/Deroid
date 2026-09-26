@@ -28,7 +28,11 @@ use utim_core::compositor::protocols::{ProtocolRegistry, WaylandInterface};
 use utim_core::compositor::server::WaylandServer;
 use utim_core::compositor::systemui::{QuickTileKind, SystemUiShade};
 use utim_core::graphics::composer::{HwcComposer, HwcVersion};
-use utim_core::graphics::{AppGridItem, DrmInteractiveState, DrmKmsDevice, RgbaImage, TerminalTabInfo};
+use utim_core::graphics::{
+    AppGridItem, DrmInteractiveState, DrmKmsDevice, DrawerSearchHit, HomeActionHit,
+    LauncherLayout, RgbaImage, TerminalTabHit, TerminalTabInfo,
+    SpringConfig, SpringSimulation, apply_overscroll_resistance,
+};
 
 #[derive(Debug, Clone)]
 pub struct ManagedApp {
@@ -647,6 +651,19 @@ fn run_daemon() {
     let mut drawer_search = String::with_capacity(64);
     let mut drawer_search_active = false;
     let mut selected_home_icon: Option<String> = None;
+    // Lawnchair 17 / Pixel Launcher Animations and Transitions
+    let mut drawer_progress: f32 = 0.0;
+    let mut home_scroll_offset: f32 = 0.0;
+    let mut app_launch_progress: f32 = 0.0;
+    let mut app_launch_origin: Option<(f32, f32)> = None;
+    let mut app_launch_color: u32 = 0xFF2563EB;
+    let mut touch_ripple: Option<(f32, f32, f32, f32)> = None;
+    let mut touch_drag_start: Option<(f32, f32)> = None;
+    let mut drawer_spring = SpringSimulation::new(0.0, 0.0, SpringConfig::drawer());
+    let mut page_scroll_spring = SpringSimulation::new(0.0, 0.0, SpringConfig::page_swipe());
+    let mut app_launch_spring = SpringSimulation::new(0.0, 0.0, SpringConfig::app_launch());
+    let mut icon_bounce_spring = SpringSimulation::new(1.0, 1.0, SpringConfig::icon_bounce());
+    let mut pressed_icon_id: Option<String> = None;
 
     let mut desktop_catalogue = DesktopCatalogue::new();
     desktop_catalogue.scan_system_directories();
@@ -743,6 +760,86 @@ fn run_daemon() {
                                 } else {
                                     match res {
                                         InputDispatchResult::Touch(raw_touch) => {
+                                            match raw_touch.phase {
+                                                TouchPhase::Down => {
+                                                    touch_drag_start = Some((raw_touch.x, raw_touch.y));
+                                                    let w = server.scene.width as f32;
+                                                    let h = server.scene.height as f32;
+                                                    if active_app.is_none() && !server.scene.system_ui.is_open() && !server.scene.keyboard.is_active {
+                                                        if app_drawer_open {
+                                                            let drawer_y_offset = (1.0 - drawer_progress.clamp(0.0, 1.0)) * h;
+                                                            if let Some(idx) = LauncherLayout::drawer_grid_hit_with_offset(w, h, drawer_y_offset, raw_touch.x, raw_touch.y) {
+                                                                if idx < all_managed_apps.len() {
+                                                                    pressed_icon_id = Some(all_managed_apps[idx].id.clone());
+                                                                    icon_bounce_spring.value = 0.92;
+                                                                    icon_bounce_spring.velocity = 0.0;
+                                                                    icon_bounce_spring.set_target(1.0);
+                                                                }
+                                                            }
+                                                        } else {
+                                                            if let Some(idx) = LauncherLayout::home_grid_hit_with_scroll(w, h, raw_touch.x, raw_touch.y, selected_home_icon.is_some(), home_scroll_offset) {
+                                                                if let Some(page) = home_pages.get(current_home_page) {
+                                                                    if let Some(id) = page.get(idx) {
+                                                                        pressed_icon_id = Some(id.clone());
+                                                                        icon_bounce_spring.value = 0.92;
+                                                                        icon_bounce_spring.velocity = 0.0;
+                                                                        icon_bounce_spring.set_target(1.0);
+                                                                    }
+                                                                }
+                                                            } else if let Some(slot) = LauncherLayout::home_dock_hit(w, h, raw_touch.x, raw_touch.y, 5) {
+                                                                let dock_ids = ["phone", "messages", "apps", "browser", "camera"];
+                                                                if slot < dock_ids.len() {
+                                                                    pressed_icon_id = Some(dock_ids[slot].to_string());
+                                                                    icon_bounce_spring.value = 0.92;
+                                                                    icon_bounce_spring.velocity = 0.0;
+                                                                    icon_bounce_spring.set_target(1.0);
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                TouchPhase::Move => {
+                                                    if active_app.is_none() && !server.scene.system_ui.is_open() && !server.scene.keyboard.is_active {
+                                                        if let Some((_, sy)) = touch_drag_start {
+                                                            let dy = sy - raw_touch.y;
+                                                            let drag_span = (server.scene.height as f32 * 0.6).max(100.0);
+                                                            if !app_drawer_open && dy > 10.0 {
+                                                                drawer_progress = (dy / drag_span).clamp(0.0, 1.0);
+                                                                drawer_spring.value = drawer_progress;
+                                                                drawer_spring.velocity = 0.0;
+                                                            } else if app_drawer_open && dy < -10.0 {
+                                                                drawer_progress = (1.0 + dy / drag_span).clamp(0.0, 1.0);
+                                                                drawer_spring.value = drawer_progress;
+                                                                drawer_spring.velocity = 0.0;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                TouchPhase::Up | TouchPhase::Cancel => {
+                                                    if let Some((_, sy)) = touch_drag_start.take() {
+                                                        let dy = sy - raw_touch.y;
+                                                        if active_app.is_none() && !server.scene.system_ui.is_open() && !server.scene.keyboard.is_active {
+                                                            if !app_drawer_open {
+                                                                if drawer_progress > 0.35 || dy > 80.0 {
+                                                                    app_drawer_open = true;
+                                                                }
+                                                            } else {
+                                                                if drawer_progress < 0.65 || dy < -80.0 {
+                                                                    app_drawer_open = false;
+                                                                    drawer_search_active = false;
+                                                                    drawer_search.clear();
+                                                                }
+                                                            }
+                                                            let target = if app_drawer_open { 1.0 } else { 0.0 };
+                                                            drawer_spring.set_target(target);
+                                                            let fling_vel = (dy / 50.0).clamp(-12.0, 12.0);
+                                                            drawer_spring.velocity = fling_vel;
+                                                        }
+                                                    }
+                                                    icon_bounce_spring.set_target(1.0);
+                                                }
+                                            }
+
                                             let gesture_act = gesture_engine.process_touch(&raw_touch);
                                             match gesture_act {
                                                 GestureAction::Home { progress, .. } if progress >= 1.0 => {
@@ -789,35 +886,55 @@ fn run_daemon() {
                                                         search_active = false;
                                                     }
                                                 }
-                                                GestureAction::Swipe { delta_x, delta_y } => {
-                                                    if active_app.is_none() && !server.scene.system_ui.is_open() && !server.scene.keyboard.is_active {
-                                                        if app_drawer_open {
-                                                            if delta_y > 45.0 {
-                                                                // Swiped down in App Drawer -> close drawer
-                                                                app_drawer_open = false;
-                                                                drawer_search_active = false;
-                                                                drawer_search.clear();
-                                                            }
+                                                GestureAction::Swipe { delta_x, delta_y }
+                                                    if active_app.is_none()
+                                                        && !server.scene.system_ui.is_open()
+                                                        && !server.scene.keyboard.is_active =>
+                                                {
+                                                    if app_drawer_open {
+                                                        if delta_y > 45.0 {
+                                                            // Swiped down in App Drawer -> close drawer
+                                                            app_drawer_open = false;
+                                                            drawer_search_active = false;
+                                                            drawer_search.clear();
+                                                        }
+                                                    } else if delta_y < -45.0 {
+                                                        // Swiped up on home screen -> open App Drawer!
+                                                        app_drawer_open = true;
+                                                        selected_home_icon = None;
+                                                    } else if delta_x < -45.0 {
+                                                        // Swiped left -> next page
+                                                        if current_home_page + 1 < home_pages.len() {
+                                                            current_home_page += 1;
+                                                            home_scroll_offset = server.scene.width as f32 * 0.45;
+                                                            page_scroll_spring.value = home_scroll_offset;
+                                                            page_scroll_spring.velocity = -250.0;
+                                                            page_scroll_spring.set_target(0.0);
+                                                            selected_home_icon = None;
+                                                            println!("[UTLC] Swiped left to Home Page {}", current_home_page + 1);
                                                         } else {
-                                                            if delta_y < -45.0 {
-                                                                // Swiped up on home screen -> open App Drawer!
-                                                                app_drawer_open = true;
-                                                                selected_home_icon = None;
-                                                            } else if delta_x < -45.0 {
-                                                                // Swiped left -> next page
-                                                                if current_home_page + 1 < home_pages.len() {
-                                                                    current_home_page += 1;
-                                                                    selected_home_icon = None;
-                                                                    println!("[UTLC] Swiped left to Home Page {}", current_home_page + 1);
-                                                                }
-                                                            } else if delta_x > 45.0 {
-                                                                // Swiped right -> prev page
-                                                                if current_home_page > 0 {
-                                                                    current_home_page -= 1;
-                                                                    selected_home_icon = None;
-                                                                    println!("[UTLC] Swiped right to Home Page {}", current_home_page + 1);
-                                                                }
-                                                            }
+                                                            let resisted = apply_overscroll_resistance(delta_x, server.scene.width as f32);
+                                                            page_scroll_spring.value = resisted;
+                                                            page_scroll_spring.velocity = 120.0;
+                                                            page_scroll_spring.set_target(0.0);
+                                                            home_scroll_offset = resisted;
+                                                        }
+                                                    } else if delta_x > 45.0 {
+                                                        // Swiped right -> prev page
+                                                        if current_home_page > 0 {
+                                                            current_home_page -= 1;
+                                                            home_scroll_offset = -(server.scene.width as f32 * 0.45);
+                                                            page_scroll_spring.value = home_scroll_offset;
+                                                            page_scroll_spring.velocity = 250.0;
+                                                            page_scroll_spring.set_target(0.0);
+                                                            selected_home_icon = None;
+                                                            println!("[UTLC] Swiped right to Home Page {}", current_home_page + 1);
+                                                        } else {
+                                                            let resisted = apply_overscroll_resistance(delta_x, server.scene.width as f32);
+                                                            page_scroll_spring.value = resisted;
+                                                            page_scroll_spring.velocity = -120.0;
+                                                            page_scroll_spring.set_target(0.0);
+                                                            home_scroll_offset = resisted;
                                                         }
                                                     }
                                                 }
@@ -827,21 +944,21 @@ fn run_daemon() {
                                         InputDispatchResult::Tap { x, y } => {
                                             let w = server.scene.width as f32;
                                             let h = server.scene.height as f32;
-                                            let kb_h = 420.0;
-                                            let kb_y = h - kb_h - 20.0;
+                                            let kb_h = LauncherLayout::KB_H;
+                                            let kb_y = h - kb_h - LauncherLayout::KB_BOTTOM_MARGIN;
+
+                                            // Trigger tactile touch ripple on every tap
+                                            touch_ripple = Some((x, y, 12.0, 0.7));
 
                                             if server.scene.system_ui.is_open() {
-                                                if y < 44.0 || y > 580.0 {
+                                                if y < LauncherLayout::STATUS_BAR_H || y > 580.0 {
                                                     server.scene.system_ui.close();
-                                                } else if (155.0..=450.0).contains(&y) {
-                                                    let col = if x < (w / 2.0) { 0 } else { 1 };
-                                                    let row = ((y - 155.0) / 84.0) as usize;
-                                                    if row < 4 {
-                                                        let idx = row * 2 + col;
+                                                } else if let Some(idx) = LauncherLayout::quick_tile_hit(w, x, y) {
+                                                    if idx < quick_tiles_active.len() {
                                                         quick_tiles_active[idx] = !quick_tiles_active[idx];
                                                     }
                                                 }
-                                            } else if server.scene.keyboard.is_active && y >= kb_y && y <= (h - 20.0) {
+                                            } else if server.scene.keyboard.is_active && y >= kb_y && y <= (h - LauncherLayout::KB_BOTTOM_MARGIN) {
                                                 // Virtual Keyboard key tap
                                                 let kb_w = w - 24.0;
                                                 let kb_x = 12.0;
@@ -1041,9 +1158,9 @@ fn run_daemon() {
                                             } else if server.scene.keyboard.is_active {
                                                 // Tapped outside keyboard while keyboard was active
                                                 if active_app.is_some() {
-                                                    if ((20.0..=130.0).contains(&x) && (48.0..=110.0).contains(&y))
-                                                        || (x >= (w - 90.0) && (48.0..=110.0).contains(&y))
-                                                        || (y >= (h - 40.0))
+                                                    if LauncherLayout::app_bar_back_hit(x, y)
+                                                        || LauncherLayout::app_bar_close_hit(w, x, y)
+                                                        || LauncherLayout::bottom_nav_pill_hit(h, y)
                                                     {
                                                         if active_app.as_deref() == Some("Terminal") {
                                                             for tab in &terminal_tabs {
@@ -1071,15 +1188,119 @@ fn run_daemon() {
                                                     } else {
                                                         app_input_focused = true;
                                                     }
+                                                } else if app_drawer_open {
+                                                    let drawer_y_offset = (1.0 - drawer_progress.clamp(0.0, 1.0)) * h;
+                                                    match LauncherLayout::drawer_search_hit_with_offset(w, drawer_y_offset, x, y) {
+                                                        DrawerSearchHit::Clear => {
+                                                            drawer_search.clear();
+                                                        }
+                                                        DrawerSearchHit::Focus => {
+                                                            drawer_search_active = true;
+                                                        }
+                                                        DrawerSearchHit::None => {
+                                                            if let Some(idx) = LauncherLayout::drawer_grid_hit_with_offset(w, h, drawer_y_offset, x, y) {
+                                                                let drawer_apps: Vec<&ManagedApp> = if !drawer_search.is_empty() {
+                                                                    let q = drawer_search.to_lowercase();
+                                                                    all_managed_apps
+                                                                        .iter()
+                                                                        .filter(|a| a.name.to_lowercase().contains(&q) || a.id.to_lowercase().contains(&q))
+                                                                        .collect()
+                                                                } else {
+                                                                    all_managed_apps.iter().collect()
+                                                                };
+                                                                if let Some(target_app) = drawer_apps.get(idx) {
+                                                                    let col = idx % LauncherLayout::GRID_COLS;
+                                                                    let row = idx / LauncherLayout::GRID_COLS;
+                                                                    let col_w = w / LauncherLayout::GRID_COLS as f32;
+                                                                    let cx = col as f32 * col_w + col_w / 2.0;
+                                                                    let cy = drawer_y_offset + LauncherLayout::DRAWER_GRID_TOP + row as f32 * LauncherLayout::GRID_ROW_H;
+                                                                    app_launch_origin = Some((cx, cy));
+                                                                    app_launch_progress = 0.01;
+                                                                    app_launch_color = target_app.color;
+
+                                                                    let app_to_launch = target_app.name.clone();
+                                                                    let app_exec = target_app.exec.clone();
+
+                                                                    active_app = Some(app_to_launch.clone());
+                                                                    app_input.clear();
+                                                                    app_input_focused = false;
+                                                                    app_drawer_open = false;
+                                                                    drawer_search_active = false;
+                                                                    drawer_search.clear();
+
+                                                                    if app_to_launch == "Terminal" {
+                                                                        server.scene.keyboard.activate();
+                                                                        app_input_focused = true;
+                                                                    } else {
+                                                                        server.scene.keyboard.deactivate();
+                                                                    }
+
+                                                                    if !app_exec.is_empty() {
+                                                                        launch_desktop_app(&app_exec, &socket_dir);
+                                                                    }
+                                                                }
+                                                            } else if y < drawer_y_offset || LauncherLayout::drawer_handle_hit(drawer_y_offset, y) || LauncherLayout::bottom_nav_pill_hit(h, y) {
+                                                                app_drawer_open = false;
+                                                                drawer_search_active = false;
+                                                                drawer_search.clear();
+                                                                server.scene.keyboard.deactivate();
+                                                            } else {
+                                                                server.scene.keyboard.deactivate();
+                                                                drawer_search_active = false;
+                                                            }
+                                                        }
+                                                    }
+                                                } else if search_active {
+                                                    if LauncherLayout::home_search_hit(w, x, y) {
+                                                        // Tap on search bar keeps focus
+                                                    } else if let Some(idx) = LauncherLayout::home_grid_hit_with_scroll(w, h, x, y, false, home_scroll_offset) {
+                                                        let filtered: Vec<&ManagedApp> = if !search_query.is_empty() {
+                                                            let q = search_query.to_lowercase();
+                                                            all_managed_apps
+                                                                .iter()
+                                                                .filter(|a| a.name.to_lowercase().contains(&q) || a.id.to_lowercase().contains(&q))
+                                                                .collect()
+                                                        } else {
+                                                            let current_page_app_ids = &home_pages[current_home_page];
+                                                            current_page_app_ids
+                                                                .iter()
+                                                                .filter_map(|id| all_managed_apps.iter().find(|a| a.id == *id))
+                                                                .collect()
+                                                        };
+                                                        if let Some(target_app) = filtered.get(idx) {
+                                                            let col = idx % LauncherLayout::GRID_COLS;
+                                                            let row = idx / LauncherLayout::GRID_COLS;
+                                                            let col_w = w / LauncherLayout::GRID_COLS as f32;
+                                                            let cx = col as f32 * col_w + col_w / 2.0 + home_scroll_offset;
+                                                            let cy = LauncherLayout::GRID_TOP_NORMAL + row as f32 * LauncherLayout::GRID_ROW_H;
+                                                            app_launch_origin = Some((cx, cy));
+                                                            app_launch_progress = 0.01;
+                                                            app_launch_color = target_app.color;
+                                                            let app_to_launch = target_app.name.clone();
+                                                            let app_exec = target_app.exec.clone();
+                                                            active_app = Some(app_to_launch.clone());
+                                                            app_input.clear();
+                                                            app_input_focused = false;
+                                                            search_active = false;
+                                                            server.scene.keyboard.deactivate();
+                                                            if !app_exec.is_empty() {
+                                                                launch_desktop_app(&app_exec, &socket_dir);
+                                                            }
+                                                        }
+                                                    } else {
+                                                        server.scene.keyboard.deactivate();
+                                                        search_active = false;
+                                                    }
                                                 } else {
                                                     server.scene.keyboard.deactivate();
                                                     search_active = false;
+                                                    drawer_search_active = false;
                                                 }
                                             } else if active_app.is_some() {
                                                 // An app is open and keyboard is not active
-                                                if ((20.0..=130.0).contains(&x) && (48.0..=110.0).contains(&y))
-                                                    || (x >= (w - 90.0) && (48.0..=110.0).contains(&y))
-                                                    || (y >= (h - 40.0))
+                                                if LauncherLayout::app_bar_back_hit(x, y)
+                                                    || LauncherLayout::app_bar_close_hit(w, x, y)
+                                                    || LauncherLayout::bottom_nav_pill_hit(h, y)
                                                 {
                                                     if active_app.as_deref() == Some("Terminal") {
                                                         for tab in &terminal_tabs {
@@ -1092,45 +1313,36 @@ fn run_daemon() {
                                                     app_input_focused = false;
                                                     app_input.clear();
                                                 } else if active_app.as_deref() == Some("Terminal") {
-                                                    let start_x = 36.0;
-                                                    let tab_w = 200.0;
-                                                    let spacing = 10.0;
-                                                    let mut handled_tab_tap = false;
-
-                                                    if (120.0..=175.0).contains(&y) {
-                                                        for i in 0..terminal_tabs.len() {
-                                                            let tab_x = start_x + i as f32 * (tab_w + spacing);
-                                                            if x >= tab_x && x < tab_x + tab_w {
-                                                                if i == active_tab_idx && terminal_tabs.len() > 1 && x >= tab_x + tab_w - 35.0 {
-                                                                    terminal_tabs[i].cleanup_child();
-                                                                    terminal_tabs.remove(i);
-                                                                    if active_tab_idx >= terminal_tabs.len() {
-                                                                        active_tab_idx = terminal_tabs.len() - 1;
-                                                                    }
-                                                                } else {
-                                                                    active_tab_idx = i;
-                                                                }
-                                                                server.scene.keyboard.activate();
-                                                                app_input_focused = true;
-                                                                handled_tab_tap = true;
-                                                                break;
-                                                            }
+                                                    match LauncherLayout::terminal_tab_hit(x, y, terminal_tabs.len(), active_tab_idx) {
+                                                        TerminalTabHit::SelectTab(i) => {
+                                                            active_tab_idx = i;
+                                                            server.scene.keyboard.activate();
+                                                            app_input_focused = true;
                                                         }
-                                                        if !handled_tab_tap && terminal_tabs.len() < 4 {
-                                                            let plus_x = start_x + terminal_tabs.len() as f32 * (tab_w + spacing);
-                                                            if x >= plus_x && x <= plus_x + 60.0 {
+                                                        TerminalTabHit::CloseTab(i) => {
+                                                            if terminal_tabs.len() > 1 && i < terminal_tabs.len() {
+                                                                terminal_tabs[i].cleanup_child();
+                                                                terminal_tabs.remove(i);
+                                                                if active_tab_idx >= terminal_tabs.len() {
+                                                                    active_tab_idx = terminal_tabs.len() - 1;
+                                                                }
+                                                            }
+                                                            server.scene.keyboard.activate();
+                                                            app_input_focused = true;
+                                                        }
+                                                        TerminalTabHit::AddTab => {
+                                                            if terminal_tabs.len() < 4 {
                                                                 terminal_tabs.push(TerminalTab::new(next_tab_id));
                                                                 next_tab_id += 1;
                                                                 active_tab_idx = terminal_tabs.len() - 1;
                                                                 server.scene.keyboard.activate();
                                                                 app_input_focused = true;
-                                                                handled_tab_tap = true;
                                                             }
                                                         }
-                                                    }
-                                                    if !handled_tab_tap {
-                                                        server.scene.keyboard.activate();
-                                                        app_input_focused = true;
+                                                        TerminalTabHit::None => {
+                                                            server.scene.keyboard.activate();
+                                                            app_input_focused = true;
+                                                        }
                                                     }
                                                 } else if active_app.as_deref() == Some("Messages") {
                                                     let content_y = 48.0 + 56.0 + 12.0;
@@ -1153,103 +1365,125 @@ fn run_daemon() {
                                                     server.scene.keyboard.activate();
                                                 }
                                             } else if app_drawer_open {
-                                                // App Drawer tap handling
-                                                if y <= 65.0 {
+                                                // App Drawer tap handling with dynamic sliding offset
+                                                let drawer_y_offset = (1.0 - drawer_progress.clamp(0.0, 1.0)) * h;
+                                                if y < drawer_y_offset || LauncherLayout::drawer_handle_hit(drawer_y_offset, y) {
                                                     // Pull handle / top area: dismiss drawer
                                                     app_drawer_open = false;
                                                     drawer_search_active = false;
                                                     server.scene.keyboard.deactivate();
-                                                } else if (68.0..=125.0).contains(&y) {
-                                                    // Search bar in App Drawer
-                                                    if x >= (w - 70.0) && !drawer_search.is_empty() {
-                                                        drawer_search.clear();
-                                                    } else {
-                                                        drawer_search_active = true;
-                                                        server.scene.keyboard.activate();
-                                                    }
-                                                } else if (165.0..(h - 40.0)).contains(&y) {
-                                                    // Tap an application inside the App Drawer
-                                                    let col_width = w / 4.0;
-                                                    let col = (x / col_width).clamp(0.0, 3.0) as usize;
-                                                    let row = ((y - 165.0) / 115.0) as usize;
-                                                    let idx = row * 4 + col;
-
-                                                    let drawer_apps: Vec<&ManagedApp> = if !drawer_search.is_empty() {
-                                                        let q = drawer_search.to_lowercase();
-                                                        all_managed_apps
-                                                            .iter()
-                                                            .filter(|a| a.name.to_lowercase().contains(&q) || a.id.to_lowercase().contains(&q))
-                                                            .collect()
-                                                    } else {
-                                                        all_managed_apps.iter().collect()
-                                                    };
-
-                                                    if let Some(target_app) = drawer_apps.get(idx) {
-                                                        let app_to_launch = target_app.name.clone();
-                                                        let app_exec = target_app.exec.clone();
-
-                                                        active_app = Some(app_to_launch.clone());
-                                                        app_input.clear();
-                                                        app_input_focused = false;
-                                                        app_drawer_open = false;
-                                                        drawer_search_active = false;
-                                                        drawer_search.clear();
-
-                                                        if app_to_launch == "Terminal" {
+                                                } else {
+                                                    match LauncherLayout::drawer_search_hit_with_offset(w, drawer_y_offset, x, y) {
+                                                        DrawerSearchHit::Clear => {
+                                                            drawer_search.clear();
+                                                        }
+                                                        DrawerSearchHit::Focus => {
+                                                            drawer_search_active = true;
                                                             server.scene.keyboard.activate();
-                                                            app_input_focused = true;
-                                                        } else {
-                                                            server.scene.keyboard.deactivate();
                                                         }
+                                                        DrawerSearchHit::None => {
+                                                            if LauncherLayout::bottom_nav_pill_hit(h, y) {
+                                                                // Bottom pill: close drawer
+                                                                app_drawer_open = false;
+                                                                drawer_search_active = false;
+                                                                drawer_search.clear();
+                                                                server.scene.keyboard.deactivate();
+                                                            } else if let Some(idx) = LauncherLayout::drawer_grid_hit_with_offset(w, h, drawer_y_offset, x, y) {
+                                                                let drawer_apps: Vec<&ManagedApp> = if !drawer_search.is_empty() {
+                                                                    let q = drawer_search.to_lowercase();
+                                                                    all_managed_apps
+                                                                        .iter()
+                                                                        .filter(|a| a.name.to_lowercase().contains(&q) || a.id.to_lowercase().contains(&q))
+                                                                        .collect()
+                                                                } else {
+                                                                    all_managed_apps.iter().collect()
+                                                                };
 
-                                                        if !app_exec.is_empty() {
-                                                            launch_desktop_app(&app_exec, &socket_dir);
+                                                                if let Some(target_app) = drawer_apps.get(idx) {
+                                                                    let col = idx % LauncherLayout::GRID_COLS;
+                                                                    let row = idx / LauncherLayout::GRID_COLS;
+                                                                    let col_w = w / LauncherLayout::GRID_COLS as f32;
+                                                                    let cx = col as f32 * col_w + col_w / 2.0;
+                                                                    let cy = drawer_y_offset + LauncherLayout::DRAWER_GRID_TOP + row as f32 * LauncherLayout::GRID_ROW_H;
+                                                                    app_launch_origin = Some((cx, cy));
+                                                                    app_launch_progress = 0.01;
+                                                                    app_launch_color = target_app.color;
+
+                                                                    let app_to_launch = target_app.name.clone();
+                                                                    let app_exec = target_app.exec.clone();
+
+                                                                    active_app = Some(app_to_launch.clone());
+                                                                    app_input.clear();
+                                                                    app_input_focused = false;
+                                                                    app_drawer_open = false;
+                                                                    drawer_search_active = false;
+                                                                    drawer_search.clear();
+
+                                                                    if app_to_launch == "Terminal" {
+                                                                        server.scene.keyboard.activate();
+                                                                        app_input_focused = true;
+                                                                    } else {
+                                                                        server.scene.keyboard.deactivate();
+                                                                    }
+
+                                                                    if !app_exec.is_empty() {
+                                                                        launch_desktop_app(&app_exec, &socket_dir);
+                                                                    }
+                                                                }
+                                                            }
                                                         }
                                                     }
-                                                } else if y >= (h - 35.0) {
-                                                    // Bottom pill: close drawer
-                                                    app_drawer_open = false;
-                                                    drawer_search_active = false;
-                                                    drawer_search.clear();
-                                                    server.scene.keyboard.deactivate();
                                                 }
                                             } else {
                                                 // Home screen hit testing
-                                                let dock_y = h - 140.0;
-                                                if y <= 50.0 {
+                                                if LauncherLayout::status_bar_hit(y) {
                                                     server.scene.system_ui.toggle();
-                                                } else if selected_home_icon.is_some() && (295.0..=345.0).contains(&y) {
-                                                    // Action Bar chips: [ Remove from Home ] [ Move to Page ]
-                                                    if x <= (w / 2.0) {
-                                                        // Remove from Home screen
-                                                        if let Some(ref sel_id) = selected_home_icon {
-                                                            if let Some(pos) = home_pages[current_home_page].iter().position(|id| id == sel_id) {
-                                                                home_pages[current_home_page].remove(pos);
-                                                                println!("[UTLC] Removed app '{}' from Home Page {}", sel_id, current_home_page + 1);
+                                                } else if selected_home_icon.is_some() && LauncherLayout::home_action_chips_hit(w, x, y).is_some() {
+                                                    match LauncherLayout::home_action_chips_hit(w, x, y) {
+                                                        Some(HomeActionHit::RemoveFromHome) => {
+                                                            if let Some(ref sel_id) = selected_home_icon {
+                                                                if let Some(pos) = home_pages[current_home_page].iter().position(|id| id == sel_id) {
+                                                                    home_pages[current_home_page].remove(pos);
+                                                                    println!("[UTLC] Removed app '{}' from Home Page {}", sel_id, current_home_page + 1);
+                                                                }
+                                                            }
+                                                            selected_home_icon = None;
+                                                        }
+                                                        Some(HomeActionHit::MoveToOtherPage) => {
+                                                            if let Some(sel_id) = selected_home_icon.take() {
+                                                                if let Some(pos) = home_pages[current_home_page].iter().position(|id| *id == sel_id) {
+                                                                    home_pages[current_home_page].remove(pos);
+                                                                }
+                                                                let target_page = if current_home_page == 0 { 1 } else { 0 };
+                                                                while home_pages.len() <= target_page {
+                                                                    home_pages.push(Vec::new());
+                                                                }
+                                                                home_pages[target_page].push(sel_id.clone());
+                                                                if target_page > current_home_page {
+                                                                    home_scroll_offset = w * 0.45;
+                                                                } else {
+                                                                    home_scroll_offset = -(w * 0.45);
+                                                                }
+                                                                current_home_page = target_page;
+                                                                println!("[UTLC] Moved app '{}' to Home Page {}", sel_id, current_home_page + 1);
                                                             }
                                                         }
-                                                        selected_home_icon = None;
-                                                    } else {
-                                                        // Move to other Page
-                                                        if let Some(sel_id) = selected_home_icon.take() {
-                                                            if let Some(pos) = home_pages[current_home_page].iter().position(|id| *id == sel_id) {
-                                                                home_pages[current_home_page].remove(pos);
-                                                            }
-                                                            let target_page = if current_home_page == 0 { 1 } else { 0 };
-                                                            while home_pages.len() <= target_page {
-                                                                home_pages.push(Vec::new());
-                                                            }
-                                                            home_pages[target_page].push(sel_id.clone());
-                                                            current_home_page = target_page;
-                                                            println!("[UTLC] Moved app '{}' to Home Page {}", sel_id, current_home_page + 1);
-                                                        }
+                                                        None => {}
                                                     }
-                                                } else if (32.0..=(w - 32.0)).contains(&x) && (235.0..=295.0).contains(&y) {
+                                                } else if LauncherLayout::home_clock_hit(w, x, y) {
+                                                    active_app = Some("Clock".to_string());
+                                                    app_launch_origin = Some((w / 2.0, LauncherLayout::CLOCK_Y + 35.0));
+                                                    app_launch_progress = 0.01;
+                                                    app_launch_color = 0xFFEF4444;
+                                                    app_input.clear();
+                                                    app_input_focused = false;
+                                                    selected_home_icon = None;
+                                                    server.scene.keyboard.deactivate();
+                                                    search_active = false;
+                                                } else if LauncherLayout::home_search_hit(w, x, y) {
                                                     search_active = true;
                                                     server.scene.keyboard.activate();
-                                                } else if (dock_y - 28.0..dock_y - 8.0).contains(&y) {
-                                                    // Page dots indicator
-                                                    let target_page = if x < w / 2.0 { 0 } else { 1.min(home_pages.len().saturating_sub(1)) };
+                                                } else if let Some(target_page) = LauncherLayout::home_page_dots_hit(w, h, x, y, home_pages.len()) {
                                                     if let Some(sel_id) = selected_home_icon.take() {
                                                         if target_page != current_home_page {
                                                             if let Some(pos) = home_pages[current_home_page].iter().position(|id| *id == sel_id) {
@@ -1262,12 +1496,17 @@ fn run_daemon() {
                                                             println!("[UTLC] Moved app '{}' to Home Page {}", sel_id, target_page + 1);
                                                         }
                                                     }
-                                                    current_home_page = target_page;
-                                                } else if y >= (h - 150.0) && y <= (h - 35.0) {
-                                                    let dock_col_w = (w - 40.0) / 5.0;
-                                                    let dock_col = ((x - 20.0) / dock_col_w).clamp(0.0, 4.0) as usize;
+                                                    if target_page != current_home_page {
+                                                        if target_page > current_home_page {
+                                                            home_scroll_offset = w * 0.45;
+                                                        } else {
+                                                            home_scroll_offset = -(w * 0.45);
+                                                        }
+                                                        current_home_page = target_page;
+                                                    }
+                                                } else if let Some(dock_slot) = LauncherLayout::home_dock_hit(w, h, x, y, 5) {
                                                     let dock_apps = ["Phone", "Messages", "Apps", "Browser", "Camera"];
-                                                    let app = dock_apps[dock_col];
+                                                    let app = dock_apps[dock_slot];
                                                     if app == "Apps" {
                                                         // Tapping "Apps" on dock toggles the App Drawer!
                                                         app_drawer_open = !app_drawer_open;
@@ -1276,6 +1515,14 @@ fn run_daemon() {
                                                         drawer_search_active = false;
                                                         server.scene.keyboard.deactivate();
                                                     } else {
+                                                        let dock_col_w = (w - LauncherLayout::DOCK_PAD_X * 2.0) / 5.0;
+                                                        let cx = LauncherLayout::DOCK_PAD_X + dock_slot as f32 * dock_col_w + dock_col_w / 2.0;
+                                                        let cy = h - LauncherLayout::DOCK_H - LauncherLayout::DOCK_BOTTOM_MARGIN + LauncherLayout::DOCK_H / 2.0;
+                                                        app_launch_origin = Some((cx, cy));
+                                                        app_launch_progress = 0.01;
+                                                        let entry = all_managed_apps.iter().find(|a| a.name == app);
+                                                        app_launch_color = entry.map(|a| a.color).unwrap_or(0xFF2563EB);
+
                                                         active_app = Some(app.to_string());
                                                         app_input.clear();
                                                         app_input_focused = false;
@@ -1295,7 +1542,7 @@ fn run_daemon() {
                                                             }
                                                         }
                                                     }
-                                                } else if y >= (h - 30.0) {
+                                                } else if LauncherLayout::bottom_nav_pill_hit(h, y) {
                                                     active_app = None;
                                                     search_active = false;
                                                     app_drawer_open = false;
@@ -1304,68 +1551,75 @@ fn run_daemon() {
                                                     app_input.clear();
                                                     server.scene.keyboard.deactivate();
                                                     server.scene.system_ui.close();
-                                                } else {
-                                                    // Home Screen App Grid (CORRECTED COORDINATES STARTING AT 275.0)
-                                                    let grid_start_y = if selected_home_icon.is_some() { 310.0 } else { 275.0 };
-                                                    let grid_end_y = (dock_y - 25.0).min(750.0);
-                                                    if (grid_start_y..grid_end_y).contains(&y) {
-                                                        let col_width = w / 4.0;
-                                                        let col = (x / col_width).clamp(0.0, 3.0) as usize;
-                                                        let row = ((y - grid_start_y) / 115.0) as usize;
-                                                        let idx = row * 4 + col;
+                                                } else if let Some(idx) = LauncherLayout::home_grid_hit_with_scroll(w, h, x, y, selected_home_icon.is_some(), home_scroll_offset) {
+                                                    let col = idx % LauncherLayout::GRID_COLS;
+                                                    let row = idx / LauncherLayout::GRID_COLS;
+                                                    let col_w = w / LauncherLayout::GRID_COLS as f32;
+                                                    let grid_top = if selected_home_icon.is_some() {
+                                                        LauncherLayout::GRID_TOP_SELECTED
+                                                    } else {
+                                                        LauncherLayout::GRID_TOP_NORMAL
+                                                    };
+                                                    let cx = col as f32 * col_w + col_w / 2.0 + home_scroll_offset;
+                                                    let cy = grid_top + row as f32 * LauncherLayout::GRID_ROW_H;
 
-                                                        if search_active && !search_query.is_empty() {
-                                                            let q = search_query.to_lowercase();
-                                                            let filtered: Vec<&ManagedApp> = all_managed_apps
-                                                                .iter()
-                                                                .filter(|a| a.name.to_lowercase().contains(&q) || a.id.to_lowercase().contains(&q))
-                                                                .collect();
-                                                            if let Some(target_app) = filtered.get(idx) {
+                                                    if search_active && !search_query.is_empty() {
+                                                        let q = search_query.to_lowercase();
+                                                        let filtered: Vec<&ManagedApp> = all_managed_apps
+                                                            .iter()
+                                                            .filter(|a| a.name.to_lowercase().contains(&q) || a.id.to_lowercase().contains(&q))
+                                                            .collect();
+                                                        if let Some(target_app) = filtered.get(idx) {
+                                                            app_launch_origin = Some((cx, cy));
+                                                            app_launch_progress = 0.01;
+                                                            app_launch_color = target_app.color;
+                                                            let app_to_launch = target_app.name.clone();
+                                                            let app_exec = target_app.exec.clone();
+                                                            active_app = Some(app_to_launch.clone());
+                                                            app_input.clear();
+                                                            app_input_focused = false;
+                                                            search_active = false;
+                                                            server.scene.keyboard.deactivate();
+                                                            if !app_exec.is_empty() {
+                                                                launch_desktop_app(&app_exec, &socket_dir);
+                                                            }
+                                                        }
+                                                    } else if let Some(sel_id) = selected_home_icon.take() {
+                                                        // Moving icon in edit mode to selected slot
+                                                        if let Some(old_pos) = home_pages[current_home_page].iter().position(|id| *id == sel_id) {
+                                                            home_pages[current_home_page].remove(old_pos);
+                                                            let insert_pos = idx.min(home_pages[current_home_page].len());
+                                                            home_pages[current_home_page].insert(insert_pos, sel_id.clone());
+                                                            println!("[UTLC] Moved app '{}' from slot {} to slot {}", sel_id, old_pos, insert_pos);
+                                                        }
+                                                    } else {
+                                                        let page_app_ids = &home_pages[current_home_page];
+                                                        if let Some(app_id) = page_app_ids.get(idx) {
+                                                            if let Some(target_app) = all_managed_apps.iter().find(|a| a.id == *app_id) {
+                                                                app_launch_origin = Some((cx, cy));
+                                                                app_launch_progress = 0.01;
+                                                                app_launch_color = target_app.color;
                                                                 let app_to_launch = target_app.name.clone();
                                                                 let app_exec = target_app.exec.clone();
                                                                 active_app = Some(app_to_launch.clone());
                                                                 app_input.clear();
                                                                 app_input_focused = false;
-                                                                search_active = false;
-                                                                server.scene.keyboard.deactivate();
+                                                                selected_home_icon = None;
+                                                                if app_to_launch == "Terminal" {
+                                                                    server.scene.keyboard.activate();
+                                                                    app_input_focused = true;
+                                                                } else {
+                                                                    server.scene.keyboard.deactivate();
+                                                                    search_active = false;
+                                                                }
                                                                 if !app_exec.is_empty() {
                                                                     launch_desktop_app(&app_exec, &socket_dir);
                                                                 }
                                                             }
-                                                        } else if let Some(sel_id) = selected_home_icon.take() {
-                                                            // Moving icon in edit mode to selected slot
-                                                            if let Some(old_pos) = home_pages[current_home_page].iter().position(|id| *id == sel_id) {
-                                                                home_pages[current_home_page].remove(old_pos);
-                                                                let insert_pos = idx.min(home_pages[current_home_page].len());
-                                                                home_pages[current_home_page].insert(insert_pos, sel_id.clone());
-                                                                println!("[UTLC] Moved app '{}' from slot {} to slot {}", sel_id, old_pos, insert_pos);
-                                                            }
-                                                        } else {
-                                                            let page_app_ids = &home_pages[current_home_page];
-                                                            if let Some(app_id) = page_app_ids.get(idx) {
-                                                                if let Some(target_app) = all_managed_apps.iter().find(|a| a.id == *app_id) {
-                                                                    let app_to_launch = target_app.name.clone();
-                                                                    let app_exec = target_app.exec.clone();
-                                                                    active_app = Some(app_to_launch.clone());
-                                                                    app_input.clear();
-                                                                    app_input_focused = false;
-                                                                    selected_home_icon = None;
-                                                                    if app_to_launch == "Terminal" {
-                                                                        server.scene.keyboard.activate();
-                                                                        app_input_focused = true;
-                                                                    } else {
-                                                                        server.scene.keyboard.deactivate();
-                                                                        search_active = false;
-                                                                    }
-                                                                    if !app_exec.is_empty() {
-                                                                        launch_desktop_app(&app_exec, &socket_dir);
-                                                                    }
-                                                                }
-                                                            }
                                                         }
-                                                    } else if selected_home_icon.is_some() {
-                                                        selected_home_icon = None;
                                                     }
+                                                } else if selected_home_icon.is_some() {
+                                                    selected_home_icon = None;
                                                 }
                                             }
                                         }
@@ -1443,20 +1697,14 @@ fn run_daemon() {
                                                         if active_app.as_deref() == Some("Terminal") && !terminal_tabs.is_empty() {
                                                             active_tab_idx = (active_tab_idx + 1) % terminal_tabs.len();
                                                         }
-                                                    } else if code == KEY_1 {
-                                                        if active_app.as_deref() == Some("Terminal") && !terminal_tabs.is_empty() {
+                                                    } else if active_app.as_deref() == Some("Terminal") {
+                                                        if code == KEY_1 && !terminal_tabs.is_empty() {
                                                             active_tab_idx = 0;
-                                                        }
-                                                    } else if code == KEY_2 {
-                                                        if active_app.as_deref() == Some("Terminal") && terminal_tabs.len() > 1 {
+                                                        } else if code == KEY_2 && terminal_tabs.len() > 1 {
                                                             active_tab_idx = 1;
-                                                        }
-                                                    } else if code == KEY_3 {
-                                                        if active_app.as_deref() == Some("Terminal") && terminal_tabs.len() > 2 {
+                                                        } else if code == KEY_3 && terminal_tabs.len() > 2 {
                                                             active_tab_idx = 2;
-                                                        }
-                                                    } else if code == KEY_4 {
-                                                        if active_app.as_deref() == Some("Terminal") && terminal_tabs.len() > 3 {
+                                                        } else if code == KEY_4 && terminal_tabs.len() > 3 {
                                                             active_tab_idx = 3;
                                                         }
                                                     }
@@ -1544,13 +1792,10 @@ fn run_daemon() {
                                         InputDispatchResult::LongPress { x, y } => {
                                             let w = server.scene.width as f32;
                                             let h = server.scene.height as f32;
-                                            let dock_y = h - 140.0;
+                                            touch_ripple = Some((x, y, 18.0, 0.9));
                                             if app_drawer_open {
-                                                if (165.0..(h - 40.0)).contains(&y) {
-                                                    let col_width = w / 4.0;
-                                                    let col = (x / col_width).clamp(0.0, 3.0) as usize;
-                                                    let row = ((y - 165.0) / 115.0) as usize;
-                                                    let idx = row * 4 + col;
+                                                let drawer_y_offset = (1.0 - drawer_progress.clamp(0.0, 1.0)) * h;
+                                                if let Some(idx) = LauncherLayout::drawer_grid_hit_with_offset(w, h, drawer_y_offset, x, y) {
                                                     let drawer_apps: Vec<&ManagedApp> = if !drawer_search.is_empty() {
                                                         let q = drawer_search.to_lowercase();
                                                         all_managed_apps
@@ -1571,13 +1816,7 @@ fn run_daemon() {
                                                     }
                                                 }
                                             } else if active_app.is_none() && !server.scene.system_ui.is_open() {
-                                                let grid_start_y = if selected_home_icon.is_some() { 310.0 } else { 275.0 };
-                                                let grid_end_y = (dock_y - 25.0).min(750.0);
-                                                if (grid_start_y..grid_end_y).contains(&y) {
-                                                    let col_width = w / 4.0;
-                                                    let col = (x / col_width).clamp(0.0, 3.0) as usize;
-                                                    let row = ((y - grid_start_y) / 115.0) as usize;
-                                                    let idx = row * 4 + col;
+                                                if let Some(idx) = LauncherLayout::home_grid_hit_with_scroll(w, h, x, y, selected_home_icon.is_some(), home_scroll_offset) {
                                                     let page_app_ids = &home_pages[current_home_page];
                                                     if let Some(app_id) = page_app_ids.get(idx) {
                                                         selected_home_icon = Some(app_id.clone());
@@ -1745,6 +1984,48 @@ fn run_daemon() {
             last_frame = Instant::now();
             let _ = server.step_frame(dt);
 
+            // Modern Lawnchair 17 / Pixel Launcher Animations and Transitions
+            let drawer_target = if app_drawer_open { 1.0 } else { 0.0 };
+            if touch_drag_start.is_none() {
+                drawer_spring.set_target(drawer_target);
+                drawer_spring.step(dt);
+                drawer_progress = drawer_spring.value.clamp(0.0, 1.0);
+            }
+
+            page_scroll_spring.step(dt);
+            home_scroll_offset = page_scroll_spring.value;
+
+            icon_bounce_spring.step(dt);
+            if icon_bounce_spring.is_at_rest() && (icon_bounce_spring.value - 1.0).abs() < 0.005 {
+                pressed_icon_id = None;
+                icon_bounce_spring.value = 1.0;
+            }
+
+            if app_launch_progress > 0.0 {
+                if app_launch_spring.target != 1.0 {
+                    app_launch_spring.set_target(1.0);
+                    app_launch_spring.value = app_launch_progress;
+                    app_launch_spring.velocity = 2.0;
+                }
+                app_launch_spring.step(dt);
+                app_launch_progress = app_launch_spring.value.clamp(0.0, 1.0);
+                if app_launch_progress >= 0.98 {
+                    app_launch_progress = 0.0;
+                    app_launch_origin = None;
+                    app_launch_spring.set_target(0.0);
+                    app_launch_spring.value = 0.0;
+                    app_launch_spring.velocity = 0.0;
+                }
+            }
+
+            if let Some((_, _, ref mut r, ref mut a)) = touch_ripple {
+                *r += dt * 140.0;
+                *a -= dt * 3.0;
+                if *a <= 0.0 {
+                    touch_ripple = None;
+                }
+            }
+
             if let Some(ref mut drm) = drm_display {
                 let t_str = format_current_time(&mut time_buf);
                 if active_tab_idx >= terminal_tabs.len() {
@@ -1875,6 +2156,14 @@ fn run_daemon() {
                     home_page: current_home_page,
                     total_home_pages: home_pages.len(),
                     selected_icon_id: selected_home_icon.as_deref(),
+                    drawer_progress,
+                    home_scroll_offset,
+                    app_launch_progress,
+                    app_launch_origin,
+                    app_launch_color,
+                    touch_ripple,
+                    pressed_icon_id: pressed_icon_id.as_deref(),
+                    icon_press_scale: icon_bounce_spring.value,
                 };
                 drm.render_interactive_ui(&drm_state);
                 drm.flush();
@@ -2072,6 +2361,7 @@ fn handle_terminal_enter(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_ime_action(
     act: ImeAction,
     active_app: &mut Option<String>,
@@ -2095,10 +2385,8 @@ fn apply_ime_action(
                 if search_query.len() + s.len() <= 60 {
                     search_query.push_str(&s);
                 }
-            } else if active_app.is_some() && *app_input_focused {
-                if app_input.len() + s.len() <= 120 {
-                    app_input.push_str(&s);
-                }
+            } else if active_app.is_some() && *app_input_focused && app_input.len() + s.len() <= 120 {
+                app_input.push_str(&s);
             }
         }
         ImeAction::DeleteSurroundingText { .. } => {
@@ -2132,9 +2420,6 @@ fn apply_ime_action(
                         messages_list.push(format!("You: {}", app_input));
                         app_input.clear();
                     }
-                } else if active_app.as_deref() == Some("Browser") || active_app.as_deref() == Some("Firefox") {
-                    keyboard.deactivate();
-                    *app_input_focused = false;
                 } else {
                     keyboard.deactivate();
                     *app_input_focused = false;
@@ -2172,7 +2457,7 @@ fn clean_terminal_line(line: &str) -> String {
                 chars.next();
                 while let Some(&next) = chars.peek() {
                     chars.next();
-                    if next >= '@' && next <= '~' {
+                    if ('@'..='~').contains(&next) {
                         break;
                     }
                 }
@@ -2498,6 +2783,7 @@ fn run_command_process(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_terminal_command(
     terminal_lines: &mut Vec<String>,
     terminal_input: &mut String,
@@ -3364,7 +3650,7 @@ mod tests {
             vec!["settings".to_string(), "files".to_string(), "terminal".to_string(), "gallery".to_string()],
             vec!["clock".to_string(), "contacts".to_string()],
         ];
-        let mut current_page = 0;
+        let current_page = 0;
         let mut selected_icon: Option<String> = Some("terminal".to_string());
 
         // 1. Reorder within Page 0: move "terminal" from index 2 to slot 0
@@ -3433,6 +3719,258 @@ mod tests {
         // 4. Close drawer
         app_drawer_open = false;
         assert!(!app_drawer_open);
+    }
+
+    #[test]
+    fn test_launcher_layout_geometric_hitboxes() {
+        let w = 1080.0;
+        let h = 2400.0;
+
+        // 1. Status Bar
+        assert!(LauncherLayout::status_bar_hit(20.0));
+        assert!(LauncherLayout::status_bar_hit(44.0));
+        assert!(!LauncherLayout::status_bar_hit(45.0));
+        assert!(!LauncherLayout::status_bar_hit(-5.0), "Negative y is out of bounds");
+
+        // 2. Home Search Bar
+        assert!(LauncherLayout::home_search_hit(w, 540.0, 250.0));
+        assert!(!LauncherLayout::home_search_hit(w, 10.0, 250.0));
+        assert!(!LauncherLayout::home_search_hit(w, 540.0, 310.0));
+
+        // 3. Home Action Chips (Edit Mode)
+        assert_eq!(
+            LauncherLayout::home_action_chips_hit(w, 100.0, 320.0),
+            Some(HomeActionHit::RemoveFromHome)
+        );
+        assert_eq!(
+            LauncherLayout::home_action_chips_hit(w, 800.0, 320.0),
+            Some(HomeActionHit::MoveToOtherPage)
+        );
+        assert_eq!(LauncherLayout::home_action_chips_hit(w, 540.0, 320.0), None);
+
+        // 4. Page Indicator Dots
+        let dock_y = h - 140.0;
+        let dots_y = dock_y - 20.0;
+        assert_eq!(LauncherLayout::home_page_dots_hit(w, h, 200.0, dots_y, 2), Some(0));
+        assert_eq!(LauncherLayout::home_page_dots_hit(w, h, 800.0, dots_y, 2), Some(1));
+        assert_eq!(LauncherLayout::home_page_dots_hit(w, h, 500.0, dots_y - 40.0, 2), None);
+
+        // 5. Dock Slots (5 slots)
+        assert_eq!(LauncherLayout::home_dock_hit(w, h, 50.0, dock_y + 50.0, 5), Some(0)); // Phone
+        assert_eq!(LauncherLayout::home_dock_hit(w, h, 260.0, dock_y + 50.0, 5), Some(1)); // Messages
+        assert_eq!(LauncherLayout::home_dock_hit(w, h, 540.0, dock_y + 50.0, 5), Some(2)); // Apps
+        assert_eq!(LauncherLayout::home_dock_hit(w, h, 800.0, dock_y + 50.0, 5), Some(3)); // Browser
+        assert_eq!(LauncherLayout::home_dock_hit(w, h, 1020.0, dock_y + 50.0, 5), Some(4)); // Camera
+        assert_eq!(LauncherLayout::home_dock_hit(w, h, 540.0, dock_y - 30.0, 5), None);
+
+        // 6. Home Grid Alignment
+        // Normal top is 325. Row 0 center is at 325. Row 1 center is at 440.
+        // Tapping row 0 at center (y = 325, x = 135 for col 0):
+        assert_eq!(LauncherLayout::home_grid_hit(w, h, 135.0, 325.0, false), Some(0));
+        assert_eq!(LauncherLayout::home_grid_hit(w, h, 405.0, 325.0, false), Some(1));
+        assert_eq!(LauncherLayout::home_grid_hit(w, h, 675.0, 325.0, false), Some(2));
+        assert_eq!(LauncherLayout::home_grid_hit(w, h, 945.0, 325.0, false), Some(3));
+        // Row 1 (y = 440):
+        assert_eq!(LauncherLayout::home_grid_hit(w, h, 135.0, 440.0, false), Some(4));
+        assert_eq!(LauncherLayout::home_grid_hit(w, h, 405.0, 440.0, false), Some(5));
+
+        // Edit Mode (selected icon): GRID_TOP_SELECTED is 395.0. Clean separation from Action Chips (303..343)
+        assert_eq!(LauncherLayout::home_grid_hit(w, h, 135.0, 395.0, true), Some(0));
+        assert_eq!(LauncherLayout::home_grid_hit(w, h, 135.0, 365.0, true), Some(0));
+        assert_eq!(LauncherLayout::home_action_chips_hit(w, 135.0, 365.0), None);
+
+        // 7. App Drawer Search Hit
+        assert_eq!(
+            LauncherLayout::drawer_search_hit(w, 200.0, 85.0),
+            DrawerSearchHit::Focus
+        );
+        assert_eq!(
+            LauncherLayout::drawer_search_hit(w, w - 30.0, 85.0),
+            DrawerSearchHit::Clear
+        );
+        assert_eq!(
+            LauncherLayout::drawer_search_hit(w, 200.0, 20.0),
+            DrawerSearchHit::None
+        );
+
+        // 8. App Drawer Grid Hit
+        // Drawer Grid Top is 198. Row 0 is at 198.
+        assert_eq!(LauncherLayout::drawer_grid_hit(w, h, 135.0, 198.0), Some(0));
+        assert_eq!(LauncherLayout::drawer_grid_hit(w, h, 405.0, 198.0), Some(1));
+        assert_eq!(LauncherLayout::drawer_grid_hit(w, h, 135.0, 313.0), Some(4)); // Row 1
+
+        // 9. Quick Tiles Hit
+        assert_eq!(LauncherLayout::quick_tile_hit(w, 100.0, 180.0), Some(0));
+        assert_eq!(LauncherLayout::quick_tile_hit(w, 700.0, 180.0), Some(1));
+        assert_eq!(LauncherLayout::quick_tile_hit(w, 100.0, 260.0), Some(2));
+        assert_eq!(LauncherLayout::quick_tile_hit(w, 700.0, 260.0), Some(3));
+
+        // 10. Nav Bar & App Bar Hits
+        assert!(LauncherLayout::bottom_nav_pill_hit(h, h - 10.0));
+        assert!(!LauncherLayout::bottom_nav_pill_hit(h, h - 50.0));
+        assert!(LauncherLayout::app_bar_back_hit(50.0, 70.0));
+        assert!(LauncherLayout::app_bar_close_hit(w, w - 50.0, 70.0));
+
+        // 11. Terminal Tab Hits
+        assert_eq!(
+            LauncherLayout::terminal_tab_hit(50.0, 140.0, 2, 0),
+            TerminalTabHit::SelectTab(0)
+        );
+        assert_eq!(
+            LauncherLayout::terminal_tab_hit(215.0, 140.0, 2, 0),
+            TerminalTabHit::CloseTab(0)
+        );
+        assert_eq!(
+            LauncherLayout::terminal_tab_hit(260.0, 140.0, 2, 0),
+            TerminalTabHit::SelectTab(1)
+        );
+        assert_eq!(
+            LauncherLayout::terminal_tab_hit(470.0, 140.0, 2, 0),
+            TerminalTabHit::AddTab
+        );
+    }
+
+    #[test]
+    fn test_lawnchair_animation_physics_step() {
+        // Drawer progress interpolation towards open
+        let mut drawer_prog: f32 = 0.0;
+        let drawer_target: f32 = 1.0;
+        let dt: f32 = 0.016;
+
+        for _ in 0..10 {
+            let diff = drawer_target - drawer_prog;
+            drawer_prog += diff * (dt * 14.0).min(1.0);
+        }
+        assert!(drawer_prog > 0.85, "Drawer should smoothly ease open in ~160ms");
+
+        // Home scroll offset decay (returning smoothly to center)
+        let mut scroll_offset: f32 = 400.0;
+        for _ in 0..20 {
+            if scroll_offset.abs() > 0.5 {
+                scroll_offset *= 1.0 - (dt * 12.0).min(0.9);
+            } else {
+                scroll_offset = 0.0;
+            }
+        }
+        assert!(scroll_offset < 10.0, "Scroll offset should spring-decay quickly to rest");
+
+        // Touch ripple radius expansion and alpha fade
+        let mut ripple = Some((500.0, 600.0, 12.0, 0.7));
+        for _ in 0..10 {
+            if let Some((_, _, ref mut r, ref mut a)) = ripple {
+                *r += dt * 140.0;
+                *a -= dt * 3.0;
+                if *a <= 0.0 {
+                    ripple = None;
+                }
+            }
+        }
+        let (_, _, r, a) = ripple.expect("Ripple should still be active at 160ms");
+        assert!(r > 30.0, "Ripple radius should expand over time");
+        assert!(a < 0.35, "Ripple alpha should decay towards zero");
+
+        // After additional frames, ripple fades completely to None
+        for _ in 0..15 {
+            if let Some((_, _, ref mut r, ref mut a)) = ripple {
+                *r += dt * 140.0;
+                *a -= dt * 3.0;
+                if *a <= 0.0 {
+                    ripple = None;
+                }
+            }
+        }
+        assert!(ripple.is_none(), "Ripple should fade completely after duration");
+    }
+
+    #[test]
+    fn test_launcher_advanced_geometry_and_animations() {
+        let w = 1080.0;
+        let h = 2400.0;
+
+        // 1. Home Clock Widget Hit
+        assert!(LauncherLayout::home_clock_hit(w, 540.0, 150.0));
+        assert!(LauncherLayout::home_clock_hit(w, 200.0, 200.0));
+        assert!(!LauncherLayout::home_clock_hit(w, 10.0, 150.0), "Outside padding");
+        assert!(!LauncherLayout::home_clock_hit(w, 540.0, 50.0), "Above clock");
+        assert!(!LauncherLayout::home_clock_hit(w, 540.0, 240.0), "Below clock in search");
+
+        // 2. Home Page Dots Multi-Page and Out-of-bounds
+        let dock_y = h - LauncherLayout::DOCK_H - LauncherLayout::DOCK_BOTTOM_MARGIN;
+        let dots_y = dock_y - 20.0;
+        assert_eq!(LauncherLayout::home_page_dots_hit(w, h, -10.0, dots_y, 2), None, "Negative x is out of bounds");
+        assert_eq!(LauncherLayout::home_page_dots_hit(w, h, w + 10.0, dots_y, 2), None, "x > w is out of bounds");
+        assert_eq!(LauncherLayout::home_page_dots_hit(w, h, 200.0, dots_y, 0), None, "0 total pages is None");
+        assert_eq!(LauncherLayout::home_page_dots_hit(w, h, 200.0, dots_y, 1), Some(0));
+        // 3 pages: slots are 0..360, 360..720, 720..1080
+        assert_eq!(LauncherLayout::home_page_dots_hit(w, h, 180.0, dots_y, 3), Some(0));
+        assert_eq!(LauncherLayout::home_page_dots_hit(w, h, 540.0, dots_y, 3), Some(1));
+        assert_eq!(LauncherLayout::home_page_dots_hit(w, h, 900.0, dots_y, 3), Some(2));
+
+        // 3. Home Grid Hit with Scroll Offset
+        // Row 0 center is at 325. Col 0 center without scroll is at 135 (col_w = 270).
+        // With scroll_offset = 270.0 (scrolled 1 col to the right):
+        // Physical touch at x = 405 (rel_x = 405 - 270 = 135) should hit col 0!
+        assert_eq!(
+            LauncherLayout::home_grid_hit_with_scroll(w, h, 405.0, 325.0, false, 270.0),
+            Some(0)
+        );
+        // rel_x negative is out of bounds
+        assert_eq!(
+            LauncherLayout::home_grid_hit_with_scroll(w, h, 100.0, 325.0, false, 200.0),
+            None
+        );
+
+        // 4. App Drawer Hit with Animated Offset
+        let drawer_y_offset = 600.0; // Drawer is 25% down the screen
+        assert!(LauncherLayout::drawer_handle_hit(drawer_y_offset, drawer_y_offset + 20.0));
+        assert!(!LauncherLayout::drawer_handle_hit(drawer_y_offset, 200.0));
+
+        assert_eq!(
+            LauncherLayout::drawer_search_hit_with_offset(w, drawer_y_offset, 200.0, drawer_y_offset + 85.0),
+            DrawerSearchHit::Focus
+        );
+        assert_eq!(
+            LauncherLayout::drawer_search_hit_with_offset(w, drawer_y_offset, w - 30.0, drawer_y_offset + 85.0),
+            DrawerSearchHit::Clear
+        );
+
+        // Drawer grid row 0 center is at drawer_y_offset + DRAWER_GRID_TOP (600 + 198 = 798)
+        assert_eq!(
+            LauncherLayout::drawer_grid_hit_with_offset(w, h, drawer_y_offset, 135.0, 798.0),
+            Some(0)
+        );
+        // Above drawer offset is not a grid hit
+        assert_eq!(
+            LauncherLayout::drawer_grid_hit_with_offset(w, h, drawer_y_offset, 135.0, 500.0),
+            None
+        );
+        // Off-screen x is out of bounds
+        assert_eq!(
+            LauncherLayout::drawer_grid_hit_with_offset(w, h, drawer_y_offset, -20.0, 798.0),
+            None
+        );
+
+        // 5. Unified Row Limits
+        let max_home = LauncherLayout::max_home_rows(h, false);
+        assert!(max_home >= 15 && max_home <= 20, "1080x2400 screen should fit ~17 home rows");
+        let max_drawer = LauncherLayout::max_drawer_rows(h);
+        assert!(max_drawer >= 17 && max_drawer <= 22, "1080x2400 screen should fit ~19 drawer rows");
+    }
+
+    #[test]
+    fn test_typography_proportional_metrics() {
+        // Test text_width with proportional character spacing
+        let scale = 2;
+        let w_i = utim_core::graphics::text_width("i", scale);
+        let w_m = utim_core::graphics::text_width("m", scale);
+        assert!(w_i < w_m, "Proportional 'i' ({}px) must be narrower than 'm' ({}px)", w_i, w_m);
+
+        let w_space = utim_core::graphics::text_width(" ", scale);
+        let w_w = utim_core::graphics::text_width("W", scale);
+        assert!(w_space < w_w, "Space should be narrower than capital W");
+
+        let w_full = utim_core::graphics::text_width("Universal Treble", scale);
+        assert!(w_full > 0);
     }
 }
 

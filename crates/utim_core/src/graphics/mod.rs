@@ -14,7 +14,13 @@ pub use composer::{
     CompositionType, DisplayConfig, HwcComposer, HwcError, HwcLayer, HwcVersion, PresentFences,
     Rect, Transform,
 };
-pub use drm_kms::{AppGridItem, DrmInteractiveState, DrmKmsDevice, TerminalTabInfo};
+pub use drm_kms::{
+    AppGridItem, DrmInteractiveState, DrmKmsDevice, TerminalTabInfo,
+    DrawerSearchHit, HomeActionHit, LauncherLayout, TerminalTabHit,
+    FontWeight, MaterialYouPalette, SpringConfig, SpringSimulation,
+    apply_frosted_blur, apply_frosted_blur_region, apply_overscroll_resistance,
+    format_apps_count, text_width,
+};
 pub use png::{decode_png, RgbaImage};
 pub use elf_align::{
     inspect_elf_bytes, inspect_elf_file, verify_64k_alignment, ElfAlignmentReport,
