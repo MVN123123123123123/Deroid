@@ -4,3 +4,4 @@ GEMINI.md
 /build/
 /dist/
 AGENTS.md
+*/__pycache__/
