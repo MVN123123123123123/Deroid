@@ -152,6 +152,24 @@ fn apply_app_icons(apps: &mut [ManagedApp], cache: &mut IconCache) {
     }
 }
 
+/// The app drawer's visible list, as an iterator.
+///
+/// The drawer grid, the press feedback and the launch handler all need "the
+/// nth app the drawer is showing"; this is the single definition of that, and
+/// it allocates nothing.
+fn drawer_view<'a>(
+    apps: &'a [ManagedApp],
+    query: &str,
+) -> Box<dyn Iterator<Item = &'a ManagedApp> + 'a> {
+    if query.is_empty() {
+        return Box::new(apps.iter());
+    }
+    let q = query.to_lowercase();
+    Box::new(apps.iter().filter(move |a| {
+        a.name.to_lowercase().contains(&q) || a.id.to_lowercase().contains(&q)
+    }))
+}
+
 fn get_app_color(name_or_id: &str) -> u32 {
     const PALETTE: [u32; 10] = [
         0xFF3B82F6, // Sky Blue
@@ -800,14 +818,11 @@ fn run_daemon() {
                                                         && !server.scene.system_ui.is_open()
                                                         && !server.scene.keyboard.is_active
                                                     {
-                                                        // Press feedback: compress the icon
-                                                        // under the finger and hand it a
-                                                        // bouncy spring to rebound on release.
                                                         // Finger down: the icon compresses
                                                         // toward 0.90 and *stays* there
-                                                        // until release, so the press
-                                                        // reads as tactile rather than as
-                                                        // a one-shot pop.
+                                                        // until release, so the press reads
+                                                        // as tactile rather than as a
+                                                        // one-shot pop.
                                                         fn press(
                                                             target: &mut Option<String>,
                                                             id: String,
@@ -822,21 +837,18 @@ fn run_daemon() {
                                                             if let Some(idx) =
                                                                 l.drawer_grid_hit(off, raw_touch.x, raw_touch.y)
                                                             {
-                                                                let visible: Vec<&ManagedApp> =
-                                                                    if drawer_search.is_empty() {
-                                                                        all_managed_apps.iter().collect()
-                                                                    } else {
-                                                                        let q = drawer_search.to_lowercase();
-                                                                        all_managed_apps
-                                                                            .iter()
-                                                                            .filter(|a| {
-                                                                                a.name.to_lowercase().contains(&q)
-                                                                                    || a.id.to_lowercase().contains(&q)
-                                                                            })
-                                                                            .collect()
-                                                                    };
-                                                                if let Some(app) = visible.get(idx) {
-                                                                    press(&mut pressed_icon_id, app.id.clone(), &mut icon_bounce_spring);
+                                                                // No intermediate Vec: the
+                                                                // drawer's filtered view is an
+                                                                // iterator, and this runs on
+                                                                // every touch down.
+                                                                if let Some(app) = drawer_view(&all_managed_apps, &drawer_search)
+                                                                    .nth(idx)
+                                                                {
+                                                                    press(
+                                                                        &mut pressed_icon_id,
+                                                                        app.id.clone(),
+                                                                        &mut icon_bounce_spring,
+                                                                    );
                                                                 }
                                                             }
                                                         } else {
@@ -1246,16 +1258,12 @@ fn run_daemon() {
                                                         DrawerSearchHit::None => {
                                                             let drawer_l = Layout::plain(w, h);
                                                             if let Some(idx) = drawer_l.drawer_grid_hit(drawer_y_offset, x, y) {
-                                                                let drawer_apps: Vec<&ManagedApp> = if !drawer_search.is_empty() {
-                                                                    let q = drawer_search.to_lowercase();
-                                                                    all_managed_apps
-                                                                        .iter()
-                                                                        .filter(|a| a.name.to_lowercase().contains(&q) || a.id.to_lowercase().contains(&q))
-                                                                        .collect()
-                                                                } else {
-                                                                    all_managed_apps.iter().collect()
-                                                                };
-                                                                if let Some(target_app) = drawer_apps.get(idx) {
+                                                                if let Some(target_app) = drawer_view(
+                                                                    &all_managed_apps,
+                                                                    &drawer_search,
+                                                                )
+                                                                .nth(idx)
+                                                                {
                                                                     let cell = drawer_l.drawer_icon_cell(idx);
                                                                     app_launch_origin = Some((
                                                                         cell.center_x(),
@@ -1306,20 +1314,20 @@ fn run_daemon() {
                                                     } else if let Some(idx) =
                                                         home_l.home_grid_hit(x, y, home_scroll_offset)
                                                     {
-                                                        let filtered: Vec<&ManagedApp> = if !search_query.is_empty() {
-                                                            let q = search_query.to_lowercase();
-                                                            all_managed_apps
+                                                        // Search results replace the page
+                                                        // contents, so the two views share
+                                                        // the same iteration shape.
+                                                        let target = if search_query.is_empty() {
+                                                            home_pages[current_home_page]
                                                                 .iter()
-                                                                .filter(|a| a.name.to_lowercase().contains(&q) || a.id.to_lowercase().contains(&q))
-                                                                .collect()
+                                                                .filter_map(|id| {
+                                                                    all_managed_apps.iter().find(|a| a.id == *id)
+                                                                })
+                                                                .nth(idx)
                                                         } else {
-                                                            let current_page_app_ids = &home_pages[current_home_page];
-                                                            current_page_app_ids
-                                                                .iter()
-                                                                .filter_map(|id| all_managed_apps.iter().find(|a| a.id == *id))
-                                                                .collect()
+                                                            drawer_view(&all_managed_apps, search_query.as_str()).nth(idx)
                                                         };
-                                                        if let Some(target_app) = filtered.get(idx) {
+                                                        if let Some(target_app) = target {
                                                             let cell = home_l.grid_icon(idx);
                                                             app_launch_origin = Some((
                                                                 cell.center_x() + home_scroll_offset,
@@ -1452,17 +1460,12 @@ fn run_daemon() {
                                                             } else if let Some(idx) =
                                                                 drawer_l.drawer_grid_hit(drawer_y_offset, x, y)
                                                             {
-                                                                let drawer_apps: Vec<&ManagedApp> = if !drawer_search.is_empty() {
-                                                                    let q = drawer_search.to_lowercase();
-                                                                    all_managed_apps
-                                                                        .iter()
-                                                                        .filter(|a| a.name.to_lowercase().contains(&q) || a.id.to_lowercase().contains(&q))
-                                                                        .collect()
-                                                                } else {
-                                                                    all_managed_apps.iter().collect()
-                                                                };
-
-                                                                if let Some(target_app) = drawer_apps.get(idx) {
+                                                                if let Some(target_app) = drawer_view(
+                                                                    &all_managed_apps,
+                                                                    &drawer_search,
+                                                                )
+                                                                .nth(idx)
+                                                                {
                                                                     let cell = drawer_l.drawer_icon_cell(idx);
                                                                     app_launch_origin = Some((
                                                                         cell.center_x(),
@@ -1636,12 +1639,12 @@ fn run_daemon() {
                                                     let cy = cell.center_y();
 
                                                     if search_active && !search_query.is_empty() {
-                                                        let q = search_query.to_lowercase();
-                                                        let filtered: Vec<&ManagedApp> = all_managed_apps
-                                                            .iter()
-                                                            .filter(|a| a.name.to_lowercase().contains(&q) || a.id.to_lowercase().contains(&q))
-                                                            .collect();
-                                                        if let Some(target_app) = filtered.get(idx) {
+                                                        if let Some(target_app) = drawer_view(
+                                                            &all_managed_apps,
+                                                            search_query.as_str(),
+                                                        )
+                                                        .nth(idx)
+                                                        {
                                                             app_launch_origin = Some((cx, cy));
                                                             app_launch_progress = 0.01;
                                                             app_launch_color = target_app.color;
@@ -1870,16 +1873,9 @@ fn run_daemon() {
                                                 if let Some(idx) =
                                                     Layout::plain(w, h).drawer_grid_hit(drawer_y_offset, x, y)
                                                 {
-                                                    let drawer_apps: Vec<&ManagedApp> = if !drawer_search.is_empty() {
-                                                        let q = drawer_search.to_lowercase();
-                                                        all_managed_apps
-                                                            .iter()
-                                                            .filter(|a| a.name.to_lowercase().contains(&q) || a.id.to_lowercase().contains(&q))
-                                                            .collect()
-                                                    } else {
-                                                        all_managed_apps.iter().collect()
-                                                    };
-                                                    if let Some(target_app) = drawer_apps.get(idx) {
+                                                    if let Some(target_app) =
+                                                        drawer_view(&all_managed_apps, &drawer_search).nth(idx)
+                                                    {
                                                         if !home_pages[current_home_page].contains(&target_app.id) {
                                                             home_pages[current_home_page].push(target_app.id.clone());
                                                             println!("[UTLC] Pinned '{}' to Home Page {}", target_app.name, current_home_page + 1);
