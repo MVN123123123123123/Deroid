@@ -3925,10 +3925,8 @@ mod tests {
 
     #[test]
     fn test_home_pages_icon_reordering_and_movement() {
-        let mut home_pages = vec![
-            vec!["settings".to_string(), "files".to_string(), "terminal".to_string(), "gallery".to_string()],
-            vec!["clock".to_string(), "contacts".to_string()],
-        ];
+        let mut home_pages = [vec!["settings".to_string(), "files".to_string(), "terminal".to_string(), "gallery".to_string()],
+            vec!["clock".to_string(), "contacts".to_string()]];
         let current_page = 0;
         let mut selected_icon: Option<String> = Some("terminal".to_string());
 
@@ -3968,9 +3966,7 @@ mod tests {
     #[test]
     fn test_pixelui_app_drawer_and_pinning() {
         let all_apps = build_all_apps(&DesktopCatalogue::new());
-        let mut home_pages = vec![
-            vec!["terminal".to_string(), "gallery".to_string()],
-        ];
+        let mut home_pages = [vec!["terminal".to_string(), "gallery".to_string()]];
         let current_page = 0;
         let mut app_drawer_open = false;
 

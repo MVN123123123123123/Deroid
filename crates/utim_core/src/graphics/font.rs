@@ -354,7 +354,7 @@ mod tests {
         // Every printable ASCII glyph must have a positive, sane advance.
         for c in 0x20u8..0x80 {
             let a = glyph_of(c).a;
-            assert!(a >= 200.0 && a <= 900.0, "glyph {} advance {}", c, a);
+            assert!((200.0..=900.0).contains(&a), "glyph {} advance {}", c, a);
         }
         // Digits are tabular: the clock never jitters.
         let d0 = char_advance(b'0', 100.0);
@@ -371,7 +371,7 @@ mod tests {
     fn descenders_and_ascenders_exist_in_the_outlines() {
         // g, j, p, q, y must reach below the baseline; b, d, h, k, l above
         // the x-height.
-        for c in [b'g', b'j', b'p', b'q', b'y', b',', b';'] {
+        for c in *b"gjpqy,;" {
             let g = glyph_of(c);
             let mut min_y = f32::MAX;
             for sub in g.sub {
@@ -381,7 +381,7 @@ mod tests {
             }
             assert!(min_y < -100.0, "{} must descend (min y {})", c as char, min_y);
         }
-        for c in [b'b', b'd', b'h', b'k', b'l', b't', b'f'] {
+        for c in *b"bdhkltf" {
             let g = glyph_of(c);
             let mut max_y = f32::MIN;
             for sub in g.sub {

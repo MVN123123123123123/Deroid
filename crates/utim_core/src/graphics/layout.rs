@@ -1410,17 +1410,17 @@ mod tests {
             assert_eq!(k.hit(x, y), Some(Key::Enter), "{n}: enter");
             let (x, y) = probe(k.row4_space);
             assert_eq!(k.hit(x, y), Some(Key::Space), "{n}: space");
-            for i in 0..KB_ROW1 {
+            for (i, key) in ROW1.iter().enumerate() {
                 let (x, y) = probe(k.row1_at(i));
-                assert_eq!(k.hit(x, y), Some(Key::Char(ROW1[i])), "{n}: row1 {i}");
+                assert_eq!(k.hit(x, y), Some(Key::Char(*key)), "{n}: row1 {i}");
             }
-            for i in 0..KB_ROW2 {
+            for (i, key) in ROW2.iter().enumerate() {
                 let (x, y) = probe(k.row2_at(i));
-                assert_eq!(k.hit(x, y), Some(Key::Char(ROW2[i])), "{n}: row2 {i}");
+                assert_eq!(k.hit(x, y), Some(Key::Char(*key)), "{n}: row2 {i}");
             }
-            for i in 0..KB_ROW3_MID {
+            for (i, key) in ROW3.iter().enumerate() {
                 let (x, y) = probe(k.row3_mid[i]);
-                assert_eq!(k.hit(x, y), Some(Key::Char(ROW3[i])), "{n}: row3 {i}");
+                assert_eq!(k.hit(x, y), Some(Key::Char(*key)), "{n}: row3 {i}");
             }
         }
     }

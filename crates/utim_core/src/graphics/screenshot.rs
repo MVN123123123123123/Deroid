@@ -168,7 +168,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, n)| AppGridItem {
-                id: *n,
+                id: n,
                 name: n,
                 color: colour.wrapping_add((i as u32) * 0x0A0A0A),
                 glyph: "A",
@@ -190,7 +190,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, n)| AppGridItem {
-                id: *n,
+                id: n,
                 name: n,
                 color: 0xFF2563EBu32.wrapping_add(i as u32).wrapping_mul(0x080808),
                 glyph: "A",
@@ -201,7 +201,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, n)| AppGridItem {
-                id: *n,
+                id: n,
                 name: n,
                 color: 0xFF10B981u32.wrapping_add(i as u32).wrapping_mul(0x080808),
                 glyph: "A",
@@ -372,7 +372,7 @@ mod tests {
         let grid: Vec<AppGridItem> = names
             .iter()
             .map(|n| AppGridItem {
-                id: *n,
+                id: n,
                 name: n,
                 color: 0xFF2563EB,
                 glyph: "A",
@@ -637,7 +637,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, n)| AppGridItem {
-                id: *n,
+                id: n,
                 name: n,
                 color: 0xFFF59E0Bu32.wrapping_add(i as u32).wrapping_mul(0x080808),
                 glyph: "A",
@@ -712,7 +712,7 @@ mod tests {
         let grid: Vec<AppGridItem> = names
             .iter()
             .map(|n| AppGridItem {
-                id: *n,
+                id: n,
                 name: n,
                 color: 0xFF2563EB,
                 glyph: "A",
@@ -722,7 +722,7 @@ mod tests {
         let dock: Vec<AppGridItem> = ["Phone", "Messages", "Apps", "Browser", "Camera"]
             .iter()
             .map(|n| AppGridItem {
-                id: *n,
+                id: n,
                 name: n,
                 color: 0xFF10B981,
                 glyph: "A",
