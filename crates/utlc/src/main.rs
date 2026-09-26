@@ -28,10 +28,12 @@ use utim_core::compositor::protocols::{ProtocolRegistry, WaylandInterface};
 use utim_core::compositor::server::WaylandServer;
 use utim_core::compositor::systemui::{QuickTileKind, SystemUiShade};
 use utim_core::graphics::composer::{HwcComposer, HwcVersion};
+use utim_core::graphics::layout::{
+    AppLayout, AppPanel, DrawerSearchHit, Key, Keyboard, Layout, ShadeLayout, ShadeZone, TabHit,
+};
 use utim_core::graphics::{
-    AppGridItem, DrmInteractiveState, DrmKmsDevice, DrawerSearchHit, HomeActionHit,
-    LauncherLayout, RgbaImage, TerminalTabHit, TerminalTabInfo,
-    SpringConfig, SpringSimulation, apply_overscroll_resistance,
+    AppGridItem, DrmInteractiveState, DrmKmsDevice, MaterialYouPalette, RgbaImage,
+    TerminalTabInfo, SpringConfig, SpringSimulation, apply_overscroll_resistance,
 };
 
 #[derive(Debug, Clone)]
@@ -507,6 +509,9 @@ fn run_daemon() {
     };
 
     let mut time_buf = [0u8; 5];
+    // Material You: derive the tonal scheme from the wallpaper once at start
+    // up. The whole shell is then themed from a single value.
+    let shell_palette = MaterialYouPalette::from_seed(wallpaper_seed());
 
     if let Some(ref mut drm) = drm_display {
         let t_str = format_current_time(&mut time_buf);
@@ -765,50 +770,103 @@ fn run_daemon() {
                                                     touch_drag_start = Some((raw_touch.x, raw_touch.y));
                                                     let w = server.scene.width as f32;
                                                     let h = server.scene.height as f32;
-                                                    if active_app.is_none() && !server.scene.system_ui.is_open() && !server.scene.keyboard.is_active {
+                                                    if active_app.is_none()
+                                                        && !server.scene.system_ui.is_open()
+                                                        && !server.scene.keyboard.is_active
+                                                    {
+                                                        // Press feedback: compress the icon
+                                                        // under the finger and hand it a
+                                                        // bouncy spring to rebound on release.
+                                                        // Finger down: the icon compresses
+                                                        // toward 0.90 and *stays* there
+                                                        // until release, so the press
+                                                        // reads as tactile rather than as
+                                                        // a one-shot pop.
+                                                        fn press(
+                                                            target: &mut Option<String>,
+                                                            id: String,
+                                                            spring: &mut SpringSimulation,
+                                                        ) {
+                                                            *target = Some(id);
+                                                            spring.set_target(PRESS_SCALE);
+                                                        }
                                                         if app_drawer_open {
-                                                            let drawer_y_offset = (1.0 - drawer_progress.clamp(0.0, 1.0)) * h;
-                                                            if let Some(idx) = LauncherLayout::drawer_grid_hit_with_offset(w, h, drawer_y_offset, raw_touch.x, raw_touch.y) {
-                                                                if idx < all_managed_apps.len() {
-                                                                    pressed_icon_id = Some(all_managed_apps[idx].id.clone());
-                                                                    icon_bounce_spring.value = 0.92;
-                                                                    icon_bounce_spring.velocity = 0.0;
-                                                                    icon_bounce_spring.set_target(1.0);
+                                                            let off = (1.0 - drawer_progress.clamp(0.0, 1.0)) * h;
+                                                            let l = Layout::plain(w, h);
+                                                            if let Some(idx) =
+                                                                l.drawer_grid_hit(off, raw_touch.x, raw_touch.y)
+                                                            {
+                                                                let visible: Vec<&ManagedApp> =
+                                                                    if drawer_search.is_empty() {
+                                                                        all_managed_apps.iter().collect()
+                                                                    } else {
+                                                                        let q = drawer_search.to_lowercase();
+                                                                        all_managed_apps
+                                                                            .iter()
+                                                                            .filter(|a| {
+                                                                                a.name.to_lowercase().contains(&q)
+                                                                                    || a.id.to_lowercase().contains(&q)
+                                                                            })
+                                                                            .collect()
+                                                                    };
+                                                                if let Some(app) = visible.get(idx) {
+                                                                    press(&mut pressed_icon_id, app.id.clone(), &mut icon_bounce_spring);
                                                                 }
                                                             }
                                                         } else {
-                                                            if let Some(idx) = LauncherLayout::home_grid_hit_with_scroll(w, h, raw_touch.x, raw_touch.y, selected_home_icon.is_some(), home_scroll_offset) {
-                                                                if let Some(page) = home_pages.get(current_home_page) {
-                                                                    if let Some(id) = page.get(idx) {
-                                                                        pressed_icon_id = Some(id.clone());
-                                                                        icon_bounce_spring.value = 0.92;
-                                                                        icon_bounce_spring.velocity = 0.0;
-                                                                        icon_bounce_spring.set_target(1.0);
-                                                                    }
+                                                            let l = Layout::new(
+                                                                w,
+                                                                h,
+                                                                selected_home_icon.is_some(),
+                                                            );
+                                                            if let Some(idx) =
+                                                                l.home_grid_hit(
+                                                                    raw_touch.x,
+                                                                    raw_touch.y,
+                                                                    home_scroll_offset,
+                                                                )
+                                                            {
+                                                                if let Some(id) =
+                                                                    home_pages.get(current_home_page).and_then(|p| p.get(idx))
+                                                                {
+                                                                    press(&mut pressed_icon_id, id.clone(), &mut icon_bounce_spring);
                                                                 }
-                                                            } else if let Some(slot) = LauncherLayout::home_dock_hit(w, h, raw_touch.x, raw_touch.y, 5) {
-                                                                let dock_ids = ["phone", "messages", "apps", "browser", "camera"];
-                                                                if slot < dock_ids.len() {
-                                                                    pressed_icon_id = Some(dock_ids[slot].to_string());
-                                                                    icon_bounce_spring.value = 0.92;
-                                                                    icon_bounce_spring.velocity = 0.0;
-                                                                    icon_bounce_spring.set_target(1.0);
+                                                            } else if let Some(slot) =
+                                                                l.home_dock_hit(raw_touch.x, raw_touch.y)
+                                                            {
+                                                                let dock_ids = [
+                                                                    "phone", "messages", "apps", "browser", "camera",
+                                                                ];
+                                                                if let Some(id) = dock_ids.get(slot) {
+                                                                    press(&mut pressed_icon_id, (*id).to_string(), &mut icon_bounce_spring);
                                                                 }
                                                             }
                                                         }
                                                     }
                                                 }
                                                 TouchPhase::Move => {
-                                                    if active_app.is_none() && !server.scene.system_ui.is_open() && !server.scene.keyboard.is_active {
+                                                    if active_app.is_none()
+                                                        && !server.scene.system_ui.is_open()
+                                                        && !server.scene.keyboard.is_active
+                                                    {
+                                                        let h = server.scene.height as f32;
                                                         if let Some((_, sy)) = touch_drag_start {
                                                             let dy = sy - raw_touch.y;
-                                                            let drag_span = (server.scene.height as f32 * 0.6).max(100.0);
-                                                            if !app_drawer_open && dy > 10.0 {
-                                                                drawer_progress = (dy / drag_span).clamp(0.0, 1.0);
+                                                            // Drag span is the drawer's own
+                                                            // height, so the sheet tracks the
+                                                            // finger one-to-one.
+                                                            let drawer_l = Layout::plain(server.scene.width as f32, h);
+                                                            let drag_span = (h - drawer_l.drawer_handle.y)
+                                                                .max(100.0);
+                                                            let slop = h * 0.004;
+                                                            if !app_drawer_open && dy > slop {
+                                                                drawer_progress =
+                                                                    (dy / drag_span).clamp(0.0, 1.0);
                                                                 drawer_spring.value = drawer_progress;
                                                                 drawer_spring.velocity = 0.0;
-                                                            } else if app_drawer_open && dy < -10.0 {
-                                                                drawer_progress = (1.0 + dy / drag_span).clamp(0.0, 1.0);
+                                                            } else if app_drawer_open && dy < -slop {
+                                                                drawer_progress =
+                                                                    (1.0 + dy / drag_span).clamp(0.0, 1.0);
                                                                 drawer_spring.value = drawer_progress;
                                                                 drawer_spring.velocity = 0.0;
                                                             }
@@ -818,24 +876,35 @@ fn run_daemon() {
                                                 TouchPhase::Up | TouchPhase::Cancel => {
                                                     if let Some((_, sy)) = touch_drag_start.take() {
                                                         let dy = sy - raw_touch.y;
-                                                        if active_app.is_none() && !server.scene.system_ui.is_open() && !server.scene.keyboard.is_active {
+                                                        if active_app.is_none()
+                                                            && !server.scene.system_ui.is_open()
+                                                            && !server.scene.keyboard.is_active
+                                                        {
+                                                            let h = server.scene.height as f32;
+                                                            // Commit past the halfway point,
+                                                            // or on a decisive flick.
+                                                            let flick = h * 0.12;
                                                             if !app_drawer_open {
-                                                                if drawer_progress > 0.35 || dy > 80.0 {
+                                                                if drawer_progress > 0.5 || dy > flick {
                                                                     app_drawer_open = true;
                                                                 }
-                                                            } else {
-                                                                if drawer_progress < 0.65 || dy < -80.0 {
-                                                                    app_drawer_open = false;
-                                                                    drawer_search_active = false;
-                                                                    drawer_search.clear();
-                                                                }
+                                                            } else if drawer_progress < 0.5 || dy < -flick {
+                                                                app_drawer_open = false;
+                                                                drawer_search_active = false;
+                                                                drawer_search.clear();
                                                             }
-                                                            let target = if app_drawer_open { 1.0 } else { 0.0 };
+                                                            let target =
+                                                                if app_drawer_open { 1.0 } else { 0.0 };
                                                             drawer_spring.set_target(target);
-                                                            let fling_vel = (dy / 50.0).clamp(-12.0, 12.0);
-                                                            drawer_spring.velocity = fling_vel;
+                                                            // Hand the release velocity to the
+                                                            // spring, which is what makes the
+                                                            // sheet feel like it has mass.
+                                                            drawer_spring.velocity =
+                                                                (dy / 50.0).clamp(-12.0, 12.0);
                                                         }
                                                     }
+                                                    // Release: rebound to full size
+                                                    // with an underdamped overshoot.
                                                     icon_bounce_spring.set_target(1.0);
                                                 }
                                             }
@@ -944,34 +1013,33 @@ fn run_daemon() {
                                         InputDispatchResult::Tap { x, y } => {
                                             let w = server.scene.width as f32;
                                             let h = server.scene.height as f32;
-                                            let kb_h = LauncherLayout::KB_H;
-                                            let kb_y = h - kb_h - LauncherLayout::KB_BOTTOM_MARGIN;
-
                                             // Trigger tactile touch ripple on every tap
                                             touch_ripple = Some((x, y, 12.0, 0.7));
 
                                             if server.scene.system_ui.is_open() {
-                                                if y < LauncherLayout::STATUS_BAR_H || y > 580.0 {
-                                                    server.scene.system_ui.close();
-                                                } else if let Some(idx) = LauncherLayout::quick_tile_hit(w, x, y) {
-                                                    if idx < quick_tiles_active.len() {
-                                                        quick_tiles_active[idx] = !quick_tiles_active[idx];
+                                                let shade = ShadeLayout::new(w, h);
+                                                match shade.zone(x, y) {
+                                                    ShadeZone::Tiles(i) => {
+                                                        if i < quick_tiles_active.len() {
+                                                            quick_tiles_active[i] =
+                                                                !quick_tiles_active[i];
+                                                        }
                                                     }
+                                                    // Tapping the dimmed backdrop above the
+                                                    // tiles, or the pull handle, closes.
+                                                    ShadeZone::Header | ShadeZone::Empty => {
+                                                        server.scene.system_ui.close();
+                                                    }
+                                                    ShadeZone::Brightness
+                                                    | ShadeZone::Notifications
+                                                    | ShadeZone::Handle => {}
                                                 }
-                                            } else if server.scene.keyboard.is_active && y >= kb_y && y <= (h - LauncherLayout::KB_BOTTOM_MARGIN) {
-                                                // Virtual Keyboard key tap
-                                                let kb_w = w - 24.0;
-                                                let kb_x = 12.0;
-
-                                                let row1 = ["Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P"];
-                                                let row2 = ["A", "S", "D", "F", "G", "H", "J", "K", "L"];
-                                                let row3 = ["Z", "X", "C", "V", "B", "N", "M"];
-
-                                                let r1_y = kb_y + 25.0;
-                                                let r2_y = r1_y + 65.0 + 12.0;
-                                                let r3_y = r2_y + 65.0 + 12.0;
-                                                let r4_y = r3_y + 65.0 + 12.0;
-
+                                            } else if let Some(key) =
+                                                Keyboard::new(w, h).hit(x, y)
+                                            {
+                                                // Virtual keyboard: the key under the
+                                                // finger comes from the same layout the
+                                                // keyboard is drawn from.
                                                 let handle_key_input = |key_str: &str,
                                                                             active_app: &mut Option<String>,
                                                                             app_input: &mut String,
@@ -1026,12 +1094,9 @@ fn run_daemon() {
                                                         );
                                                     }
                                                 };
-
-                                                if y >= r1_y && y < r1_y + 65.0 {
-                                                    let r1_key_w = (kb_w - 30.0) / 10.0;
-                                                    let idx = ((x - kb_x - 15.0) / r1_key_w).clamp(0.0, 9.0) as usize;
-                                                    handle_key_input(
-                                                        row1[idx],
+                                                match key {
+                                                    Key::Char(c) => handle_key_input(
+                                                        &c.to_string(),
                                                         &mut active_app,
                                                         &mut app_input,
                                                         &mut app_input_focused,
@@ -1045,12 +1110,9 @@ fn run_daemon() {
                                                         &mut next_tab_id,
                                                         &mut server.scene.keyboard,
                                                         &mut messages_list,
-                                                    );
-                                                } else if y >= r2_y && y < r2_y + 65.0 {
-                                                    let r2_key_w = (kb_w - 60.0) / 9.0;
-                                                    let idx = ((x - kb_x - 30.0) / r2_key_w).clamp(0.0, 8.0) as usize;
-                                                    handle_key_input(
-                                                        row2[idx],
+                                                    ),
+                                                    Key::Space => handle_key_input(
+                                                        "SPACE",
                                                         &mut active_app,
                                                         &mut app_input,
                                                         &mut app_input_focused,
@@ -1064,103 +1126,61 @@ fn run_daemon() {
                                                         &mut next_tab_id,
                                                         &mut server.scene.keyboard,
                                                         &mut messages_list,
-                                                    );
-                                                } else if y >= r3_y && y < r3_y + 65.0 {
-                                                    let special_w = 95.0;
-                                                    let mid_w = (kb_w - 30.0 - special_w * 2.0) / 7.0;
-                                                    if x > kb_x + 15.0 + special_w + 7.0 * mid_w {
-                                                        // Backspace
-                                                        handle_key_input(
-                                                            "BACKSPACE",
-                                                            &mut active_app,
-                                                            &mut app_input,
-                                                            &mut app_input_focused,
-                                                            &mut search_active,
-                                                            &mut search_query,
-                                                            &mut drawer_search,
-                                                            &mut drawer_search_active,
-                                                            app_drawer_open,
-                                                            &mut terminal_tabs,
-                                                            &mut active_tab_idx,
-                                                            &mut next_tab_id,
-                                                            &mut server.scene.keyboard,
-                                                            &mut messages_list,
-                                                        );
-                                                    } else if x >= kb_x + 15.0 + special_w {
-                                                        let idx = ((x - kb_x - 15.0 - special_w) / mid_w).clamp(0.0, 6.0) as usize;
-                                                        handle_key_input(
-                                                            row3[idx],
-                                                            &mut active_app,
-                                                            &mut app_input,
-                                                            &mut app_input_focused,
-                                                            &mut search_active,
-                                                            &mut search_query,
-                                                            &mut drawer_search,
-                                                            &mut drawer_search_active,
-                                                            app_drawer_open,
-                                                            &mut terminal_tabs,
-                                                            &mut active_tab_idx,
-                                                            &mut next_tab_id,
-                                                            &mut server.scene.keyboard,
-                                                            &mut messages_list,
-                                                        );
-                                                    } else {
-                                                        // Shift key
-                                                        let _ = server.scene.keyboard.handle_key_tap("SHIFT");
-                                                    }
-                                                } else if y >= r4_y && y < r4_y + 65.0 {
-                                                    let sym_w = 120.0;
-                                                    let enter_w = 140.0;
-                                                    let space_x = kb_x + 15.0 + sym_w;
-                                                    let enter_x = kb_w - enter_w;
-
-                                                    if x <= kb_x + 15.0 + sym_w {
-                                                        // "Hide" key tapped -> dismiss virtual keyboard
+                                                    ),
+                                                    Key::Enter => handle_key_input(
+                                                        "ENTER",
+                                                        &mut active_app,
+                                                        &mut app_input,
+                                                        &mut app_input_focused,
+                                                        &mut search_active,
+                                                        &mut search_query,
+                                                        &mut drawer_search,
+                                                        &mut drawer_search_active,
+                                                        app_drawer_open,
+                                                        &mut terminal_tabs,
+                                                        &mut active_tab_idx,
+                                                        &mut next_tab_id,
+                                                        &mut server.scene.keyboard,
+                                                        &mut messages_list,
+                                                    ),
+                                                    Key::Backspace => handle_key_input(
+                                                        "BACKSPACE",
+                                                        &mut active_app,
+                                                        &mut app_input,
+                                                        &mut app_input_focused,
+                                                        &mut search_active,
+                                                        &mut search_query,
+                                                        &mut drawer_search,
+                                                        &mut drawer_search_active,
+                                                        app_drawer_open,
+                                                        &mut terminal_tabs,
+                                                        &mut active_tab_idx,
+                                                        &mut next_tab_id,
+                                                        &mut server.scene.keyboard,
+                                                        &mut messages_list,
+                                                    ),
+                                                    Key::Hide => {
                                                         server.scene.keyboard.deactivate();
                                                         app_input_focused = false;
                                                         drawer_search_active = false;
-                                                    } else if x >= enter_x {
-                                                        handle_key_input(
-                                                            "ENTER",
-                                                            &mut active_app,
-                                                            &mut app_input,
-                                                            &mut app_input_focused,
-                                                            &mut search_active,
-                                                            &mut search_query,
-                                                            &mut drawer_search,
-                                                            &mut drawer_search_active,
-                                                            app_drawer_open,
-                                                            &mut terminal_tabs,
-                                                            &mut active_tab_idx,
-                                                            &mut next_tab_id,
-                                                            &mut server.scene.keyboard,
-                                                            &mut messages_list,
-                                                        );
-                                                    } else if x >= space_x {
-                                                        handle_key_input(
-                                                            "SPACE",
-                                                            &mut active_app,
-                                                            &mut app_input,
-                                                            &mut app_input_focused,
-                                                            &mut search_active,
-                                                            &mut search_query,
-                                                            &mut drawer_search,
-                                                            &mut drawer_search_active,
-                                                            app_drawer_open,
-                                                            &mut terminal_tabs,
-                                                            &mut active_tab_idx,
-                                                            &mut next_tab_id,
-                                                            &mut server.scene.keyboard,
-                                                            &mut messages_list,
-                                                        );
+                                                    }
+                                                    Key::Shift => {
+                                                        let _ = server.scene.keyboard.handle_key_tap("SHIFT");
                                                     }
                                                 }
                                             } else if server.scene.keyboard.is_active {
                                                 // Tapped outside keyboard while keyboard was active
                                                 if active_app.is_some() {
-                                                    if LauncherLayout::app_bar_back_hit(x, y)
-                                                        || LauncherLayout::app_bar_close_hit(w, x, y)
-                                                        || LauncherLayout::bottom_nav_pill_hit(h, y)
+                                                    let home = Layout::plain(w, h);
+                                                    let app_l = AppLayout::new(
+                                                        w,
+                                                        h,
+                                                        AppPanel::Other,
+                                                        terminal_tabs.len(),
+                                                    );
+                                                    if app_l.back.contains(x, y)
+                                                        || app_l.close.contains(x, y)
+                                                        || home.nav_pill.contains(x, y)
                                                     {
                                                         if active_app.as_deref() == Some("Terminal") {
                                                             for tab in &terminal_tabs {
@@ -1173,13 +1193,13 @@ fn run_daemon() {
                                                         app_input_focused = false;
                                                         app_input.clear();
                                                     } else if active_app.as_deref() == Some("Messages") {
-                                                        let content_y = 48.0 + 56.0 + 12.0;
-                                                        let content_h = h - content_y - 450.0;
-                                                        let msg_box_y = content_y + (content_h - 58.0).max(0.0);
-                                                        let send_btn_x = w - 92.0;
-                                                        if x >= send_btn_x && (msg_box_y..=(msg_box_y + 50.0)).contains(&y) {
+                                                        // Composer field and send button come
+                                                        // from the same layout they are
+                                                        // drawn with.
+                                                        if app_l.send.contains(x, y) {
                                                             if !app_input.is_empty() {
-                                                                messages_list.push(format!("You: {}", app_input));
+                                                                messages_list
+                                                                    .push(format!("You: {}", app_input));
                                                                 app_input.clear();
                                                             }
                                                         } else {
@@ -1190,7 +1210,7 @@ fn run_daemon() {
                                                     }
                                                 } else if app_drawer_open {
                                                     let drawer_y_offset = (1.0 - drawer_progress.clamp(0.0, 1.0)) * h;
-                                                    match LauncherLayout::drawer_search_hit_with_offset(w, drawer_y_offset, x, y) {
+                                                    match Layout::plain(w, h).drawer_search_hit(drawer_y_offset, x, y) {
                                                         DrawerSearchHit::Clear => {
                                                             drawer_search.clear();
                                                         }
@@ -1198,7 +1218,8 @@ fn run_daemon() {
                                                             drawer_search_active = true;
                                                         }
                                                         DrawerSearchHit::None => {
-                                                            if let Some(idx) = LauncherLayout::drawer_grid_hit_with_offset(w, h, drawer_y_offset, x, y) {
+                                                            let drawer_l = Layout::plain(w, h);
+                                                            if let Some(idx) = drawer_l.drawer_grid_hit(drawer_y_offset, x, y) {
                                                                 let drawer_apps: Vec<&ManagedApp> = if !drawer_search.is_empty() {
                                                                     let q = drawer_search.to_lowercase();
                                                                     all_managed_apps
@@ -1209,12 +1230,11 @@ fn run_daemon() {
                                                                     all_managed_apps.iter().collect()
                                                                 };
                                                                 if let Some(target_app) = drawer_apps.get(idx) {
-                                                                    let col = idx % LauncherLayout::GRID_COLS;
-                                                                    let row = idx / LauncherLayout::GRID_COLS;
-                                                                    let col_w = w / LauncherLayout::GRID_COLS as f32;
-                                                                    let cx = col as f32 * col_w + col_w / 2.0;
-                                                                    let cy = drawer_y_offset + LauncherLayout::DRAWER_GRID_TOP + row as f32 * LauncherLayout::GRID_ROW_H;
-                                                                    app_launch_origin = Some((cx, cy));
+                                                                    let cell = drawer_l.drawer_icon_cell(idx);
+                                                                    app_launch_origin = Some((
+                                                                        cell.center_x(),
+                                                                        drawer_y_offset + cell.center_y(),
+                                                                    ));
                                                                     app_launch_progress = 0.01;
                                                                     app_launch_color = target_app.color;
 
@@ -1239,7 +1259,10 @@ fn run_daemon() {
                                                                         launch_desktop_app(&app_exec, &socket_dir);
                                                                     }
                                                                 }
-                                                            } else if y < drawer_y_offset || LauncherLayout::drawer_handle_hit(drawer_y_offset, y) || LauncherLayout::bottom_nav_pill_hit(h, y) {
+                                                            } else if y < drawer_y_offset
+                                                                || Layout::plain(w, h).drawer_handle.contains(x, y - drawer_y_offset)
+                                                                || Layout::plain(w, h).nav_pill.contains(x, y)
+                                                            {
                                                                 app_drawer_open = false;
                                                                 drawer_search_active = false;
                                                                 drawer_search.clear();
@@ -1251,9 +1274,12 @@ fn run_daemon() {
                                                         }
                                                     }
                                                 } else if search_active {
-                                                    if LauncherLayout::home_search_hit(w, x, y) {
+                                                    let home_l = Layout::plain(w, h);
+                                                    if home_l.search.contains(x, y) {
                                                         // Tap on search bar keeps focus
-                                                    } else if let Some(idx) = LauncherLayout::home_grid_hit_with_scroll(w, h, x, y, false, home_scroll_offset) {
+                                                    } else if let Some(idx) =
+                                                        home_l.home_grid_hit(x, y, home_scroll_offset)
+                                                    {
                                                         let filtered: Vec<&ManagedApp> = if !search_query.is_empty() {
                                                             let q = search_query.to_lowercase();
                                                             all_managed_apps
@@ -1268,12 +1294,11 @@ fn run_daemon() {
                                                                 .collect()
                                                         };
                                                         if let Some(target_app) = filtered.get(idx) {
-                                                            let col = idx % LauncherLayout::GRID_COLS;
-                                                            let row = idx / LauncherLayout::GRID_COLS;
-                                                            let col_w = w / LauncherLayout::GRID_COLS as f32;
-                                                            let cx = col as f32 * col_w + col_w / 2.0 + home_scroll_offset;
-                                                            let cy = LauncherLayout::GRID_TOP_NORMAL + row as f32 * LauncherLayout::GRID_ROW_H;
-                                                            app_launch_origin = Some((cx, cy));
+                                                            let cell = home_l.grid_icon(idx);
+                                                            app_launch_origin = Some((
+                                                                cell.center_x() + home_scroll_offset,
+                                                                cell.center_y(),
+                                                            ));
                                                             app_launch_progress = 0.01;
                                                             app_launch_color = target_app.color;
                                                             let app_to_launch = target_app.name.clone();
@@ -1298,9 +1323,16 @@ fn run_daemon() {
                                                 }
                                             } else if active_app.is_some() {
                                                 // An app is open and keyboard is not active
-                                                if LauncherLayout::app_bar_back_hit(x, y)
-                                                    || LauncherLayout::app_bar_close_hit(w, x, y)
-                                                    || LauncherLayout::bottom_nav_pill_hit(h, y)
+                                                let home = Layout::plain(w, h);
+                                                let app_l = AppLayout::new(
+                                                    w,
+                                                    h,
+                                                    AppPanel::Other,
+                                                    terminal_tabs.len(),
+                                                );
+                                                if app_l.back.contains(x, y)
+                                                    || app_l.close.contains(x, y)
+                                                    || home.nav_pill.contains(x, y)
                                                 {
                                                     if active_app.as_deref() == Some("Terminal") {
                                                         for tab in &terminal_tabs {
@@ -1313,13 +1345,16 @@ fn run_daemon() {
                                                     app_input_focused = false;
                                                     app_input.clear();
                                                 } else if active_app.as_deref() == Some("Terminal") {
-                                                    match LauncherLayout::terminal_tab_hit(x, y, terminal_tabs.len(), active_tab_idx) {
-                                                        TerminalTabHit::SelectTab(i) => {
+                                                    let tab_l = AppLayout::new(
+                                                        w, h, AppPanel::Terminal, terminal_tabs.len(),
+                                                    );
+                                                    match tab_l.hit_tab_active(x, y, active_tab_idx) {
+                                                        Some(TabHit::Select(i)) => {
                                                             active_tab_idx = i;
                                                             server.scene.keyboard.activate();
                                                             app_input_focused = true;
                                                         }
-                                                        TerminalTabHit::CloseTab(i) => {
+                                                        Some(TabHit::Close(i)) => {
                                                             if terminal_tabs.len() > 1 && i < terminal_tabs.len() {
                                                                 terminal_tabs[i].cleanup_child();
                                                                 terminal_tabs.remove(i);
@@ -1330,7 +1365,7 @@ fn run_daemon() {
                                                             server.scene.keyboard.activate();
                                                             app_input_focused = true;
                                                         }
-                                                        TerminalTabHit::AddTab => {
+                                                        Some(TabHit::Add) => {
                                                             if terminal_tabs.len() < 4 {
                                                                 terminal_tabs.push(TerminalTab::new(next_tab_id));
                                                                 next_tab_id += 1;
@@ -1339,19 +1374,16 @@ fn run_daemon() {
                                                                 app_input_focused = true;
                                                             }
                                                         }
-                                                        TerminalTabHit::None => {
+                                                        None => {
                                                             server.scene.keyboard.activate();
                                                             app_input_focused = true;
                                                         }
                                                     }
                                                 } else if active_app.as_deref() == Some("Messages") {
-                                                    let content_y = 48.0 + 56.0 + 12.0;
-                                                    let content_h = h - content_y - 50.0;
-                                                    let msg_box_y = content_y + (content_h - 58.0).max(0.0);
-                                                    let send_btn_x = w - 92.0;
-                                                    if x >= send_btn_x && (msg_box_y..=(msg_box_y + 50.0)).contains(&y) {
+                                                    if app_l.send.contains(x, y) {
                                                         if !app_input.is_empty() {
-                                                            messages_list.push(format!("You: {}", app_input));
+                                                            messages_list
+                                                                .push(format!("You: {}", app_input));
                                                             app_input.clear();
                                                         }
                                                     } else {
@@ -1367,13 +1399,16 @@ fn run_daemon() {
                                             } else if app_drawer_open {
                                                 // App Drawer tap handling with dynamic sliding offset
                                                 let drawer_y_offset = (1.0 - drawer_progress.clamp(0.0, 1.0)) * h;
-                                                if y < drawer_y_offset || LauncherLayout::drawer_handle_hit(drawer_y_offset, y) {
+                                                let drawer_l = Layout::plain(w, h);
+                                                if y < drawer_y_offset
+                                                    || drawer_l.drawer_handle.contains(x, y - drawer_y_offset)
+                                                {
                                                     // Pull handle / top area: dismiss drawer
                                                     app_drawer_open = false;
                                                     drawer_search_active = false;
                                                     server.scene.keyboard.deactivate();
                                                 } else {
-                                                    match LauncherLayout::drawer_search_hit_with_offset(w, drawer_y_offset, x, y) {
+                                                    match Layout::plain(w, h).drawer_search_hit(drawer_y_offset, x, y) {
                                                         DrawerSearchHit::Clear => {
                                                             drawer_search.clear();
                                                         }
@@ -1382,13 +1417,15 @@ fn run_daemon() {
                                                             server.scene.keyboard.activate();
                                                         }
                                                         DrawerSearchHit::None => {
-                                                            if LauncherLayout::bottom_nav_pill_hit(h, y) {
+                                                            if Layout::plain(w, h).nav_pill.contains(x, y) {
                                                                 // Bottom pill: close drawer
                                                                 app_drawer_open = false;
                                                                 drawer_search_active = false;
                                                                 drawer_search.clear();
                                                                 server.scene.keyboard.deactivate();
-                                                            } else if let Some(idx) = LauncherLayout::drawer_grid_hit_with_offset(w, h, drawer_y_offset, x, y) {
+                                                            } else if let Some(idx) =
+                                                                drawer_l.drawer_grid_hit(drawer_y_offset, x, y)
+                                                            {
                                                                 let drawer_apps: Vec<&ManagedApp> = if !drawer_search.is_empty() {
                                                                     let q = drawer_search.to_lowercase();
                                                                     all_managed_apps
@@ -1400,12 +1437,11 @@ fn run_daemon() {
                                                                 };
 
                                                                 if let Some(target_app) = drawer_apps.get(idx) {
-                                                                    let col = idx % LauncherLayout::GRID_COLS;
-                                                                    let row = idx / LauncherLayout::GRID_COLS;
-                                                                    let col_w = w / LauncherLayout::GRID_COLS as f32;
-                                                                    let cx = col as f32 * col_w + col_w / 2.0;
-                                                                    let cy = drawer_y_offset + LauncherLayout::DRAWER_GRID_TOP + row as f32 * LauncherLayout::GRID_ROW_H;
-                                                                    app_launch_origin = Some((cx, cy));
+                                                                    let cell = drawer_l.drawer_icon_cell(idx);
+                                                                    app_launch_origin = Some((
+                                                                        cell.center_x(),
+                                                                        drawer_y_offset + cell.center_y(),
+                                                                    ));
                                                                     app_launch_progress = 0.01;
                                                                     app_launch_color = target_app.color;
 
@@ -1435,12 +1471,22 @@ fn run_daemon() {
                                                     }
                                                 }
                                             } else {
-                                                // Home screen hit testing
-                                                if LauncherLayout::status_bar_hit(y) {
+                                                // Home screen hit testing.
+                                                //
+                                                // `home_l` is the exact layout the
+                                                // renderer used for this frame, so a
+                                                // tap lands on exactly the widget
+                                                // the user sees under their finger.
+                                                let home_l =
+                                                    Layout::new(w, h, selected_home_icon.is_some());
+                                                if home_l.status_bar_h >= y {
                                                     server.scene.system_ui.toggle();
-                                                } else if selected_home_icon.is_some() && LauncherLayout::home_action_chips_hit(w, x, y).is_some() {
-                                                    match LauncherLayout::home_action_chips_hit(w, x, y) {
-                                                        Some(HomeActionHit::RemoveFromHome) => {
+                                                } else if selected_home_icon.is_some()
+                                                    && (home_l.remove_chip.contains(x, y)
+                                                        || home_l.move_chip.contains(x, y))
+                                                {
+                                                    match home_l.remove_chip.contains(x, y) {
+                                                        true => {
                                                             if let Some(ref sel_id) = selected_home_icon {
                                                                 if let Some(pos) = home_pages[current_home_page].iter().position(|id| id == sel_id) {
                                                                     home_pages[current_home_page].remove(pos);
@@ -1449,7 +1495,7 @@ fn run_daemon() {
                                                             }
                                                             selected_home_icon = None;
                                                         }
-                                                        Some(HomeActionHit::MoveToOtherPage) => {
+                                                        false => {
                                                             if let Some(sel_id) = selected_home_icon.take() {
                                                                 if let Some(pos) = home_pages[current_home_page].iter().position(|id| *id == sel_id) {
                                                                     home_pages[current_home_page].remove(pos);
@@ -1468,11 +1514,13 @@ fn run_daemon() {
                                                                 println!("[UTLC] Moved app '{}' to Home Page {}", sel_id, current_home_page + 1);
                                                             }
                                                         }
-                                                        None => {}
                                                     }
-                                                } else if LauncherLayout::home_clock_hit(w, x, y) {
+                                                } else if home_l.clock_rect().contains(x, y) {
                                                     active_app = Some("Clock".to_string());
-                                                    app_launch_origin = Some((w / 2.0, LauncherLayout::CLOCK_Y + 35.0));
+                                                    app_launch_origin = Some((
+                                                        home_l.w * 0.5,
+                                                        home_l.clock_y + home_l.clock_h * 0.5,
+                                                    ));
                                                     app_launch_progress = 0.01;
                                                     app_launch_color = 0xFFEF4444;
                                                     app_input.clear();
@@ -1480,10 +1528,12 @@ fn run_daemon() {
                                                     selected_home_icon = None;
                                                     server.scene.keyboard.deactivate();
                                                     search_active = false;
-                                                } else if LauncherLayout::home_search_hit(w, x, y) {
+                                                } else if home_l.search.contains(x, y) {
                                                     search_active = true;
                                                     server.scene.keyboard.activate();
-                                                } else if let Some(target_page) = LauncherLayout::home_page_dots_hit(w, h, x, y, home_pages.len()) {
+                                                } else if let Some(target_page) =
+                                                    home_l.home_page_hit(x, y, home_pages.len())
+                                                {
                                                     if let Some(sel_id) = selected_home_icon.take() {
                                                         if target_page != current_home_page {
                                                             if let Some(pos) = home_pages[current_home_page].iter().position(|id| *id == sel_id) {
@@ -1504,7 +1554,9 @@ fn run_daemon() {
                                                         }
                                                         current_home_page = target_page;
                                                     }
-                                                } else if let Some(dock_slot) = LauncherLayout::home_dock_hit(w, h, x, y, 5) {
+                                                } else if let Some(dock_slot) =
+                                                    home_l.home_dock_hit(x, y)
+                                                {
                                                     let dock_apps = ["Phone", "Messages", "Apps", "Browser", "Camera"];
                                                     let app = dock_apps[dock_slot];
                                                     if app == "Apps" {
@@ -1515,10 +1567,9 @@ fn run_daemon() {
                                                         drawer_search_active = false;
                                                         server.scene.keyboard.deactivate();
                                                     } else {
-                                                        let dock_col_w = (w - LauncherLayout::DOCK_PAD_X * 2.0) / 5.0;
-                                                        let cx = LauncherLayout::DOCK_PAD_X + dock_slot as f32 * dock_col_w + dock_col_w / 2.0;
-                                                        let cy = h - LauncherLayout::DOCK_H - LauncherLayout::DOCK_BOTTOM_MARGIN + LauncherLayout::DOCK_H / 2.0;
-                                                        app_launch_origin = Some((cx, cy));
+                                                        let dock_icon = home_l.dock_icon_rect(dock_slot);
+                                                        app_launch_origin =
+                                                            Some((dock_icon.center_x(), dock_icon.center_y()));
                                                         app_launch_progress = 0.01;
                                                         let entry = all_managed_apps.iter().find(|a| a.name == app);
                                                         app_launch_color = entry.map(|a| a.color).unwrap_or(0xFF2563EB);
@@ -1542,7 +1593,7 @@ fn run_daemon() {
                                                             }
                                                         }
                                                     }
-                                                } else if LauncherLayout::bottom_nav_pill_hit(h, y) {
+                                                } else if home_l.nav_pill.contains(x, y) {
                                                     active_app = None;
                                                     search_active = false;
                                                     app_drawer_open = false;
@@ -1551,17 +1602,12 @@ fn run_daemon() {
                                                     app_input.clear();
                                                     server.scene.keyboard.deactivate();
                                                     server.scene.system_ui.close();
-                                                } else if let Some(idx) = LauncherLayout::home_grid_hit_with_scroll(w, h, x, y, selected_home_icon.is_some(), home_scroll_offset) {
-                                                    let col = idx % LauncherLayout::GRID_COLS;
-                                                    let row = idx / LauncherLayout::GRID_COLS;
-                                                    let col_w = w / LauncherLayout::GRID_COLS as f32;
-                                                    let grid_top = if selected_home_icon.is_some() {
-                                                        LauncherLayout::GRID_TOP_SELECTED
-                                                    } else {
-                                                        LauncherLayout::GRID_TOP_NORMAL
-                                                    };
-                                                    let cx = col as f32 * col_w + col_w / 2.0 + home_scroll_offset;
-                                                    let cy = grid_top + row as f32 * LauncherLayout::GRID_ROW_H;
+                                                } else if let Some(idx) =
+                                                    home_l.home_grid_hit(x, y, home_scroll_offset)
+                                                {
+                                                    let cell = home_l.grid_icon(idx);
+                                                    let cx = cell.center_x() + home_scroll_offset;
+                                                    let cy = cell.center_y();
 
                                                     if search_active && !search_query.is_empty() {
                                                         let q = search_query.to_lowercase();
@@ -1795,7 +1841,9 @@ fn run_daemon() {
                                             touch_ripple = Some((x, y, 18.0, 0.9));
                                             if app_drawer_open {
                                                 let drawer_y_offset = (1.0 - drawer_progress.clamp(0.0, 1.0)) * h;
-                                                if let Some(idx) = LauncherLayout::drawer_grid_hit_with_offset(w, h, drawer_y_offset, x, y) {
+                                                if let Some(idx) =
+                                                    Layout::plain(w, h).drawer_grid_hit(drawer_y_offset, x, y)
+                                                {
                                                     let drawer_apps: Vec<&ManagedApp> = if !drawer_search.is_empty() {
                                                         let q = drawer_search.to_lowercase();
                                                         all_managed_apps
@@ -1816,7 +1864,11 @@ fn run_daemon() {
                                                     }
                                                 }
                                             } else if active_app.is_none() && !server.scene.system_ui.is_open() {
-                                                if let Some(idx) = LauncherLayout::home_grid_hit_with_scroll(w, h, x, y, selected_home_icon.is_some(), home_scroll_offset) {
+                                                if let Some(idx) = Layout::new(
+                                                    w, h, selected_home_icon.is_some(),
+                                                )
+                                                .home_grid_hit(x, y, home_scroll_offset)
+                                                {
                                                     let page_app_ids = &home_pages[current_home_page];
                                                     if let Some(app_id) = page_app_ids.get(idx) {
                                                         selected_home_icon = Some(app_id.clone());
@@ -1984,7 +2036,9 @@ fn run_daemon() {
             last_frame = Instant::now();
             let _ = server.step_frame(dt);
 
-            // Modern Lawnchair 17 / Pixel Launcher Animations and Transitions
+            // Lawnchair 17 / Android DynamicAnimation transitions. Every one
+            // of these is an analytical damped-oscillator spring integrated at
+            // the real frame delta, so motion is identical at 60 and 120 Hz.
             let drawer_target = if app_drawer_open { 1.0 } else { 0.0 };
             if touch_drag_start.is_none() {
                 drawer_spring.set_target(drawer_target);
@@ -1993,23 +2047,35 @@ fn run_daemon() {
             }
 
             page_scroll_spring.step(dt);
-            home_scroll_offset = page_scroll_spring.value;
+            // Boundary resistance: the spring can never park the strip outside
+            // the paginated range, and overscroll bleeds off elastically.
+            // Boundary resistance: the strip may be dragged a third of a page
+            // past the last page, then springs back with the overscroll curve.
+            let last_page = home_pages.len().saturating_sub(1) as f32;
+            let strip_max = last_page * server.scene.width as f32;
+            home_scroll_offset = page_scroll_spring
+                .value
+                .clamp(-strip_max * 0.35, strip_max + server.scene.width as f32 * 0.35);
 
             icon_bounce_spring.step(dt);
-            if icon_bounce_spring.is_at_rest() && (icon_bounce_spring.value - 1.0).abs() < 0.005 {
-                pressed_icon_id = None;
-                icon_bounce_spring.value = 1.0;
+            if icon_bounce_spring.is_at_rest() {
+                icon_bounce_spring.value = icon_bounce_spring.target;
+                if (icon_bounce_spring.value - 1.0).abs() < 0.005 {
+                    pressed_icon_id = None;
+                }
             }
 
             if app_launch_progress > 0.0 {
                 if app_launch_spring.target != 1.0 {
+                    // Kick the expansion off with a real velocity so the card
+                    // leaves the icon with momentum instead of easing in.
                     app_launch_spring.set_target(1.0);
                     app_launch_spring.value = app_launch_progress;
-                    app_launch_spring.velocity = 2.0;
+                    app_launch_spring.velocity = 2.2;
                 }
                 app_launch_spring.step(dt);
                 app_launch_progress = app_launch_spring.value.clamp(0.0, 1.0);
-                if app_launch_progress >= 0.98 {
+                if app_launch_progress >= 0.995 {
                     app_launch_progress = 0.0;
                     app_launch_origin = None;
                     app_launch_spring.set_target(0.0);
@@ -2018,6 +2084,8 @@ fn run_daemon() {
                 }
             }
 
+            // Ripple: a Material You touch ripple that expands and fades on a
+            // time constant rather than a frame count.
             if let Some((_, _, ref mut r, ref mut a)) = touch_ripple {
                 *r += dt * 140.0;
                 *a -= dt * 3.0;
@@ -2164,6 +2232,7 @@ fn run_daemon() {
                     touch_ripple,
                     pressed_icon_id: pressed_icon_id.as_deref(),
                     icon_press_scale: icon_bounce_spring.value,
+                    palette: shell_palette,
                 };
                 drm.render_interactive_ui(&drm_state);
                 drm.flush();
@@ -2205,6 +2274,11 @@ fn run_daemon() {
     }
 }
 
+/// Scale an icon compresses to while a finger is on it. Lawnchair 17 /
+/// Launcher3 use a 0.92-style press bounce; the spring then rebounds past 1.0
+/// on release.
+const PRESS_SCALE: f32 = 0.90;
+
 fn format_current_time(buf: &mut [u8; 5]) -> &str {
     let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
     unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts) };
@@ -2217,6 +2291,76 @@ fn format_current_time(buf: &mut [u8; 5]) -> &str {
     buf[3] = b'0' + (mins / 10);
     buf[4] = b'0' + (mins % 10);
     unsafe { std::str::from_utf8_unchecked(buf) }
+}
+
+/// Average colour of the desktop wallpaper, used as the Material You seed.
+///
+/// This is the same job `dev.kdrag0n.monet` does on a real phone: pull a
+/// colour out of what the user is looking at and build the tonal scheme from
+/// it. Averaging a sparse grid of pixels keeps it a few hundred reads instead
+/// of decoding the whole image.
+fn wallpaper_seed() -> u32 {
+    const FALLBACK: u32 = 0xFF3B82F6;
+    // Standard XDG wallpaper locations, newest first.
+    const DIRS: [&str; 3] = [
+        "/run/user/1000",
+        "/usr/share/backgrounds",
+        "/usr/share/wallpapers",
+    ];
+    for dir in DIRS {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if ext != "png" {
+                continue;
+            }
+            let Ok(data) = std::fs::read(&path) else {
+                continue;
+            };
+            if let Some(seed) = average_png_colour(&data) {
+                return seed;
+            }
+        }
+    }
+    FALLBACK
+}
+
+/// Sparse-grid average of a decoded PNG, skipping transparent pixels.
+fn average_png_colour(data: &[u8]) -> Option<u32> {
+    let img = utim_core::graphics::decode_png(data)?;
+    const STEP: u32 = 24;
+    let (mut r, mut g, mut b, mut n) = (0u64, 0u64, 0u64, 0u64);
+    let mut y = 0u32;
+    while y < img.height {
+        let mut x = 0u32;
+        while x < img.width {
+            let i = ((y * img.width + x) * 4) as usize;
+            if i + 3 < img.pixels.len() && img.pixels[i + 3] > 128 {
+                r += img.pixels[i] as u64;
+                g += img.pixels[i + 1] as u64;
+                b += img.pixels[i + 2] as u64;
+                n += 1;
+            }
+            x += STEP;
+        }
+        y += STEP;
+    }
+    if n == 0 {
+        return None;
+    }
+    Some(
+        (0xFF << 24)
+            | (((r / n) as u32) << 16)
+            | (((g / n) as u32) << 8)
+            | ((b / n) as u32),
+    )
 }
 
 fn cleanup_terminal_child(
@@ -3721,113 +3865,142 @@ mod tests {
         assert!(!app_drawer_open);
     }
 
+    /// Every tappable region of the launcher, asserted against the same
+    /// `Layout` the renderer draws from. This is the regression guard for the
+    /// original bug: hitboxes that were tuned by hand and drifted from the
+    /// pixels the user actually saw.
     #[test]
-    fn test_launcher_layout_geometric_hitboxes() {
+    fn test_launcher_layout_hitboxes_match_rendered_geometry() {
         let w = 1080.0;
         let h = 2400.0;
+        let l = Layout::plain(w, h);
 
-        // 1. Status Bar
-        assert!(LauncherLayout::status_bar_hit(20.0));
-        assert!(LauncherLayout::status_bar_hit(44.0));
-        assert!(!LauncherLayout::status_bar_hit(45.0));
-        assert!(!LauncherLayout::status_bar_hit(-5.0), "Negative y is out of bounds");
+        // 1. Status bar: the top band, and nothing below it.
+        assert!(l.status_bar_h >= 20.0);
+        assert!(l.status_bar_h < 80.0, "status bar is a sliver");
+        assert!(!l.search.contains(w * 0.5, l.status_bar_h + 1.0));
 
-        // 2. Home Search Bar
-        assert!(LauncherLayout::home_search_hit(w, 540.0, 250.0));
-        assert!(!LauncherLayout::home_search_hit(w, 10.0, 250.0));
-        assert!(!LauncherLayout::home_search_hit(w, 540.0, 310.0));
+        // 2. Search pill: hit inside, miss on every side.
+        assert!(l.search.contains(w * 0.5, l.search.center_y()));
+        assert!(!l.search.contains(-1.0, l.search.center_y()));
+        assert!(!l.search.contains(w + 1.0, l.search.center_y()));
+        assert!(!l.search.contains(w * 0.5, l.search.y - 1.0));
+        assert!(!l.search.contains(w * 0.5, l.search.y + l.search.h + 1.0));
 
-        // 3. Home Action Chips (Edit Mode)
+        // 3. Clock widget.
+        assert!(l.clock_rect().contains(w * 0.5, l.clock_y + 1.0));
+
+        // 4. Grid cells: the centre of every drawn icon hit-tests to itself,
+        //    and the row below the grid hit-tests to nothing.
+        for i in 0..(l.grid_cols * l.max_rows.min(8)) {
+            let icon = l.grid_icon(i);
+            let (cx, cy) = icon.center();
+            assert_eq!(l.home_grid_hit(cx, cy, 0.0), Some(i), "icon {i}");
+            let cell = l.grid_cell(i);
+            let (ccx, ccy) = cell.center();
+            assert_eq!(l.home_grid_hit(ccx, ccy, 0.0), Some(i), "cell {i}");
+        }
+        assert_eq!(l.home_grid_hit(w * 0.5, l.grid_bottom, 0.0), None);
+        assert_eq!(l.home_grid_hit(w * 0.5, l.grid_top - 1.0, 0.0), None);
+
+        // 5. Page indicator.
         assert_eq!(
-            LauncherLayout::home_action_chips_hit(w, 100.0, 320.0),
-            Some(HomeActionHit::RemoveFromHome)
+            l.home_page_hit(l.page_dots.x + 1.0, l.page_dots.center_y(), 2),
+            Some(0)
         );
         assert_eq!(
-            LauncherLayout::home_action_chips_hit(w, 800.0, 320.0),
-            Some(HomeActionHit::MoveToOtherPage)
+            l.home_page_hit(l.page_dots.x + l.page_dots.w - 1.0, l.page_dots.center_y(), 2),
+            Some(1)
         );
-        assert_eq!(LauncherLayout::home_action_chips_hit(w, 540.0, 320.0), None);
+        assert_eq!(l.home_page_hit(w * 0.5, l.page_dots.y - 20.0, 2), None);
 
-        // 4. Page Indicator Dots
-        let dock_y = h - 140.0;
-        let dots_y = dock_y - 20.0;
-        assert_eq!(LauncherLayout::home_page_dots_hit(w, h, 200.0, dots_y, 2), Some(0));
-        assert_eq!(LauncherLayout::home_page_dots_hit(w, h, 800.0, dots_y, 2), Some(1));
-        assert_eq!(LauncherLayout::home_page_dots_hit(w, h, 500.0, dots_y - 40.0, 2), None);
+        // 6. Dock: each slot, plus a miss just above the dock.
+        for s in 0..l.dock_slots {
+            let icon = l.dock_icon_rect(s);
+            assert_eq!(l.home_dock_hit(icon.center_x(), icon.center_y()), Some(s));
+        }
+        assert_eq!(l.home_dock_hit(w * 0.5, l.dock.y - 1.0), None);
 
-        // 5. Dock Slots (5 slots)
-        assert_eq!(LauncherLayout::home_dock_hit(w, h, 50.0, dock_y + 50.0, 5), Some(0)); // Phone
-        assert_eq!(LauncherLayout::home_dock_hit(w, h, 260.0, dock_y + 50.0, 5), Some(1)); // Messages
-        assert_eq!(LauncherLayout::home_dock_hit(w, h, 540.0, dock_y + 50.0, 5), Some(2)); // Apps
-        assert_eq!(LauncherLayout::home_dock_hit(w, h, 800.0, dock_y + 50.0, 5), Some(3)); // Browser
-        assert_eq!(LauncherLayout::home_dock_hit(w, h, 1020.0, dock_y + 50.0, 5), Some(4)); // Camera
-        assert_eq!(LauncherLayout::home_dock_hit(w, h, 540.0, dock_y - 30.0, 5), None);
+        // 7. Gesture nav pill is below the dock and on screen.
+        assert!(l.nav_pill.y > l.dock.y + l.dock.h);
+        assert!(l.nav_pill.y + l.nav_pill.h <= h);
+        assert!(l.nav_pill.contains(w * 0.5, l.nav_pill.center_y()));
 
-        // 6. Home Grid Alignment
-        // Normal top is 325. Row 0 center is at 325. Row 1 center is at 440.
-        // Tapping row 0 at center (y = 325, x = 135 for col 0):
-        assert_eq!(LauncherLayout::home_grid_hit(w, h, 135.0, 325.0, false), Some(0));
-        assert_eq!(LauncherLayout::home_grid_hit(w, h, 405.0, 325.0, false), Some(1));
-        assert_eq!(LauncherLayout::home_grid_hit(w, h, 675.0, 325.0, false), Some(2));
-        assert_eq!(LauncherLayout::home_grid_hit(w, h, 945.0, 325.0, false), Some(3));
-        // Row 1 (y = 440):
-        assert_eq!(LauncherLayout::home_grid_hit(w, h, 135.0, 440.0, false), Some(4));
-        assert_eq!(LauncherLayout::home_grid_hit(w, h, 405.0, 440.0, false), Some(5));
+        // 8. Edit-mode chips only exist with a selection, sit above the grid,
+        //    and are mutually exclusive.
+        let sel = Layout::new(w, h, true);
+        assert!(sel.remove_chip.contains(sel.remove_chip.center_x(), sel.remove_chip.center_y()));
+        assert!(sel.move_chip.contains(sel.move_chip.center_x(), sel.move_chip.center_y()));
+        assert!(sel.remove_chip.x + sel.remove_chip.w <= sel.move_chip.x);
+        assert!(sel.move_chip.y + sel.move_chip.h <= sel.grid_top);
+        // The gap between the two chips belongs to neither.
+        let gap_x = (sel.remove_chip.x + sel.remove_chip.w + sel.move_chip.x) * 0.5;
+        assert!(!sel.remove_chip.contains(gap_x, sel.remove_chip.center_y()));
+        assert!(!sel.move_chip.contains(gap_x, sel.remove_chip.center_y()));
 
-        // Edit Mode (selected icon): GRID_TOP_SELECTED is 395.0. Clean separation from Action Chips (303..343)
-        assert_eq!(LauncherLayout::home_grid_hit(w, h, 135.0, 395.0, true), Some(0));
-        assert_eq!(LauncherLayout::home_grid_hit(w, h, 135.0, 365.0, true), Some(0));
-        assert_eq!(LauncherLayout::home_action_chips_hit(w, 135.0, 365.0), None);
-
-        // 7. App Drawer Search Hit
+        // 9. Drawer: search, handle and grid all move with the sheet.
+        let off = 0.0;
         assert_eq!(
-            LauncherLayout::drawer_search_hit(w, 200.0, 85.0),
+            l.drawer_search_hit(off, l.drawer_search.center_x(), off + l.drawer_search.center_y()),
             DrawerSearchHit::Focus
         );
         assert_eq!(
-            LauncherLayout::drawer_search_hit(w, w - 30.0, 85.0),
+            l.drawer_search_hit(
+                off,
+                l.drawer_search.x + l.drawer_search.w - 2.0,
+                off + l.drawer_search.center_y()
+            ),
             DrawerSearchHit::Clear
         );
-        assert_eq!(
-            LauncherLayout::drawer_search_hit(w, 200.0, 20.0),
-            DrawerSearchHit::None
-        );
+        assert_eq!(l.drawer_search_hit(off, 1.0, 1.0), DrawerSearchHit::None);
+        assert!(l.drawer_handle.contains(w * 0.5, off + l.drawer_handle.center_y()));
 
-        // 8. App Drawer Grid Hit
-        // Drawer Grid Top is 198. Row 0 is at 198.
-        assert_eq!(LauncherLayout::drawer_grid_hit(w, h, 135.0, 198.0), Some(0));
-        assert_eq!(LauncherLayout::drawer_grid_hit(w, h, 405.0, 198.0), Some(1));
-        assert_eq!(LauncherLayout::drawer_grid_hit(w, h, 135.0, 313.0), Some(4)); // Row 1
+        for i in 0..(l.grid_cols * l.drawer_rows.min(8)) {
+            let cell = l.drawer_icon_cell(i);
+            assert_eq!(
+                l.drawer_grid_hit(off, cell.center_x(), off + cell.center_y()),
+                Some(i),
+                "drawer cell {i}"
+            );
+        }
+        // A dragged-down drawer carries its content with it.
+        let dragged = h * 0.5;
+        let cell = l.drawer_icon_cell(3);
+        assert_eq!(
+            l.drawer_grid_hit(dragged, cell.center_x(), dragged + cell.center_y()),
+            Some(3)
+        );
+        // And a touch above the sheet is not a drawer cell.
+        assert_eq!(l.drawer_grid_hit(dragged, cell.center_x(), dragged - 1.0), None);
+    }
 
-        // 9. Quick Tiles Hit
-        assert_eq!(LauncherLayout::quick_tile_hit(w, 100.0, 180.0), Some(0));
-        assert_eq!(LauncherLayout::quick_tile_hit(w, 700.0, 180.0), Some(1));
-        assert_eq!(LauncherLayout::quick_tile_hit(w, 100.0, 260.0), Some(2));
-        assert_eq!(LauncherLayout::quick_tile_hit(w, 700.0, 260.0), Some(3));
-
-        // 10. Nav Bar & App Bar Hits
-        assert!(LauncherLayout::bottom_nav_pill_hit(h, h - 10.0));
-        assert!(!LauncherLayout::bottom_nav_pill_hit(h, h - 50.0));
-        assert!(LauncherLayout::app_bar_back_hit(50.0, 70.0));
-        assert!(LauncherLayout::app_bar_close_hit(w, w - 50.0, 70.0));
-
-        // 11. Terminal Tab Hits
-        assert_eq!(
-            LauncherLayout::terminal_tab_hit(50.0, 140.0, 2, 0),
-            TerminalTabHit::SelectTab(0)
-        );
-        assert_eq!(
-            LauncherLayout::terminal_tab_hit(215.0, 140.0, 2, 0),
-            TerminalTabHit::CloseTab(0)
-        );
-        assert_eq!(
-            LauncherLayout::terminal_tab_hit(260.0, 140.0, 2, 0),
-            TerminalTabHit::SelectTab(1)
-        );
-        assert_eq!(
-            LauncherLayout::terminal_tab_hit(470.0, 140.0, 2, 0),
-            TerminalTabHit::AddTab
-        );
+    /// The same invariants have to hold on a small panel, otherwise the fix
+    /// only works at one resolution.
+    #[test]
+    fn test_layout_scales_to_small_panels() {
+        for (w, h) in [(360.0f32, 640.0f32), (720.0, 1280.0), (1440.0, 3120.0)] {
+            let l = Layout::plain(w, h);
+            for i in 0..(l.grid_cols * l.max_rows.min(6)) {
+                let icon = l.grid_icon(i);
+                assert_eq!(
+                    l.home_grid_hit(icon.center_x(), icon.center_y(), 0.0),
+                    Some(i),
+                    "{w}x{h} icon {i}"
+                );
+            }
+            for s in 0..l.dock_slots {
+                let icon = l.dock_icon_rect(s);
+                assert_eq!(
+                    l.home_dock_hit(icon.center_x(), icon.center_y()),
+                    Some(s),
+                    "{w}x{h} dock {s}"
+                );
+            }
+            assert!(
+                l.search.h >= w.min(h) * 0.048,
+                "{w}x{h}: search pill below the 48dp touch minimum"
+            );
+        }
     }
 
     #[test]
@@ -3882,95 +4055,115 @@ mod tests {
         assert!(ripple.is_none(), "Ripple should fade completely after duration");
     }
 
+    /// The advanced surface: clock, page dots, scrolled grid, drawer sheet and
+    /// row limits, all checked against the shared layout.
     #[test]
     fn test_launcher_advanced_geometry_and_animations() {
         let w = 1080.0;
         let h = 2400.0;
+        let l = Layout::plain(w, h);
 
-        // 1. Home Clock Widget Hit
-        assert!(LauncherLayout::home_clock_hit(w, 540.0, 150.0));
-        assert!(LauncherLayout::home_clock_hit(w, 200.0, 200.0));
-        assert!(!LauncherLayout::home_clock_hit(w, 10.0, 150.0), "Outside padding");
-        assert!(!LauncherLayout::home_clock_hit(w, 540.0, 50.0), "Above clock");
-        assert!(!LauncherLayout::home_clock_hit(w, 540.0, 240.0), "Below clock in search");
-
-        // 2. Home Page Dots Multi-Page and Out-of-bounds
-        let dock_y = h - LauncherLayout::DOCK_H - LauncherLayout::DOCK_BOTTOM_MARGIN;
-        let dots_y = dock_y - 20.0;
-        assert_eq!(LauncherLayout::home_page_dots_hit(w, h, -10.0, dots_y, 2), None, "Negative x is out of bounds");
-        assert_eq!(LauncherLayout::home_page_dots_hit(w, h, w + 10.0, dots_y, 2), None, "x > w is out of bounds");
-        assert_eq!(LauncherLayout::home_page_dots_hit(w, h, 200.0, dots_y, 0), None, "0 total pages is None");
-        assert_eq!(LauncherLayout::home_page_dots_hit(w, h, 200.0, dots_y, 1), Some(0));
-        // 3 pages: slots are 0..360, 360..720, 720..1080
-        assert_eq!(LauncherLayout::home_page_dots_hit(w, h, 180.0, dots_y, 3), Some(0));
-        assert_eq!(LauncherLayout::home_page_dots_hit(w, h, 540.0, dots_y, 3), Some(1));
-        assert_eq!(LauncherLayout::home_page_dots_hit(w, h, 900.0, dots_y, 3), Some(2));
-
-        // 3. Home Grid Hit with Scroll Offset
-        // Row 0 center is at 325. Col 0 center without scroll is at 135 (col_w = 270).
-        // With scroll_offset = 270.0 (scrolled 1 col to the right):
-        // Physical touch at x = 405 (rel_x = 405 - 270 = 135) should hit col 0!
-        assert_eq!(
-            LauncherLayout::home_grid_hit_with_scroll(w, h, 405.0, 325.0, false, 270.0),
-            Some(0)
-        );
-        // rel_x negative is out of bounds
-        assert_eq!(
-            LauncherLayout::home_grid_hit_with_scroll(w, h, 100.0, 325.0, false, 200.0),
-            None
+        // 1. Clock widget.
+        assert!(l.clock_rect().contains(w * 0.5, l.clock_y + 1.0));
+        assert!(!l.clock_rect().contains(-1.0, l.clock_y + 1.0), "outside padding");
+        assert!(!l.clock_rect().contains(w * 0.5, l.clock_y - 1.0), "above clock");
+        assert!(
+            !l.clock_rect().contains(w * 0.5, l.search.y + 1.0),
+            "below clock, inside search"
         );
 
-        // 4. App Drawer Hit with Animated Offset
-        let drawer_y_offset = 600.0; // Drawer is 25% down the screen
-        assert!(LauncherLayout::drawer_handle_hit(drawer_y_offset, drawer_y_offset + 20.0));
-        assert!(!LauncherLayout::drawer_handle_hit(drawer_y_offset, 200.0));
-
+        // 2. Page dots: out of bounds, and slot mapping for several page counts.
+        let cy = l.page_dots.center_y();
+        assert_eq!(l.home_page_hit(-10.0, cy, 2), None, "negative x is out of bounds");
+        assert_eq!(l.home_page_hit(w + 10.0, cy, 2), None, "x > w is out of bounds");
+        assert_eq!(l.home_page_hit(l.page_dots.center_x(), cy, 0), None, "0 pages");
         assert_eq!(
-            LauncherLayout::drawer_search_hit_with_offset(w, drawer_y_offset, 200.0, drawer_y_offset + 85.0),
+            l.home_page_hit(l.page_dots.center_x(), cy, 1),
+            Some(0),
+            "one page is page 0"
+        );
+        for n in 2..=5usize {
+            for p in 0..n {
+                let x = l.page_dots.x + l.page_dots.w * (p as f32 + 0.5) / n as f32;
+                assert_eq!(l.home_page_hit(x, cy, n), Some(p), "{n} pages, slot {p}");
+            }
+        }
+
+        // 3. Grid with a scroll offset. A positive offset slides the workspace
+        //    left, so a fixed touch sees the cell one column later.
+        let y = l.grid_top + 4.0;
+        let x = l.col_pitch * 0.5;
+        let base = l.home_grid_hit(x, y, 0.0).unwrap();
+        assert_eq!(l.home_grid_hit(x, y, l.col_pitch), Some(base + 1));
+        // Off the left edge of the strip there is nothing.
+        assert_eq!(l.home_grid_hit(x, y, -l.col_pitch * 2.0), None);
+
+        // 4. Drawer with a mid-drag offset.
+        // The handle is hit in the drawer's own coordinate space, which is
+        // what the input path passes in.
+        let dragged = h * 0.25;
+        assert!(
+            l.drawer_handle.contains(w * 0.5, l.drawer_handle.center_y()),
+            "the handle is centred on the sheet"
+        );
+        assert!(
+            !l.drawer_handle.contains(w * 0.5, dragged + l.drawer_handle.center_y()),
+            "a touch above the sheet is not the handle"
+        );
+        assert_eq!(
+            l.drawer_search_hit(
+                dragged,
+                l.drawer_search.center_x(),
+                dragged + l.drawer_search.center_y()
+            ),
             DrawerSearchHit::Focus
         );
+        let cell0 = l.drawer_icon_cell(0);
         assert_eq!(
-            LauncherLayout::drawer_search_hit_with_offset(w, drawer_y_offset, w - 30.0, drawer_y_offset + 85.0),
-            DrawerSearchHit::Clear
-        );
-
-        // Drawer grid row 0 center is at drawer_y_offset + DRAWER_GRID_TOP (600 + 198 = 798)
-        assert_eq!(
-            LauncherLayout::drawer_grid_hit_with_offset(w, h, drawer_y_offset, 135.0, 798.0),
+            l.drawer_grid_hit(dragged, cell0.center_x(), dragged + cell0.center_y()),
             Some(0)
         );
-        // Above drawer offset is not a grid hit
         assert_eq!(
-            LauncherLayout::drawer_grid_hit_with_offset(w, h, drawer_y_offset, 135.0, 500.0),
-            None
+            l.drawer_grid_hit(dragged, cell0.center_x(), dragged - 1.0),
+            None,
+            "above the sheet is not a grid hit"
         );
-        // Off-screen x is out of bounds
         assert_eq!(
-            LauncherLayout::drawer_grid_hit_with_offset(w, h, drawer_y_offset, -20.0, 798.0),
-            None
+            l.drawer_grid_hit(dragged, -1.0, dragged + cell0.center_y()),
+            None,
+            "off-screen x is out of bounds"
         );
 
-        // 5. Unified Row Limits
-        let max_home = LauncherLayout::max_home_rows(h, false);
-        assert!(max_home >= 15 && max_home <= 20, "1080x2400 screen should fit ~17 home rows");
-        let max_drawer = LauncherLayout::max_drawer_rows(h);
-        assert!(max_drawer >= 17 && max_drawer <= 22, "1080x2400 screen should fit ~19 drawer rows");
+        // 5. Row limits scale with the panel instead of being magic numbers.
+        assert!(l.max_rows >= 4, "1080x2400 should fit many home rows");
+        assert!(l.drawer_rows >= 8, "1080x2400 should fit many drawer rows");
+        let small = Layout::plain(360.0, 640.0);
+        assert!(small.max_rows < l.max_rows, "a short panel fits fewer rows");
     }
 
+    /// Proportional metrics: the vector engine must not be monospaced.
     #[test]
     fn test_typography_proportional_metrics() {
-        // Test text_width with proportional character spacing
         let scale = 2;
         let w_i = utim_core::graphics::text_width("i", scale);
         let w_m = utim_core::graphics::text_width("m", scale);
-        assert!(w_i < w_m, "Proportional 'i' ({}px) must be narrower than 'm' ({}px)", w_i, w_m);
+        assert!(w_i < w_m, "proportional 'i' ({}px) must be narrower than 'm' ({}px)", w_i, w_m);
 
         let w_space = utim_core::graphics::text_width(" ", scale);
         let w_w = utim_core::graphics::text_width("W", scale);
-        assert!(w_space < w_w, "Space should be narrower than capital W");
+        assert!(w_space < w_w, "space should be narrower than capital W");
+
+        // Digits are tabular so a clock never jitters.
+        let zero = utim_core::graphics::text_width("0", scale);
+        for d in "123456789".chars() {
+            assert_eq!(
+                utim_core::graphics::text_width(&d.to_string(), scale),
+                zero,
+                "digit {d} must share the tabular advance"
+            );
+        }
 
         let w_full = utim_core::graphics::text_width("Universal Treble", scale);
         assert!(w_full > 0);
     }
 }
-

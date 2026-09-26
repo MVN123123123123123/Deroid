@@ -2,12 +2,22 @@
 //! Provides zero-dependency, bare-metal hardware display presentation for Universal Treble Linux
 //! via Linux DRM dumb buffers and CRTC modesetting. Adheres strictly to GEMINI.md systems rules.
 
+// The framebuffer is addressed as (buf, stride, w, h) throughout: the render
+// path is a bare pointer plus a stride, and wrapping that in a struct would
+// have meant an allocation or a self-referential borrow on the hot path.
+#![allow(clippy::too_many_arguments)]
+
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
+use super::layout::{
+    ShadeLayout,
+    AppLayout, AppPanel, Keyboard, Layout, ICON_RADIUS, KB_ROW1, KB_ROW2, KB_ROW3_MID,
+    LABEL_GAP, PANEL_PAD_FRACTION,
+};
 use super::png::RgbaImage;
 
 // --- DRM KMS IOCTL Definitions (Standard Linux ABI) ---
@@ -440,6 +450,7 @@ pub struct DrmInteractiveState<'a> {
     pub touch_ripple: Option<(f32, f32, f32, f32)>,
     pub pressed_icon_id: Option<&'a str>,
     pub icon_press_scale: f32,
+    pub palette: MaterialYouPalette,
 }
 
 impl<'a> Default for DrmInteractiveState<'a> {
@@ -480,6 +491,7 @@ impl<'a> Default for DrmInteractiveState<'a> {
             touch_ripple: None,
             pressed_icon_id: None,
             icon_press_scale: 1.0,
+            palette: MaterialYouPalette::default_dark(),
         }
     }
 }
@@ -856,978 +868,1614 @@ impl DrmKmsDevice {
         let h = self.height as usize;
         let stride = (self.pitch / 4) as usize;
         let buf = self.buffer_mut();
+        paint_frame(buf, stride, w, h, state);
+    }
+}
 
-        // 1. Background: Modern Sleek Deep Space Mobile Gradient
-        // Top: #0a1128 -> Center: #080d1a -> Bottom: #04060b
-        for y in 0..h {
-            let t = y as f32 / h as f32;
-            let r = ((1.0 - t) * 12.0 + t * 4.0) as u32;
-            let g = ((1.0 - t) * 20.0 + t * 6.0) as u32;
-            let b = ((1.0 - t) * 45.0 + t * 15.0) as u32;
-            let row_offset = y * stride;
-            let pixel = (0xFF << 24) | (r << 16) | (g << 8) | b;
-            for x in 0..w {
-                buf[row_offset + x] = pixel;
-            }
-        }
+/// Compose one full shell frame into an ARGB8888 buffer.
+///
+/// Kept free of DRM state so the exact production draw path can be replayed
+/// offscreen (see `super::screenshot`) and diffed in tests.
+#[allow(clippy::too_many_lines)]
+pub fn paint_frame(buf: &mut [u32], stride: usize, w: usize, h: usize, state: &DrmInteractiveState) {
+    if w == 0 || h == 0 {
+        return;
+    }
 
-        // Subtle ambient glowing mesh accents (Cyan top-right, Violet bottom-left)
-        draw_glow_circle(buf, stride, w, h, (w * 8) / 10, h / 8, 300, 0x00, 0x99, 0xff, 25);
-        draw_glow_circle(buf, stride, w, h, (w * 2) / 10, (h * 8) / 10, 350, 0x88, 0x33, 0xff, 20);
+    // 1. Palette-driven background, then the system status bar on top of it.
+    draw_background(buf, stride, w, h, state);
+    draw_status_bar(buf, stride, w, h, state, 0);
 
-        // 2. SystemUI Status Bar (Y: 0 .. 44)
-        draw_rect(buf, stride, w, h, 0, 0, w, 44, 0x22000000);
-        draw_text_weighted(buf, stride, w, h, 24, 14, state.time_str, 0xFFFFFFFF, 2, FontWeight::Medium);
+    if state.is_locked {
+        // Lock screen: a large Material You clock, a padlock above it, the
+        // date under it, and the unlock affordance pinned to the bottom. Every
+        // dimension is a fraction of the panel so it scales with the display.
+        let wf = w as f32;
+        let hf = h as f32;
+        let cx = (wf * 0.5) as usize;
+        // Clock occupies the upper third, with room for lock and date.
+        let cap = (hf * 0.085).max(wf * 0.09);
+        let clock_cy = (hf * 0.30) as usize;
+        let lock_size = cap * 0.34;
+        draw_lock_glyph(
+            buf,
+            stride,
+            w,
+            h,
+            cx,
+            (clock_cy as f32 - cap * 0.5 - lock_size * 1.9) as usize,
+            lock_size,
+            state.palette.on_surface_variant,
+        );
+        draw_material_you_clock(
+            buf, stride, w, h, cx, clock_cy, state.time_str, state.palette.primary, cap as usize,
+        );
+        draw_text_centered_clipped(
+            buf,
+            stride,
+            w,
+            h,
+            cx,
+            (clock_cy as f32 + cap * 0.5 + hf * 0.016) as usize,
+            wf * 0.9,
+            "Tuesday, Sep 22",
+            state.palette.on_surface_variant,
+            2,
+            FontWeight::Medium,
+        );
+        // Bottom affordance.
+        let hint_y = h - (hf * 0.075) as usize;
+        let em1 = super::font::em_px_at(1, w);
+        let pill_h = (em1 * 2.2).max(hf * 0.020);
+        let pill_w = (wf * 0.46).max(super::font::measure("Click or swipe up to unlock", em1) + em1 * 2.0);
+        draw_rounded_rect_f(
+            buf, stride, w, h, wf * 0.5 - pill_w * 0.5, hint_y as f32 - pill_h * 0.5,
+            pill_w, pill_h, pill_h * 0.5, state.palette.surface_container,
+        );
+        draw_text_centered(
+            buf, stride, w, h, cx, (hint_y as f32 - em1 * 0.31) as usize,
+            "Click or swipe up to unlock", state.palette.on_surface_variant, 1,
+        );
+    } else if state.shade_open {
+        // 3. Quick settings and notifications.
+        //
+        // The shade is a scrim over the workspace plus a `ShadeLayout`-driven
+        // stack: header clock, tile grid, brightness slider and notification
+        // cards. Those are the same rects the input path hit-tests, so a tile
+        // is tappable exactly where it is drawn.
+        let sl = ShadeLayout::new(w as f32, h as f32);
+        let wf = w as f32;
+        let hf = h as f32;
+        let scrim = (0xEE << 24) | (state.palette.surface_container & 0x00FF_FFFF);
+        draw_rect_f(
+            buf, stride, w, h, 0.0, sl.top, wf, hf - sl.top, scrim,
+        );
 
-        // Status Icons (Right side of status bar)
-        let icon_right = w - 24;
-        draw_battery(buf, stride, w, h, icon_right - 40, 14, 98);
-        if state.quick_tiles_active[0] {
-            draw_wifi(buf, stride, w, h, icon_right - 80, 14);
-        }
-        let rat_label = if state.quick_tiles_active[1] { "5G" } else { "OFF" };
-        let rat_color = if state.quick_tiles_active[1] { 0xFFFFFFFF } else { 0xFF888888 };
-        draw_text_weighted(buf, stride, w, h, icon_right - 135, 14, rat_label, rat_color, 2, FontWeight::Bold);
+        // Header: display clock on the left, date and build on the right.
+        let em1 = super::font::em_px_at(1, w);
+        let pad = wf * PANEL_PAD_FRACTION;
+        let clock_w = clock_run_width(state.time_str, sl.clock_size, w);
+        draw_material_you_clock(
+            buf, stride, w, h, (pad + clock_w * 0.5) as usize, (sl.date_y - em1 * 0.9) as usize,
+            state.time_str, state.palette.primary, sl.clock_size as usize,
+        );
+        let date_x = pad + clock_w + em1;
+        draw_text_clipped(
+            buf, stride, w, h, date_x, sl.date_y, wf - date_x - pad,
+            "Tue, Sep 22  |  Universal Treble GSI", state.palette.on_surface_variant, 1,
+            FontWeight::Medium,
+        );
 
-        if state.is_locked {
-            // Lock Screen UI with Lawnchair 17 / Pixel Material You Clock
-            let center_x = w / 2;
-            let center_y = h / 3;
-            draw_material_you_clock(buf, stride, w, h, center_x, center_y, state.time_str, 0xFFFFFFFF, 96);
-            draw_text_centered(
-                buf,
-                stride,
-                w,
-                h,
-                center_x,
-                center_y + 80,
-                "Tuesday, Sep 22",
-                0xFFB0C4DE,
-                2,
-            );
-            draw_text_centered(
-                buf,
-                stride,
-                w,
-                h,
-                center_x,
-                h - 180,
-                "Click or Swipe up to unlock",
-                0xFF8899A6,
-                2,
-            );
-            draw_padlock(buf, stride, w, h, center_x, center_y - 80);
-        } else if state.shade_open {
-            // 3. Full-Screen Quick Settings & Notification Shade
-            draw_rect(buf, stride, w, h, 0, 44, w, h - 44, 0xDD080D1A);
-            
-            // Header clock & date
-            draw_material_you_clock(buf, stride, w, h, 36 + 65, 80, state.time_str, 0xFFFFFFFF, 46);
-            draw_text_weighted(buf, stride, w, h, 36, 115, "Tue, Sep 22 | Universal Treble GSI", 0xFF94A3B8, 2, FontWeight::Medium);
-
-            // Quick Settings Tiles (2 columns x 4 rows)
-            let tile_names = [
-                "Wi-Fi",
-                "Mobile Data",
-                "Bluetooth",
-                "Flashlight",
-                "Auto-rotate",
-                "Airplane mode",
-                "Battery Saver",
-                "Hotspot",
-            ];
-            let tile_w = (w - 72 - 20) / 2;
-            let tile_h = 70;
-            let tile_start_y = 155;
-
-            for (idx, name) in tile_names.iter().enumerate() {
-                let col = idx % 2;
-                let row = idx / 2;
-                let tx = 36 + col * (tile_w + 20);
-                let ty = tile_start_y + row * (tile_h + 14);
-
-                let is_active = state.quick_tiles_active[idx];
-                let bg_color = if is_active { 0xFF2563EB } else { 0xFF1E293B };
-                let text_color = if is_active { 0xFFFFFFFF } else { 0xFF94A3B8 };
-                let status_str = if is_active { "ON" } else { "OFF" };
-
-                draw_rounded_rect(buf, stride, w, h, tx, ty, tile_w, tile_h, 16, bg_color);
-                draw_text_weighted(buf, stride, w, h, tx + 18, ty + 18, name, text_color, 2, FontWeight::Medium);
-                draw_text(buf, stride, w, h, tx + 18, ty + 42, status_str, if is_active { 0xFF93C5FD } else { 0xFF64748B }, 1);
-            }
-
-            // Brightness Slider Bar
-            let slider_y = tile_start_y + 4 * (tile_h + 14) + 10;
-            let slider_w = w - 72;
-            draw_rounded_rect(buf, stride, w, h, 36, slider_y, slider_w, 42, 21, 0xFF1E293B);
-            let fill_w = (slider_w * 78) / 100;
-            draw_rounded_rect(buf, stride, w, h, 36, slider_y, fill_w, 42, 21, 0xFF38BDF8);
-            draw_text(buf, stride, w, h, 54, slider_y + 14, "* Brightness: 78%", 0xFF082F49, 2);
-
-            // Notifications List Section
-            let notif_y = slider_y + 65;
-            draw_text_weighted(buf, stride, w, h, 36, notif_y, "NOTIFICATIONS", 0xFF64748B, 2, FontWeight::Bold);
-
-            // Notification Card 1
-            draw_rounded_rect(buf, stride, w, h, 36, notif_y + 26, w - 72, 85, 18, 0xFF1E293B);
-            draw_text_weighted(buf, stride, w, h, 56, notif_y + 40, "UTIM PID 1 & UTLC Wayland", 0xFFF8FAFC, 2, FontWeight::Medium);
-            draw_text(buf, stride, w, h, 56, notif_y + 68, "Interactive mobile compositor active with < 8ms input response", 0xFF94A3B8, 1);
-
-            // Notification Card 2
-            draw_rounded_rect(buf, stride, w, h, 36, notif_y + 125, w - 72, 85, 18, 0xFF1E293B);
-            draw_text_weighted(buf, stride, w, h, 56, notif_y + 139, "Direct DRM KMS Scanout", 0xFFF8FAFC, 2, FontWeight::Medium);
-            draw_text(buf, stride, w, h, 56, notif_y + 167, "1080x2400 @ 120Hz native scanout via /dev/dri/card0", 0xFF94A3B8, 1);
-
-            // Pull handle at bottom
-            let handle_y = h - 60;
-            draw_rounded_rect(buf, stride, w, h, (w - 140) / 2, handle_y, 140, 6, 3, 0xFF64748B);
-            draw_text_centered(buf, stride, w, h, w / 2, handle_y - 25, "Tap to close", 0xFF94A3B8, 1);
-        } else if let Some(app_name) = state.active_app {
-            // 4. Active Application Window View
-            // Top App Bar
-            let bar_h = 56;
-            let bar_y = 48;
-            draw_rounded_rect(buf, stride, w, h, 16, bar_y, w - 32, bar_h, 16, 0xFF1E293B);
-
-            // Back button
-            draw_rounded_rect(buf, stride, w, h, 26, bar_y + 8, 95, 40, 10, 0xFF334155);
-            draw_text(buf, stride, w, h, 38, bar_y + 18, "< Back", 0xFFF8FAFC, 2);
-
-            // App title
-            draw_text_centered_weighted(buf, stride, w, h, w / 2, bar_y + 18, app_name, 0xFFFFFFFF, 2, FontWeight::Bold);
-
-            // Close button
-            draw_rounded_rect(buf, stride, w, h, w - 85, bar_y + 8, 60, 40, 10, 0xFFEF4444);
-            draw_text(buf, stride, w, h, w - 63, bar_y + 18, "X", 0xFFFFFFFF, 2);
-
-            // App Content Container
-            let content_y = bar_y + bar_h + 12;
-            let content_h = if state.keyboard_active {
-                h - content_y - 450
+        // Tile grid.
+        let tile_names = [
+            "Wi-Fi", "Mobile Data", "Bluetooth", "Flashlight",
+            "Auto-rotate", "Airplane mode", "Battery Saver", "Hotspot",
+        ];
+        let label_pad = sl.tiles.tile.1 * 0.22;
+        let tile_em = super::font::em_px_at(1, w);
+        for (idx, name) in tile_names.iter().enumerate() {
+            let c = sl.tiles.cell(idx);
+            let on = state.quick_tiles_active[idx];
+            let bg = if on {
+                state.palette.primary
             } else {
-                h - content_y - 50
+                state.palette.surface_container_high
             };
-            draw_rounded_rect(buf, stride, w, h, 16, content_y, w - 32, content_h, 18, 0xFF0A0E17);
-
-            if app_name == "Terminal" {
-                // Interactive Linux Shell Terminal Window with Tabbed Multi-Terminal Bar
-                let tab_bar_y = content_y + 12;
-                let tab_bar_h = 42;
-
-                // Render tabs if available
-                let default_single_tab = [TerminalTabInfo {
-                    id: 1,
-                    title: "Tab 1: bash",
-                    is_running: state.terminal_running,
-                    is_active: true,
-                }];
-                let tabs = if !state.terminal_tabs.is_empty() {
-                    state.terminal_tabs
-                } else {
-                    &default_single_tab[..]
-                };
-
-                let start_x = 36;
-                let tab_w = 200;
-                let spacing = 10;
-
-                for (i, tab) in tabs.iter().enumerate().take(4) {
-                    let tab_x = start_x + i * (tab_w + spacing);
-                    let is_active = tab.is_active || (tabs.len() == 1 && i == 0);
-
-                    // Tab background: vibrant sky highlight for active tab, subtle slate for inactive
-                    let bg_color = if is_active {
-                        0xFF0284C7 // Sky-600
-                    } else {
-                        0xFF1E293B // Slate-800
-                    };
-                    draw_rounded_rect(buf, stride, w, h, tab_x, tab_bar_y, tab_w, tab_bar_h, 8, bg_color);
-
-                    // Running indicator dot
-                    let text_offset_x = if tab.is_running {
-                        draw_rounded_rect(buf, stride, w, h, tab_x + 10, tab_bar_y + 16, 10, 10, 5, 0xFF10B981); // Emerald dot
-                        tab_x + 26
-                    } else {
-                        tab_x + 12
-                    };
-
-                    // Tab title (Scale 2)
-                    let text_color = if is_active { 0xFFFFFFFF } else { 0xFF94A3B8 };
-                    draw_text(buf, stride, w, h, text_offset_x, tab_bar_y + 12, tab.title, text_color, 2);
-
-                    // Close indicator 'x' on active tab when multiple tabs open
-                    if is_active && tabs.len() > 1 {
-                        draw_text(buf, stride, w, h, tab_x + tab_w - 20, tab_bar_y + 12, "x", 0xFFE2E8F0, 2);
-                    }
-                }
-
-                // Add Tab button [+] if less than 4 tabs
-                if tabs.len() < 4 {
-                    let plus_x = start_x + tabs.len() * (tab_w + spacing);
-                    draw_rounded_rect(buf, stride, w, h, plus_x, tab_bar_y, 56, tab_bar_h, 8, 0xFF334155);
-                    draw_text_centered(buf, stride, w, h, plus_x + 28, tab_bar_y + 10, "+", 0xFF38BDF8, 3);
-                }
-
-                // Divider line below tab bar
-                draw_rect(buf, stride, w, h, 24, tab_bar_y + tab_bar_h + 6, w - 48, 2, 0xFF1E293B);
-
-                let mut line_y = tab_bar_y + tab_bar_h + 16;
-                draw_text(buf, stride, w, h, 36, line_y, "Universal Treble Linux 1.0 (Debian Sid ARM64)", 0xFF38BDF8, 3);
-                line_y += 38;
-                draw_text(buf, stride, w, h, 36, line_y, "Linux 6.1.23-android14-4-00257 (Android GKI)", 0xFF94A3B8, 2);
-                line_y += 26;
-                draw_text(buf, stride, w, h, 36, line_y, "UTIM PID 1 init | UTLC Wayland Compositor", 0xFF94A3B8, 2);
-                line_y += 26;
-                draw_text(buf, stride, w, h, 36, line_y, "Debian Sid ARM64 GNU/Linux - Multi-Tab Terminal Active", 0xFF64748B, 2);
-                line_y += 38;
-
-                // Terminal text scaling (Scale 3 = 18x21px font cell, 34px line height)
-                let line_h = 34;
-                let header_used = line_y - content_y;
-                let available_h = content_h.saturating_sub(header_used + 45);
-                let max_lines = (available_h / line_h).saturating_sub(1);
-
-                // Auto-scroll viewport: show the most recent lines so the active prompt is always visible
-                let visible_lines = if state.terminal_lines.len() > max_lines {
-                    &state.terminal_lines[state.terminal_lines.len() - max_lines..]
-                } else {
-                    state.terminal_lines
-                };
-
-                for line in visible_lines {
-                    if line_y + line_h <= content_y + content_h - 40 {
-                        draw_text(buf, stride, w, h, 36, line_y, line, 0xFFE2E8F0, 3);
-                        line_y += line_h;
-                    }
-                }
-
-                // Active prompt line with typed characters and blinking cursor (Scale 3)
-                if line_y + line_h <= content_y + content_h {
-                    if state.terminal_running {
-                        draw_text(buf, stride, w, h, 36, line_y, "[running... (Ctrl+C to stop)]", 0xFFF59E0B, 3);
-                    } else {
-                        draw_text(buf, stride, w, h, 36, line_y, "root@treble-gsi:~# ", 0xFF10B981, 3);
-                        let prompt_w = 19 * 18;
-                        draw_text(buf, stride, w, h, 36 + prompt_w, line_y, state.terminal_input, 0xFFFFFFFF, 3);
-                        let cursor_x = 36 + prompt_w + state.terminal_input.len() * 18;
-                        draw_rect(buf, stride, w, h, cursor_x, line_y, 14, 22, 0xFF10B981);
-                    }
-                }
-            } else if app_name == "Settings" {
-                // Interactive Mobile Settings Page with Search Input Bar
-                let s_bar_y = content_y + 12;
-                let s_bar_h = 44;
-                let s_bar_x = 32;
-                let s_bar_w = w - 64;
-                let s_border = if state.app_input_focused { 0xFF38BDF8 } else { 0xFF334155 };
-                draw_rounded_rect(buf, stride, w, h, s_bar_x - 1, s_bar_y - 1, s_bar_w + 2, s_bar_h + 2, 14, s_border);
-                draw_rounded_rect(buf, stride, w, h, s_bar_x, s_bar_y, s_bar_w, s_bar_h, 13, 0xFF1E293B);
-                let s_disp = if !state.app_input.is_empty() { state.app_input } else { "Search settings..." };
-                let s_col = if !state.app_input.is_empty() { 0xFFFFFFFF } else { 0xFF94A3B8 };
-                draw_text(buf, stride, w, h, s_bar_x + 16, s_bar_y + 13, s_disp, s_col, 2);
-                if state.app_input_focused {
-                    let cur_x = s_bar_x + 16 + (state.app_input.len() * 12).min(s_bar_w - 30);
-                    draw_rect(buf, stride, w, h, cur_x, s_bar_y + 11, 2, 22, 0xFF38BDF8);
-                }
-
-                let mut card_y = s_bar_y + s_bar_h + 14;
-                let cards = [
-                    ("Network & Internet", "Wi-Fi, Mobile, Hotspot, VPN"),
-                    ("Connected Devices", "Bluetooth, Android HAL bridge"),
-                    ("Display & Graphics", "1080x2400 @ 120Hz Direct DRM KMS"),
-                    ("Sound & Multimedia", "PipeWire spa-droid Audio"),
-                    ("Storage", "4.00 GB ext4 System GSI Image"),
-                    ("Battery", "98% - Mobile Power Governor active"),
-                    ("About Phone", "Universal Treble Linux (Android 14 GKI)"),
-                ];
-                let query = state.app_input.to_lowercase();
-                for (title, desc) in cards {
-                    if !query.is_empty() && !title.to_lowercase().contains(&query) && !desc.to_lowercase().contains(&query) {
-                        continue;
-                    }
-                    if card_y + 70 < content_y + content_h {
-                        draw_rounded_rect(buf, stride, w, h, 32, card_y, w - 64, 60, 12, 0xFF1E293B);
-                        draw_text(buf, stride, w, h, 48, card_y + 12, title, 0xFFF8FAFC, 2);
-                        draw_text(buf, stride, w, h, 48, card_y + 36, desc, 0xFF94A3B8, 1);
-                        card_y += 72;
-                    }
-                }
-            } else if app_name == "Browser" || app_name == "Web" || app_name.contains("Browser") || app_name == "Firefox" {
-                // Interactive Modern Mobile Android Browser Window with Active Omnibox
-                let bar_top = content_y + 10;
-                let bar_h = 46;
-                let pad = 16;
-                let url_w = w - pad * 2 - 32;
-
-                let url_border = if state.app_input_focused { 0xFF38BDF8 } else { 0xFF334155 };
-                draw_rounded_rect(buf, stride, w, h, pad + 15, bar_top - 1, url_w + 2, bar_h + 2, 16, url_border);
-                draw_rounded_rect(buf, stride, w, h, pad + 16, bar_top, url_w, bar_h, 15, 0xFF1E293B);
-
-                // SSL Padlock indicator (Emerald)
-                draw_rounded_rect(buf, stride, w, h, pad + 28, bar_top + 14, 16, 16, 4, 0xFF10B981);
-                draw_text(buf, stride, w, h, pad + 32, bar_top + 15, "*", 0xFFFFFFFF, 1);
-
-                // URL display & cursor
-                let b_disp = if !state.app_input.is_empty() {
-                    state.app_input
-                } else if state.app_input_focused {
-                    "Search or type web address"
-                } else {
-                    "https://www.google.com"
-                };
-                let b_col = if !state.app_input.is_empty() { 0xFFFFFFFF } else { 0xFF94A3B8 };
-                draw_text(buf, stride, w, h, pad + 54, bar_top + 14, b_disp, b_col, 2);
-                if state.app_input_focused {
-                    let cur_x = pad + 54 + (state.app_input.len() * 12).min(url_w.saturating_sub(80));
-                    draw_rect(buf, stride, w, h, cur_x, bar_top + 12, 2, 22, 0xFF38BDF8);
-                }
-
-                // Tab count badge [ 1 ] and Reload icon
-                draw_rounded_rect(buf, stride, w, h, pad + 16 + url_w - 60, bar_top + 11, 24, 24, 6, 0xFF334155);
-                draw_text(buf, stride, w, h, pad + 16 + url_w - 53, bar_top + 15, "1", 0xFFFFFFFF, 1);
-                draw_text(buf, stride, w, h, pad + 16 + url_w - 28, bar_top + 14, "O", 0xFF94A3B8, 2);
-
-                // Web View Viewport Container
-                let toolbar_h = 52;
-                let page_y = bar_top + bar_h + 12;
-                let page_h = content_h.saturating_sub(bar_h + toolbar_h + 30);
-                draw_rounded_rect(buf, stride, w, h, pad + 16, page_y, url_w, page_h, 16, 0xFF0F172A);
-
-                if !state.app_input.is_empty() {
-                    // Active search result view
-                    draw_rounded_rect(buf, stride, w, h, pad + 32, page_y + 24, url_w - 32, 42, 10, 0xFF1E293B);
-                    draw_text(buf, stride, w, h, pad + 44, page_y + 36, "Web results for: ", 0xFF94A3B8, 2);
-                    draw_text(buf, stride, w, h, pad + 210, page_y + 36, state.app_input, 0xFF38BDF8, 2);
-
-                    // Card 1
-                    draw_rounded_rect(buf, stride, w, h, pad + 32, page_y + 80, url_w - 32, 90, 12, 0xFF1E293B);
-                    draw_text(buf, stride, w, h, pad + 48, page_y + 94, state.app_input, 0xFF60A5FA, 2);
-                    draw_text(buf, stride, w, h, pad + 48, page_y + 118, "https://www.google.com/search", 0xFF34D399, 1);
-                    draw_text(buf, stride, w, h, pad + 48, page_y + 138, "Top match and official verified web destination.", 0xFF94A3B8, 1);
-
-                    // Card 2
-                    draw_rounded_rect(buf, stride, w, h, pad + 32, page_y + 184, url_w - 32, 90, 12, 0xFF1E293B);
-                    draw_text(buf, stride, w, h, pad + 48, page_y + 198, "Wikipedia - Free Encyclopedia", 0xFF60A5FA, 2);
-                    draw_text(buf, stride, w, h, pad + 48, page_y + 222, "https://en.wikipedia.org/wiki", 0xFF34D399, 1);
-                    draw_text(buf, stride, w, h, pad + 48, page_y + 242, "Overview, history, documentation, and references.", 0xFF94A3B8, 1);
-                } else {
-                    // Google / Mobile Web Start Page
-                    let center_x = w / 2;
-                    let g_y = page_y + 40;
-                    // Google stylized multi-color logo
-                    draw_text(buf, stride, w, h, center_x - 84, g_y, "G", 0xFF4285F4, 4);
-                    draw_text(buf, stride, w, h, center_x - 56, g_y, "o", 0xFFEA4335, 4);
-                    draw_text(buf, stride, w, h, center_x - 28, g_y, "o", 0xFFFBBC05, 4);
-                    draw_text(buf, stride, w, h, center_x,      g_y, "g", 0xFF4285F4, 4);
-                    draw_text(buf, stride, w, h, center_x + 28, g_y, "l", 0xFF34A853, 4);
-                    draw_text(buf, stride, w, h, center_x + 48, g_y, "e", 0xFFEA4335, 4);
-
-                    // Start page in-page search bar
-                    let s_box_y = g_y + 60;
-                    let s_box_w = (url_w - 40).min(500);
-                    let s_box_x = center_x - s_box_w / 2;
-                    draw_rounded_rect(buf, stride, w, h, s_box_x, s_box_y, s_box_w, 46, 23, 0xFF1E293B);
-                    draw_text(buf, stride, w, h, s_box_x + 20, s_box_y + 14, "G", 0xFF4285F4, 2);
-                    draw_text(buf, stride, w, h, s_box_x + 44, s_box_y + 14, "Search or type web address", 0xFF64748B, 2);
-
-                    // Shortcuts Grid (2 rows x 3 cols)
-                    let sc_start_y = s_box_y + 70;
-                    let shortcuts = [
-                        ("Google", 0xFF4285F4, "G"),
-                        ("YouTube", 0xFFFF0000, "Y"),
-                        ("Wikipedia", 0xFF475569, "W"),
-                        ("Reddit", 0xFFFF4500, "R"),
-                        ("GitHub", 0xFF24292F, "g"),
-                        ("Weather", 0xFF0284C7, "W"),
-                    ];
-                    let sc_cols = 3;
-                    let sc_col_w = (url_w - 40) / sc_cols;
-                    for (idx, (sc_title, sc_color, sc_glyph)) in shortcuts.iter().enumerate() {
-                        let sc_c = idx % sc_cols;
-                        let sc_r = idx / sc_cols;
-                        let sc_x = pad + 20 + sc_c * sc_col_w + sc_col_w / 2;
-                        let sc_y = sc_start_y + sc_r * 72;
-                        if sc_y + 50 < page_y + page_h {
-                            draw_rounded_rect(buf, stride, w, h, sc_x - 22, sc_y, 44, 44, 22, *sc_color);
-                            draw_text_centered(buf, stride, w, h, sc_x, sc_y + 12, sc_glyph, 0xFFFFFFFF, 2);
-                            draw_text_centered(buf, stride, w, h, sc_x, sc_y + 50, sc_title, 0xFF94A3B8, 1);
-                        }
-                    }
-                }
-
-                // Bottom Mobile Browser Toolbar (Back, Forward, Home, Tabs, Menu)
-                let tb_y = page_y + page_h + 8;
-                draw_rounded_rect(buf, stride, w, h, pad + 16, tb_y, url_w, toolbar_h, 14, 0xFF1E293B);
-                let tb_slots = ["<", ">", "H", "1", ":"];
-                let tb_slot_w = url_w / tb_slots.len();
-                for (t_idx, symbol) in tb_slots.iter().enumerate() {
-                    let tx = pad + 16 + t_idx * tb_slot_w + tb_slot_w / 2;
-                    let t_col = if t_idx == 2 { 0xFF38BDF8 } else { 0xFF94A3B8 };
-                    draw_text_centered(buf, stride, w, h, tx, tb_y + 16, symbol, t_col, 2);
-                }
-            } else if app_name == "Messages" {
-                // Interactive Messages App with live chat and message input bar
-                let header_y = content_y + 12;
-                draw_rounded_rect(buf, stride, w, h, 32, header_y, w - 64, 40, 10, 0xFF1E293B);
-                draw_text_centered(buf, stride, w, h, w / 2, header_y + 11, "Treble Carrier (SIM 1 - 4G LTE Active)", 0xFF38BDF8, 2);
-
-                // Chat bubble list
-                let mut bubble_y = header_y + 54;
-                let max_bubble_w = w - 120;
-
-                // Incoming system bubble
-                draw_rounded_rect(buf, stride, w, h, 32, bubble_y, max_bubble_w, 48, 12, 0xFF1E293B);
-                draw_text(buf, stride, w, h, 48, bubble_y + 14, "Treble: Welcome! Tap below to type a message.", 0xFFE2E8F0, 2);
-                bubble_y += 60;
-
-                // User sent messages
-                for msg in state.messages_list.iter() {
-                    if bubble_y + 50 < content_y + content_h - 60 {
-                        let msg_w = (msg.len() * 12 + 32).min(max_bubble_w);
-                        let bubble_x = (w - 32).saturating_sub(msg_w);
-                        draw_rounded_rect(buf, stride, w, h, bubble_x, bubble_y, msg_w, 44, 12, 0xFF0284C7);
-                        draw_text(buf, stride, w, h, bubble_x + 16, bubble_y + 12, msg, 0xFFFFFFFF, 2);
-                        bubble_y += 54;
-                    }
-                }
-
-                // Bottom Message Input Box + Send Button
-                let msg_box_h = 46;
-                let msg_box_y = content_y + content_h.saturating_sub(msg_box_h + 12);
-                let msg_box_x = 32;
-                let send_btn_w = 64;
-                let msg_box_w = w - 64 - send_btn_w - 12;
-
-                let msg_border = if state.app_input_focused { 0xFF38BDF8 } else { 0xFF334155 };
-                draw_rounded_rect(buf, stride, w, h, msg_box_x - 1, msg_box_y - 1, msg_box_w + 2, msg_box_h + 2, 14, msg_border);
-                draw_rounded_rect(buf, stride, w, h, msg_box_x, msg_box_y, msg_box_w, msg_box_h, 13, 0xFF1E293B);
-                let m_disp = if !state.app_input.is_empty() { state.app_input } else { "Type a message..." };
-                let m_col = if !state.app_input.is_empty() { 0xFFFFFFFF } else { 0xFF94A3B8 };
-                draw_text(buf, stride, w, h, msg_box_x + 16, msg_box_y + 14, m_disp, m_col, 2);
-                if state.app_input_focused {
-                    let cur_x = msg_box_x + 16 + (state.app_input.len() * 12).min(msg_box_w.saturating_sub(30));
-                    draw_rect(buf, stride, w, h, cur_x, msg_box_y + 12, 2, 22, 0xFF38BDF8);
-                }
-
-                let send_x = msg_box_x + msg_box_w + 12;
-                draw_rounded_rect(buf, stride, w, h, send_x, msg_box_y, send_btn_w, msg_box_h, 13, 0xFF0284C7);
-                draw_text_centered(buf, stride, w, h, send_x + send_btn_w / 2, msg_box_y + 14, "Send", 0xFFFFFFFF, 2);
-            } else if app_name == "Phone" {
-                // Interactive Phone Dialer
-                let num_y = content_y + 12;
-                let num_h = 48;
-                let num_x = 32;
-                let num_w = w - 64;
-                let num_border = if state.app_input_focused { 0xFF38BDF8 } else { 0xFF334155 };
-                draw_rounded_rect(buf, stride, w, h, num_x - 1, num_y - 1, num_w + 2, num_h + 2, 14, num_border);
-                draw_rounded_rect(buf, stride, w, h, num_x, num_y, num_w, num_h, 13, 0xFF1E293B);
-                let p_disp = if !state.app_input.is_empty() { state.app_input } else { "Enter phone number..." };
-                let p_col = if !state.app_input.is_empty() { 0xFFFFFFFF } else { 0xFF94A3B8 };
-                draw_text(buf, stride, w, h, num_x + 16, num_y + 14, p_disp, p_col, 2);
-                if state.app_input_focused {
-                    let cur_x = num_x + 16 + (state.app_input.len() * 12).min(num_w.saturating_sub(30));
-                    draw_rect(buf, stride, w, h, cur_x, num_y + 13, 2, 22, 0xFF38BDF8);
-                }
-
-                // Call status / dial info
-                draw_text_centered(buf, stride, w, h, w / 2, num_y + 80, "Universal Cellular RIL Bridge", 0xFF10B981, 2);
-                draw_rounded_rect(buf, stride, w, h, (w - 180) / 2, num_y + 120, 180, 52, 14, 0xFF10B981);
-                draw_text_centered(buf, stride, w, h, w / 2, num_y + 135, "Call", 0xFFFFFFFF, 3);
-            } else if app_name == "Contacts" {
-                // Interactive Contacts App
-                let c_bar_y = content_y + 12;
-                let c_bar_h = 44;
-                let c_bar_x = 32;
-                let c_bar_w = w - 64;
-                let c_border = if state.app_input_focused { 0xFF38BDF8 } else { 0xFF334155 };
-                draw_rounded_rect(buf, stride, w, h, c_bar_x - 1, c_bar_y - 1, c_bar_w + 2, c_bar_h + 2, 14, c_border);
-                draw_rounded_rect(buf, stride, w, h, c_bar_x, c_bar_y, c_bar_w, c_bar_h, 13, 0xFF1E293B);
-                let c_disp = if !state.app_input.is_empty() { state.app_input } else { "Search contacts..." };
-                let c_col = if !state.app_input.is_empty() { 0xFFFFFFFF } else { 0xFF94A3B8 };
-                draw_text(buf, stride, w, h, c_bar_x + 16, c_bar_y + 13, c_disp, c_col, 2);
-                if state.app_input_focused {
-                    let cur_x = c_bar_x + 16 + (state.app_input.len() * 12).min(c_bar_w.saturating_sub(30));
-                    draw_rect(buf, stride, w, h, cur_x, c_bar_y + 11, 2, 22, 0xFF38BDF8);
-                }
-
-                let contacts = [
-                    ("Emergency Services", "112 / 911"),
-                    ("Voice Mailbox", "*86"),
-                    ("Treble Support", "+1 800 555 0199"),
-                ];
-                let mut cy = c_bar_y + c_bar_h + 16;
-                for (name, num) in contacts {
-                    if cy + 60 < content_y + content_h {
-                        draw_rounded_rect(buf, stride, w, h, 32, cy, w - 64, 52, 12, 0xFF1E293B);
-                        draw_text(buf, stride, w, h, 48, cy + 10, name, 0xFFF8FAFC, 2);
-                        draw_text(buf, stride, w, h, 48, cy + 30, num, 0xFF94A3B8, 1);
-                        cy += 62;
-                    }
-                }
-            } else if app_name == "Files" {
-                // Interactive Files App
-                let f_bar_y = content_y + 12;
-                let f_bar_h = 44;
-                let f_bar_x = 32;
-                let f_bar_w = w - 64;
-                let f_border = if state.app_input_focused { 0xFF38BDF8 } else { 0xFF334155 };
-                draw_rounded_rect(buf, stride, w, h, f_bar_x - 1, f_bar_y - 1, f_bar_w + 2, f_bar_h + 2, 14, f_border);
-                draw_rounded_rect(buf, stride, w, h, f_bar_x, f_bar_y, f_bar_w, f_bar_h, 13, 0xFF1E293B);
-                let f_disp = if !state.app_input.is_empty() { state.app_input } else { "Filter files (/root)..." };
-                let f_col = if !state.app_input.is_empty() { 0xFFFFFFFF } else { 0xFF94A3B8 };
-                draw_text(buf, stride, w, h, f_bar_x + 16, f_bar_y + 13, f_disp, f_col, 2);
-                if state.app_input_focused {
-                    let cur_x = f_bar_x + 16 + (state.app_input.len() * 12).min(f_bar_w.saturating_sub(30));
-                    draw_rect(buf, stride, w, h, cur_x, f_bar_y + 11, 2, 22, 0xFF38BDF8);
-                }
-
-                let dirs = [
-                    ("Documents", "Directory"),
-                    ("Downloads", "Directory"),
-                    ("Pictures", "Directory"),
-                    ("Music", "Directory"),
-                ];
-                let mut fy = f_bar_y + f_bar_h + 16;
-                for (name, kind) in dirs {
-                    if fy + 60 < content_y + content_h {
-                        draw_rounded_rect(buf, stride, w, h, 32, fy, w - 64, 52, 12, 0xFF1E293B);
-                        draw_text(buf, stride, w, h, 48, fy + 10, name, 0xFFF8FAFC, 2);
-                        draw_text(buf, stride, w, h, 48, fy + 30, kind, 0xFF94A3B8, 1);
-                        fy += 62;
-                    }
-                }
+            let fg = if on {
+                state.palette.on_primary
             } else {
-                // Generic Modern Mobile App Screen with Universal Text Input Bar
-                let g_bar_y = content_y + 12;
-                let g_bar_h = 44;
-                let g_bar_x = 32;
-                let g_bar_w = w - 64;
-                let g_border = if state.app_input_focused { 0xFF38BDF8 } else { 0xFF334155 };
-                draw_rounded_rect(buf, stride, w, h, g_bar_x - 1, g_bar_y - 1, g_bar_w + 2, g_bar_h + 2, 14, g_border);
-                draw_rounded_rect(buf, stride, w, h, g_bar_x, g_bar_y, g_bar_w, g_bar_h, 13, 0xFF1E293B);
-                let g_disp = if !state.app_input.is_empty() { state.app_input } else { "Search or enter text..." };
-                let g_col = if !state.app_input.is_empty() { 0xFFFFFFFF } else { 0xFF94A3B8 };
-                draw_text(buf, stride, w, h, g_bar_x + 16, g_bar_y + 13, g_disp, g_col, 2);
-                if state.app_input_focused {
-                    let cur_x = g_bar_x + 16 + (state.app_input.len() * 12).min(g_bar_w.saturating_sub(30));
-                    draw_rect(buf, stride, w, h, cur_x, g_bar_y + 11, 2, 22, 0xFF38BDF8);
-                }
-
-                draw_text_centered(buf, stride, w, h, w / 2, content_y + 90, app_name, 0xFF38BDF8, 4);
-                draw_text_centered(buf, stride, w, h, w / 2, content_y + 140, "Universal Treble Linux Mobile Application", 0xFF94A3B8, 2);
-                draw_rounded_rect(buf, stride, w, h, (w - 200) / 2, content_y + 190, 200, 50, 14, 0xFF3B82F6);
-                draw_text_centered(buf, stride, w, h, w / 2, content_y + 205, "Action Ready", 0xFFFFFFFF, 2);
+                state.palette.on_surface_variant
+            };
+            draw_rounded_rect_f(
+                buf, stride, w, h, c.x, c.y, c.w, c.h, c.radius, bg,
+            );
+            draw_text_clipped(
+                buf, stride, w, h, c.x + label_pad, c.y + label_pad, c.w - label_pad * 2.0,
+                name, fg, 1, FontWeight::Bold,
+            );
+            // Active dot instead of an ON/OFF word: less noise, same meaning.
+            if on {
+                draw_circle_glyph(
+                    buf, stride, w, h, c.x + c.w - label_pad, c.y + c.h - label_pad,
+                    tile_em * 0.22, fg,
+                );
             }
+        }
 
-            // Bottom Navigation Pill
-            let nav_y = h - 20;
-            let nav_w = 140;
-            let nav_x = (w - nav_w) / 2;
-            draw_rounded_rect(buf, stride, w, h, nav_x, nav_y, nav_w, 5, 2, 0xFFFFFFFF);
+        // Brightness slider: track plus a filled level.
+        let br = sl.brightness;
+        draw_rounded_rect_f(
+            buf, stride, w, h, br.x, br.y, br.w, br.h, br.radius,
+            state.palette.surface_container_high,
+        );
+        let fill = br.w * 0.78;
+        draw_rounded_rect_f(
+            buf, stride, w, h, br.x, br.y, fill, br.h, br.radius, state.palette.primary,
+        );
+        // Thumb.
+        draw_circle_glyph(
+            buf, stride, w, h, br.x + fill, br.center_y(), br.h * 0.26,
+            state.palette.on_primary,
+        );
+        draw_text_clipped(
+            buf, stride, w, h, br.x + br.h * 0.6, br.center_y() - tile_em * 0.31,
+            br.w - br.h * 1.2, "Brightness  78%", state.palette.on_primary, 1, FontWeight::Medium,
+        );
+
+        // Notifications.
+        draw_text_weighted(
+            buf, stride, w, h, sl.tiles.origin.0 as usize, sl.notif_title_y as usize,
+            "NOTIFICATIONS", state.palette.on_surface_variant, 1, FontWeight::Bold,
+        );
+        let cards = [
+            ("UTIM PID 1 & UTLC Wayland", "Interactive compositor, < 8ms input response"),
+            ("Direct DRM KMS Scanout", "Native scanout via /dev/dri/card0"),
+        ];
+        for (i, (title, body)) in cards.iter().enumerate() {
+            let c = sl.notifs[i];
+            draw_rounded_rect_f(
+                buf, stride, w, h, c.x, c.y, c.w, c.h, c.radius,
+                state.palette.surface_container_high,
+            );
+            let tx = c.x + label_pad;
+            let tw = c.w - label_pad * 2.0;
+            draw_text_clipped(
+                buf, stride, w, h, tx, c.y + c.h * 0.20, tw, title,
+                state.palette.on_surface, 1, FontWeight::Bold,
+            );
+            draw_text_clipped(
+                buf, stride, w, h, tx, c.y + c.h * 0.20 + tile_em * 1.1, tw, body,
+                state.palette.on_surface_variant, 1, FontWeight::Regular,
+            );
+        }
+
+        // Pull handle to dismiss.
+        let hd = sl.handle;
+        draw_rounded_rect_f(
+            buf, stride, w, h, hd.x, hd.y, hd.w, hd.h, hd.radius, state.palette.outline,
+        );
+    } else if let Some(app_name) = state.active_app {
+        // 4. Active Application Window View
+        //
+        // The top bar, its buttons and the content card all come from
+        // `AppLayout`, which is the same value the input path uses, so the
+        // back/close affordances cannot drift from their hit areas.
+        let panel = match app_name {
+            "Browser" => AppPanel::Browser,
+            "Terminal" => AppPanel::Terminal,
+            "Messages" => AppPanel::Messages,
+            "Settings" => AppPanel::Settings,
+            "Phone" => AppPanel::Phone,
+            _ => AppPanel::Other,
+        };
+        let tabs_n = state.terminal_tabs.len().max(1);
+        let al = AppLayout::new(w as f32, h as f32, panel, tabs_n);
+        let bar = al.bar;
+
+        draw_rounded_rect(
+            buf, stride, w, h,
+            bar.x as usize, bar.y as usize, bar.w as usize, bar.h as usize,
+            bar.radius as usize, state.palette.surface_container,
+        );
+        // Back button.
+        let em2 = super::font::em_px_at(2, w);
+        let btn_text_y = al.back.center_y() - em2 * 0.30;
+        draw_rounded_rect(
+            buf, stride, w, h,
+            al.back.x as usize, al.back.y as usize, al.back.w as usize, al.back.h as usize,
+            (al.back.h * 0.25) as usize, state.palette.surface_container_high,
+        );
+        draw_text(buf, stride, w, h, (al.back.x + al.back.h * 0.35) as usize, btn_text_y as usize, "<", state.palette.on_surface, 2);
+        draw_text(
+            buf, stride, w, h, (al.back.x + al.back.h * 0.95) as usize, btn_text_y as usize,
+            "Back", state.palette.on_surface, 2,
+        );
+
+        // App title, clipped so a long name cannot run into a button.
+        let title_x = al.back.x + al.back.w;
+        let title_w = (al.close.x - title_x - al.back.h * 0.3).max(0.0);
+        draw_text_centered_clipped(
+            buf, stride, w, h,
+            (title_x + title_w * 0.5) as usize,
+            (bar.center_y() - em2 * 0.32) as usize,
+            title_w,
+            app_name, state.palette.on_surface, 2, FontWeight::Bold,
+        );
+
+        // Close button.
+        draw_rounded_rect(
+            buf, stride, w, h,
+            al.close.x as usize, al.close.y as usize, al.close.w as usize, al.close.h as usize,
+            (al.close.h * 0.25) as usize, 0xFFEF4444,
+        );
+        let cx_c = al.close.center_x();
+        let cy_c = al.close.center_y();
+        let r = al.close.h * 0.17;
+        draw_line(buf, stride, w, h, cx_c - r, cy_c - r, cx_c + r, cy_c + r, 0xFFFFFFFF);
+        draw_line(buf, stride, w, h, cx_c + r, cy_c - r, cx_c - r, cy_c + r, 0xFFFFFFFF);
+
+        // App content container. The keyboard shortens it, so the drawn card
+        // and the scrolled content band move together.
+        let kb_h = if state.keyboard_active {
+            Keyboard::new(w as f32, h as f32).frame.h
         } else {
-            // 5. Foundational Layer: Home Screen
-            let widget_y = LauncherLayout::CLOCK_Y as usize;
-            draw_material_you_clock(buf, stride, w, h, w / 2, widget_y + 35, state.time_str, 0xFFFFFFFF, 72);
-            draw_text_centered_weighted(
-                buf,
-                stride,
-                w,
-                h,
-                w / 2,
-                widget_y + 85,
-                "Tue, Sep 22  |  28 C Sunny",
-                0xFF88A0C0,
-                2,
-                FontWeight::Medium,
+            0.0
+        };
+        let content_y = al.scroll_top;
+        let content_h = (h as f32 - kb_h - h as f32 * 0.030 - content_y).max(0.0);
+        draw_rounded_rect(
+            buf, stride, w, h,
+            bar.x as usize, content_y as usize, bar.w as usize, content_h as usize,
+            (bar.h * 0.32) as usize, state.palette.outline_variant,
+        );
+
+        if app_name == "Terminal" {
+            // Interactive Linux shell with a tabbed multi-terminal bar. The
+            // strip geometry is `AppLayout::tab_rect` / `add_tab_rect`, which
+            // the input path hit-tests, so tabs cannot overlap or drift.
+            let default_single_tab = [TerminalTabInfo {
+                id: 1,
+                title: "Tab 1: bash",
+                is_running: state.terminal_running,
+                is_active: true,
+            }];
+            let tabs = if state.terminal_tabs.is_empty() {
+                &default_single_tab[..]
+            } else {
+                state.terminal_tabs
+            };
+            let tab_al = AppLayout::new(w as f32, h as f32, AppPanel::Terminal, tabs.len());
+            let t_em = super::font::em_px_at(1, w);
+
+            for (i, tab) in tabs.iter().enumerate().take(4) {
+                let r = tab_al.tab_rect(i);
+                let is_active = tab.is_active || (tabs.len() == 1 && i == 0);
+                let bg = if is_active {
+                    state.palette.primary
+                } else {
+                    state.palette.surface_container_high
+                };
+                let fg = if is_active { state.palette.on_primary } else { state.palette.on_surface_variant };
+                draw_rounded_rect(
+                    buf, stride, w, h,
+                    r.x as usize, r.y as usize, r.w as usize, r.h as usize, r.radius as usize, bg,
+                );
+
+                // Running indicator, then a title clipped to what is left.
+                let dot_r = r.h * 0.13;
+                let mut tx = r.x + r.h * 0.28;
+                if tab.is_running {
+                    draw_rounded_rect(
+                        buf, stride, w, h,
+                        tx as usize, (r.center_y() - dot_r) as usize,
+                        (dot_r * 2.0) as usize, (dot_r * 2.0) as usize, dot_r as usize,
+                        0xFF10B981,
+                    );
+                    tx += dot_r * 3.4;
+                }
+                let close = tab_al.tab_close_zone(i, i);
+                let title_w = (close.x - tx - r.h * 0.12).max(0.0);
+                draw_text_clipped(
+                    buf, stride, w, h, tx, r.center_y() - t_em * 0.30,
+                    title_w, tab.title, fg, 1, FontWeight::Medium,
+                );
+
+                // Close affordance only on the active tab, and only when
+                // there is more than one tab to close.
+                if is_active && tabs.len() > 1 {
+                    let cxr = close.center_x();
+                    let cyr = r.center_y();
+                    let cr = r.h * 0.13;
+                    draw_line(buf, stride, w, h, cxr - cr, cyr - cr, cxr + cr, cyr + cr, fg);
+                    draw_line(buf, stride, w, h, cxr + cr, cyr - cr, cxr - cr, cyr + cr, fg);
+                }
+            }
+
+            // Add-tab button, exactly where `add_tab_rect` says it is.
+            if let Some(add) = tab_al.add_tab_rect() {
+                draw_rounded_rect(
+                    buf, stride, w, h,
+                    add.x as usize, add.y as usize, add.w as usize, add.h as usize, add.radius as usize,
+                    state.palette.surface_container_high,
+                );
+                let ar = add.h * 0.22;
+                let acx = add.center_x();
+                let acy = add.center_y();
+                draw_line(buf, stride, w, h, acx - ar, acy, acx + ar, acy, state.palette.primary);
+                draw_line(buf, stride, w, h, acx, acy - ar, acx, acy + ar, state.palette.primary);
+            }
+
+            // Divider line below the tab strip, then the shell banner.
+            let strip_bottom = tab_al.tabs.y + tab_al.tabs.h;
+            draw_rect(
+                buf, stride, w, h,
+                (bar.x + bar.h * 0.25) as usize, (strip_bottom + h as f32 * 0.004) as usize,
+                (bar.w - bar.h * 0.5) as usize, (h as f32 * 0.0015).max(1.0) as usize,
+                state.palette.outline_variant,
             );
 
-            // 6. Google / Treble Search Pill Widget
-            let search_y = LauncherLayout::SEARCH_Y as usize;
-            let search_h = LauncherLayout::SEARCH_H as usize;
-            let search_pad_x = LauncherLayout::SEARCH_PAD_X as usize;
-            let search_w = w - search_pad_x * 2;
-            let search_x = search_pad_x;
-            let pill_bg = if state.search_active { 0xFF334155 } else { 0xFF2A3345 };
-            let pill_border = if state.search_active { 0xFF38BDF8 } else { 0xFF475569 };
-            draw_rounded_rect(buf, stride, w, h, search_x - 2, search_y - 2, search_w + 4, search_h + 4, (search_h + 4) / 2, pill_border);
-            draw_rounded_rect(buf, stride, w, h, search_x, search_y, search_w, search_h, search_h / 2, pill_bg);
-            draw_text(buf, stride, w, h, search_x + 20, search_y + 16, "G", 0xFF4285F4, 3);
+            let mut line_y = strip_bottom + h as f32 * 0.010;
+            draw_text(buf, stride, w, h, 36, line_y as usize, "Universal Treble Linux 1.0 (Debian Sid ARM64)", 0xFF38BDF8, 3);
+            line_y += h as f32 * 0.016;
+            draw_text(buf, stride, w, h, 36, line_y as usize, "Linux 6.1.23-android14-4-00257 (Android GKI)", 0xFF94A3B8, 2);
+            line_y += h as f32 * 0.011;
+            draw_text(buf, stride, w, h, 36, line_y as usize, "UTIM PID 1 init | UTLC Wayland Compositor", 0xFF94A3B8, 2);
+            line_y += h as f32 * 0.011;
+            draw_text(buf, stride, w, h, 36, line_y as usize, "Debian Sid ARM64 GNU/Linux - Multi-Tab Terminal Active", 0xFF64748B, 2);
+            line_y += h as f32 * 0.016;
 
-            if state.search_active {
-                let disp_query = if state.search_query.is_empty() {
-                    "Type to search..."
-                } else {
-                    state.search_query
-                };
-                let q_color = if state.search_query.is_empty() { 0xFF94A3B8 } else { 0xFFFFFFFF };
-                draw_text(buf, stride, w, h, search_x + 55, search_y + 18, disp_query, q_color, 2);
-                let cur_x = search_x + 55 + (if state.search_query.is_empty() { 0 } else { text_width(state.search_query, 2) });
-                draw_rect(buf, stride, w, h, cur_x, search_y + 16, 2, 24, 0xFF38BDF8);
+            // Terminal body: scale 3 with a 1.18 line box.
+            let term_em = super::font::em_px_at(3, w);
+            let line_h = (term_em * 1.18).round();
+            let header_used = line_y - content_y;
+            let available_h = (content_h - header_used - h as f32 * 0.020).max(0.0);
+            let max_lines = ((available_h / line_h) as usize).saturating_sub(1);
+
+            // Auto-scroll viewport: show the most recent lines so the active prompt is always visible
+            let visible_lines = if state.terminal_lines.len() > max_lines {
+                &state.terminal_lines[state.terminal_lines.len() - max_lines..]
             } else {
-                draw_text(buf, stride, w, h, search_x + 55, search_y + 18, "Search apps, web...", 0xFF8A99AD, 2);
-                draw_text(buf, stride, w, h, search_x + search_w - 36, search_y + 16, "*", 0xFFEA4335, 3);
-            }
-
-            // Edit Mode Action Bar (if an icon is selected on Home Screen)
-            let has_selection = state.selected_icon_id.is_some();
-            if has_selection {
-                let act_y = LauncherLayout::ACTION_CHIPS_Y as usize;
-                let act_h = LauncherLayout::ACTION_CHIPS_H as usize;
-                let chip_w = (w - 76) / 2;
-                // Remove from Home chip
-                draw_rounded_rect(buf, stride, w, h, 28, act_y, chip_w, act_h, 12, 0xDD7F1D1D);
-                draw_rounded_rect(buf, stride, w, h, 27, act_y - 1, chip_w + 2, act_h + 2, 13, 0xFFEF4444);
-                draw_text_centered_weighted(buf, stride, w, h, 28 + chip_w / 2, act_y + 12, "X Remove from Home", 0xFFFFFFFF, 2, FontWeight::Medium);
-
-                // Move to Page chip
-                let chip2_x = 28 + chip_w + 20;
-                let move_label = if state.home_page == 0 { "-> Move to Page 2" } else { "<- Move to Page 1" };
-                draw_rounded_rect(buf, stride, w, h, chip2_x, act_y, chip_w, act_h, 12, 0xDD1E3A8A);
-                draw_rounded_rect(buf, stride, w, h, chip2_x - 1, act_y - 1, chip_w + 2, act_h + 2, 13, 0xFF3B82F6);
-                draw_text_centered_weighted(buf, stride, w, h, chip2_x + chip_w / 2, act_y + 12, move_label, 0xFFFFFFFF, 2, FontWeight::Medium);
-            }
-
-            // 7. App Grid Icons (4 columns x dynamic rows)
-            let grid_top = if has_selection {
-                LauncherLayout::GRID_TOP_SELECTED as usize
-            } else {
-                LauncherLayout::GRID_TOP_NORMAL as usize
+                state.terminal_lines
             };
-            let cols = LauncherLayout::GRID_COLS;
-            let col_width = w / cols;
-            let icon_size = LauncherLayout::ICON_SIZE as usize;
-            let grid_row_h = LauncherLayout::GRID_ROW_H as usize;
 
-            let apps: &[AppGridItem] = state.grid_apps;
+            for line in visible_lines {
+                if line_y + line_h <= content_y + content_h - h as f32 * 0.014 {
+                    draw_text_clipped(
+                        buf, stride, w, h, 36.0, line_y, bar.w - 36.0 * 2.0, line, 0xFFE2E8F0, 3,
+                        FontWeight::Regular,
+                    );
+                    line_y += line_h;
+                }
+            }
 
-            let dock_h = LauncherLayout::DOCK_H as usize;
-            let dock_bottom_margin = LauncherLayout::DOCK_BOTTOM_MARGIN as usize;
-            let dock_y = h - dock_h - dock_bottom_margin;
-            let max_rows = LauncherLayout::max_home_rows(h as f32, has_selection);
-            let max_apps = max_rows * cols;
-            let scroll_dx = state.home_scroll_offset as i32;
-
-            for (idx, app) in apps.iter().take(max_apps).enumerate() {
-                let row = idx / cols;
-                let col = idx % cols;
-                let cx_base = (col * col_width + col_width / 2) as i32;
-                let cx = cx_base + scroll_dx;
-                let cy = (grid_top + row * grid_row_h) as i32;
-
-                let ix = cx - (icon_size as i32) / 2;
-                let iy = cy - (icon_size as i32) / 2;
-
-                if ix + (icon_size as i32) <= 0 || ix >= w as i32 {
+            // Active prompt line with typed characters and blinking cursor (Scale 3)
+            if line_y + line_h <= content_y + content_h {
+                if state.terminal_running {
+                    draw_text(buf, stride, w, h, 36, line_y as usize, "[running... (Ctrl+C to stop)]", 0xFFF59E0B, 3);
+                } else {
+                    const PROMPT: &str = "root@treble-gsi:~# ";
+                    let prompt_w = super::font::measure(PROMPT, term_em);
+                    let baseline = line_y + term_em * 0.30;
+                    draw_text(buf, stride, w, h, 36, baseline as usize, PROMPT, 0xFF10B981, 3);
+                    // The typed line is clipped to the content card, and the
+                    // caret tracks the real measured advance.
+                    let input_x = 36.0 + prompt_w;
+                    let avail = (bar.x + bar.w - 36.0 - input_x).max(0.0);
+                    draw_text_clipped(
+                        buf, stride, w, h, input_x, baseline, avail, state.terminal_input,
+                        0xFFFFFFFF, 3, FontWeight::Regular,
+                    );
+                    let caret_x = input_x + super::font::measure(state.terminal_input, term_em);
+                    if caret_x < 36.0 + avail {
+                        draw_rect(
+                            buf, stride, w, h, caret_x as usize, baseline as usize,
+                            (term_em * 0.09).round().max(2.0) as usize, (term_em * 0.72) as usize,
+                            0xFF10B981,
+                        );
+                    }
+                }
+            }
+        } else if app_name == "Settings" {
+            // Settings: a top search field over a filtered list of system
+            // section cards. The field is the same rect the input path
+            // hit-tests, and every card is clipped to the content card.
+            let (list, list_h) = draw_app_search_field(
+                buf, stride, w, h, &bar, content_y, al, state, "Search settings...",
+            );
+            let cards = [
+                ("Network & Internet", "Wi-Fi, Mobile, Hotspot, VPN"),
+                ("Connected Devices", "Bluetooth, Android HAL bridge"),
+                ("Display & Graphics", "1080x2400 @ 120Hz Direct DRM KMS"),
+                ("Sound & Multimedia", "PipeWire spa-droid Audio"),
+                ("Storage", "4.00 GB ext4 System GSI Image"),
+                ("Battery", "98% - Mobile Power Governor active"),
+                ("About Phone", "Universal Treble Linux (Android 14 GKI)"),
+            ];
+            let query = state.app_input.to_lowercase();
+            let mut y = list;
+            let card_h = (list_h / cards.len() as f32 * 0.82).min(h as f32 * 0.030);
+            let step = card_h + h as f32 * 0.006;
+            let x = bar.x + bar.h * 0.25;
+            let rw = bar.w - bar.h * 0.5;
+            let title_em = super::font::em_px_at(1, w);
+            for (title, desc) in cards {
+                if !query.is_empty()
+                    && !title.to_lowercase().contains(&query)
+                    && !desc.to_lowercase().contains(&query)
+                {
                     continue;
                 }
-
-                let is_selected = state.selected_icon_id == Some(app.id);
-                if is_selected {
-                    draw_rounded_rect_i32(buf, stride, w, h, ix - 5, iy - 5, icon_size + 10, icon_size + 10, 20, 0xFF38BDF8);
-                    draw_rounded_rect_i32(buf, stride, w, h, ix - 2, iy - 2, icon_size + 4, icon_size + 4, 18, 0xFF0B1120);
+                if y + card_h > list + list_h {
+                    break;
                 }
-
-                draw_rounded_rect_i32(buf, stride, w, h, ix, iy, icon_size, icon_size, 16, app.color);
-                match app.icon {
-                    Some(icon) => {
-                        draw_icon_bitmap_i32(buf, stride, w, h, ix, iy, icon_size, icon_size, 16, icon);
-                    }
-                    None => {
-                        draw_text_centered_i32(buf, stride, w, h, cx, cy - 8, app.glyph, 0xFFFFFFFF, 3);
-                    }
-                }
-                draw_text_centered_weighted_i32(buf, stride, w, h, cx, cy + 42, app.name, 0xFFE2E8F0, 2, FontWeight::Medium);
+                draw_rounded_rect_f(
+                    buf, stride, w, h, x, y, rw, card_h, card_h * 0.24,
+                    state.palette.surface_container_high,
+                );
+                let tx = x + card_h * 0.45;
+                let tw = rw - card_h * 0.9;
+                draw_text_clipped(
+                    buf, stride, w, h, tx, y + card_h * 0.16, tw, title,
+                    state.palette.on_surface, 1, FontWeight::Bold,
+                );
+                draw_text_clipped(
+                    buf, stride, w, h, tx, y + card_h * 0.16 + title_em, tw, desc,
+                    state.palette.on_surface_variant, 1, FontWeight::Regular,
+                );
+                y += step;
             }
+        } else if app_name == "Browser" || app_name == "Web" || app_name.contains("Browser") || app_name == "Firefox" {
+            // Mobile browser. The omnibox, viewport and toolbar are all sized
+            // from the content card, so nothing can be drawn outside it.
+            let card_x = bar.x + bar.h * 0.25;
+            let card_w = bar.w - bar.h * 0.5;
+            let inset = card_w * 0.022;
+            let url_x = card_x + inset;
+            let url_w = card_w - inset * 2.0;
+            let bar_top = content_y + h as f32 * 0.008;
+            let bar_h = h as f32 * 0.030;
+            let toolbar_h = h as f32 * 0.034;
+            let page_y = bar_top + bar_h + h as f32 * 0.008;
+            let page_h = ((content_y + content_h) - page_y - toolbar_h - h as f32 * 0.010).max(0.0);
 
-            // Multi-Page Indicator Dots with Smooth Sliding Active Pill
-            let dots_y = dock_y - 20;
-            let total_pages = state.total_home_pages.max(1);
-            let dot_spacing = 22;
-            let total_dots_w = (total_pages - 1) * dot_spacing + 24;
-            let start_dot_x = (w - total_dots_w) / 2;
-            for p in 0..total_pages {
-                let dx = start_dot_x + p * dot_spacing;
-                draw_rounded_rect(buf, stride, w, h, dx + 8, dots_y, 6, 6, 3, 0x66FFFFFF);
-            }
-            let fractional_page = (state.home_page as f32 - (state.home_scroll_offset / w as f32))
-                .clamp(0.0, (total_pages - 1) as f32);
-            let active_dot_x = (start_dot_x as f32 + fractional_page * (dot_spacing as f32)) as usize;
-            draw_rounded_rect(buf, stride, w, h, active_dot_x, dots_y, 22, 6, 3, 0xFFFFFFFF);
-
-            // 8. Persistent Hotseat Dock at Bottom
-            let dock_x = LauncherLayout::DOCK_PAD_X as usize;
-            let dock_w = w - dock_x * 2;
-
-            draw_rounded_rect(buf, stride, w, h, dock_x, dock_y, dock_w, dock_h, 32, 0xFF182236);
-
-            let fallback_dock = [
-                AppGridItem { id: "phone", name: "Phone", color: 0xFF10B981, glyph: "P", icon: None },
-                AppGridItem { id: "messages", name: "Messages", color: 0xFF3B82F6, glyph: "M", icon: None },
-                AppGridItem { id: "apps", name: "Apps", color: 0xFF475569, glyph: ":", icon: None },
-                AppGridItem { id: "browser", name: "Browser", color: 0xFF06B6D4, glyph: "B", icon: None },
-                AppGridItem { id: "camera", name: "Camera", color: 0xFFF43F5E, glyph: "C", icon: None },
-            ];
-            let dock_apps: &[AppGridItem] = if !state.dock_apps.is_empty() {
-                state.dock_apps
+            let ring = (w as f32 * 0.003).max(1.0);
+            let url_border = if state.app_input_focused {
+                state.palette.primary
             } else {
-                &fallback_dock[..]
+                state.palette.outline
             };
+            draw_rounded_rect_f(
+                buf, stride, w, h, url_x - ring, bar_top - ring, url_w + ring * 2.0,
+                bar_h + ring * 2.0, bar_h * 0.5 + ring, url_border,
+            );
+            draw_rounded_rect_f(
+                buf, stride, w, h, url_x, bar_top, url_w, bar_h, bar_h * 0.5,
+                state.palette.surface_container_high,
+            );
 
-            let dock_col_w = dock_w / dock_apps.len().max(1);
-            for (i, app) in dock_apps.iter().enumerate() {
-                let cx = dock_x + i * dock_col_w + dock_col_w / 2;
-                let cy = dock_y + dock_h / 2;
-                let d_size = 54;
-                let dx = cx.saturating_sub(d_size / 2);
-                let dy = cy.saturating_sub(d_size / 2);
-                draw_rounded_rect(buf, stride, w, h, dx, dy, d_size, d_size, 16, app.color);
-                match app.icon {
-                    Some(icon) => {
-                        draw_icon_bitmap(buf, stride, w, h, dx, dy, d_size, d_size, 16, icon);
-                    }
-                    None => {
-                        draw_text_centered(buf, stride, w, h, cx, cy, app.glyph, 0xFFFFFFFF, 2);
-                    }
+            // Lock badge, drawn as a real padlock silhouette.
+            let lock_r = bar_h * 0.20;
+            let lock_cx = url_x + bar_h * 0.55;
+            let lock_cy = bar_top + bar_h * 0.5;
+            draw_rounded_rect_f(
+                buf, stride, w, h, lock_cx - lock_r * 1.15, lock_cy - lock_r * 1.7,
+                lock_r * 2.3, lock_r * 2.2, lock_r * 0.6, 0xFF10B981,
+            );
+            draw_rounded_rect_f(
+                buf, stride, w, h, lock_cx - lock_r * 0.75, lock_cy - lock_r * 0.5,
+                lock_r * 1.5, lock_r * 1.1, lock_r * 0.3, state.palette.surface_container_high,
+            );
+
+            // URL, clipped to what the trailing badges leave.
+            let badge_w = bar_h * 0.95;
+            let trail = bar_h * 0.55;
+            let b_disp = if !state.app_input.is_empty() {
+                state.app_input
+            } else if state.app_input_focused {
+                "Search or type web address"
+            } else {
+                "https://www.google.com"
+            };
+            let b_col = if !state.app_input.is_empty() {
+                state.palette.on_surface
+            } else {
+                state.palette.on_surface_variant
+            };
+            let b_em = super::font::em_px_at(2, w);
+            let b_text_h = b_em * 0.62;
+            let b_tx = url_x + bar_h * 1.10;
+            let b_w = (url_x + url_w - trail - b_tx).max(0.0);
+            let b_ty = bar_top + (bar_h - b_text_h) * 0.5 - b_em * 0.14;
+            draw_text_clipped(buf, stride, w, h, b_tx, b_ty, b_w, b_disp, b_col, 2, FontWeight::Regular);
+            if state.app_input_focused {
+                let cur_x = b_tx + super::font::measure(b_disp, b_em) + ring;
+                if cur_x < b_tx + b_w {
+                    draw_rect(
+                        buf, stride, w, h, cur_x as usize, b_ty as usize,
+                        ring.max(2.0) as usize, b_text_h as usize, state.palette.primary,
+                    );
                 }
             }
 
-            // 9. Gesture Navigation Bar (Pill at bottom)
-            let nav_y = h - 20;
-            let nav_w = 140;
-            let nav_x = (w - nav_w) / 2;
-            draw_rounded_rect(buf, stride, w, h, nav_x, nav_y, nav_w, 5, 2, 0xFFFFFFFF);
+            // Tab-count badge and reload glyph on the trailing edge.
+            let badge_x = url_x + url_w - trail - badge_w;
+            draw_rounded_rect_f(
+                buf, stride, w, h, badge_x, bar_top + (bar_h - badge_w) * 0.5, badge_w, badge_w,
+                badge_w * 0.28, state.palette.surface_container,
+            );
+            draw_text_centered(
+                buf, stride, w, h, (badge_x + badge_w * 0.5) as usize,
+                (bar_top + (bar_h - badge_w) * 0.5 + badge_w * 0.16) as usize,
+                "1", state.palette.on_surface_variant, 1,
+            );
+            let rr = badge_w * 0.26;
+            let rcx = url_x + url_w - trail * 0.5;
+            let rcy = bar_top + bar_h * 0.5;
+            // Refresh: an arc approximated by four ticks plus an arrow head.
+            for i in 0..8 {
+                let ang = i as f32 * std::f32::consts::TAU / 8.0;
+                let px = rcx + rr * ang.cos();
+                let py = rcy + rr * ang.sin();
+                draw_rect_f(buf, stride, w, h, px - 1.0, py - 1.0, 2.0, 2.0, state.palette.on_surface_variant);
+            }
+            draw_line(buf, stride, w, h, rcx + rr * 0.7, rcy - rr * 0.7, rcx + rr * 1.15, rcy - rr * 0.7, state.palette.on_surface_variant);
+            draw_line(buf, stride, w, h, rcx + rr * 1.15, rcy - rr * 0.7, rcx + rr * 1.15, rcy - rr * 0.25, state.palette.on_surface_variant);
 
-            // Layered App Drawer Overlay (Lawnchair 17 sliding drawer with frosted blur)
-            if state.app_drawer_open || state.drawer_progress > 0.001 {
-                let drawer_prog = if state.drawer_progress > 0.001 {
-                    state.drawer_progress.clamp(0.0, 1.0)
-                } else if state.app_drawer_open {
-                    1.0
+            // Viewport.
+            draw_rounded_rect_f(
+                buf, stride, w, h, card_x, page_y, card_w, page_h, bar.h * 0.4,
+                state.palette.outline_variant,
+            );
+            let body_x = card_x + inset;
+            let body_w = card_w - inset * 2.0;
+
+            if !state.app_input.is_empty() {
+                // Search results view: header, then two result cards.
+                let head_h = h as f32 * 0.028;
+                draw_rounded_rect_f(
+                    buf, stride, w, h, body_x, page_y + inset, body_w, head_h, head_h * 0.24,
+                    state.palette.surface_container_high,
+                );
+                let head_em = super::font::em_px_at(1, w);
+                let label = "Results for";
+                let q_w = super::font::measure(state.app_input, head_em);
+                let lbl_w = super::font::measure(label, head_em);
+                let hy = page_y + inset + (head_h - head_em * 0.62) * 0.5;
+                draw_text_weighted(
+                    buf, stride, w, h, (body_x + inset) as usize, hy as usize,
+                    label, state.palette.on_surface_variant, 1, FontWeight::Regular,
+                );
+                draw_text_weighted(
+                    buf, stride, w, h, (body_x + inset + lbl_w + head_em * 0.2) as usize, hy as usize,
+                    state.app_input, state.palette.primary, 1, FontWeight::Bold,
+                );
+                let _ = q_w;
+
+                let card_top = page_y + inset + head_h + inset;
+                let ch = ((page_y + page_h - card_top) * 0.5 - inset).max(0.0);
+                for (i, (title, url, snippet)) in [
+                    (state.app_input, "https://www.google.com/search", "Top match and official verified web destination."),
+                    ("Wikipedia - Free Encyclopedia", "https://en.wikipedia.org/wiki", "Overview, history, documentation, and references."),
+                ]
+                .iter()
+                .enumerate()
+                {
+                    let cy = card_top + i as f32 * (ch + inset);
+                    draw_rounded_rect_f(
+                        buf, stride, w, h, body_x, cy, body_w, ch, ch * 0.14,
+                        state.palette.surface_container_high,
+                    );
+                    let t_em = super::font::em_px_at(1, w);
+                    draw_text_clipped(
+                        buf, stride, w, h, body_x + inset, cy + ch * 0.14, body_w - inset * 2.0,
+                        title, state.palette.primary, 1, FontWeight::Bold,
+                    );
+                    draw_text_clipped(
+                        buf, stride, w, h, body_x + inset, cy + ch * 0.14 + t_em, body_w - inset * 2.0,
+                        url, state.palette.on_surface_variant, 1, FontWeight::Regular,
+                    );
+                    draw_text_clipped(
+                        buf, stride, w, h, body_x + inset, cy + ch * 0.14 + t_em * 2.0, body_w - inset * 2.0,
+                        snippet, state.palette.on_surface_variant, 1, FontWeight::Regular,
+                    );
+                }
+            } else {
+                // Start page: wordmark, in-page search, shortcut grid.
+                let word_em = super::font::em_px_at(4, w);
+                let word = "Google";
+                let word_w = super::font::measure(word, word_em);
+                let center_x = card_x + card_w * 0.5;
+                let g_y = page_y + page_h * 0.10;
+                // Multi-colour wordmark, one glyph at a time.
+                let cols = [0xFF4285F4u32, 0xFFEA4335, 0xFFFBBC05, 0xFF4285F4, 0xFF34A853, 0xFFEA4335];
+                let mut wx = center_x - word_w * 0.5;
+                for (i, b) in word.bytes().enumerate() {
+                    let adv = super::font::char_advance(b, word_em);
+                    super::font::draw_glyph(
+                        buf, stride, w, h, wx, g_y, b, cols[i % cols.len()], word_em, FontWeight::Medium,
+                    );
+                    wx += adv;
+                }
+
+                let s_h = h as f32 * 0.030;
+                let s_w = (body_w * 0.7).min(word_w * 1.9);
+                let s_x = center_x - s_w * 0.5;
+                let s_y = g_y + word_em * 1.05;
+                draw_rounded_rect_f(
+                    buf, stride, w, h, s_x, s_y, s_w, s_h, s_h * 0.5,
+                    state.palette.surface_container_high,
+                );
+                let s_em = super::font::em_px_at(1, w);
+                let s_tx = s_x + s_h * 0.30;
+                draw_text_weighted(
+                    buf, stride, w, h, s_tx as usize, (s_y + (s_h - s_em * 0.62) * 0.5) as usize,
+                    "Search or type web address", state.palette.on_surface_variant, 1, FontWeight::Regular,
+                );
+                let _ = s_em;
+                let _ = s_tx;
+
+                // Shortcut grid: three columns of tiles inside the viewport.
+                let sc_start = s_y + s_h + h as f32 * 0.020;
+                let shortcuts = [
+                    ("Google", 0xFF4285F4u32),
+                    ("YouTube", 0xFFFF0000),
+                    ("Wikipedia", 0xFF475569),
+                    ("Reddit", 0xFFFF4500),
+                    ("GitHub", 0xFF24292F),
+                    ("Weather", 0xFF0284C7),
+                ];
+                let sc_cols = 3;
+                let sc_col_w = body_w / sc_cols as f32;
+                let sc_size = (sc_col_w * 0.44).min((page_y + page_h - sc_start) * 0.30);
+                for (idx, (title, color)) in shortcuts.iter().enumerate() {
+                    let cc = idx % sc_cols;
+                    let cr = idx / sc_cols;
+                    let cx = body_x + sc_col_w * (cc as f32 + 0.5);
+                    let cy = sc_start + sc_size * 0.5 + sc_size * 1.75 * cr as f32;
+                    if cy + sc_size * 0.95 > page_y + page_h {
+                        break;
+                    }
+                    draw_rounded_rect_f(
+                        buf, stride, w, h, cx - sc_size * 0.5, cy - sc_size * 0.5, sc_size, sc_size,
+                        sc_size * 0.5, *color,
+                    );
+                    draw_text_centered(
+                        buf, stride, w, h, cx as usize, (cy - sc_size * 0.30) as usize,
+                        &title.chars().next().unwrap_or('?').to_string(), 0xFFFFFFFF, 2,
+                    );
+                    draw_text_centered_clipped(
+                        buf, stride, w, h, cx as usize, (cy + sc_size * 0.62) as usize,
+                        sc_col_w * 0.94, title, state.palette.on_surface_variant, 1, FontWeight::Regular,
+                    );
+                }
+            }
+
+            // Bottom toolbar: back, forward, home, tabs, menu.
+            let tb_y = page_y + page_h + h as f32 * 0.004;
+            draw_rounded_rect_f(
+                buf, stride, w, h, card_x, tb_y, card_w, toolbar_h, toolbar_h * 0.28,
+                state.palette.surface_container_high,
+            );
+            let tb_slots = ["<", ">", "H", "1", ":"];
+            let tb_slot_w = card_w / tb_slots.len() as f32;
+            let tb_em = super::font::em_px_at(2, w);
+            for (t_idx, symbol) in tb_slots.iter().enumerate() {
+                let tx = card_x + tb_slot_w * (t_idx as f32 + 0.5);
+                let t_col = if t_idx == 2 {
+                    state.palette.primary
                 } else {
-                    0.0
+                    state.palette.on_surface_variant
                 };
-                let drawer_y_offset = ((1.0 - drawer_prog) * h as f32) as usize;
+                draw_text_centered(
+                    buf, stride, w, h, tx as usize, (tb_y + (toolbar_h - tb_em * 0.62) * 0.5) as usize,
+                    symbol, t_col, 2,
+                );
+            }
+        } else if app_name == "Messages" {
+            // Messaging: carrier header, chat bubbles, and the composer row
+            // whose field and send button come from `AppLayout`.
+            let card_x = bar.x + bar.h * 0.25;
+            let card_w = bar.w - bar.h * 0.5;
+            let inset = card_w * 0.022;
+            let head_h = h as f32 * 0.028;
+            let head_y = content_y + inset;
+            draw_rounded_rect_f(
+                buf, stride, w, h, card_x, head_y, card_w, head_h, head_h * 0.24,
+                state.palette.surface_container_high,
+            );
+            draw_text_centered_clipped(
+                buf, stride, w, h, card_x as usize, (head_y + head_h * 0.20) as usize,
+                card_w - inset * 2.0, "Treble Carrier (SIM 1 - 4G LTE Active)",
+                state.palette.primary, 1, FontWeight::Bold,
+            );
 
-                if drawer_y_offset < h {
-                    let dh = h - drawer_y_offset;
-                    apply_frosted_blur_region(buf, stride, w, drawer_y_offset, h);
-                    draw_rect(buf, stride, w, h, 0, drawer_y_offset, w, dh, 0xCC080D1A);
+            // Composer: the exact rects the input path hit-tests.
+            let comp = al.input;
+            let composer_top = comp.y - h as f32 * 0.010;
+            let bubble_h = (h as f32 * 0.026).max(comp.h * 0.9);
+            let bubble_gap = h as f32 * 0.006;
+            let max_bubble_w = card_w - inset * 2.0;
+            let m_em = super::font::em_px_at(1, w);
 
-                    // Top Status Bar text (visible over blur)
-                    draw_text_weighted(buf, stride, w, h, 24, drawer_y_offset + 14, state.time_str, 0xFFFFFFFF, 2, FontWeight::Medium);
-                    let icon_right = w - 24;
-                    draw_battery(buf, stride, w, h, icon_right - 40, drawer_y_offset + 14, 98);
-                    if state.quick_tiles_active[0] {
-                        draw_wifi(buf, stride, w, h, icon_right - 80, drawer_y_offset + 14);
-                    }
+            // Chat list, laid out upward from the composer.
+            let mut bubble_y = composer_top - bubble_gap - bubble_h;
+            for msg in state.messages_list.iter().rev() {
+                if bubble_y < head_y + head_h + bubble_gap {
+                    break;
+                }
+                let msg_w = (super::font::measure(msg, m_em) + m_em * 0.9)
+                    .max(bubble_h * 0.8)
+                    .min(max_bubble_w);
+                let bx = card_x + card_w - inset - msg_w;
+                draw_rounded_rect_f(
+                    buf, stride, w, h, bx, bubble_y, msg_w, bubble_h, bubble_h * 0.28,
+                    state.palette.primary,
+                );
+                draw_text_clipped(
+                    buf, stride, w, h, bx + m_em * 0.45, bubble_y + (bubble_h - m_em * 0.62) * 0.5,
+                    msg_w - m_em * 0.9, msg, state.palette.on_primary, 1, FontWeight::Regular,
+                );
+                bubble_y -= bubble_h + bubble_gap;
+            }
 
-                    // Pull handle at top
-                    draw_rounded_rect(buf, stride, w, h, (w - 72) / 2, drawer_y_offset + LauncherLayout::DRAWER_HANDLE_Y as usize, 72, 5, 2, 0xFF64748B);
+            // System greeting, pinned under the header.
+            let greet = "Treble: Welcome! Tap below to type a message.";
+            draw_rounded_rect_f(
+                buf, stride, w, h, card_x + inset, head_y + head_h + bubble_gap, max_bubble_w, bubble_h,
+                bubble_h * 0.28, state.palette.surface_container_high,
+            );
+            draw_text_clipped(
+                buf, stride, w, h, card_x + inset * 2.0,
+                head_y + head_h + bubble_gap + (bubble_h - m_em * 0.62) * 0.5,
+                max_bubble_w - m_em * 0.9, greet, state.palette.on_surface, 1, FontWeight::Regular,
+            );
 
-                    // PixelUI App Drawer Search Bar
-                    let search_y = drawer_y_offset + LauncherLayout::DRAWER_SEARCH_Y as usize;
-                    let search_h = LauncherLayout::DRAWER_SEARCH_H as usize;
-                    let search_x = LauncherLayout::DRAWER_SEARCH_X as usize;
-                    let search_w = w - search_x * 2;
-                    draw_rounded_rect(buf, stride, w, h, search_x - 1, search_y - 1, search_w + 2, search_h + 2, 26, 0x4438BDF8);
-                    draw_rounded_rect(buf, stride, w, h, search_x, search_y, search_w, search_h, 25, 0xEE1E293B);
-                    draw_text(buf, stride, w, h, search_x + 18, search_y + 15, "G", 0xFF4285F4, 2);
-                    let search_text = if state.drawer_search.is_empty() { "Search apps..." } else { state.drawer_search };
-                    let text_col = if state.drawer_search.is_empty() { 0xFF94A3B8 } else { 0xFFFFFFFF };
-                    draw_text(buf, stride, w, h, search_x + 48, search_y + 16, search_text, text_col, 2);
-                    if !state.drawer_search.is_empty() {
-                        draw_text(buf, stride, w, h, search_x + search_w - 32, search_y + 16, "X", 0xFF94A3B8, 2);
-                    }
+            // Composer field + send button, both from `AppLayout`.
+            let ring = (w as f32 * 0.003).max(1.0);
+            let c_border = if state.app_input_focused {
+                state.palette.primary
+            } else {
+                state.palette.outline
+            };
+            draw_rounded_rect_f(
+                buf, stride, w, h, comp.x - ring, comp.y - ring, comp.w + ring * 2.0,
+                comp.h + ring * 2.0, comp.radius + ring, c_border,
+            );
+            draw_rounded_rect_f(
+                buf, stride, w, h, comp.x, comp.y, comp.w, comp.h, comp.radius,
+                state.palette.surface_container_high,
+            );
+            let m_disp = if state.app_input.is_empty() {
+                "Type a message..."
+            } else {
+                state.app_input
+            };
+            let m_col = if state.app_input.is_empty() {
+                state.palette.on_surface_variant
+            } else {
+                state.palette.on_surface
+            };
+            let m_tx = comp.x + comp.h * 0.40;
+            let m_ty = comp.center_y() - m_em * 0.31;
+            draw_text_clipped(
+                buf, stride, w, h, m_tx, m_ty, comp.w - comp.h * 0.75, m_disp, m_col, 1,
+                FontWeight::Regular,
+            );
+            if state.app_input_focused {
+                let cur_x = m_tx + super::font::measure(m_disp, m_em) + ring;
+                if cur_x < comp.x + comp.w - comp.h * 0.3 {
+                    draw_rect(
+                        buf, stride, w, h, cur_x as usize, m_ty as usize,
+                        ring.max(2.0) as usize, (m_em * 0.62) as usize, state.palette.primary,
+                    );
+                }
+            }
+            let send = al.send;
+            draw_rounded_rect_f(
+                buf, stride, w, h, send.x, send.y, send.w, send.h, send.h * 0.28,
+                state.palette.primary,
+            );
+            draw_text_centered_clipped(
+                buf, stride, w, h, send.center_x() as usize, (send.center_y() - m_em * 0.31) as usize,
+                send.w * 0.9, "Send", state.palette.on_primary, 1, FontWeight::Bold,
+            );
+        } else if app_name == "Phone" {
+            // Dialer: number field, RIL status, call button.
+            let card_x = bar.x + bar.h * 0.25;
+            let card_w = bar.w - bar.h * 0.5;
+            let inset = card_w * 0.022;
+            let p_em = super::font::em_px_at(2, w);
+            let num_h = h as f32 * 0.032;
+            let num_y = content_y + inset;
+            let num_x = card_x + inset;
+            let num_w = card_w - inset * 2.0;
+            let ring = (w as f32 * 0.003).max(1.0);
+            let num_border = if state.app_input_focused {
+                state.palette.primary
+            } else {
+                state.palette.outline
+            };
+            draw_rounded_rect_f(
+                buf, stride, w, h, num_x - ring, num_y - ring, num_w + ring * 2.0,
+                num_h + ring * 2.0, num_h * 0.28 + ring, num_border,
+            );
+            draw_rounded_rect_f(
+                buf, stride, w, h, num_x, num_y, num_w, num_h, num_h * 0.28,
+                state.palette.surface_container_high,
+            );
+            let p_disp = if state.app_input.is_empty() {
+                "Enter phone number..."
+            } else {
+                state.app_input
+            };
+            let p_col = if state.app_input.is_empty() {
+                state.palette.on_surface_variant
+            } else {
+                state.palette.on_surface
+            };
+            let p_tx = num_x + num_h * 0.42;
+            let p_ty = num_y + (num_h - p_em * 0.62) * 0.5 - p_em * 0.14;
+            draw_text_clipped(
+                buf, stride, w, h, p_tx, p_ty, num_w - num_h * 0.75, p_disp, p_col, 2,
+                FontWeight::Regular,
+            );
+            if state.app_input_focused {
+                let cur_x = p_tx + super::font::measure(p_disp, p_em) + ring;
+                if cur_x < num_x + num_w - num_h * 0.3 {
+                    draw_rect(
+                        buf, stride, w, h, cur_x as usize, p_ty as usize,
+                        ring.max(2.0) as usize, (p_em * 0.62) as usize, state.palette.primary,
+                    );
+                }
+            }
 
-                    // Category Header
-                    let header_y = drawer_y_offset + LauncherLayout::DRAWER_HEADER_Y as usize;
-                    draw_text_weighted(buf, stride, w, h, 28, header_y, "ALL APPLICATIONS", 0xFF94A3B8, 2, FontWeight::Bold);
-                    let mut count_buf = [0u8; 16];
-                    let count_str = format_apps_count(&mut count_buf, state.drawer_apps.len());
-                    draw_text(buf, stride, w, h, w - 28 - text_width(count_str, 2), header_y, count_str, 0xFF64748B, 2);
+            // RIL status and the call button, centred in the content card.
+            let status_y = num_y + num_h + h as f32 * 0.030;
+            let s_em = super::font::em_px_at(1, w);
+            draw_text_centered_weighted(
+                buf, stride, w, h, (card_x + card_w * 0.5) as usize, status_y as usize,
+                "Universal Cellular RIL Bridge", state.palette.on_surface_variant, 1, FontWeight::Medium,
+            );
+            let call_h = (h as f32 * 0.036).max(w.min(h) as f32 * 0.10);
+            let call_w = call_h * 3.4;
+            let call_x = card_x + (card_w - call_w) * 0.5;
+            let call_y = status_y + s_em * 1.6 + h as f32 * 0.012;
+            draw_rounded_rect_f(
+                buf, stride, w, h, call_x, call_y, call_w, call_h, call_h * 0.5, 0xFF10B981,
+            );
+            draw_text_centered(
+                buf, stride, w, h, (call_x + call_w * 0.5) as usize,
+                (call_y + (call_h - p_em * 0.62) * 0.5) as usize, "Call", 0xFFFFFFFF, 2,
+            );
+        } else if app_name == "Contacts" {
+            // Contacts: search field over a scrollable row list.
+            let (list, list_h) = draw_app_search_field(
+                buf, stride, w, h, &bar, content_y, al, state, "Search contacts...",
+            );
+            let contacts = [
+                ("Emergency Services", "112 / 911"),
+                ("Voice Mailbox", "*86"),
+                ("Treble Support", "+1 800 555 0199"),
+            ];
+            draw_app_row_list(
+                buf, stride, w, h, &bar, list, list_h, &contacts, state,
+            );
+        } else if app_name == "Files" {
+            let (list, list_h) = draw_app_search_field(
+                buf, stride, w, h, &bar, content_y, al, state, "Filter files (/root)...",
+            );
+            let dirs = [
+                ("Documents", "Directory"),
+                ("Downloads", "Directory"),
+                ("Pictures", "Directory"),
+                ("Music", "Directory"),
+            ];
+            draw_app_row_list(buf, stride, w, h, &bar, list, list_h, &dirs, state);
+        } else {
+            // Generic app screen: search field, wordmark and an action chip.
+            let (list, list_h) = draw_app_search_field(
+                buf, stride, w, h, &bar, content_y, al, state, "Search or enter text...",
+            );
+            let cx = bar.center_x();
+            let mark = super::font::em_px_at(4, w);
+            let mark_y = list + h as f32 * 0.030;
+            draw_text_centered(
+                buf, stride, w, h, cx as usize, mark_y as usize, app_name, state.palette.primary, 4,
+            );
+            let sub_y = mark_y + mark * 0.95;
+            draw_text_centered_clipped(
+                buf, stride, w, h, cx as usize, sub_y as usize, bar.w * 0.86,
+                "Universal Treble Linux Mobile Application", state.palette.on_surface_variant, 1,
+                FontWeight::Regular,
+            );
+            let btn_h = (h as f32 * 0.030).max(w.min(h) as f32 * 0.085);
+            let btn_w = btn_h * 4.0;
+            let btn_x = cx - btn_w * 0.5;
+            let btn_y = sub_y + h as f32 * 0.020;
+            if btn_y + btn_h < list + list_h {
+                draw_rounded_rect_f(
+                    buf, stride, w, h, btn_x, btn_y, btn_w, btn_h, btn_h * 0.5,
+                    state.palette.primary,
+                );
+                let em = super::font::em_px_at(1, w);
+                draw_text_centered_weighted(
+                    buf, stride, w, h, cx as usize, (btn_y + (btn_h - em * 0.62) * 0.5) as usize,
+                    "Action Ready", state.palette.on_primary, 1, FontWeight::Bold,
+                );
+            }
+        }
 
-                    // Full Apps Grid
-                    let drawer_grid_top = drawer_y_offset + LauncherLayout::DRAWER_GRID_TOP as usize;
-                    let cols = LauncherLayout::GRID_COLS;
-                    let col_width = w / cols;
-                    let icon_size = LauncherLayout::ICON_SIZE as usize;
-                    let grid_row_h = LauncherLayout::GRID_ROW_H as usize;
-                    let max_drawer_rows = LauncherLayout::max_drawer_rows(h as f32);
-                    let max_drawer_apps = max_drawer_rows * cols;
+        // Gesture navigation pill, from the same layout the home screen uses.
+        let nav = Layout::plain(w as f32, h as f32).nav_pill;
+        draw_rounded_rect_f(
+            buf, stride, w, h, nav.x, nav.y, nav.w, nav.h, nav.radius, state.palette.on_surface,
+        );
+    } else {
+        // 5. Foundational Layer: Home Screen
+        //
+        // Every rectangle below comes out of the shared `Layout`, the same
+        // value the input path hit-tests against, so a drawn cell and a
+        // tappable cell are the same cell by construction.
+        let has_selection = state.selected_icon_id.is_some();
+        let l = Layout::new(w as f32, h as f32, has_selection);
+        let wf = w as f32;
+        let hf = h as f32;
 
-                    for (idx, app) in state.drawer_apps.iter().take(max_drawer_apps).enumerate() {
-                        let row = idx / cols;
-                        let col = idx % cols;
-                        let cx = col * col_width + col_width / 2;
-                        let cy = drawer_grid_top + row * grid_row_h;
+        // 5a. Clock widget: display-weight digits over a date line.
+        draw_material_you_clock(
+            buf,
+            stride,
+            w,
+            h,
+            w / 2,
+            l.clock_y as usize + (l.clock_h * 0.5) as usize,
+            state.time_str,
+            state.palette.primary,
+            l.clock_h as usize,
+        );
+        let date_y = l.clock_y + l.clock_h + hf * 0.008;
+        draw_text_centered_weighted(
+            buf,
+            stride,
+            w,
+            h,
+            w / 2,
+            date_y as usize,
+            "Tue, Sep 22  |  28 C Sunny",
+            state.palette.on_surface_variant,
+            if hf >= 1200.0 { 2 } else { 1 },
+            FontWeight::Medium,
+        );
 
-                        let ix = cx.saturating_sub(icon_size / 2);
-                        let iy = cy.saturating_sub(icon_size / 2);
+        // 5b. Search pill: outlined when idle, filled and accented when active.
+        let s = l.search;
+        let pill_bg = if state.search_active {
+            state.palette.surface_container_high
+        } else {
+            state.palette.surface_container
+        };
+        let pill_fg = if state.search_active {
+            state.palette.primary
+        } else {
+            state.palette.outline
+        };
+        let border = l.w * 0.004;
+        draw_rounded_rect_f(
+            buf, stride, w, h,
+            s.x - border, s.y - border, s.w + border * 2.0, s.h + border * 2.0,
+            s.radius + border, pill_fg,
+        );
+        draw_rounded_rect(
+            buf,
+            stride,
+            w,
+            h,
+            s.x as usize,
+            s.y as usize,
+            s.w as usize,
+            s.h as usize,
+            s.radius as usize,
+            pill_bg,
+        );
 
-                        let is_selected = state.selected_icon_id == Some(app.id);
-                        if is_selected {
-                            draw_rounded_rect(buf, stride, w, h, ix - 4, iy - 4, icon_size + 8, icon_size + 8, 20, 0xFF38BDF8);
-                        }
+        // 5c. Search glyph, query text and caret, all on the pill's own row.
+        let glyph = l.search_glyph_w;
+        let glyph_x = s.x + s.h * 0.42;
+        let text_x = glyph_x + glyph + s.h * 0.28;
+        let text_y = s.center_y() - (super::font::em_px_at(2, w) * 0.30);
+        let text_h = super::font::em_px_at(2, w) * 0.62;
+        let text_max = s.x + s.w - s.h * 0.55 - text_x;
+        draw_text(
+            buf,
+            stride,
+            w,
+            h,
+            glyph_x as usize,
+            (s.center_y() - text_h * 0.62) as usize,
+            "G",
+            0xFF4285F4,
+            2,
+        );
+        let query: &str = if state.search_active {
+            if state.search_query.is_empty() {
+                "Type to search..."
+            } else {
+                state.search_query
+            }
+        } else {
+            "Search apps, web..."
+        };
+        let q_color = if state.search_active && !state.search_query.is_empty() {
+            state.palette.on_surface
+        } else {
+            state.palette.on_surface_variant
+        };
+        draw_text_clipped(
+            buf,
+            stride,
+            w,
+            h,
+            text_x,
+            text_y,
+            text_max,
+            query,
+            q_color,
+            2,
+            FontWeight::Regular,
+        );
+        if state.search_active {
+            let caret_x = text_x + text_width_at(query, 2, w) as f32 + border * 2.0;
+            if caret_x < s.x + s.w - s.h * 0.3 {
+                draw_rect(
+                    buf,
+                    stride,
+                    w,
+                    h,
+                    caret_x as usize,
+                    text_y as usize,
+                    (l.w * 0.004).max(2.0) as usize,
+                    text_h as usize,
+                    state.palette.primary,
+                );
+            }
+        }
 
-                        draw_rounded_rect(buf, stride, w, h, ix, iy, icon_size, icon_size, 16, app.color);
-                        match app.icon {
-                            Some(icon) => {
-                                draw_icon_bitmap(buf, stride, w, h, ix, iy, icon_size, icon_size, 16, icon);
-                            }
-                            None => {
-                                draw_text_centered(buf, stride, w, h, cx, cy - 8, app.glyph, 0xFFFFFFFF, 3);
-                            }
-                        }
-                        draw_text_centered_weighted(buf, stride, w, h, cx, cy + 42, app.name, 0xFFE2E8F0, 2, FontWeight::Medium);
-                    }
+        // 5d. Edit-mode action chips. Their band is what pushes the grid down.
+        if has_selection {
+            for (btn, label, tone) in [
+                (l.remove_chip, "Remove from Home", ChipTone::Destructive),
+                (
+                    l.move_chip,
+                    if state.home_page == 0 {
+                        "Move to Page 2"
+                    } else {
+                        "Move to Page 1"
+                    },
+                    ChipTone::Primary,
+                ),
+            ] {
+                let radius = btn.h * 0.30;
+                let (bg, fg) = match tone {
+                    ChipTone::Destructive => (0xFF7F1D1D, 0xFFFFFFFF),
+                    ChipTone::Primary => (state.palette.surface_container_high, state.palette.on_surface),
+                };
+                let ring = if tone == ChipTone::Destructive { 0xFFEF4444 } else { state.palette.primary };
+                let t = (l.w * 0.003).max(1.0);
+                draw_rect(
+                    buf,
+                    stride,
+                    w,
+                    h,
+                    (btn.x - t) as usize,
+                    (btn.y - t) as usize,
+                    (btn.w + t * 2.0) as usize,
+                    (btn.h + t * 2.0) as usize,
+                    ring,
+                );
+                draw_rounded_rect(
+                    buf,
+                    stride,
+                    w,
+                    h,
+                    btn.x as usize,
+                    btn.y as usize,
+                    btn.w as usize,
+                    btn.h as usize,
+                    radius as usize,
+                    bg,
+                );
+                let em = super::font::em_px_at(1, w);
+                draw_text_centered_weighted(
+                    buf,
+                    stride,
+                    w,
+                    h,
+                    btn.center_x() as usize,
+                    (btn.center_y() - em * 0.30) as usize,
+                    label,
+                    fg,
+                    1,
+                    FontWeight::Medium,
+                );
+            }
+        }
 
-                    // Bottom Navigation Pill in Drawer
-                    let nav_y = h - 20;
-                    let nav_w = 140;
-                    let nav_x = (w - nav_w) / 2;
-                    draw_rounded_rect(buf, stride, w, h, nav_x, nav_y, nav_w, 5, 2, 0xFFFFFFFF);
+        // 5e. Workspace grid. Icons carry the press spring, the label sits in
+        // the gap the layout reserved for it, and both move with the page.
+        let max_apps = l.max_rows * l.grid_cols;
+        let scroll = state.home_scroll_offset;
+
+        for (idx, app) in state.grid_apps.iter().take(max_apps).enumerate() {
+            let icon = l.grid_icon(idx);
+            let (cx, cy) = (icon.center_x() + scroll, icon.center_y());
+            if cx + icon.w < -4.0 || cx - icon.w > wf + 4.0 {
+                continue;
+            }
+            // Tactile press compression (0.92x) with a spring rebound.
+            let pressed = state.pressed_icon_id == Some(app.id);
+            let k = if pressed { state.icon_press_scale.clamp(0.5, 1.5) } else { 1.0 };
+            let size = (icon.w * k).round();
+            let radius = (icon.radius * k).round();
+            let x = (cx - size * 0.5).round() as i32;
+            let y = (cy - size * 0.5).round() as i32;
+
+            if state.selected_icon_id == Some(app.id) {
+                let pad = l.icon_size * 0.10 * k;
+                let inner = (pad * 0.5).max(1.0);
+                draw_rounded_rect_i32(
+                    buf, stride, w, h,
+                    (x as f32 - pad).round() as i32, (y as f32 - pad).round() as i32,
+                    (size + pad * 2.0).round() as usize, (size + pad * 2.0).round() as usize,
+                    (radius + pad) as usize, state.palette.primary,
+                );
+                draw_rounded_rect_i32(
+                    buf, stride, w, h,
+                    (x as f32 - pad + inner).round() as i32,
+                    (y as f32 - pad + inner).round() as i32,
+                    (size + pad * 2.0 - inner * 2.0).round() as usize,
+                    (size + pad * 2.0 - inner * 2.0).round() as usize,
+                    (radius + pad - inner) as usize, state.palette.surface,
+                );
+            }
+
+            draw_rounded_rect_i32(
+                buf, stride, w, h, x, y, size as usize, size as usize, radius as usize, app.color,
+            );
+            match app.icon {
+                Some(icon_img) => {
+                    draw_icon_bitmap_i32(
+                        buf, stride, w, h, x, y, size as usize, size as usize, radius as usize, icon_img,
+                    );
+                }
+                None => {
+                    let em = super::font::em_px_at(2, w);
+                    draw_text_centered_i32(
+                        buf, stride, w, h, cx as i32, (cy - em * 0.30) as i32, app.glyph, 0xFFFFFFFF, 2,
+                    );
+                }
+            }
+            // Label: centred under the icon, in the reserved gap.
+            let label_y = icon.y + icon.h + icon.h * LABEL_GAP;
+            let label_w = l.col_pitch * 0.94;
+            draw_text_centered_clipped_i32(
+                buf,
+                stride,
+                w,
+                h,
+                cx as i32,
+                label_y,
+                label_w,
+                app.name,
+                state.palette.on_surface,
+                l.label_scale,
+                FontWeight::Medium,
+            );
+        }
+
+        // 5f. Page indicator: inert dots plus a sliding active pill.
+        let total_pages = state.total_home_pages.max(1);
+        let dots = l.page_dots;
+        let dot_r = dots.h * 0.5;
+        let pitch = if total_pages > 1 { dots.w / (total_pages as f32 - 1.0) } else { 0.0 };
+        let dot_w = dot_r * 2.0;
+        let x0 = dots.center_x() - pitch * (total_pages as f32 - 1.0) * 0.5;
+        let dot_color = (0x66 << 24) | (state.palette.on_surface & 0x00FFFFFF);
+        for p in 0..total_pages {
+            let dx = (x0 + p as f32 * pitch).round() as usize;
+            draw_rounded_rect(
+                buf, stride, w, h, dx, dots.y as usize, dot_w as usize, dots.h as usize, dot_r as usize, dot_color,
+            );
+        }
+        // Fractional position: page index minus the scroll fraction of a page.
+        let frac = (state.home_page as f32 - scroll / wf).clamp(0.0, (total_pages - 1) as f32);
+        let ax = (x0 + frac * pitch - dot_w * 0.5).round() as i32;
+        let pill_w = dot_w * 3.0;
+        draw_rounded_rect_i32(
+            buf, stride, w, h, ax, dots.y as i32, pill_w as usize, dots.h as usize, dot_r as usize, state.palette.primary,
+        );
+
+        // 5g. Hotseat.
+        draw_rounded_rect(
+            buf, stride, w, h,
+            l.dock.x as usize, l.dock.y as usize, l.dock.w as usize, l.dock.h as usize,
+            l.dock.radius as usize, state.palette.surface_container,
+        );
+        let fallback_dock = [
+            AppGridItem { id: "phone", name: "Phone", color: 0xFF10B981, glyph: "P", icon: None },
+            AppGridItem { id: "messages", name: "Messages", color: 0xFF3B82F6, glyph: "M", icon: None },
+            AppGridItem { id: "apps", name: "Apps", color: 0xFF475569, glyph: ":", icon: None },
+            AppGridItem { id: "browser", name: "Browser", color: 0xFF06B6D4, glyph: "B", icon: None },
+            AppGridItem { id: "camera", name: "Camera", color: 0xFFF43F5E, glyph: "C", icon: None },
+        ];
+        let dock_apps: &[AppGridItem] = if state.dock_apps.is_empty() {
+            &fallback_dock[..]
+        } else {
+            state.dock_apps
+        };
+        // The rendered slot count follows the apps present, so the icons stay
+        // centred even when the hotseat is not full.
+        let slots = dock_apps.len().min(l.dock_slots).max(1);
+        for (i, app) in dock_apps.iter().take(slots).enumerate() {
+            let pitch = l.dock.w / slots as f32;
+            let cx = l.dock.x + pitch * (i as f32 + 0.5);
+            let cy = l.dock.center_y();
+            let pressed = state.pressed_icon_id == Some(app.id);
+            let k = if pressed { state.icon_press_scale.clamp(0.5, 1.5) } else { 1.0 };
+            let size = (l.dock_icon * k).round();
+            let radius = (l.dock_icon * ICON_RADIUS * k).round();
+            let x = (cx - size * 0.5).round() as i32;
+            let y = (cy - size * 0.5).round() as i32;
+            draw_rounded_rect_i32(buf, stride, w, h, x, y, size as usize, size as usize, radius as usize, app.color);
+            match app.icon {
+                Some(icon_img) => {
+                    draw_icon_bitmap_i32(buf, stride, w, h, x, y, size as usize, size as usize, radius as usize, icon_img);
+                }
+                None => {
+                    let em = super::font::em_px_at(2, w);
+                    draw_text_centered_i32(
+                        buf, stride, w, h, cx as i32, (cy - em * 0.30) as i32, app.glyph, 0xFFFFFFFF, 2,
+                    );
                 }
             }
         }
 
-        // 10. Virtual Keyboard (Gboard Style) when active
-        if state.keyboard_active && !state.is_locked && !state.shade_open {
-            let kb_h = 420;
-            let kb_y = h - kb_h - 20;
-            let kb_w = w - 24;
-            let kb_x = 12;
+        // 5h. Gesture navigation pill, drawn last so overlays can cover it.
+        draw_rounded_rect(
+            buf, stride, w, h,
+            l.nav_pill.x as usize, l.nav_pill.y as usize, l.nav_pill.w as usize, l.nav_pill.h as usize,
+            l.nav_pill.radius as usize, state.palette.on_surface,
+        );
 
-            draw_rounded_rect(buf, stride, w, h, kb_x, kb_y, kb_w, kb_h, 24, 0xF0111827);
-            draw_rect(buf, stride, w, h, kb_x + 10, kb_y + 1, kb_w - 20, 2, 0xFF334155);
-
-            // Row 1: Q W E R T Y U I O P (10 keys)
-            let row1 = if state.keyboard_shift_active {
-                ["Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P"]
+        // 5i. App drawer overlay: frosted sheet sliding up over the workspace.
+        if state.app_drawer_open || state.drawer_progress > 0.001 {
+            let prog = if state.drawer_progress > 0.001 {
+                state.drawer_progress.clamp(0.0, 1.0)
+            } else if state.app_drawer_open {
+                1.0
             } else {
-                ["q", "w", "e", "r", "t", "y", "u", "i", "o", "p"]
+                0.0
             };
-            let r1_key_w = (kb_w - 30) / 10;
-            let key_h = 65;
-            let r1_y = kb_y + 25;
-            for (i, k) in row1.iter().enumerate() {
-                let kx = kb_x + 15 + i * r1_key_w;
-                draw_rounded_rect(buf, stride, w, h, kx + 2, r1_y, r1_key_w - 4, key_h, 10, 0xFF334155);
-                draw_text_centered(buf, stride, w, h, kx + r1_key_w / 2, r1_y + 18, k, 0xFFFFFFFF, 3);
-            }
+            let off = ((1.0 - prog) * hf).round() as i32;
+            if off < h as i32 {
+                // Frost the whole workspace so the home screen reads as glass
+                // behind the sheet, then lay an opaque Material surface over it.
+                apply_frosted_blur(buf, stride, w, h);
+                let sheet = state.palette.surface_container;
+                draw_rect_f(
+                    buf, stride, w, h, 0.0, off.max(0) as f32, w as f32, (h as f32 - off as f32).max(0.0),
+                    sheet,
+                );
 
-            // Row 2: A S D F G H J K L (9 keys)
-            let row2 = if state.keyboard_shift_active {
-                ["A", "S", "D", "F", "G", "H", "J", "K", "L"]
-            } else {
-                ["a", "s", "d", "f", "g", "h", "j", "k", "l"]
-            };
-            let r2_key_w = (kb_w - 60) / 9;
-            let r2_y = r1_y + key_h + 12;
-            let r2_offset = kb_x + 30;
-            for (i, k) in row2.iter().enumerate() {
-                let kx = r2_offset + i * r2_key_w;
-                draw_rounded_rect(buf, stride, w, h, kx + 2, r2_y, r2_key_w - 4, key_h, 10, 0xFF334155);
-                draw_text_centered(buf, stride, w, h, kx + r2_key_w / 2, r2_y + 18, k, 0xFFFFFFFF, 3);
-            }
+                draw_status_bar(buf, stride, w, h, state, off);
 
-            // Row 3: [SHIFT] Z X C V B N M [DEL]
-            let r3_y = r2_y + key_h + 12;
-            let special_w = 95;
-            let mid_w = (kb_w - 30 - special_w * 2) / 7;
-            // Shift
-            let shift_bg = if state.keyboard_shift_active { 0xFF0284C7 } else { 0xFF1E293B };
-            draw_rounded_rect(buf, stride, w, h, kb_x + 15, r3_y, special_w - 4, key_h, 10, shift_bg);
-            draw_text_centered(buf, stride, w, h, kb_x + 15 + special_w / 2, r3_y + 22, "^", 0xFFFFFFFF, 3);
-
-            let row3 = if state.keyboard_shift_active {
-                ["Z", "X", "C", "V", "B", "N", "M"]
-            } else {
-                ["z", "x", "c", "v", "b", "n", "m"]
-            };
-            for (i, k) in row3.iter().enumerate() {
-                let kx = kb_x + 15 + special_w + i * mid_w;
-                draw_rounded_rect(buf, stride, w, h, kx + 2, r3_y, mid_w - 4, key_h, 10, 0xFF334155);
-                draw_text_centered(buf, stride, w, h, kx + mid_w / 2, r3_y + 18, k, 0xFFFFFFFF, 3);
-            }
-
-            // Backspace / Del
-            let del_x = kb_x + 15 + special_w + 7 * mid_w;
-            draw_rounded_rect(buf, stride, w, h, del_x + 2, r3_y, special_w - 4, key_h, 10, 0xFF1E293B);
-            draw_text_centered(buf, stride, w, h, del_x + special_w / 2, r3_y + 22, "<-", 0xFFFFFFFF, 2);
-
-            // Row 4: [?123] [SPACE] [ENTER]
-            let r4_y = r3_y + key_h + 12;
-            let sym_w = 120;
-            let enter_w = 140;
-            let space_w = kb_w - 30 - sym_w - enter_w;
-
-            draw_rounded_rect(buf, stride, w, h, kb_x + 15, r4_y, sym_w - 4, key_h, 10, 0xFF1E293B);
-            draw_text_centered(buf, stride, w, h, kb_x + 15 + sym_w / 2, r4_y + 22, "Hide", 0xFF94A3B8, 2);
-
-            let space_x = kb_x + 15 + sym_w;
-            draw_rounded_rect(buf, stride, w, h, space_x + 2, r4_y, space_w - 4, key_h, 10, 0xFF334155);
-            draw_text_centered(buf, stride, w, h, space_x + space_w / 2, r4_y + 22, "English", 0xFF94A3B8, 2);
-
-            let enter_x = space_x + space_w;
-            draw_rounded_rect(buf, stride, w, h, enter_x + 2, r4_y, enter_w - 4, key_h, 10, 0xFF3B82F6);
-            draw_text_centered(buf, stride, w, h, enter_x + enter_w / 2, r4_y + 22, "Enter", 0xFFFFFFFF, 2);
-        }
-
-        // 11. Interactive Touch Ripple / Cursor Pointer
-        if let Some((cx, cy)) = state.cursor_pos {
-            if state.is_touching {
-                // Vibrant glowing ripple when touching or clicking
-                draw_glow_circle(buf, stride, w, h, cx, cy, 26, 0x00, 0xE5, 0xFF, 50);
-                draw_rounded_rect(buf, stride, w, h, cx.saturating_sub(8), cy.saturating_sub(8), 16, 16, 8, 0xFFFFFFFF);
-            } else {
-                // Sleek, modern subtle pointer dot for cursor hovering
-                draw_rounded_rect(buf, stride, w, h, cx.saturating_sub(5), cy.saturating_sub(5), 10, 10, 5, 0xAAFFFFFF);
-                draw_rounded_rect(buf, stride, w, h, cx.saturating_sub(2), cy.saturating_sub(2), 4, 4, 2, 0xFF00E5FF);
-            }
-        }
-
-        // 12. Tactile Touch Ripple Animation (Lawnchair 17 / Material You touch feedback)
-        if let Some((rx, ry, radius, alpha)) = state.touch_ripple {
-            if alpha > 0.01 && radius > 1.0 {
-                let r_int = radius as usize;
-                let alpha_u8 = (alpha * 255.0).clamp(0.0, 255.0) as u8;
-                draw_glow_circle(buf, stride, w, h, rx as usize, ry as usize, r_int, 0x38, 0xBD, 0xF8, alpha_u8 / 2);
-                let ripple_color = ((alpha_u8 as u32) << 24) | 0x00FFFFFF;
-                draw_rounded_rect_i32(
+                // Pull handle.
+                let hd = l.drawer_handle;
+                draw_rounded_rect(
                     buf, stride, w, h,
-                    (rx - radius) as i32,
-                    (ry - radius) as i32,
-                    r_int * 2,
-                    r_int * 2,
-                    r_int,
-                    ripple_color,
+                    hd.x as usize, (off as f32 + hd.y) as usize, hd.w as usize, hd.h as usize,
+                    hd.radius as usize, state.palette.outline,
+                );
+
+                // Drawer search pill.
+                let ds = l.drawer_search;
+                let ds_y = off as f32 + ds.y;
+                let ds_x = ds.x;
+                let ds_w = ds.w;
+                let ds_border = (0x55 << 24) | (state.palette.primary & 0x00FFFFFF);
+                let ds_bg = (0xF0 << 24) | (state.palette.surface_container_high & 0x00FFFFFF);
+                let t = (l.w * 0.003).max(1.0);
+                draw_rounded_rect_f(
+                    buf, stride, w, h,
+                    ds_x - t, ds_y - t, ds_w + t * 2.0, ds.h + t * 2.0, ds.radius + t, ds_border,
+                );
+                draw_rounded_rect(
+                    buf, stride, w, h,
+                    ds_x as usize, ds_y as usize, ds_w as usize, ds.h as usize, ds.radius as usize, ds_bg,
+                );
+                let d_em = super::font::em_px_at(2, w);
+                let d_text_h = d_em * 0.62;
+                let d_glyph_x = ds_x + ds.h * 0.40;
+                let d_text_x = d_glyph_x + ds.h * 0.30 + d_em * 0.30;
+                let d_text_y = ds_y + (ds.h - d_text_h) * 0.5 - d_em * 0.20;
+                draw_text(buf, stride, w, h, d_glyph_x as usize, d_text_y as usize, "G", 0xFF4285F4, 1);
+                let dstext: &str = if state.drawer_search.is_empty() {
+                    "Search all apps"
+                } else {
+                    state.drawer_search
+                };
+                let dcol = if state.drawer_search.is_empty() {
+                    state.palette.on_surface_variant
+                } else {
+                    state.palette.on_surface
+                };
+                let d_clear_w = if state.drawer_search.is_empty() { 0.0 } else { ds.h * 0.62 };
+                draw_text_clipped(
+                    buf, stride, w, h, d_text_x, d_text_y,
+                    ds_x + ds.w - ds.h * 0.35 - d_clear_w - d_text_x, dstext, dcol, 2, FontWeight::Regular,
+                );
+                if !state.drawer_search.is_empty() {
+                    let cx = ds_x + ds.w - ds.h * 0.66;
+                    draw_circle_glyph(buf, stride, w, h, cx, ds_y + ds.h * 0.5, ds.h * 0.22, state.palette.on_surface_variant);
+                    let arm = ds.h * 0.16;
+                    draw_line(buf, stride, w, h, cx + arm * 0.6, ds_y + ds.h * 0.5 + arm * 0.6, cx + arm, ds_y + ds.h * 0.5 + arm, state.palette.on_surface_variant);
+                }
+
+                // Section header with the right-aligned app count.
+                let hy = off as f32 + l.drawer_header_y;
+                draw_text_weighted(
+                    buf, stride, w, h, l.drawer_search.x as usize, hy as usize,
+                    "ALL APPLICATIONS", state.palette.on_surface_variant, 1, FontWeight::Bold,
+                );
+                let mut count_buf = [0u8; 16];
+                let count_str = format_apps_count(&mut count_buf, state.drawer_apps.len());
+                let cw = text_width_at(count_str, 1, w) as f32;
+                draw_text_weighted(
+                    buf, stride, w, h, (ds_x + ds_w - cw) as usize, hy as usize,
+                    count_str, state.palette.outline, 1, FontWeight::Medium,
+                );
+
+                // Full app grid, clipped to the drawer's own band.
+                let max_apps = l.drawer_rows * l.grid_cols;
+                let d_label_em = super::font::em_px(l.drawer_label_scale);
+                for (idx, app) in state.drawer_apps.iter().take(max_apps).enumerate() {
+                    let cell = l.drawer_icon_cell(idx);
+                    let (cx, cy) = (cell.center_x(), off as f32 + cell.center_y());
+                    let pressed = state.pressed_icon_id == Some(app.id);
+                    let k = if pressed { state.icon_press_scale.clamp(0.5, 1.5) } else { 1.0 };
+                    let size = (cell.w.min(cell.h) * k).round();
+                    let radius = (cell.radius * k).round();
+                    let x = (cx - size * 0.5).round() as i32;
+                    let y = (cy - size * 0.5).round() as i32;
+                    if state.selected_icon_id == Some(app.id) {
+                        let pad = cell.h * 0.10 * k;
+                        draw_rounded_rect_i32(
+                            buf, stride, w, h,
+                            (x as f32 - pad).round() as i32, (y as f32 - pad).round() as i32,
+                            (size + pad * 2.0).round() as usize, (size + pad * 2.0).round() as usize,
+                            (radius + pad) as usize, state.palette.primary,
+                        );
+                    }
+                    draw_rounded_rect_i32(
+                        buf, stride, w, h, x, y, size as usize, size as usize, radius as usize, app.color,
+                    );
+                    match app.icon {
+                        Some(icon_img) => {
+                            draw_icon_bitmap_i32(
+                                buf, stride, w, h, x, y, size as usize, size as usize, radius as usize, icon_img,
+                            );
+                        }
+                        None => {
+                            draw_text_centered_i32(
+                                buf, stride, w, h, cx as i32, (cy - d_label_em * 0.30) as i32,
+                                app.glyph, 0xFFFFFFFF, 2,
+                            );
+                        }
+                    }
+                    let label_y = off as f32 + cell.y + cell.h + cell.h * LABEL_GAP;
+                    draw_text_centered_clipped_i32(
+                        buf, stride, w, h, cx as i32, label_y, l.col_pitch * 0.94,
+                        app.name, state.palette.on_surface, l.drawer_label_scale, FontWeight::Medium,
+                    );
+                }
+
+                // The drawer's own nav pill sits above the blur sheet.
+                draw_rounded_rect(
+                    buf, stride, w, h,
+                    l.nav_pill.x as usize, l.nav_pill.y as usize, l.nav_pill.w as usize, l.nav_pill.h as usize,
+                    l.nav_pill.radius as usize, state.palette.on_surface,
                 );
             }
         }
+    }
 
-        // 13. App Launch Expansion Animation (Lawnchair 17 / Pixel Launcher app opening transition)
-        if let Some((ox, oy)) = state.app_launch_origin {
-            if state.app_launch_progress > 0.001 && state.app_launch_progress < 0.999 {
-                let t = state.app_launch_progress.clamp(0.0, 1.0);
-                let ease = 1.0 - (1.0 - t).powi(3);
-                let cur_w = 64.0 + (w as f32 - 64.0) * ease;
-                let cur_h = 64.0 + (h as f32 - 64.0) * ease;
-                let cur_x = (ox - cur_w / 2.0).clamp(0.0, (w as f32 - cur_w).max(0.0));
-                let cur_y = (oy - cur_h / 2.0).clamp(0.0, (h as f32 - cur_h).max(0.0));
-                let radius = 32.0 * (1.0 - ease) + 16.0 * ease;
-                let alpha = (ease * 230.0) as u32;
-                let app_rgb = state.app_launch_color & 0x00FFFFFF;
-                let color = (alpha << 24) | app_rgb;
-                draw_rounded_rect_i32(
-                    buf, stride, w, h,
-                    cur_x as i32,
-                    cur_y as i32,
-                    cur_w as usize,
-                    cur_h as usize,
-                    radius as usize,
-                    color,
-                );
-            }
+    // 10. Virtual keyboard, when active.
+    //
+    // Key rects come straight from `Keyboard`, the same struct the input path
+    // hit-tests, so a key that is drawn is exactly a key that can be pressed.
+    if state.keyboard_active && !state.is_locked && !state.shade_open {
+        let kb = Keyboard::new(w as f32, h as f32);
+        let f = kb.frame;
+        let k_em = super::font::em_px_at(2, w);
+        let k_text_h = k_em * 0.62;
+
+        // Sheet, with a hairline along the top edge.
+        draw_rounded_rect_f(
+            buf, stride, w, h, f.x, f.y, f.w, f.h, f.radius,
+            state.palette.surface_container,
+        );
+        draw_rect_f(
+            buf, stride, w, h, f.x, f.y, f.w, (h as f32 * 0.0012).max(1.0),
+            state.palette.outline,
+        );
+
+        // Modifier keys, then the character rows.
+        let shift_on = state.keyboard_shift_active;
+        let (shift_bg, shift_fg) = if shift_on {
+            (state.palette.primary, state.palette.on_primary)
+        } else {
+            (state.palette.surface_container_high, state.palette.on_surface)
+        };
+        fn key(
+            buf: &mut [u32], stride: usize, w: usize, h: usize, r: &super::layout::Rect, bg: u32,
+        ) {
+            draw_rounded_rect_f(buf, stride, w, h, r.x, r.y, r.w, r.h, r.radius, bg);
+        }
+        #[allow(clippy::too_many_arguments)]
+        fn legend(
+            buf: &mut [u32], stride: usize, w: usize, h: usize, r: &super::layout::Rect,
+            label: &str, col: u32, scale: usize,
+        ) {
+            let em = super::font::em_px_at(scale, w);
+            draw_text_centered(
+                buf, stride, w, h, r.center_x() as usize,
+                (r.center_y() - em * 0.31) as usize, label, col, scale,
+            );
+        }
+
+        key(buf, stride, w, h, &kb.row3_shift, shift_bg);
+        legend(buf, stride, w, h, &kb.row3_shift, if shift_on { "V" } else { "^" }, shift_fg, 1);
+        key(buf, stride, w, h, &kb.row3_backspace, state.palette.surface_container_high);
+        // Backspace: a left-pointing wedge plus the delete bar.
+        let bx = kb.row3_backspace.center_x();
+        let by = kb.row3_backspace.center_y();
+        let br = kb.row3_backspace.h * 0.17;
+        for i in 0..=4 {
+            let t = i as f32 / 4.0;
+            let px = bx - br * 1.5 + t * br * 1.4;
+            let dy = br * (1.0 - (t * 2.0 - 1.0).abs());
+            draw_line(
+                buf, stride, w, h, px, by - dy, px, by + dy,
+                state.palette.on_surface_variant,
+            );
+        }
+        draw_line(
+            buf, stride, w, h, bx - br * 0.1, by, bx + br * 1.4, by,
+            state.palette.on_surface_variant,
+        );
+
+        for i in 0..KB_ROW1 {
+            let r = kb.row1_at(i);
+            key(buf, stride, w, h, &r, state.palette.surface_container_high);
+            let ch = super::layout::ROW1[i];
+            let label = if shift_on {
+                char_to_upper(ch)
+            } else {
+                ch.to_string()
+            };
+            legend(buf, stride, w, h, &r, &label, state.palette.on_surface, 2);
+        }
+        for i in 0..KB_ROW2 {
+            let r = kb.row2_at(i);
+            key(buf, stride, w, h, &r, state.palette.surface_container_high);
+            let ch = super::layout::ROW2[i];
+            let label = if shift_on {
+                char_to_upper(ch)
+            } else {
+                ch.to_string()
+            };
+            legend(buf, stride, w, h, &r, &label, state.palette.on_surface, 2);
+        }
+        for i in 0..KB_ROW3_MID {
+            let r = kb.row3_mid[i];
+            key(buf, stride, w, h, &r, state.palette.surface_container_high);
+            let ch = super::layout::ROW3[i];
+            let label = if shift_on {
+                char_to_upper(ch)
+            } else {
+                ch.to_string()
+            };
+            legend(buf, stride, w, h, &r, &label, state.palette.on_surface, 2);
+        }
+
+        // Bottom row: hide, space with a language label, enter.
+        key(buf, stride, w, h, &kb.row4_hide, state.palette.surface_container_high);
+        legend(
+            buf, stride, w, h, &kb.row4_hide, "Hide", state.palette.on_surface_variant, 1,
+        );
+        key(buf, stride, w, h, &kb.row4_space, state.palette.surface_container_high);
+        legend(
+            buf, stride, w, h, &kb.row4_space, "English", state.palette.on_surface_variant, 1,
+        );
+        key(buf, stride, w, h, &kb.row4_enter, state.palette.primary);
+        legend(buf, stride, w, h, &kb.row4_enter, "Enter", state.palette.on_primary, 1);
+        let _ = k_text_h;
+    }
+
+    // 11. Interactive Touch Ripple / Cursor Pointer
+    if let Some((cx, cy)) = state.cursor_pos {
+        if state.is_touching {
+            // Vibrant glowing ripple when touching or clicking
+            let (pr, pg, pb) = (
+                ((state.palette.primary >> 16) & 0xFF) as u8,
+                ((state.palette.primary >> 8) & 0xFF) as u8,
+                (state.palette.primary & 0xFF) as u8,
+            );
+            draw_glow_circle(buf, stride, w, h, cx, cy, 26, pr, pg, pb, 50);
+            draw_rounded_rect(buf, stride, w, h, cx.saturating_sub(8), cy.saturating_sub(8), 16, 16, 8, state.palette.primary);
+        } else {
+            // Sleek, modern subtle pointer dot for cursor hovering
+            draw_rounded_rect(buf, stride, w, h, cx.saturating_sub(5), cy.saturating_sub(5), 10, 10, 5, 0xAAFFFFFF);
+            draw_rounded_rect(buf, stride, w, h, cx.saturating_sub(2), cy.saturating_sub(2), 4, 4, 2, state.palette.primary);
+        }
+    }
+
+    // 12. Tactile Touch Ripple Animation (Lawnchair 17 / Material You touch feedback)
+    if let Some((rx, ry, radius, alpha)) = state.touch_ripple {
+        if alpha > 0.01 && radius > 1.0 {
+            let r_int = radius as usize;
+            let alpha_u8 = (alpha * 255.0).clamp(0.0, 255.0) as u8;
+            let (pr, pg, pb) = (
+                ((state.palette.primary >> 16) & 0xFF) as u8,
+                ((state.palette.primary >> 8) & 0xFF) as u8,
+                (state.palette.primary & 0xFF) as u8,
+            );
+            draw_glow_circle(buf, stride, w, h, rx as usize, ry as usize, r_int, pr, pg, pb, alpha_u8 / 2);
+            let ripple_color = ((alpha_u8 as u32) << 24) | (state.palette.primary & 0x00FFFFFF);
+            draw_rounded_rect_i32(
+                buf, stride, w, h,
+                (rx - radius) as i32,
+                (ry - radius) as i32,
+                r_int * 2,
+                r_int * 2,
+                r_int,
+                ripple_color,
+            );
+        }
+    }
+
+    // 13. App Launch Expansion Animation (Lawnchair 17 / Pixel Launcher app opening transition)
+    // 12. App launch container transform.
+    //
+    // The expanding card grows out of the icon that was tapped: it starts at
+    // the icon's own size and corner radius and ends covering the panel, which
+    // is Launcher3's container transform. Progress comes from the spring in
+    // `state.app_launch_progress`, so the motion has overshoot and settles.
+    if let Some((ox, oy)) = state.app_launch_origin {
+        let t = state.app_launch_progress.clamp(0.0, 1.0);
+        if t > 0.001 && t < 0.999 {
+            let l = Layout::plain(w as f32, h as f32);
+            // Interpolate size, centre and radius together, easing the first
+            // third so the card reads as leaving the icon rather than growing.
+            let e = t * t * (3.0 - 2.0 * t);
+            let start = l.icon_size;
+            let cur_w = start + (w as f32 - start) * e;
+            let cur_h = start + (h as f32 - start) * e;
+            let cur_x = (ox - cur_w * 0.5).clamp(0.0, (w as f32 - cur_w).max(0.0));
+            let cur_y = (oy - cur_h * 0.5).clamp(0.0, (h as f32 - cur_h).max(0.0));
+            let radius = l.icon_radius + (l.nav_pill.radius.max(16.0) - l.icon_radius) * e;
+            let alpha = (e * 255.0) as u32;
+            let app_rgb = state.app_launch_color & 0x00FF_FFFF;
+            // A hairline in the primary colour keeps the card edge crisp
+            // while it is still small enough to read as a chip.
+            let edge = (0x66 << 24) | (state.palette.primary & 0x00FF_FFFF);
+            let ring = (l.w * 0.004).max(1.0);
+            draw_rounded_rect_f(
+                buf, stride, w, h, cur_x, cur_y, cur_w, cur_h, radius + ring, edge,
+            );
+            let color = (alpha << 24) | app_rgb;
+            draw_rounded_rect_f(
+                buf, stride, w, h, cur_x, cur_y, cur_w, cur_h, radius, color,
+            );
         }
     }
 }
@@ -1989,8 +2637,12 @@ fn interactive_state_hash(state: &DrmInteractiveState) -> u64 {
     h
 }
 
-/// Zero-allocation, in-place frosted glass blur filter applied to a vertical scanline region.
-/// Subsamples and blends 4x4 blocks with a deep translucent acrylic tint (Material 3 Expressive).
+/// Zero-allocation, in-place frosted glass over a scanline region.
+///
+/// A 3x3 box average plus a palette-tinted veil, evaluated entirely in place:
+/// no scratch buffer, no allocation, and it darkens rather than washes out so
+/// text behind the glass stays readable. Tile size is fixed at 3px which is
+/// cheap enough to run over a 2.6Mpx frame inside the render budget.
 pub fn apply_frosted_blur_region(
     buf: &mut [u32],
     stride: usize,
@@ -1998,37 +2650,48 @@ pub fn apply_frosted_blur_region(
     y_start: usize,
     y_end: usize,
 ) {
-    let block = 4;
-    let y_start = y_start.min(y_end);
-    for y in (y_start..y_end).step_by(block) {
-        let row_idx = y * stride;
-        for x in (0..w).step_by(block) {
-            let p = buf[row_idx + x];
-            let r = (p >> 16) & 0xFF;
-            let g = (p >> 8) & 0xFF;
-            let b = p & 0xFF;
-
-            // Blend 40% original, 60% frosted slate dark tint (#0F172A)
-            let br = ((r * 2) + (0x0F * 3)) / 5;
-            let bg = ((g * 2) + (0x17 * 3)) / 5;
-            let bb = ((b * 2) + (0x2A * 3)) / 5;
-            let blended = (0xFF << 24) | (br << 16) | (bg << 8) | bb;
-
-            for dy in 0..block {
-                if y + dy < y_end {
-                    let fill_row = (y + dy) * stride;
-                    for dx in 0..block {
-                        if x + dx < w {
-                            buf[fill_row + x + dx] = blended;
-                        }
-                    }
+    const TILE: usize = 3;
+    // Rows are clamped to what the buffer actually holds: the caller passes a
+    // region in pixels, and `stride` gives the addressable row count.
+    let rows = buf.len() / stride.max(1);
+    let y_start = y_start.min(y_end).min(rows);
+    let y_end = y_end.min(rows);
+    for by in (y_start..y_end).step_by(TILE) {
+        let y1 = (by + TILE).min(y_end);
+        for bx in (0..w).step_by(TILE) {
+            let x1 = (bx + TILE).min(w);
+            let mut r = 0u32;
+            let mut g = 0u32;
+            let mut b = 0u32;
+            let mut n = 0u32;
+            for y in by..y1 {
+                let row = y * stride;
+                for x in bx..x1 {
+                    let p = buf[row + x];
+                    r += (p >> 16) & 0xFF;
+                    g += (p >> 8) & 0xFF;
+                    b += p & 0xFF;
+                    n += 1;
+                }
+            }
+            if n == 0 {
+                continue;
+            }
+            // Veil toward the deep surface so the glass reads as frosted and
+            // contrast is preserved instead of being averaged into mush.
+            let out = |sum: u32| -> u32 { ((sum * 5) / (n * 8) + (0x0B * n) / (n * 8)).min(255) };
+            let pixel = (0xFF << 24) | (out(r) << 16) | (out(g) << 8) | out(b);
+            for y in by..y1 {
+                let row = y * stride;
+                for x in bx..x1 {
+                    buf[row + x] = pixel;
                 }
             }
         }
     }
 }
 
-/// Zero-allocation, in-place frosted glass blur filter for full screen.
+/// Frost the whole frame.
 pub fn apply_frosted_blur(buf: &mut [u32], stride: usize, w: usize, h: usize) {
     apply_frosted_blur_region(buf, stride, w, 0, h);
 }
@@ -2202,7 +2865,8 @@ fn draw_icon_bitmap_i32(
     }
 }
 
-#[inline]
+/// Test-only wrapper over [`draw_icon_bitmap_i32`] with integer geometry.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn draw_icon_bitmap(
     buf: &mut [u32],
@@ -2384,251 +3048,42 @@ fn draw_glow_circle(
     }
 }
 
-fn draw_battery(buf: &mut [u32], stride: usize, w: usize, h: usize, x: usize, y: usize, pct: u32) {
-    draw_rect(buf, stride, w, h, x, y, 24, 14, 0xFF8899A6);
-    draw_rect(buf, stride, w, h, x + 2, y + 2, 20, 10, 0xFF000000);
-    draw_rect(buf, stride, w, h, x + 24, y + 4, 3, 6, 0xFF8899A6);
 
-    let fill_w = ((pct as usize * 18) / 100).max(2);
-    let color = if pct > 20 { 0xFF10B981 } else { 0xFFEF4444 };
-    draw_rect(buf, stride, w, h, x + 3, y + 3, fill_w, 8, color);
+
+
+
+
+// ---------------------------------------------------------------------------
+// Typography
+//
+// All text is rasterised by the vector engine in `super::font`: real outlines,
+// proportional advances, a Material 3 weight axis and analytic anti-aliasing.
+// `scale` keeps the historical UI scale semantics (1 = caption, 2 = body,
+// 3 = display) and is multiplied by the panel's density, so the same call site
+// produces the same optical size on every display.
+// ---------------------------------------------------------------------------
+
+/// Typography font weight for the Lawnchair 17 / Material Design 3 type scale.
+pub use super::font::FontWeight;
+
+/// Em size in pixels for a UI scale factor on a `panel_w`-wide panel.
+#[inline]
+pub fn text_size(scale: usize, panel_w: usize) -> f32 {
+    super::font::em_px_at(scale, panel_w)
 }
 
-fn draw_wifi(buf: &mut [u32], stride: usize, w: usize, h: usize, x: usize, y: usize) {
-    for r in &[12, 8, 4] {
-        draw_glow_circle(buf, stride, w, h, x + 10, y + 14, *r, 255, 255, 255, 40);
-    }
-    draw_rounded_rect(buf, stride, w, h, x + 8, y + 10, 4, 4, 2, 0xFFFFFFFF);
-}
-
-fn draw_padlock(buf: &mut [u32], stride: usize, w: usize, h: usize, cx: usize, cy: usize) {
-    draw_rounded_rect(buf, stride, w, h, cx - 14, cy - 20, 28, 20, 10, 0xFFE2E8F0);
-    draw_rounded_rect(buf, stride, w, h, cx - 8, cy - 14, 16, 16, 8, 0xFF000000);
-    draw_rounded_rect(buf, stride, w, h, cx - 18, cy - 6, 36, 26, 6, 0xFFE2E8F0);
-}
-
-
-
-/// Typography Font Weight for Lawnchair 17 / Material Design 3 type scale hierarchy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FontWeight {
-    Regular,
-    Medium,
-    Bold,
-}
-
-// 8x16 High-Definition Anti-Aliased Bitmap Font with full lowercase descenders (g, j, p, q, y)
-static FONT_8X16: [[u8; 16]; 96] = [
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // 32 (0x20) ' '
-    [0x00, 0x00, 0x18, 0x3c, 0x3c, 0x3c, 0x18, 0x18, 0x18, 0x00, 0x18, 0x18, 0x00, 0x00, 0x00, 0x00], // 33 (0x21) '!'
-    [0x00, 0x66, 0x66, 0x66, 0x24, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // 34 (0x22) '"'
-    [0x00, 0x00, 0x00, 0x6c, 0x6c, 0xfe, 0x6c, 0x6c, 0x6c, 0xfe, 0x6c, 0x6c, 0x00, 0x00, 0x00, 0x00], // 35 (0x23) '#'
-    [0x18, 0x18, 0x7c, 0xc6, 0xc2, 0xc0, 0x7c, 0x06, 0x06, 0x86, 0xc6, 0x7c, 0x18, 0x18, 0x00, 0x00], // 36 (0x24) '$'
-    [0x00, 0x00, 0x00, 0x00, 0xc2, 0xc6, 0x0c, 0x18, 0x30, 0x60, 0xc6, 0x86, 0x00, 0x00, 0x00, 0x00], // 37 (0x25) '%'
-    [0x00, 0x00, 0x38, 0x6c, 0x6c, 0x38, 0x76, 0xdc, 0xcc, 0xcc, 0xcc, 0x76, 0x00, 0x00, 0x00, 0x00], // 38 (0x26) '&'
-    [0x00, 0x30, 0x30, 0x30, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // 39 (0x27) "'"
-    [0x00, 0x00, 0x0c, 0x18, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x18, 0x0c, 0x00, 0x00, 0x00, 0x00], // 40 (0x28) '('
-    [0x00, 0x00, 0x30, 0x18, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x18, 0x30, 0x00, 0x00, 0x00, 0x00], // 41 (0x29) ')'
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0x66, 0x3c, 0xff, 0x3c, 0x66, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // 42 (0x2a) '*'
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x18, 0x7e, 0x18, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // 43 (0x2b) '+'
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x18, 0x18, 0x30, 0x00, 0x00, 0x00], // 44 (0x2c) ','
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // 45 (0x2d) '-'
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x18, 0x00, 0x00, 0x00, 0x00], // 46 (0x2e) '.'
-    [0x00, 0x00, 0x00, 0x00, 0x02, 0x06, 0x0c, 0x18, 0x30, 0x60, 0xc0, 0x80, 0x00, 0x00, 0x00, 0x00], // 47 (0x2f) '/'
-    [0x00, 0x00, 0x7c, 0xc6, 0xc6, 0xce, 0xde, 0xf6, 0xe6, 0xc6, 0xc6, 0x7c, 0x00, 0x00, 0x00, 0x00], // 48 (0x30) '0'
-    [0x00, 0x00, 0x18, 0x38, 0x78, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x7e, 0x00, 0x00, 0x00, 0x00], // 49 (0x31) '1'
-    [0x00, 0x00, 0x7c, 0xc6, 0x06, 0x0c, 0x18, 0x30, 0x60, 0xc0, 0xc6, 0xfe, 0x00, 0x00, 0x00, 0x00], // 50 (0x32) '2'
-    [0x00, 0x00, 0x7c, 0xc6, 0x06, 0x06, 0x3c, 0x06, 0x06, 0x06, 0xc6, 0x7c, 0x00, 0x00, 0x00, 0x00], // 51 (0x33) '3'
-    [0x00, 0x00, 0x0c, 0x1c, 0x3c, 0x6c, 0xcc, 0xfe, 0x0c, 0x0c, 0x0c, 0x1e, 0x00, 0x00, 0x00, 0x00], // 52 (0x34) '4'
-    [0x00, 0x00, 0xfe, 0xc0, 0xc0, 0xc0, 0xfc, 0x06, 0x06, 0x06, 0xc6, 0x7c, 0x00, 0x00, 0x00, 0x00], // 53 (0x35) '5'
-    [0x00, 0x00, 0x38, 0x60, 0xc0, 0xc0, 0xfc, 0xc6, 0xc6, 0xc6, 0xc6, 0x7c, 0x00, 0x00, 0x00, 0x00], // 54 (0x36) '6'
-    [0x00, 0x00, 0xfe, 0xc6, 0x06, 0x06, 0x0c, 0x18, 0x30, 0x30, 0x30, 0x30, 0x00, 0x00, 0x00, 0x00], // 55 (0x37) '7'
-    [0x00, 0x00, 0x7c, 0xc6, 0xc6, 0xc6, 0x7c, 0xc6, 0xc6, 0xc6, 0xc6, 0x7c, 0x00, 0x00, 0x00, 0x00], // 56 (0x38) '8'
-    [0x00, 0x00, 0x7c, 0xc6, 0xc6, 0xc6, 0x7e, 0x06, 0x06, 0x06, 0x0c, 0x78, 0x00, 0x00, 0x00, 0x00], // 57 (0x39) '9'
-    [0x00, 0x00, 0x00, 0x00, 0x18, 0x18, 0x00, 0x00, 0x00, 0x18, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00], // 58 (0x3a) ':'
-    [0x00, 0x00, 0x00, 0x00, 0x18, 0x18, 0x00, 0x00, 0x00, 0x18, 0x18, 0x30, 0x00, 0x00, 0x00, 0x00], // 59 (0x3b) ';'
-    [0x00, 0x00, 0x00, 0x06, 0x0c, 0x18, 0x30, 0x60, 0x30, 0x18, 0x0c, 0x06, 0x00, 0x00, 0x00, 0x00], // 60 (0x3c) '<'
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0x7e, 0x00, 0x00, 0x7e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // 61 (0x3d) '='
-    [0x00, 0x00, 0x00, 0x60, 0x30, 0x18, 0x0c, 0x06, 0x0c, 0x18, 0x30, 0x60, 0x00, 0x00, 0x00, 0x00], // 62 (0x3e) '>'
-    [0x00, 0x00, 0x7c, 0xc6, 0xc6, 0x0c, 0x18, 0x18, 0x18, 0x00, 0x18, 0x18, 0x00, 0x00, 0x00, 0x00], // 63 (0x3f) '?'
-    [0x00, 0x00, 0x7c, 0xc6, 0xc6, 0xc6, 0xde, 0xde, 0xde, 0xdc, 0xc0, 0x7c, 0x00, 0x00, 0x00, 0x00], // 64 (0x40) '@'
-    [0x00, 0x00, 0x10, 0x38, 0x6c, 0xc6, 0xc6, 0xfe, 0xc6, 0xc6, 0xc6, 0xc6, 0x00, 0x00, 0x00, 0x00], // 65 (0x41) 'A'
-    [0x00, 0x00, 0xfc, 0x66, 0x66, 0x66, 0x7c, 0x66, 0x66, 0x66, 0x66, 0xfc, 0x00, 0x00, 0x00, 0x00], // 66 (0x42) 'B'
-    [0x00, 0x00, 0x3c, 0x66, 0xc2, 0xc0, 0xc0, 0xc0, 0xc0, 0xc2, 0x66, 0x3c, 0x00, 0x00, 0x00, 0x00], // 67 (0x43) 'C'
-    [0x00, 0x00, 0xf8, 0x6c, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x6c, 0xf8, 0x00, 0x00, 0x00, 0x00], // 68 (0x44) 'D'
-    [0x00, 0x00, 0xfe, 0x66, 0x62, 0x68, 0x78, 0x68, 0x60, 0x62, 0x66, 0xfe, 0x00, 0x00, 0x00, 0x00], // 69 (0x45) 'E'
-    [0x00, 0x00, 0xfe, 0x66, 0x62, 0x68, 0x78, 0x68, 0x60, 0x60, 0x60, 0xf0, 0x00, 0x00, 0x00, 0x00], // 70 (0x46) 'F'
-    [0x00, 0x00, 0x3c, 0x66, 0xc2, 0xc0, 0xc0, 0xde, 0xc6, 0xc6, 0x66, 0x3a, 0x00, 0x00, 0x00, 0x00], // 71 (0x47) 'G'
-    [0x00, 0x00, 0xc6, 0xc6, 0xc6, 0xc6, 0xfe, 0xc6, 0xc6, 0xc6, 0xc6, 0xc6, 0x00, 0x00, 0x00, 0x00], // 72 (0x48) 'H'
-    [0x00, 0x00, 0x3c, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x3c, 0x00, 0x00, 0x00, 0x00], // 73 (0x49) 'I'
-    [0x00, 0x00, 0x1e, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0xcc, 0xcc, 0xcc, 0x78, 0x00, 0x00, 0x00, 0x00], // 74 (0x4a) 'J'
-    [0x00, 0x00, 0xe6, 0x66, 0x66, 0x6c, 0x78, 0x78, 0x6c, 0x66, 0x66, 0xe6, 0x00, 0x00, 0x00, 0x00], // 75 (0x4b) 'K'
-    [0x00, 0x00, 0xf0, 0x60, 0x60, 0x60, 0x60, 0x60, 0x60, 0x62, 0x66, 0xfe, 0x00, 0x00, 0x00, 0x00], // 76 (0x4c) 'L'
-    [0x00, 0x00, 0xc3, 0xe7, 0xff, 0xff, 0xdb, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0x00, 0x00, 0x00, 0x00], // 77 (0x4d) 'M'
-    [0x00, 0x00, 0xc6, 0xe6, 0xf6, 0xfe, 0xde, 0xce, 0xc6, 0xc6, 0xc6, 0xc6, 0x00, 0x00, 0x00, 0x00], // 78 (0x4e) 'N'
-    [0x00, 0x00, 0x7c, 0xc6, 0xc6, 0xc6, 0xc6, 0xc6, 0xc6, 0xc6, 0xc6, 0x7c, 0x00, 0x00, 0x00, 0x00], // 79 (0x4f) 'O'
-    [0x00, 0x00, 0xfc, 0x66, 0x66, 0x66, 0x7c, 0x60, 0x60, 0x60, 0x60, 0xf0, 0x00, 0x00, 0x00, 0x00], // 80 (0x50) 'P'
-    [0x00, 0x00, 0x7c, 0xc6, 0xc6, 0xc6, 0xc6, 0xc6, 0xc6, 0xd6, 0xde, 0x7c, 0x0c, 0x0e, 0x00, 0x00], // 81 (0x51) 'Q'
-    [0x00, 0x00, 0xfc, 0x66, 0x66, 0x66, 0x7c, 0x6c, 0x66, 0x66, 0x66, 0xe6, 0x00, 0x00, 0x00, 0x00], // 82 (0x52) 'R'
-    [0x00, 0x00, 0x7c, 0xc6, 0xc6, 0x60, 0x38, 0x0c, 0x06, 0xc6, 0xc6, 0x7c, 0x00, 0x00, 0x00, 0x00], // 83 (0x53) 'S'
-    [0x00, 0x00, 0xff, 0xdb, 0x99, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x3c, 0x00, 0x00, 0x00, 0x00], // 84 (0x54) 'T'
-    [0x00, 0x00, 0xc6, 0xc6, 0xc6, 0xc6, 0xc6, 0xc6, 0xc6, 0xc6, 0xc6, 0x7c, 0x00, 0x00, 0x00, 0x00], // 85 (0x55) 'U'
-    [0x00, 0x00, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0x66, 0x3c, 0x18, 0x00, 0x00, 0x00, 0x00], // 86 (0x56) 'V'
-    [0x00, 0x00, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xdb, 0xdb, 0xff, 0x66, 0x66, 0x00, 0x00, 0x00, 0x00], // 87 (0x57) 'W'
-    [0x00, 0x00, 0xc3, 0xc3, 0x66, 0x3c, 0x18, 0x18, 0x3c, 0x66, 0xc3, 0xc3, 0x00, 0x00, 0x00, 0x00], // 88 (0x58) 'X'
-    [0x00, 0x00, 0xc3, 0xc3, 0xc3, 0x66, 0x3c, 0x18, 0x18, 0x18, 0x18, 0x3c, 0x00, 0x00, 0x00, 0x00], // 89 (0x59) 'Y'
-    [0x00, 0x00, 0xff, 0xc3, 0x86, 0x0c, 0x18, 0x30, 0x60, 0xc1, 0xc3, 0xff, 0x00, 0x00, 0x00, 0x00], // 90 (0x5a) 'Z'
-    [0x00, 0x00, 0x3c, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x3c, 0x00, 0x00, 0x00, 0x00], // 91 (0x5b) '['
-    [0x00, 0x00, 0x00, 0x80, 0xc0, 0xe0, 0x70, 0x38, 0x1c, 0x0e, 0x06, 0x02, 0x00, 0x00, 0x00, 0x00], // 92 (0x5c) '\\'
-    [0x00, 0x00, 0x3c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x3c, 0x00, 0x00, 0x00, 0x00], // 93 (0x5d) ']'
-    [0x10, 0x38, 0x6c, 0xc6, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // 94 (0x5e) '^'
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x00, 0x00], // 95 (0x5f) '_'
-    [0x30, 0x30, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // 96 (0x60) '`'
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0x78, 0x0c, 0x7c, 0xcc, 0xcc, 0xcc, 0x76, 0x00, 0x00, 0x00, 0x00], // 97 (0x61) 'a'
-    [0x00, 0x00, 0xe0, 0x60, 0x60, 0x78, 0x6c, 0x66, 0x66, 0x66, 0x66, 0x7c, 0x00, 0x00, 0x00, 0x00], // 98 (0x62) 'b'
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0x7c, 0xc6, 0xc0, 0xc0, 0xc0, 0xc6, 0x7c, 0x00, 0x00, 0x00, 0x00], // 99 (0x63) 'c'
-    [0x00, 0x00, 0x1c, 0x0c, 0x0c, 0x3c, 0x6c, 0xcc, 0xcc, 0xcc, 0xcc, 0x76, 0x00, 0x00, 0x00, 0x00], // 100 (0x64) 'd'
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0x7c, 0xc6, 0xfe, 0xc0, 0xc0, 0xc6, 0x7c, 0x00, 0x00, 0x00, 0x00], // 101 (0x65) 'e'
-    [0x00, 0x00, 0x38, 0x6c, 0x64, 0x60, 0xf0, 0x60, 0x60, 0x60, 0x60, 0xf0, 0x00, 0x00, 0x00, 0x00], // 102 (0x66) 'f'
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0x76, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0x7c, 0x0c, 0xcc, 0x78, 0x00], // 103 (0x67) 'g'
-    [0x00, 0x00, 0xe0, 0x60, 0x60, 0x6c, 0x76, 0x66, 0x66, 0x66, 0x66, 0xe6, 0x00, 0x00, 0x00, 0x00], // 104 (0x68) 'h'
-    [0x00, 0x00, 0x18, 0x18, 0x00, 0x38, 0x18, 0x18, 0x18, 0x18, 0x18, 0x3c, 0x00, 0x00, 0x00, 0x00], // 105 (0x69) 'i'
-    [0x00, 0x00, 0x06, 0x06, 0x00, 0x0e, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x66, 0x66, 0x3c, 0x00], // 106 (0x6a) 'j'
-    [0x00, 0x00, 0xe0, 0x60, 0x60, 0x66, 0x6c, 0x78, 0x78, 0x6c, 0x66, 0xe6, 0x00, 0x00, 0x00, 0x00], // 107 (0x6b) 'k'
-    [0x00, 0x00, 0x38, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x3c, 0x00, 0x00, 0x00, 0x00], // 108 (0x6c) 'l'
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0xe6, 0xff, 0xdb, 0xdb, 0xdb, 0xdb, 0xdb, 0x00, 0x00, 0x00, 0x00], // 109 (0x6d) 'm'
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0xdc, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x00, 0x00, 0x00, 0x00], // 110 (0x6e) 'n'
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0x7c, 0xc6, 0xc6, 0xc6, 0xc6, 0xc6, 0x7c, 0x00, 0x00, 0x00, 0x00], // 111 (0x6f) 'o'
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0xdc, 0x66, 0x66, 0x66, 0x66, 0x66, 0x7c, 0x60, 0x60, 0xf0, 0x00], // 112 (0x70) 'p'
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0x76, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0x7c, 0x0c, 0x0c, 0x1e, 0x00], // 113 (0x71) 'q'
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0xdc, 0x76, 0x66, 0x60, 0x60, 0x60, 0xf0, 0x00, 0x00, 0x00, 0x00], // 114 (0x72) 'r'
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0x7c, 0xc6, 0x60, 0x38, 0x0c, 0xc6, 0x7c, 0x00, 0x00, 0x00, 0x00], // 115 (0x73) 's'
-    [0x00, 0x00, 0x10, 0x30, 0x30, 0xfc, 0x30, 0x30, 0x30, 0x30, 0x36, 0x1c, 0x00, 0x00, 0x00, 0x00], // 116 (0x74) 't'
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0x76, 0x00, 0x00, 0x00, 0x00], // 117 (0x75) 'u'
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0xc3, 0xc3, 0xc3, 0xc3, 0x66, 0x3c, 0x18, 0x00, 0x00, 0x00, 0x00], // 118 (0x76) 'v'
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0xc3, 0xc3, 0xc3, 0xdb, 0xdb, 0xff, 0x66, 0x00, 0x00, 0x00, 0x00], // 119 (0x77) 'w'
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0xc3, 0x66, 0x3c, 0x18, 0x3c, 0x66, 0xc3, 0x00, 0x00, 0x00, 0x00], // 120 (0x78) 'x'
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0xc6, 0xc6, 0xc6, 0xc6, 0xc6, 0xc6, 0x7e, 0x06, 0x0c, 0xf8, 0x00], // 121 (0x79) 'y'
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0xfe, 0xcc, 0x18, 0x30, 0x60, 0xc6, 0xfe, 0x00, 0x00, 0x00, 0x00], // 122 (0x7a) 'z'
-    [0x00, 0x00, 0x0e, 0x18, 0x18, 0x18, 0x70, 0x18, 0x18, 0x18, 0x18, 0x0e, 0x00, 0x00, 0x00, 0x00], // 123 (0x7b) '{'
-    [0x00, 0x00, 0x18, 0x18, 0x18, 0x18, 0x00, 0x18, 0x18, 0x18, 0x18, 0x18, 0x00, 0x00, 0x00, 0x00], // 124 (0x7c) '|'
-    [0x00, 0x00, 0x70, 0x18, 0x18, 0x18, 0x0e, 0x18, 0x18, 0x18, 0x18, 0x70, 0x00, 0x00, 0x00, 0x00], // 125 (0x7d) '}'
-    [0x00, 0x00, 0x76, 0xdc, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // 126 (0x7e) '~'
-    [0x00, 0x00, 0x00, 0x00, 0x10, 0x38, 0x6c, 0xc6, 0xc6, 0xc6, 0xfe, 0x00, 0x00, 0x00, 0x00, 0x00], // 127 (0x7f) '\x7f'
-];
-
-const GLYPH_SPECS: [(u8, u8, u8); 96] = [
-    (0, 0, 4), // 32 ' '
-    (2, 4, 5), // 33 '!'
-    (1, 6, 7), // 34 '"'
-    (0, 7, 9), // 35 '#'
-    (0, 7, 8), // 36 '$'
-    (0, 7, 9), // 37 '%'
-    (0, 7, 8), // 38 '&'
-    (1, 3, 4), // 39 "'"
-    (2, 4, 5), // 40 '('
-    (2, 4, 5), // 41 ')'
-    (0, 8, 9), // 42 '*'
-    (1, 6, 7), // 43 '+'
-    (2, 3, 4), // 44 ','
-    (1, 6, 7), // 45 '-'
-    (3, 2, 4), // 46 '.'
-    (0, 7, 8), // 47 '/'
-    (0, 7, 8), // 48 '0'
-    (1, 6, 7), // 49 '1'
-    (0, 7, 8), // 50 '2'
-    (0, 7, 8), // 51 '3'
-    (0, 7, 8), // 52 '4'
-    (0, 7, 8), // 53 '5'
-    (0, 7, 8), // 54 '6'
-    (0, 7, 8), // 55 '7'
-    (0, 7, 8), // 56 '8'
-    (0, 7, 8), // 57 '9'
-    (3, 2, 4), // 58 ':'
-    (2, 3, 4), // 59 ';'
-    (1, 6, 7), // 60 '<'
-    (1, 6, 7), // 61 '='
-    (1, 6, 7), // 62 '>'
-    (0, 7, 8), // 63 '?'
-    (0, 7, 9), // 64 '@'
-    (0, 7, 8), // 65 'A'
-    (0, 7, 8), // 66 'B'
-    (0, 7, 8), // 67 'C'
-    (0, 7, 8), // 68 'D'
-    (0, 7, 8), // 69 'E'
-    (0, 7, 8), // 70 'F'
-    (0, 7, 8), // 71 'G'
-    (0, 7, 8), // 72 'H'
-    (2, 4, 5), // 73 'I'
-    (0, 7, 8), // 74 'J'
-    (0, 7, 8), // 75 'K'
-    (0, 7, 8), // 76 'L'
-    (0, 8, 9), // 77 'M'
-    (0, 7, 8), // 78 'N'
-    (0, 7, 8), // 79 'O'
-    (0, 7, 8), // 80 'P'
-    (0, 7, 8), // 81 'Q'
-    (0, 7, 8), // 82 'R'
-    (0, 7, 8), // 83 'S'
-    (0, 8, 9), // 84 'T'
-    (0, 7, 8), // 85 'U'
-    (0, 8, 9), // 86 'V'
-    (0, 8, 9), // 87 'W'
-    (0, 8, 9), // 88 'X'
-    (0, 8, 9), // 89 'Y'
-    (0, 8, 9), // 90 'Z'
-    (2, 4, 5), // 91 '['
-    (0, 7, 8), // 92 '\\'
-    (2, 4, 5), // 93 ']'
-    (0, 7, 8), // 94 '^'
-    (0, 8, 9), // 95 '_'
-    (2, 3, 4), // 96 '`'
-    (0, 7, 8), // 97 'a'
-    (0, 7, 8), // 98 'b'
-    (0, 7, 8), // 99 'c'
-    (0, 7, 8), // 100 'd'
-    (0, 7, 8), // 101 'e'
-    (0, 6, 7), // 102 'f'
-    (0, 7, 8), // 103 'g'
-    (0, 7, 8), // 104 'h'
-    (2, 4, 5), // 105 'i'
-    (1, 6, 7), // 106 'j'
-    (0, 7, 8), // 107 'k'
-    (2, 4, 5), // 108 'l'
-    (0, 8, 9), // 109 'm'
-    (0, 7, 8), // 110 'n'
-    (0, 7, 8), // 111 'o'
-    (0, 7, 8), // 112 'p'
-    (0, 7, 8), // 113 'q'
-    (0, 7, 8), // 114 'r'
-    (0, 7, 8), // 115 's'
-    (0, 7, 8), // 116 't'
-    (0, 7, 8), // 117 'u'
-    (0, 8, 9), // 118 'v'
-    (0, 8, 9), // 119 'w'
-    (0, 8, 9), // 120 'x'
-    (0, 7, 8), // 121 'y'
-    (0, 7, 8), // 122 'z'
-    (1, 6, 7), // 123 '{'
-    (3, 2, 4), // 124 '|'
-    (1, 6, 7), // 125 '}'
-    (0, 7, 8), // 126 '~'
-    (0, 7, 8), // 127 '\x7f'
-];
-
-/// Calculate exact pixel rendered width for a text string under a given scale with proportional character metrics.
+/// Exact rendered width of a text string at a UI scale, in pixels (rounded).
+///
+/// Measured on the reference panel; multiply by the panel's density factor
+/// when a pixel-exact position is needed, or use the vector engine directly.
 pub fn text_width(text: &str, scale: usize) -> usize {
-    let scale = scale.max(1);
-    let mut total = 0;
-    for b in text.bytes() {
-        if (32..128).contains(&b) {
-            let (_, _, adv) = GLYPH_SPECS[(b - 32) as usize];
-            total += adv as usize * scale;
-        } else {
-            total += 8 * scale;
-        }
-    }
-    total
+    super::font::measure(text, super::font::em_px(scale)).round() as usize
+}
+
+/// [`text_width`] for a specific panel width.
+#[inline]
+pub fn text_width_at(text: &str, scale: usize, panel_w: usize) -> usize {
+    super::font::measure(text, super::font::em_px_at(scale, panel_w)).round() as usize
 }
 
 /// Zero-allocation, stack-only formatter for app count strings (e.g., "15 APPS").
@@ -2651,115 +3106,46 @@ pub fn format_apps_count(buf: &mut [u8; 16], count: usize) -> &str {
         buf[out_len] = digits[i];
         out_len += 1;
     }
-    let suffix = b" APPS";
-    for &b in suffix {
+    for &b in b" APPS" {
         buf[out_len] = b;
         out_len += 1;
     }
     std::str::from_utf8(&buf[..out_len]).unwrap_or("0 APPS")
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Draw a text run with its ascender line at `y` and left edge at `x`.
+#[inline]
 pub fn draw_text_weighted_i32(
     buf: &mut [u32],
     stride: usize,
     w: usize,
     h: usize,
-    mut x: i32,
+    x: i32,
     y: i32,
     text: &str,
     color: u32,
     scale: usize,
     weight: FontWeight,
 ) {
-    let scale = scale.max(1);
-    for b in text.bytes() {
-        if (32..128).contains(&b) {
-            let idx = (b - 32) as usize;
-            let glyph = &FONT_8X16[idx];
-            let (off, gw, adv) = GLYPH_SPECS[idx];
-            let off = off as usize;
-            let gw = gw as usize;
-
-            if x + (adv as i32 * scale as i32) > 0 && x < w as i32 {
-                let extra_w = match weight {
-                    FontWeight::Regular => 0,
-                    FontWeight::Medium | FontWeight::Bold => 1,
-                };
-                for row in 0..16 {
-                    let raw_row = glyph[row];
-                    let row_bits = match weight {
-                        FontWeight::Regular => raw_row,
-                        FontWeight::Medium | FontWeight::Bold => raw_row | (raw_row >> 1),
-                    };
-
-                    if row_bits == 0 {
-                        continue;
-                    }
-
-                    for col in 0..(gw + extra_w) {
-                        let col_idx = off + col;
-                        if col_idx < 8 {
-                            let bit_mask = 0x80 >> col_idx;
-                            if (row_bits & bit_mask) != 0 {
-                                let px = x + (col * scale) as i32;
-                                let py = y + (row * scale) as i32;
-
-                                if scale == 1 {
-                                    if px >= 0 && (px as usize) < w && py >= 0 && (py as usize) < h {
-                                        let bg = buf[(py as usize) * stride + (px as usize)];
-                                        buf[(py as usize) * stride + (px as usize)] = blend_alpha(bg, color, 255);
-                                    }
-                                } else {
-                                    // Scale >= 2: Anti-aliased corner-smoothed subpixel block for high-definition typography
-                                    let has_up = row > 0 && ((glyph[row - 1] & bit_mask) != 0);
-                                    let has_down = row + 1 < 16 && ((glyph[row + 1] & bit_mask) != 0);
-                                    let has_left = col_idx > 0 && ((row_bits & (0x80 >> (col_idx - 1))) != 0);
-                                    let has_right = col_idx + 1 < 8 && ((row_bits & (0x80 >> (col_idx + 1))) != 0);
-
-                                    for sy in 0..scale {
-                                        let cur_y = py + sy as i32;
-                                        if cur_y < 0 || (cur_y as usize) >= h { continue; }
-                                        let row_idx = (cur_y as usize) * stride;
-
-                                        let is_top_edge = sy == 0;
-                                        let is_bot_edge = sy == scale - 1;
-
-                                        for sx in 0..scale {
-                                            let cur_x = px + sx as i32;
-                                            if cur_x < 0 || (cur_x as usize) >= w { continue; }
-                                            let cur_x_u = cur_x as usize;
-
-                                            let is_left_edge = sx == 0;
-                                            let is_right_edge = sx == scale - 1;
-
-                                            let is_corner = (is_top_edge && is_left_edge && !has_up && !has_left)
-                                                || (is_top_edge && is_right_edge && !has_up && !has_right)
-                                                || (is_bot_edge && is_left_edge && !has_down && !has_left)
-                                                || (is_bot_edge && is_right_edge && !has_down && !has_right);
-
-                                            if is_corner {
-                                                let bg = buf[row_idx + cur_x_u];
-                                                buf[row_idx + cur_x_u] = blend_alpha(bg, color, 140);
-                                            } else {
-                                                buf[row_idx + cur_x_u] = color;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            x += adv as i32 * scale as i32;
-        } else {
-            x += 8 * scale as i32;
-        }
+    if x >= w as i32 || y >= h as i32 {
+        return;
     }
+    super::font::draw_run(
+        buf,
+        stride,
+        w,
+        h,
+        x as f32,
+        y as f32,
+        text,
+        color,
+        super::font::em_px_at(scale, w),
+        weight,
+    );
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Draw a text run with its ascender line at `y` and left edge at `x`.
+#[inline]
 pub fn draw_text_weighted(
     buf: &mut [u32],
     stride: usize,
@@ -2775,7 +3161,8 @@ pub fn draw_text_weighted(
     draw_text_weighted_i32(buf, stride, w, h, x as i32, y as i32, text, color, scale, weight);
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Draw a text run horizontally centred on `center_x`, ascender line at `y`.
+#[inline]
 pub fn draw_text_centered_weighted_i32(
     buf: &mut [u32],
     stride: usize,
@@ -2788,12 +3175,13 @@ pub fn draw_text_centered_weighted_i32(
     scale: usize,
     weight: FontWeight,
 ) {
-    let total_w = text_width(text, scale) as i32;
-    let x = center_x - total_w / 2;
-    draw_text_weighted_i32(buf, stride, w, h, x, y, text, color, scale, weight);
+    let size = super::font::em_px_at(scale, w);
+    let x = center_x as f32 - super::font::measure(text, size) * 0.5;
+    super::font::draw_run(buf, stride, w, h, x, y as f32, text, color, size, weight);
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Draw a text run horizontally centred on `center_x`, ascender line at `y`.
+#[inline]
 pub fn draw_text_centered_weighted(
     buf: &mut [u32],
     stride: usize,
@@ -2809,7 +3197,8 @@ pub fn draw_text_centered_weighted(
     draw_text_centered_weighted_i32(buf, stride, w, h, center_x as i32, y as i32, text, color, scale, weight);
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Draw a regular weight text run with its ascender line at `y`.
+#[inline]
 pub fn draw_text_i32(
     buf: &mut [u32],
     stride: usize,
@@ -2824,7 +3213,8 @@ pub fn draw_text_i32(
     draw_text_weighted_i32(buf, stride, w, h, x, y, text, color, scale, FontWeight::Regular);
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Draw a regular weight text run with its ascender line at `y`.
+#[inline]
 pub fn draw_text(
     buf: &mut [u32],
     stride: usize,
@@ -2836,10 +3226,11 @@ pub fn draw_text(
     color: u32,
     scale: usize,
 ) {
-    draw_text_weighted_i32(buf, stride, w, h, x as i32, y as i32, text, color, scale, FontWeight::Regular);
+    draw_text_weighted(buf, stride, w, h, x, y, text, color, scale, FontWeight::Regular);
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Draw a regular weight text run centred on `center_x`, ascender line at `y`.
+#[inline]
 pub fn draw_text_centered_i32(
     buf: &mut [u32],
     stride: usize,
@@ -2854,7 +3245,8 @@ pub fn draw_text_centered_i32(
     draw_text_centered_weighted_i32(buf, stride, w, h, center_x, y, text, color, scale, FontWeight::Regular);
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Draw a regular weight text run centred on `center_x`, ascender line at `y`.
+#[inline]
 pub fn draw_text_centered(
     buf: &mut [u32],
     stride: usize,
@@ -2867,6 +3259,493 @@ pub fn draw_text_centered(
     scale: usize,
 ) {
     draw_text_centered_weighted(buf, stride, w, h, center_x, y, text, color, scale, FontWeight::Regular);
+}
+
+/// Draw a text run truncated with an ellipsis so it never leaves `max_width`.
+///
+/// Truncation is measured on the vector engine's own advances, so the drawn
+/// width and the measured width agree and no glyph is ever cut in half.
+pub fn draw_text_clipped(
+    buf: &mut [u32],
+    stride: usize,
+    w: usize,
+    h: usize,
+    x: f32,
+    y: f32,
+    max_width: f32,
+    text: &str,
+    color: u32,
+    scale: usize,
+    weight: FontWeight,
+) {
+    if max_width <= 0.0 {
+        return;
+    }
+    let size = super::font::em_px_at(scale, w);
+    let full = super::font::measure(text, size);
+    if full <= max_width {
+        super::font::draw_run(buf, stride, w, h, x, y, text, color, size, weight);
+        return;
+    }
+    // Reserve room for the ellipsis, then take the longest prefix that fits.
+    let ell = "..";
+    let ell_w = super::font::measure(ell, size);
+    let budget = max_width - ell_w;
+    if budget <= 0.0 {
+        return;
+    }
+    let mut used = 0.0f32;
+    let mut end = 0;
+    for (i, b) in text.bytes().enumerate() {
+        let adv = super::font::char_advance(b, size);
+        if used + adv > budget {
+            break;
+        }
+        used += adv;
+        end = i + 1;
+    }
+    if end == 0 {
+        return;
+    }
+    let head = &text[..end];
+    super::font::draw_run(buf, stride, w, h, x, y, head, color, size, weight);
+    super::font::draw_run(buf, stride, w, h, x + used, y, ell, color, size, weight);
+}
+
+/// [`draw_text_clipped`] with an integer origin.
+#[inline]
+pub fn draw_text_clipped_i32(
+    buf: &mut [u32],
+    stride: usize,
+    w: usize,
+    h: usize,
+    x: i32,
+    y: f32,
+    max_width: f32,
+    text: &str,
+    color: u32,
+    scale: usize,
+    weight: FontWeight,
+) {
+    draw_text_clipped(buf, stride, w, h, x as f32, y, max_width, text, color, scale, weight);
+}
+
+/// [`draw_text_clipped`] centred on `center_x` and truncated to `max_width`.
+pub fn draw_text_centered_clipped_i32(
+    buf: &mut [u32],
+    stride: usize,
+    w: usize,
+    h: usize,
+    center_x: i32,
+    y: f32,
+    max_width: f32,
+    text: &str,
+    color: u32,
+    scale: usize,
+    weight: FontWeight,
+) {
+    if max_width <= 0.0 {
+        return;
+    }
+    let size = super::font::em_px_at(scale, w);
+    let width = super::font::measure(text, size).min(max_width);
+    draw_text_clipped(
+        buf, stride, w, h, center_x as f32 - width * 0.5, y, max_width, text, color, scale, weight,
+    );
+}
+
+/// [`draw_text_centered_clipped_i32`] with an integer centre.
+#[inline]
+pub fn draw_text_centered_clipped(
+    buf: &mut [u32],
+    stride: usize,
+    w: usize,
+    h: usize,
+    center_x: usize,
+    y: usize,
+    max_width: f32,
+    text: &str,
+    color: u32,
+    scale: usize,
+    weight: FontWeight,
+) {
+    draw_text_centered_clipped_i32(
+        buf, stride, w, h, center_x as i32, y as f32, max_width, text, color, scale, weight,
+    );
+}
+
+/// Rounded rectangle from float geometry.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub fn draw_rounded_rect_f(
+    buf: &mut [u32],
+    stride: usize,
+    w: usize,
+    h: usize,
+    x: f32,
+    y: f32,
+    rw: f32,
+    rh: f32,
+    radius: f32,
+    color: u32,
+) {
+    let xi = x.floor().max(0.0) as i32;
+    let yi = y.floor().max(0.0) as i32;
+    let x1 = (x + rw).ceil().min(w as f32) as i32;
+    let y1 = (y + rh).ceil().min(h as f32) as i32;
+    draw_rounded_rect_i32(
+        buf, stride, w, h, xi, yi, (x1 - xi).max(0) as usize, (y1 - yi).max(0) as usize,
+        radius.max(0.0).min((x1 - xi) as f32).min((y1 - yi) as f32) as usize, color,
+    );
+}
+
+/// Filled rectangle from float geometry.
+#[inline]
+pub fn draw_rect_f(
+    buf: &mut [u32],
+    stride: usize,
+    w: usize,
+    h: usize,
+    x: f32,
+    y: f32,
+    rw: f32,
+    rh: f32,
+    color: u32,
+) {
+    let xi = x.floor().max(0.0) as i32;
+    let yi = y.floor().max(0.0) as i32;
+    let x1 = (x + rw).ceil().min(w as f32) as i32;
+    let y1 = (y + rh).ceil().min(h as f32) as i32;
+    if x1 <= xi || y1 <= yi {
+        return;
+    }
+    draw_rect(
+        buf, stride, w, h, xi as usize, yi as usize, (x1 - xi) as usize, (y1 - yi) as usize, color,
+    );
+}
+
+/// A line of the given stroke width, drawn as a rotated capsule.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub fn draw_line(
+    buf: &mut [u32],
+    stride: usize,
+    w: usize,
+    h: usize,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    color: u32,
+) {
+    // Axis-aligned runs are the common case (glyph strokes, dividers).
+    if (x0 - x1).abs() < 0.5 {
+        draw_rect_f(
+            buf, stride, w, h, x0 - 0.5, y0.min(y1), 1.0, (y1 - y0).abs() + 1.0, color,
+        );
+        return;
+    }
+    if (y0 - y1).abs() < 0.5 {
+        draw_rect_f(
+            buf, stride, w, h, x0.min(x1), y0 - 0.5, (x1 - x0).abs() + 1.0, 1.0, color,
+        );
+        return;
+    }
+    // Diagonals: step along the major axis and stamp a small square.
+    let steps = ((x1 - x0).abs().max((y1 - y0).abs())).ceil().max(1.0) as usize;
+    for i in 0..=steps {
+        let t = i as f32 / steps as f32;
+        let px = x0 + (x1 - x0) * t;
+        let py = y0 + (y1 - y0) * t;
+        draw_rect_f(buf, stride, w, h, px - 0.5, py - 0.5, 1.0, 1.0, color);
+    }
+}
+
+/// A filled disc, used for dots, close affordances and ripple centres.
+#[inline]
+pub fn draw_circle_glyph(
+    buf: &mut [u32],
+    stride: usize,
+    w: usize,
+    h: usize,
+    cx: f32,
+    cy: f32,
+    r: f32,
+    color: u32,
+) {
+    if r <= 0.0 {
+        return;
+    }
+    let y0 = (cy - r).floor().max(0.0) as i32;
+    let y1 = (cy + r).ceil().min(h as f32) as i32;
+    let x0 = (cx - r).floor().max(0.0) as i32;
+    let x1 = (cx + r).ceil().min(w as f32) as i32;
+    for py in y0..y1 {
+        for px in x0..x1 {
+            let dx = px as f32 + 0.5 - cx;
+            let dy = py as f32 + 0.5 - cy;
+            let d = (dx * dx + dy * dy).sqrt();
+            let a = (r + 0.5 - d).clamp(0.0, 1.0);
+            if a <= 0.0 {
+                continue;
+            }
+            let i = py as usize * stride + px as usize;
+            buf[i] = super::font::blend_over(buf[i], color, (a * 255.0 + 0.5) as u8);
+        }
+    }
+}
+
+/// Split a packed RGB triple out of an ARGB colour.
+#[inline]
+fn rgb_of(c: u32) -> (u8, u8, u8) {
+    (((c >> 16) & 0xFF) as u8, ((c >> 8) & 0xFF) as u8, (c & 0xFF) as u8)
+}
+
+/// Width the display clock occupies, matching [`draw_material_you_clock`].
+fn clock_run_width(time_str: &str, digit_h: f32, panel_w: usize) -> f32 {
+    use super::font::{em_px_at, measure, CAP_HEIGHT};
+    let k = (panel_w as f32 / super::font::REFERENCE_PANEL_W).clamp(0.5, 2.0);
+    let size = (digit_h * k / (CAP_HEIGHT / 1000.0)).min(em_px_at(4, panel_w));
+    let tracking = size * 0.04;
+    measure(time_str, size) + tracking * (time_str.len() as f32 - 1.0).max(0.0)
+}
+
+/// A padlock: shackle arc over a body, sized from `size` (the body height).
+#[allow(clippy::too_many_arguments)]
+fn draw_lock_glyph(
+    buf: &mut [u32],
+    stride: usize,
+    w: usize,
+    h: usize,
+    cx: usize,
+    cy: usize,
+    size: f32,
+    color: u32,
+) {
+    if size <= 0.0 {
+        return;
+    }
+    let body_w = size * 0.86;
+    let body_h = size;
+    let body_y = cy as f32 + size * 0.30;
+    // Shackle: three sides of a rounded rect sitting on the body.
+    let sh_w = body_w * 0.58;
+    let sh_h = size * 0.62;
+    let sh_x = cx as f32 - sh_w * 0.5;
+    let sh_y = cy as f32;
+    let t = size * 0.15;
+    draw_rounded_rect_f(
+        buf, stride, w, h, sh_x, sh_y, sh_w, sh_h, sh_w * 0.5, color,
+    );
+    // Punch the middle of the shackle out again.
+    draw_rounded_rect_f(
+        buf, stride, w, h, sh_x + t, sh_y + t, sh_w - t * 2.0, sh_h, sh_w * 0.4,
+        state_surface_dark(),
+    );
+    draw_rounded_rect_f(
+        buf, stride, w, h, cx as f32 - body_w * 0.5, body_y, body_w, body_h, size * 0.22, color,
+    );
+}
+
+/// Background colour to punch through to when drawing the lock shackle.
+#[inline]
+fn state_surface_dark() -> u32 {
+    0xFF0B0F19
+}
+
+/// ASCII upper case, without pulling in a Unicode table for a one-line shift.
+#[inline]
+fn char_to_upper(c: char) -> String {
+    if c.is_ascii_lowercase() {
+        let mut b = [0u8; 4];
+        c.encode_utf8(&mut b).make_ascii_uppercase();
+        String::from_utf8_lossy(&b).into_owned()
+    } else {
+        c.to_string()
+    }
+}
+
+/// Draw a search field at the top of an app's content card.
+///
+/// Returns the y at which a row list can start and the height available to it.
+#[allow(clippy::too_many_arguments)]
+fn draw_app_search_field(
+    buf: &mut [u32],
+    stride: usize,
+    w: usize,
+    h: usize,
+    bar: &super::layout::Rect,
+    content_y: f32,
+    al: AppLayout,
+    state: &DrmInteractiveState,
+    placeholder: &str,
+) -> (f32, f32) {
+    // Field height is the standard touch target; the gutter keeps it clear of
+    // the app bar above and the list below.
+    let f_h = al.input.h;
+    let inset = f_h * 0.30;
+    let f_x = bar.x + inset;
+    let f_w = (bar.w - inset * 2.0).max(0.0);
+    let f_y = content_y + inset;
+    let ring = (w as f32 * 0.003).max(1.0);
+    let border = if state.app_input_focused {
+        state.palette.primary
+    } else {
+        state.palette.outline
+    };
+    draw_rounded_rect_f(
+        buf, stride, w, h, f_x - ring, f_y - ring, f_w + ring * 2.0, f_h + ring * 2.0,
+        f_h * 0.28 + ring, border,
+    );
+    draw_rounded_rect_f(
+        buf, stride, w, h, f_x, f_y, f_w, f_h, f_h * 0.28, state.palette.surface_container_high,
+    );
+    let em = super::font::em_px_at(2, w);
+    let disp = if state.app_input.is_empty() { placeholder } else { state.app_input };
+    let col = if state.app_input.is_empty() {
+        state.palette.on_surface_variant
+    } else {
+        state.palette.on_surface
+    };
+    let tx = f_x + f_h * 0.42;
+    let ty = f_y + (f_h - em * 0.62) * 0.5 - em * 0.14;
+    draw_text_clipped(
+        buf, stride, w, h, tx, ty, f_w - f_h * 0.8, disp, col, 2, FontWeight::Regular,
+    );
+    if state.app_input_focused {
+        let cur_x = tx + super::font::measure(disp, em) + ring;
+        if cur_x < f_x + f_w - f_h * 0.3 {
+            draw_rect(
+                buf, stride, w, h, cur_x as usize, ty as usize, ring.max(2.0) as usize,
+                (em * 0.62) as usize, state.palette.primary,
+            );
+        }
+    }
+    let list_top = f_y + f_h + inset;
+    let list_h = (content_y + al.scroll_bottom - list_top).max(0.0);
+    (list_top, list_h)
+}
+
+/// Draw a two-line row list inside an app content card.
+fn draw_app_row_list(
+    buf: &mut [u32],
+    stride: usize,
+    w: usize,
+    h: usize,
+    bar: &super::layout::Rect,
+    top: f32,
+    avail_h: f32,
+    rows: &[(&str, &str)],
+    state: &DrmInteractiveState,
+) {
+    let row_h = (h as f32 * 0.026).max(w.min(h) as f32 * 0.058);
+    let step = row_h + h as f32 * 0.006;
+    let x = bar.x + bar.h * 0.25;
+    let rw = bar.w - bar.h * 0.5;
+    let title_em = super::font::em_px_at(1, w);
+    let mut y = top;
+    for (name, detail) in rows {
+        if y + row_h > top + avail_h {
+            break;
+        }
+        draw_rounded_rect_f(
+            buf, stride, w, h, x, y, rw, row_h, row_h * 0.24, state.palette.surface_container_high,
+        );
+        let tx = x + row_h * 0.45;
+        let tw = rw - row_h * 0.9;
+        draw_text_clipped(
+            buf, stride, w, h, tx, y + row_h * 0.16, tw, name, state.palette.on_surface, 1,
+            FontWeight::Bold,
+        );
+        draw_text_clipped(
+            buf, stride, w, h, tx, y + row_h * 0.16 + title_em, tw, detail,
+            state.palette.on_surface_variant, 1, FontWeight::Regular,
+        );
+        y += step;
+    }
+}
+
+/// The launcher background, palette driven.
+fn draw_background(buf: &mut [u32], stride: usize, w: usize, h: usize, state: &DrmInteractiveState) {
+    let base = state.palette.surface;
+    let sr = ((base >> 16) & 0xFF) as f32;
+    let sg = ((base >> 8) & 0xFF) as f32;
+    let sb = (base & 0xFF) as f32;
+    for y in 0..h {
+        let t = y as f32 / h as f32;
+        // Darken toward the bottom so the dock and grid read as "on top".
+        let k = 1.0 - t * 0.42;
+        let r = ((sr * k).round() as u32).min(255);
+        let g = ((sg * k).round() as u32).min(255);
+        let b = ((sb * k).round() as u32).min(255);
+        let pixel = (0xFF << 24) | (r << 16) | (g << 8) | b;
+        let row = y * stride;
+        for x in 0..w {
+            buf[row + x] = pixel;
+        }
+    }
+    // Two soft accent glows, from the palette's primary and tertiary.
+    let (pr, pg, pb) = rgb_of(state.palette.primary);
+    let (tr, tg, tb) = rgb_of(state.palette.tertiary);
+    draw_glow_circle(buf, stride, w, h, w * 8 / 10, h / 8, w * 5 / 18, pr, pg, pb, 26);
+    draw_glow_circle(buf, stride, w, h, w * 2 / 10, h * 8 / 10, w * 6 / 18, tr, tg, tb, 20);
+}
+
+/// The system status bar: clock on the left, radios and battery on the right.
+fn draw_status_bar(
+    buf: &mut [u32],
+    stride: usize,
+    w: usize,
+    h: usize,
+    state: &DrmInteractiveState,
+    y_offset: i32,
+) {
+    let l = Layout::plain(w as f32, h as f32);
+    let bar_h = l.status_bar_h;
+    let em = super::font::em_px_at(1, w);
+    let y = (l.status_bar_h * 0.5 - em * 0.34) as i32 + y_offset;
+    let pad = l.w * PANEL_PAD_FRACTION;
+    draw_text_weighted_i32(
+        buf, stride, w, h, pad as i32, y, state.time_str, state.palette.on_surface, 1,
+        FontWeight::Medium,
+    );
+    let icon_r = l.w - pad;
+    let by = l.status_bar_h * 0.5 - bar_h * 0.28 + y_offset as f32;
+    draw_rounded_rect_f(
+        buf, stride, w, h, icon_r - bar_h * 1.35, by, bar_h * 1.05, bar_h * 0.56,
+        bar_h * 0.16, state.palette.on_surface_variant,
+    );
+    draw_rounded_rect_f(
+        buf, stride, w, h, icon_r - bar_h * 1.23, by + bar_h * 0.09, bar_h * 0.81, bar_h * 0.38,
+        bar_h * 0.10, state.palette.surface,
+    );
+    // Fill level inside the battery.
+    draw_rounded_rect_f(
+        buf, stride, w, h, icon_r - bar_h * 1.23, by + bar_h * 0.09, bar_h * 0.81 * 0.78,
+        bar_h * 0.38, bar_h * 0.10, 0xFF10B981,
+    );
+    if state.quick_tiles_active[0] {
+        draw_circle_glyph(
+            buf, stride, w, h, icon_r - bar_h * 2.05, l.status_bar_h * 0.5 + y_offset as f32,
+            bar_h * 0.14, state.palette.on_surface,
+        );
+    }
+    let rat = if state.quick_tiles_active[1] { "5G" } else { "OFF" };
+    let rat_col = if state.quick_tiles_active[1] {
+        state.palette.primary
+    } else {
+        state.palette.outline
+    };
+    draw_text_weighted_i32(
+        buf, stride, w, h, (icon_r - bar_h * 2.9) as i32, y, rat, rat_col, 1, FontWeight::Bold,
+    );
+}
+
+/// Tone of an edit-mode chip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChipTone {
+    Destructive,
+    Primary,
 }
 
 /// Lawnchair 17 / Android DynamicAnimation Spring Physics Configuration.
@@ -3130,8 +4009,11 @@ impl MaterialYouPalette {
     }
 }
 
-/// Lawnchair 17 / Pixel Launcher Material You Curved Digital Clock Renderer.
-/// Renders smooth, modern rounded pill digits with zero blocky pixelation.
+/// Lawnchair 17 / Pixel Launcher Material You display clock.
+///
+/// The clock is set in the shell's display weight with slightly loosened
+/// tracking (the Pixel/Lawnchair clock is not a 7-segment readout), and is
+/// optically centred on the cap height rather than the em box.
 #[allow(clippy::too_many_arguments)]
 fn draw_material_you_clock(
     buf: &mut [u32],
@@ -3144,144 +4026,42 @@ fn draw_material_you_clock(
     color: u32,
     digit_h: usize,
 ) {
-    let digit_w = (digit_h * 54) / 100;
-    let stroke = ((digit_h * 15) / 100).max(4);
-    let spacing = (digit_h * 12) / 100;
-    let colon_w = (digit_h * 18) / 100;
-
-    let mut total_w = 0;
-    for ch in time_str.chars() {
-        if ch == ':' {
-            total_w += colon_w + spacing;
-        } else if ch.is_ascii_digit() {
-            total_w += digit_w + spacing;
-        } else {
-            total_w += digit_w / 2 + spacing;
-        }
+    use super::font::{em_px_at, ASCENDER, CAP_HEIGHT};
+    // digit_h is the cap height, so derive the em size from the cap metrics
+    // and the panel's type density.
+    let k = (w as f32 / super::font::REFERENCE_PANEL_W).clamp(0.5, 2.0);
+    let size = (digit_h as f32 * k / (CAP_HEIGHT / 1000.0)).min(em_px_at(4, w));
+    let tracking = size * 0.04;
+    let mut run_w = clock_run_width(time_str, digit_h as f32, w);
+    if (run_w as usize) > w - 8 {
+        // Pathologically long string for the panel: keep it on screen.
+        run_w = (w - 8) as f32;
     }
-    if total_w > 0 {
-        total_w -= spacing;
-    }
-
-    let mut cur_x = center_x.saturating_sub(total_w / 2);
-    let top_y = center_y.saturating_sub(digit_h / 2);
-
-    for ch in time_str.chars() {
-        match ch {
-            ':' => {
-                let dot_r = stroke / 2;
-                let dot_x = cur_x + colon_w / 2;
-                let dot_y1 = top_y + digit_h / 3;
-                let dot_y2 = top_y + (digit_h * 2) / 3;
-                draw_rounded_rect(buf, stride, w, h, dot_x.saturating_sub(dot_r), dot_y1.saturating_sub(dot_r), stroke, stroke, dot_r, color);
-                draw_rounded_rect(buf, stride, w, h, dot_x.saturating_sub(dot_r), dot_y2.saturating_sub(dot_r), stroke, stroke, dot_r, color);
-                cur_x += colon_w + spacing;
-            }
-            '0'..='9' => {
-                let d = ch as u8 - b'0';
-                draw_clock_digit(buf, stride, w, h, cur_x, top_y, digit_w, digit_h, stroke, color, d);
-                cur_x += digit_w + spacing;
-            }
-            _ => {
-                cur_x += digit_w / 2 + spacing;
-            }
-        }
+    let mut pen = center_x as f32 - run_w * 0.5;
+    let top = center_y as f32 - digit_h as f32 * 0.5 - (ASCENDER - CAP_HEIGHT) / 1000.0 * size;
+    for b in time_str.bytes() {
+        pen += super::font::draw_glyph(
+            buf,
+            stride,
+            w,
+            h,
+            pen,
+            top,
+            b,
+            color,
+            size,
+            FontWeight::Medium,
+        );
+        pen += tracking;
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn draw_clock_digit(
-    buf: &mut [u32],
-    stride: usize,
-    w: usize,
-    h: usize,
-    x: usize,
-    y: usize,
-    dw: usize,
-    dh: usize,
-    st: usize,
-    color: u32,
-    digit: u8,
-) {
-    let r = st / 2;
-    let mid_y = y + dh / 2 - st / 2;
-    let bot_y = y + dh - st;
-    let right_x = x + dw - st;
-
-    let h_top = |buf: &mut [u32]| draw_rounded_rect(buf, stride, w, h, x, y, dw, st, r, color);
-    let h_mid = |buf: &mut [u32]| draw_rounded_rect(buf, stride, w, h, x, mid_y, dw, st, r, color);
-    let h_bot = |buf: &mut [u32]| draw_rounded_rect(buf, stride, w, h, x, bot_y, dw, st, r, color);
-
-    let v_left_full = |buf: &mut [u32]| draw_rounded_rect(buf, stride, w, h, x, y, st, dh, r, color);
-    let v_right_full = |buf: &mut [u32]| draw_rounded_rect(buf, stride, w, h, right_x, y, st, dh, r, color);
-    let v_left_top = |buf: &mut [u32]| draw_rounded_rect(buf, stride, w, h, x, y, st, dh / 2 + r, r, color);
-    let v_left_bot = |buf: &mut [u32]| draw_rounded_rect(buf, stride, w, h, x, mid_y, st, dh / 2 + r, r, color);
-    let v_right_top = |buf: &mut [u32]| draw_rounded_rect(buf, stride, w, h, right_x, y, st, dh / 2 + r, r, color);
-    let v_right_bot = |buf: &mut [u32]| draw_rounded_rect(buf, stride, w, h, right_x, mid_y, st, dh / 2 + r, r, color);
-
-    match digit {
-        0 => {
-            v_left_full(buf);
-            v_right_full(buf);
-            h_top(buf);
-            h_bot(buf);
-        }
-        1 => {
-            v_right_full(buf);
-            draw_rounded_rect(buf, stride, w, h, x + dw / 3, y, dw * 2 / 3, st, r, color);
-        }
-        2 => {
-            h_top(buf);
-            v_right_top(buf);
-            h_mid(buf);
-            v_left_bot(buf);
-            h_bot(buf);
-        }
-        3 => {
-            h_top(buf);
-            h_mid(buf);
-            h_bot(buf);
-            v_right_full(buf);
-        }
-        4 => {
-            v_left_top(buf);
-            h_mid(buf);
-            v_right_full(buf);
-        }
-        5 => {
-            h_top(buf);
-            v_left_top(buf);
-            h_mid(buf);
-            v_right_bot(buf);
-            h_bot(buf);
-        }
-        6 => {
-            v_left_full(buf);
-            h_top(buf);
-            h_mid(buf);
-            v_right_bot(buf);
-            h_bot(buf);
-        }
-        7 => {
-            h_top(buf);
-            v_right_full(buf);
-        }
-        8 => {
-            v_left_full(buf);
-            v_right_full(buf);
-            h_top(buf);
-            h_mid(buf);
-            h_bot(buf);
-        }
-        9 => {
-            v_left_top(buf);
-            h_top(buf);
-            h_mid(buf);
-            v_right_full(buf);
-            h_bot(buf);
-        }
-        _ => {}
-    }
+/// Descender-safe text height (ascender to descender) for a UI scale on a
+/// `panel_w`-wide panel.
+#[inline]
+pub fn text_line_height(scale: usize, panel_w: usize) -> usize {
+    let size = super::font::em_px_at(scale, panel_w);
+    ((super::font::ASCENDER - super::font::DESCENDER) / 1000.0 * size).ceil() as usize
 }
 
 #[cfg(test)]
@@ -3484,40 +4264,86 @@ mod tests {
         }
     }
 
+    /// Rows that carry any ink for `ch` drawn at UI `scale`, as (top, bottom).
+    ///
+    /// The buffer doubles as the "panel", so the type density matches the
+    /// em the renderer would actually use for it.
+    fn ink_rows(ch: char, scale: usize) -> (usize, usize) {
+        let w = 1080usize;
+        let h = 240usize;
+        let mut buf = vec![0xFF000000u32; w * h];
+        let s = ch.to_string();
+        draw_text(&mut buf, w, w, h, 40, 40, &s, 0xFFFFFFFF, scale);
+        let mut top = usize::MAX;
+        let mut bottom = 0usize;
+        for y in 0..h {
+            if buf[y * w..(y + 1) * w].iter().any(|&p| p != 0xFF000000) {
+                top = top.min(y);
+                bottom = y;
+            }
+        }
+        (top, bottom)
+    }
+
     #[test]
-    fn test_font_8x16_descenders_and_ascenders() {
-        // 'g' (103 - 32 = 71) must have active pixels below row 12 (rows 13..15)
-        let glyph_g = &FONT_8X16[(b'g' - 32) as usize];
-        let has_descender_g = glyph_g[13] != 0 || glyph_g[14] != 0 || glyph_g[15] != 0;
-        assert!(has_descender_g, "'g' must descend below baseline");
-
-        let glyph_p = &FONT_8X16[(b'p' - 32) as usize];
-        let has_descender_p = glyph_p[13] != 0 || glyph_p[14] != 0 || glyph_p[15] != 0;
-        assert!(has_descender_p, "'p' must descend below baseline");
-
-        let glyph_y = &FONT_8X16[(b'y' - 32) as usize];
-        let has_descender_y = glyph_y[13] != 0 || glyph_y[14] != 0 || glyph_y[15] != 0;
-        assert!(has_descender_y, "'y' must descend below baseline");
-
-        let glyph_j = &FONT_8X16[(b'j' - 32) as usize];
-        let has_descender_j = glyph_j[13] != 0 || glyph_j[14] != 0 || glyph_j[15] != 0;
-        assert!(has_descender_j, "'j' must descend below baseline");
-
-        // Ascender check: 'd' and 'h' must have active pixels in rows 2..4
-        let glyph_d = &FONT_8X16[(b'd' - 32) as usize];
-        let has_ascender_d = glyph_d[2] != 0 || glyph_d[3] != 0;
-        assert!(has_ascender_d, "'d' must ascend above x-height");
+    fn test_vector_type_descenders_and_ascenders() {
+        // Compare against 'o' at the same size, and require a real fraction of
+        // the em: 200-12 = 188 units of descender, 740-532 = 208 of ascender.
+        let em = crate::graphics::font::em_px_at(3, 1080);
+        let descender_px = (188.0 / 1000.0 * em) as i64;
+        let ascender_px = (208.0 / 1000.0 * em) as i64;
+        let (o_top, o_bottom) = ink_rows('o', 3);
+        assert!(o_bottom > o_top, "sanity: 'o' must have ink");
+        for ch in ['g', 'p', 'q', 'y', 'j'] {
+            let (_, bottom) = ink_rows(ch, 3);
+            assert!(
+                bottom as i64 - o_bottom as i64 >= descender_px / 2,
+                "'{}' must descend below the x-height baseline ({} vs {}, want >= {})",
+                ch,
+                bottom,
+                o_bottom,
+                descender_px / 2
+            );
+        }
+        for ch in ['b', 'd', 'h', 'k', 'l', 'f'] {
+            let (top, _) = ink_rows(ch, 3);
+            assert!(
+                o_top as i64 - top as i64 >= ascender_px / 2,
+                "'{}' must ascend above the x-height ({} vs {}, want >= {})",
+                ch,
+                top,
+                o_top,
+                ascender_px / 2
+            );
+        }
     }
 
     #[test]
     fn test_font_weight_drawing() {
         let mut buf_reg = vec![0xFF000000u32; 32 * 32];
+        let mut buf_med = vec![0xFF000000u32; 32 * 32];
         let mut buf_bold = vec![0xFF000000u32; 32 * 32];
-        draw_text_weighted(&mut buf_reg, 32, 32, 32, 0, 0, "A", 0xFFFFFFFF, 1, FontWeight::Regular);
-        draw_text_weighted(&mut buf_bold, 32, 32, 32, 0, 0, "A", 0xFFFFFFFF, 1, FontWeight::Bold);
-        let count_reg = buf_reg.iter().filter(|&&p| p == 0xFFFFFFFF).count();
-        let count_bold = buf_bold.iter().filter(|&&p| p == 0xFFFFFFFF).count();
-        assert!(count_bold > count_reg, "Bold font must have more active pixels than regular font (bold: {}, reg: {})", count_bold, count_reg);
+        draw_text_weighted(&mut buf_reg, 32, 32, 32, 4, 4, "A", 0xFFFFFFFF, 1, FontWeight::Regular);
+        draw_text_weighted(&mut buf_med, 32, 32, 32, 4, 4, "A", 0xFFFFFFFF, 1, FontWeight::Medium);
+        draw_text_weighted(&mut buf_bold, 32, 32, 32, 4, 4, "A", 0xFFFFFFFF, 1, FontWeight::Bold);
+        let ink = |b: &[u32]| b.iter().filter(|&&p| p != 0xFF000000).count();
+        let (reg, med, bold) = (ink(&buf_reg), ink(&buf_med), ink(&buf_bold));
+        assert!(bold > med, "Bold must carry more ink than Medium ({} vs {})", bold, med);
+        assert!(med > reg, "Medium must carry more ink than Regular ({} vs {})", med, reg);
+    }
+
+    #[test]
+    fn test_antialiased_glyphs_have_no_hard_edges() {
+        // Analytic coverage means a rendered glyph must contain partially
+        // covered pixels along its outline: a purely binary blit would not.
+        let w = 200usize;
+        let mut buf = vec![0xFF000000u32; w * w];
+        draw_text(&mut buf, w, w, w, 10, 40, "S", 0xFFFFFFFF, 3);
+        let partial = buf
+            .iter()
+            .filter(|&&p| (p & 0xFF) > 8 && (p & 0xFF) < 250)
+            .count();
+        assert!(partial > 40, "expected an anti-aliased ramp, got {} partial px", partial);
     }
 
     #[test]
