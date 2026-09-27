@@ -3859,81 +3859,161 @@ fn run_benchmarks(json: bool) -> bool {
     passed
 }
 
+/// In-shell gesture self-test (plan \u00a78.3).
+///
+/// This used to assert three booleans -- "did we get a Home", "did we get a
+/// Recents", "did we get a Back" -- which is why a gesture engine that
+/// dropped two of its actions and replaced the third with a duration hold
+/// still reported green. Every group below now asserts *thresholds* and
+/// carries at least one negative case, so a gesture that fires too eagerly,
+/// too late, or not at all is a failure rather than a pass.
+///
+/// Note the Recents group: Recents is a **motion pause**, not a duration
+/// hold. A finger that rises and then stops is Recents; a finger that keeps
+/// sliding at 0.9 px/ms for 200ms is a Home drag no matter how long it is
+/// held down. The negative case is the one that matters.
 fn test_gestures(json: bool) -> bool {
-    let mut engine = GestureEngine::new(1080.0, 2400.0, GestureConfig::default());
+    let cfg = GestureConfig::default();
+    let mut engine = GestureEngine::new(1080.0, 2400.0, cfg.clone());
     let t0 = Instant::now();
+    let at = |ms: u64| t0 + Duration::from_millis(ms);
+    let ev = |id: i32, phase: TouchPhase, x: f32, y: f32, ms: u64| RawTouchEvent {
+        touch_id: id,
+        phase,
+        x,
+        y,
+        timestamp: at(ms),
+    };
 
-    // 1. Home gesture
-    engine.process_touch(&RawTouchEvent {
-        touch_id: 1,
-        phase: TouchPhase::Down,
-        x: 540.0,
-        y: 2380.0,
-        timestamp: t0,
-    });
-    let home_act = engine.process_touch(&RawTouchEvent {
-        touch_id: 1,
-        phase: TouchPhase::Up,
-        x: 540.0,
-        y: 2200.0,
-        timestamp: t0 + Duration::from_millis(80),
-    });
-    let home_ok = matches!(home_act, GestureAction::Home { progress, .. } if progress >= 1.0);
+    // 1. Home: a quick bottom-edge flick commits Home at full progress, and
+    //    the window must have shrunk (scale < 1) rather than teleporting.
+    engine.process_touch(&ev(1, TouchPhase::Down, 540.0, 2380.0, 0));
+    let home_act = engine.process_touch(&ev(1, TouchPhase::Up, 540.0, 2200.0, 80));
+    let home_ok = match home_act {
+        GestureAction::Home {
+            progress,
+            scale,
+            window_alpha,
+        } => progress >= 1.0 && scale < 1.0 && window_alpha < 1.0,
+        _ => false,
+    };
 
-    // 2. Recents gesture (hold > 180ms)
-    engine.process_touch(&RawTouchEvent {
-        touch_id: 2,
-        phase: TouchPhase::Down,
-        x: 540.0,
-        y: 2380.0,
-        timestamp: t0,
-    });
-    let recents_act = engine.process_touch(&RawTouchEvent {
-        touch_id: 2,
-        phase: TouchPhase::Move,
-        x: 540.0,
-        y: 2200.0,
-        timestamp: t0 + Duration::from_millis(200),
-    });
-    let recents_ok =
-        matches!(recents_act, GestureAction::Recents { trigger_haptic, .. } if trigger_haptic);
-    engine.process_touch(&RawTouchEvent {
-        touch_id: 2,
-        phase: TouchPhase::Up,
-        x: 540.0,
-        y: 2200.0,
-        timestamp: t0 + Duration::from_millis(210),
-    });
+    // 2. Recents via motion pause. Rise fast enough to build a peak, then
+    //    creep below `motion_pause_slow` for longer than `force_pause_ms`.
+    //    The haptic must fire on the rising edge only.
+    engine.process_touch(&ev(2, TouchPhase::Down, 540.0, 2380.0, 0));
+    let mut recents_ok = false;
+    let mut haptic_edges = 0u32;
+    let mut last_y = 2380.0f32;
+    // 3.75 px/ms rise, then a 0.06 px/ms creep -- ~0.04 px per 16ms frame.
+    for step in 1..=6u64 {
+        last_y -= 60.0;
+        let a = engine.process_touch(&ev(2, TouchPhase::Move, 540.0, last_y, step * 16));
+        if let GestureAction::Recents { trigger_haptic, .. } = a {
+            if trigger_haptic {
+                haptic_edges += 1;
+                recents_ok = true;
+            }
+        }
+    }
+    for step in 7..=40u64 {
+        last_y -= 0.6;
+        let a = engine.process_touch(&ev(2, TouchPhase::Move, 540.0, last_y, step * 16));
+        if let GestureAction::Recents { trigger_haptic, .. } = a {
+            if trigger_haptic {
+                haptic_edges += 1;
+            }
+            // The pause cannot fire during the rise (the finger is still
+            // accelerating), so it is the creep that must set this.
+            recents_ok = true;
+        }
+    }
+    engine.process_touch(&ev(2, TouchPhase::Up, 540.0, last_y, 41 * 16));
+    // A latch that re-fires every frame would buzz the actuator.
+    let recents_ok = recents_ok && haptic_edges == 1;
 
-    // 3. Back gesture (edge swipe)
-    engine.process_touch(&RawTouchEvent {
-        touch_id: 3,
-        phase: TouchPhase::Down,
-        x: 10.0,
-        y: 1200.0,
-        timestamp: t0,
-    });
-    let back_act = engine.process_touch(&RawTouchEvent {
-        touch_id: 3,
-        phase: TouchPhase::Up,
-        x: 60.0,
-        y: 1200.0,
-        timestamp: t0 + Duration::from_millis(100),
-    });
-    let back_ok = matches!(back_act, GestureAction::Back { injected, .. } if injected);
+    // 3. Negative case: a continuous slow crawl held for 200ms must NOT be
+    //    Recents. This is precisely the gesture the old duration-hold rule
+    //    mis-classified, and it is the regression this group exists for.
+    let mut engine = GestureEngine::new(1080.0, 2400.0, cfg.clone());
+    engine.process_touch(&ev(3, TouchPhase::Down, 540.0, 2380.0, 0));
+    let crawl = engine.process_touch(&ev(3, TouchPhase::Move, 540.0, 2200.0, 200));
+    let crawl_not_recents = !matches!(crawl, GestureAction::Recents { .. });
+    engine.process_touch(&ev(3, TouchPhase::Up, 540.0, 2200.0, 220));
 
-    let all_ok = home_ok && recents_ok && back_ok;
+    // 4. In-app home swipe: from the *centre* of the screen (not the nav
+    //    bar) a vertical-dominant drag must report Home on MOVE, so the
+    //    window can track the finger instead of snapping on release.
+    let mut engine = GestureEngine::new(1080.0, 2400.0, cfg.clone());
+    engine.process_touch(&ev(4, TouchPhase::Down, 540.0, 1400.0, 0));
+    let mut center_move_home = false;
+    for step in 1..=10u64 {
+        let a = engine.process_touch(&ev(
+            4,
+            TouchPhase::Move,
+            540.0,
+            1400.0 - step as f32 * 40.0,
+            step * 16,
+        ));
+        if let GestureAction::Home { progress, .. } = a {
+            if progress > 0.0 && progress <= 1.0 {
+                center_move_home = true;
+            }
+        }
+    }
+    // ...and a horizontal drag in the same place must NOT be Home: that
+    // belongs to the pager, not the app-exit gesture.
+    let mut engine = GestureEngine::new(1080.0, 2400.0, cfg.clone());
+    engine.process_touch(&ev(5, TouchPhase::Down, 300.0, 1400.0, 0));
+    let mut center_h_ok = true;
+    for step in 1..=10u64 {
+        let a = engine.process_touch(&ev(
+            5,
+            TouchPhase::Move,
+            300.0 + step as f32 * 60.0,
+            1400.0,
+            step * 16,
+        ));
+        if matches!(a, GestureAction::Home { .. }) {
+            center_h_ok = false;
+        }
+    }
+    let center_ok = center_move_home && center_h_ok;
+
+    // 5. Back: an edge swipe past the threshold injects.
+    let mut engine = GestureEngine::new(1080.0, 2400.0, cfg.clone());
+    engine.process_touch(&ev(6, TouchPhase::Down, 10.0, 1200.0, 0));
+    let back_move = engine.process_touch(&ev(6, TouchPhase::Move, 60.0, 1200.0, 50));
+    let back_progress_ok = matches!(back_move, GestureAction::Back { progress, .. } if progress > 0.0);
+    let back_act = engine.process_touch(&ev(6, TouchPhase::Up, 60.0, 1200.0, 100));
+    let back_ok = matches!(back_act, GestureAction::Back { injected, .. } if injected)
+        && back_progress_ok;
+
+    // 6. Notification shade: a top-edge pull reports rising progress, and a
+    //    tap must not slam an opening shade to 0.0.
+    let mut engine = GestureEngine::new(1080.0, 2400.0, cfg.clone());
+    engine.process_touch(&ev(7, TouchPhase::Down, 540.0, 10.0, 0));
+    let shade_ok = matches!(
+        engine.process_touch(&ev(7, TouchPhase::Move, 540.0, 310.0, 60)),
+        GestureAction::NotificationShade { progress } if progress > 0.0
+    );
+
+    let all_ok = home_ok && recents_ok && crawl_not_recents && center_ok && back_ok && shade_ok;
     if json {
         println!(
-            r#"{{"home_ok":{},"recents_ok":{},"back_ok":{},"all_passed":{}}}"#,
-            home_ok, recents_ok, back_ok, all_ok
+            r#"{{"home_ok":{},"recents_motion_pause_ok":{},"crawl_not_recents":{},"inapp_home_swipe_ok":{},"back_ok":{},"shade_ok":{},"all_passed":{}}}"#,
+            home_ok, recents_ok, crawl_not_recents, center_ok, back_ok, shade_ok, all_ok
         );
     } else {
+        let mark = |b: bool| if b { "PASS" } else { "FAIL" };
         println!(
-            "[*] QuickStep Gestures: Home={}, Recents={}, Back={} -> {}",
-            if home_ok { "PASS" } else { "FAIL" },
-            if recents_ok { "PASS" } else { "FAIL" },
-            if back_ok { "PASS" } else { "FAIL" },
+            "[*] QuickStep Gestures: Home={}, Recents(motion-pause)={}, crawl-not-Recents={}, in-app-home-swipe={}, Back={}, Shade={} -> {}",
+            mark(home_ok),
+            mark(recents_ok),
+            mark(crawl_not_recents),
+            mark(center_ok),
+            mark(back_ok),
+            mark(shade_ok),
             if all_ok { "ALL PASSED" } else { "FAILED" }
         );
     }

@@ -20,11 +20,13 @@ pub mod super_extreme;
 pub mod systemui;
 
 pub use desktop::{fuzzy_match, parse_desktop_entry, DesktopApp, DesktopCatalogue};
-pub use icons::{IconCache, ICON_MAX_EDGE};
 pub use gestures::{
-    EdgeSide, GestureAction, GestureConfig, GestureEngine, RawTouchEvent, TouchPhase,
-    fast_out_slow_in,
+    cubic_bezier, emphasized, emphasized_accelerate, emphasized_decelerate, fast_out_linear_in,
+    fast_out_slow_in, linear_out_slow_in, standard_decelerate, touch_response, EdgeSide,
+    GestureAction, GestureConfig, GestureEngine, MotionHistory, MotionPause, RawTouchEvent,
+    TouchPhase, MOTION_SAMPLES,
 };
+pub use icons::{IconCache, ICON_MAX_EDGE};
 pub use ime::{ImeAction, KeyboardLayout, VirtualKeyboard};
 pub use input::{InputDispatchResult, InputDispatcher, LinuxInputEvent};
 pub use lockscreen::{FingerprintHalBridge, FingerprintResult, LockScreen, LockState, MediaWidget};
