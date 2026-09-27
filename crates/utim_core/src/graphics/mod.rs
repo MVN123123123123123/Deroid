@@ -29,8 +29,12 @@ pub use drm_kms::{
 };
 pub use font::{FontWeight as FontWeightAxis, em_px, measure};
 pub use layout::{
-    AppLayout, AppPanel, DrawerSearchHit, DrawerZone, HomeZone, Key, Keyboard, Layout,
-    ShadeLayout, ShadeZone, TabHit, grid_cols_for,
+    AppLayout, AppPanel, DeviceProfile, DotRect, DrawerSearchHit, DrawerSheetLayout, DrawerZone,
+    FastScrollerLayout, FolderLayout, HomeZone, Key, Keyboard, Layout, OVERSCROLL_DAMP_FACTOR,
+    PageIndicatorLayout, PopupMenuLayout, QsbLayout, RecentsLayout, SmartspaceLayout,
+    ShadeLayout, ShadeZone, TabHit, cell_height, cell_width, damped_scroll,
+    folder_layout_radius, folder_preview_icons, grid_cols_for, hotseat_cell_height,
+    hotseat_icon_space, page_indicator_dots,
 };
 pub use layout::Rect as LayoutRect;
 pub use png::{decode_png, RgbaImage};
