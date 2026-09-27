@@ -3,7 +3,7 @@
 //! Provides smooth viewport push animation, QWERTY/symbols/numeric layouts,
 //! commit_string, delete_surrounding_text, and haptic feedback triggers.
 
-use crate::compositor::launcher::{SpringConfig, SpringOscillator};
+use crate::compositor::spring::{SpringConfig, SpringOscillator};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyboardLayout {

@@ -26,12 +26,18 @@ pub struct CompositorMetrics {
 }
 
 /// Wayland Compositor Server
+///
+/// Note there is deliberately **no** `gestures` field here. One used to
+/// exist, and it was never consulted: the live shell owns its own
+/// `GestureEngine` (`crates/utlc/src/main.rs`), so the copy in `WaylandServer`
+/// was a second engine that only existed to be measured. `get_metrics` used
+/// to build a *third*, throwaway engine for the same purpose. All three are
+/// gone; metrics now probe the engine the caller actually owns.
 pub struct WaylandServer {
     pub socket_path: PathBuf,
     pub listener: Option<UnixListener>,
     pub protocols: ProtocolRegistry,
     pub scene: MobileScene,
-    pub gestures: GestureEngine,
     pub power_sync: UtimPowerSync,
     pub start_time: Instant,
     pub first_frame_presented_at: Option<Instant>,
@@ -50,7 +56,6 @@ impl WaylandServer {
     ) -> Self {
         let start_time = Instant::now();
         let scene = MobileScene::new(0, width, height, refresh_rate, hwc_composer);
-        let gestures = GestureEngine::new(width as f32, height as f32, GestureConfig::default());
         let power_sync = UtimPowerSync::default();
 
         Self {
@@ -58,7 +63,6 @@ impl WaylandServer {
             listener: None,
             protocols: ProtocolRegistry::new(),
             scene,
-            gestures,
             power_sync,
             start_time,
             first_frame_presented_at: None,
@@ -144,11 +148,14 @@ impl WaylandServer {
 
     /// Collect comprehensive diagnostic metrics for verification suites.
     ///
-    /// Side-effect free by construction (P5): input latency is measured on
-    /// a throwaway [`GestureEngine`] with a synthetic `u32::MAX`-range id
-    /// and the result is discarded, so neither the live gesture state nor
-    /// the scene graph is ever mutated here. Boot failures propagate as
-    /// `Err` instead of a fabricated 150ms duration (P6).
+    /// Side-effect free by construction (P5): the live scene graph is never
+    /// mutated here. Boot failures propagate as `Err` instead of a fabricated
+    /// 150 ms duration (P6).
+    ///
+    /// The touch probe lives in its own function ([`Self::measure_touch_latency`])
+    /// rather than here, precisely so it can be re-pointed at the real
+    /// `InputDispatcher` -> `GestureEngine` -> `Layout` path without touching
+    /// the boot/RSS gates.
     pub fn get_metrics(&mut self) -> Result<CompositorMetrics, String> {
         let rss = self.measure_resident_memory();
         let boot_dur = match self.first_frame_presented_at {
@@ -156,8 +163,27 @@ impl WaylandServer {
             None => self.boot_to_first_frame()?,
         };
 
-        // Measure input latency on a throwaway engine; never touch the
-        // live gesture state or the scene graph.
+        Ok(CompositorMetrics {
+            resident_memory_bytes: rss,
+            boot_to_launcher_duration: boot_dur,
+            touch_processing_latency: self.measure_touch_latency(),
+            is_rss_within_target: rss <= 15 * 1024 * 1024,
+            is_boot_within_target: boot_dur < Duration::from_millis(450),
+        })
+    }
+
+    /// Time one synthetic bottom-edge `Down` through a [`GestureEngine`].
+    ///
+    /// The engine is constructed locally and dropped, so the caller's live
+    /// gesture state cannot be perturbed. The sentinel `touch_id`
+    /// (`i32::MAX`) cannot collide with a real evdev slot id.
+    ///
+    /// Known limitation, tracked by the launcher rewrite plan §8.3: this
+    /// measures the engine in isolation. It does **not** include
+    /// `InputDispatcher::process_event` or the `Layout` hit-test, so the
+    /// reported figure is a lower bound on real end-to-end touch latency,
+    /// not a measurement of it.
+    pub fn measure_touch_latency(&self) -> Duration {
         let touch_start = Instant::now();
         let mut probe = GestureEngine::new(
             self.scene.width as f32,
@@ -167,19 +193,11 @@ impl WaylandServer {
         let _ = probe.process_touch(&RawTouchEvent {
             touch_id: i32::MAX,
             phase: TouchPhase::Down,
-            x: 540.0,
+            x: self.scene.width as f32 * 0.5,
             y: self.scene.height as f32 - 10.0,
             timestamp: touch_start,
         });
-        let touch_latency = touch_start.elapsed();
-
-        Ok(CompositorMetrics {
-            resident_memory_bytes: rss,
-            boot_to_launcher_duration: boot_dur,
-            touch_processing_latency: touch_latency,
-            is_rss_within_target: rss <= 15 * 1024 * 1024,
-            is_boot_within_target: boot_dur < Duration::from_millis(450),
-        })
+        touch_start.elapsed()
     }
 
     /// Process a single frame step.
@@ -240,24 +258,37 @@ mod tests {
         let socket_path = PathBuf::from("/tmp/test-wayland-metrics.sock");
         let mut server = WaylandServer::new(&socket_path, 1080, 2400, 60.0, hwc);
         server.boot_to_first_frame().expect("Boot failed");
-        // A fresh engine processes the probe Down as None; the live engine
-        // must be untouched by metrics.
-        let before = server.gestures.process_touch(&crate::compositor::gestures::RawTouchEvent {
-            touch_id: 7,
-            phase: crate::compositor::gestures::TouchPhase::Down,
-            x: 1.0,
-            y: 1.0,
-            timestamp: std::time::Instant::now(),
-        });
+
+        // The server no longer owns a gesture engine at all, so there is no
+        // live engine state that `get_metrics` could perturb. What it must not
+        // do is change the scene or the boot clock, so snapshot both.
+        let mode_before = server.scene.mode;
+        let first_frame_before = server.first_frame_presented_at;
         let _ = server.get_metrics().expect("metrics failed");
-        let after = server.gestures.process_touch(&crate::compositor::gestures::RawTouchEvent {
-            touch_id: 7,
-            phase: crate::compositor::gestures::TouchPhase::Down,
-            x: 1.0,
-            y: 1.0,
-            timestamp: std::time::Instant::now(),
-        });
-        assert_eq!(before, after, "get_metrics must not mutate gesture state");
+
+        assert_eq!(server.scene.mode, mode_before, "metrics must not touch the scene");
+        assert_eq!(
+            server.first_frame_presented_at, first_frame_before,
+            "metrics must not re-run the boot path"
+        );
+    }
+
+    #[test]
+    fn test_touch_latency_probe_is_repeatable_and_non_perturbing() {
+        let hwc = HwcComposer::new(HwcVersion::AidlComposer3);
+        let socket_path = PathBuf::from("/tmp/test-wayland-touch.sock");
+        let mut server = WaylandServer::new(&socket_path, 1080, 2400, 60.0, hwc);
+        server.boot_to_first_frame().expect("Boot failed");
+
+        // Every probe starts from a fresh engine, so latency must not creep
+        // upward with call count (which is what a stateful probe would do).
+        let mut worst = Duration::ZERO;
+        for _ in 0..64 {
+            let d = server.measure_touch_latency();
+            assert!(d < Duration::from_millis(8), "probe blew budget: {d:?}");
+            worst = worst.max(d);
+        }
+        assert!(worst < Duration::from_millis(8), "worst probe: {worst:?}");
     }
 
     #[test]

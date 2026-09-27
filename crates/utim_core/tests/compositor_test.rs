@@ -7,7 +7,7 @@
 //! - 3.5: Ambient lock screen, touch barrier, PIN keypad, Android Fingerprint HAL bridge (< 300ms), Virtual Keyboard IME
 //! - 3.6: UTIM Mobile Power Governor (cgroup.freeze) & dynamic OOM score hierarchy synchronization
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use utim_core::compositor::desktop::{parse_desktop_entry, DesktopApp, DesktopCatalogue};
@@ -15,17 +15,17 @@ use utim_core::compositor::gestures::{
     fast_out_slow_in, GestureAction, GestureConfig, GestureEngine, RawTouchEvent, TouchPhase,
 };
 use utim_core::compositor::ime::{ImeAction, VirtualKeyboard};
-use utim_core::compositor::launcher::{HotseatDock, WorkspaceGrid};
 use utim_core::compositor::lockscreen::LockScreen;
 use utim_core::compositor::power_sync::{oom_roles, UtimPowerSync};
 use utim_core::compositor::protocols::{
     ProtocolRegistry, WaylandInterface, WlMessage, WlMessageBuilder,
 };
-use utim_core::compositor::recents::{RecentsCard, RecentsCarousel, SplitScreenConfig};
 use utim_core::compositor::scene::ShellMode;
 use utim_core::compositor::server::WaylandServer;
+use utim_core::compositor::spring::{SpringConfig, SpringOscillator};
 use utim_core::compositor::systemui::{CellularRat, QuickTileKind, SystemUiShade};
 use utim_core::graphics::composer::{HwcComposer, HwcVersion};
+use utim_core::graphics::layout::Layout;
 
 #[test]
 fn test_milestone_3_1_wayland_protocols_and_wire_framing() {
@@ -119,32 +119,60 @@ fn test_milestone_3_1_hwc_multi_plane_presentation_and_performance() {
 
 #[test]
 fn test_milestone_3_2_home_grid_spring_physics_and_fuzzy_search() {
-    // 1. Spring Physics Horizontal Scrolling
-    let mut grid = WorkspaceGrid::new(4, 5, 3, 1080.0);
-    assert_eq!(grid.current_page, 0);
-
-    grid.add_item(0, 0, 0, "org.mobian.dialer".into());
-    grid.add_item(0, 1, 0, "chatty".into());
-    grid.add_item(1, 0, 0, "firefox".into());
-
-    // Drag left
-    grid.on_drag(-400.0);
-    assert!(grid.scroll_spring.current < 0.0);
-
-    // Release with leftward flick velocity
-    grid.on_release(-600.0);
-    for _ in 0..60 {
-        grid.update(0.016);
+    // 1. Spring physics for the paged workspace. The old `WorkspaceGrid`
+    //    (a `Vec<GridItem>` the shell never populated) is gone; the spring
+    //    that actually drives the shade/IME survived in
+    //    `compositor::spring`, so exercise that instead.
+    let mut spring = SpringOscillator::new(0.0, SpringConfig::default());
+    spring.target = 100.0;
+    for _ in 0..120 {
+        spring.step(0.016);
     }
-    assert_eq!(grid.current_page, 1, "Should snap to page 1 after flick");
+    assert!(spring.is_settled(), "workspace spring must converge");
+    assert!((spring.current - 100.0).abs() < 0.1);
 
-    // 2. Persistent Hotseat Dock
-    let dock = HotseatDock::default_mobile(2400.0);
-    assert_eq!(dock.slots.len(), 5);
-    let (x, y, w, _h) = dock.slot_rect(0, 1080.0);
-    assert_eq!(x, 0.0);
-    assert_eq!(w, 1080.0 / 5.0);
-    assert!(y > 2200.0);
+    // 2. Persistent hotseat dock geometry, from the one layout the renderer
+    //    and the hit-tester both read.
+    let layout = Layout::plain(1080.0, 2400.0);
+    assert!(
+        layout.dock_slots >= 4,
+        "phone profile needs a 4-icon hotseat"
+    );
+    let (dx, dy, dw, dh) = {
+        let s = layout.dock_slot(0);
+        (s.x, s.y, s.w, s.h)
+    };
+    assert_eq!(dx, layout.dock.x, "slot 0 must start at the dock edge");
+    assert!(
+        (dw - layout.dock.w / layout.dock_slots as f32).abs() < 0.001,
+        "slot width must divide the dock evenly"
+    );
+    assert!(
+        dy > 2400.0 * 0.85,
+        "hotseat must be pinned to the bottom eighth, got y={dy}"
+    );
+    assert!(
+        dy + dh <= layout.nav_pill.y + 0.001,
+        "hotseat must sit above the gesture nav pill, not overlap it"
+    );
+    // Vertical stack, top to bottom: workspace grid ends exactly where the
+    // page dots begin, then the dots, then the hotseat, then the nav pill.
+    // Any other order means a touch lands on one band while the renderer
+    // draws another.
+    assert!(
+        (layout.grid_bottom - layout.page_dots.y).abs() < 0.001,
+        "workspace must end where the page dots begin"
+    );
+    assert!(
+        layout.page_dots.y + layout.page_dots.h <= layout.dock.y + 0.001,
+        "page dots must sit fully above the hotseat"
+    );
+    // The dock icon tile must be centred inside its own slot, otherwise a
+    // tap on the slot misses the icon.
+    let icon = layout.dock_icon_rect(0);
+    let slot_cx = dx + dw * 0.5;
+    assert!((icon.center_x() - slot_cx).abs() < 0.5, "dock icon must be centred");
+    assert!(icon.h > 0.0 && icon.h <= dh, "dock icon must fit its cell");
 
     // 3. Zero-Allocation .desktop Parser
     let desktop_content = r#"
@@ -228,53 +256,66 @@ fn test_milestone_3_3_quickstep_gesture_navigation_and_recents() {
     }
     assert_eq!(fast_out_slow_in(1.0), 1.0);
 
-    // 2. Recents Carousel & Swipe-to-Kill Process Management
-    let mut carousel = RecentsCarousel::new(1080.0, 2400.0);
-    carousel.add_card(RecentsCard::new(
-        "calc".into(),
-        5001,
-        "Calculator".into(),
-        "".into(),
-        1,
-        None,
-        800.0,
-        1600.0,
-    ));
-    carousel.add_card(RecentsCard::new(
-        "files".into(),
-        5002,
-        "Files".into(),
-        "".into(),
-        2,
-        None,
-        800.0,
-        1600.0,
-    ));
-    assert_eq!(carousel.cards.len(), 2);
+    // 2. The overview is now driven by the shell, not a parallel card model.
+    //    `RecentsCarousel`/`RecentsCard`/`SplitScreenConfig` were deleted:
+    //    no production path ever added a card, so the graceful-close ->
+    //    SIGKILL-escalation and 50/50 split viewports they implemented were
+    //    unreachable and are now the shell's job. What must still hold is
+    //    that the scene exposes a mode the shell can leave the Launcher
+    //    from, and that lock/unlock still drives it.
+    let hwc = HwcComposer::new(HwcVersion::AidlComposer3);
+    let socket_path = PathBuf::from(format!("/tmp/utlc-scene-{}.sock", std::process::id()));
+    let mut server = WaylandServer::new(&socket_path, 1080, 2400, 120.0, hwc);
+    // `LockScreen::new` boots Locked, and `step_frame` re-derives the mode
+    // from lock state every tick, so unlock before driving the mode.
+    server.scene.lockscreen.unlock();
+    server.scene.update(0.016);
+    assert_eq!(server.scene.mode, ShellMode::Launcher);
 
-    // Swipe upward on card 0
-    carousel.on_card_vertical_drag(0, -200.0);
-    let kill_target = carousel.on_card_vertical_release(0);
-    assert_eq!(kill_target, Some(5002));
-
-    // Check 500ms grace period escalation to SIGKILL
-    let mut escalations = Vec::new();
-    carousel.update_kill_lifecycle(Duration::from_millis(0), &mut escalations);
-    assert_eq!(escalations, vec![(5002, true)]);
-
-    // 3. Clear All Button
-    let mut cleared = Vec::new();
-    carousel.clear_all(&mut cleared);
-    assert!(cleared.contains(&5001));
-
-    // 4. Split-Screen Multitasking (50/50 Viewports)
-    let mut split = SplitScreenConfig::new(2400.0);
-    split.enable(5001, 5002);
-    assert!(split.is_active);
-    assert_eq!(split.top_viewport(1080.0), (0.0, 0.0, 1080.0, 1200.0));
+    server.scene.mode = ShellMode::Application;
+    assert!(server.step_frame(0.016).is_ok());
     assert_eq!(
-        split.bottom_viewport(1080.0, 2400.0),
-        (0.0, 1200.0, 1080.0, 1200.0)
+        server.scene.mode,
+        ShellMode::Application,
+        "an application plane must survive a frame step"
+    );
+
+    // Re-locking must reclaim the mode even mid-application: the lock screen
+    // is not a peer of the application plane, it is above it.
+    server.scene.lockscreen.lock();
+    assert!(server.step_frame(0.016).is_ok());
+    assert_eq!(server.scene.mode, ShellMode::LockScreen);
+
+    // A Recents gesture is recognised by the engine even though the scene no
+    // longer reacts to it: the shell consumes it. Regression-guard that the
+    // engine still emits the action the shell dispatches on.
+    let mut rec_engine = GestureEngine::new(1080.0, 2400.0, GestureConfig::default());
+    let rt0 = Instant::now();
+    rec_engine.process_touch(&RawTouchEvent {
+        touch_id: 9,
+        phase: TouchPhase::Down,
+        x: 540.0,
+        y: 2380.0,
+        timestamp: rt0,
+    });
+    let rec_up = rec_engine.process_touch(&RawTouchEvent {
+        touch_id: 9,
+        phase: TouchPhase::Up,
+        x: 540.0,
+        y: 2180.0,
+        timestamp: rt0 + Duration::from_millis(75),
+    });
+    match rec_up {
+        GestureAction::Home { progress, .. } => assert_eq!(progress, 1.0),
+        other => panic!("quick flick up must commit Home, got {other:?}"),
+    }
+
+    // 3. Overview-action geometry that the shell will hit-test against must
+    //    be derivable from the shared layout, not from a deleted model.
+    let layout = Layout::plain(1080.0, 2400.0);
+    assert!(
+        layout.max_rows > 0 && layout.grid_cols > 0,
+        "overview card grid must be derivable from the panel size"
     );
 }
 

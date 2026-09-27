@@ -29,17 +29,6 @@ pub fn fast_out_slow_in(t: f32) -> f32 {
     3.0 * w * m * m + m * m * m // y with c1y = 0, c2y = 1
 }
 
-/// Deprecated: a cubic polynomial (`1 - (1-t)^3`), not the bezier it
-/// documented, and off the real FastOutSlowIn by up to +0.34. Kept for
-/// compatibility; use [`fast_out_slow_in`] instead.
-#[deprecated(
-    since = "0.1.0",
-    note = "not a true cubic bezier; use fast_out_slow_in instead"
-)]
-pub fn cubic_bezier_ease_out(t: f32) -> f32 {
-    fast_out_slow_in(t)
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EdgeSide {
     Bottom,

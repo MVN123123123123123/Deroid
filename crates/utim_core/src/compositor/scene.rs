@@ -3,11 +3,8 @@
 //! SystemUI Status Bar, Shade, Virtual Keyboard, Lock Screen) directly to
 //! HWC 2.x and AIDL composer3 hardware overlay planes with DMA-BUF zero-copy presentation.
 
-use crate::compositor::gestures::GestureAction;
 use crate::compositor::ime::VirtualKeyboard;
-use crate::compositor::launcher::{AppDrawer, HotseatDock, WorkspaceGrid};
 use crate::compositor::lockscreen::LockScreen;
-use crate::compositor::recents::RecentsCarousel;
 use crate::compositor::systemui::SystemUiShade;
 use crate::graphics::composer::{CompositionType, DisplayConfig, HwcComposer, HwcError, Rect};
 use crate::graphics::vsync::{VsyncConfig, VsyncPresentationValidator};
@@ -26,7 +23,6 @@ pub mod plane_z_order {
     pub const WALLPAPER_GRID: u32 = 0;
     pub const HOTSEAT_DOCK: u32 = 10;
     pub const APPLICATION_SURFACE: u32 = 20;
-    pub const RECENTS_CAROUSEL: u32 = 30;
     pub const STATUS_BAR: u32 = 40;
     pub const SYSTEM_UI_SHADE: u32 = 50;
     pub const VIRTUAL_KEYBOARD: u32 = 60;
@@ -34,26 +30,33 @@ pub mod plane_z_order {
 }
 
 /// Active Display Mode of the Mobile Shell
+///
+/// `Recents` and `SplitScreen` were removed: their only writers were
+/// `apply_gesture_action` (dead — no production caller ever dispatched a
+/// `GestureAction` here) and each other's match arms, so both were
+/// unreachable variants. The overview is owned by the shell in
+/// `crates/utlc/src/main.rs`, which has a real task list to select.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellMode {
     Launcher,
     Application,
-    Recents,
-    SplitScreen,
     LockScreen,
 }
 
 /// The unified Mobile Scene Graph orchestrating all shell components
+///
+/// This owns only what actually drives the HWC: display geometry, the three
+/// planes `prepare_frame` programs, the SystemUI/IME/lock springs that must
+/// advance every frame, and the lock-derived mode. The workspace grid, hotseat
+/// and app drawer that used to live here were never read by the renderer or
+/// the shell, which use `graphics::layout::Layout` and
+/// `drm_kms::paint_frame` instead; they were deleted rather than carried.
 pub struct MobileScene {
     pub display_id: u32,
     pub width: u32,
     pub height: u32,
     pub refresh_rate: f64,
     pub mode: ShellMode,
-    pub workspace: WorkspaceGrid,
-    pub dock: HotseatDock,
-    pub drawer: AppDrawer,
-    pub recents: RecentsCarousel,
     pub system_ui: SystemUiShade,
     pub keyboard: VirtualKeyboard,
     pub lockscreen: LockScreen,
@@ -87,10 +90,6 @@ impl MobileScene {
             height,
             refresh_rate,
             mode: ShellMode::Launcher,
-            workspace: WorkspaceGrid::new(4, 5, 3, width as f32),
-            dock: HotseatDock::default_mobile(height as f32),
-            drawer: AppDrawer::new(),
-            recents: RecentsCarousel::new(width as f32, height as f32),
             system_ui: SystemUiShade::new(width as f32, height as f32),
             keyboard: VirtualKeyboard::new(width as f32, height as f32),
             lockscreen: LockScreen::new(None),
@@ -145,49 +144,8 @@ impl MobileScene {
         Ok(())
     }
 
-    /// Dispatch gesture event to scene state machine
-    pub fn apply_gesture_action(&mut self, action: GestureAction) {
-        match action {
-            GestureAction::Home { progress, .. } => {
-                if progress >= 1.0 {
-                    self.mode = ShellMode::Launcher;
-                }
-            }
-            GestureAction::Recents { .. } => {
-                self.mode = ShellMode::Recents;
-            }
-            GestureAction::Back { injected, .. } => {
-                if injected {
-                    if self.system_ui.is_open() {
-                        self.system_ui.close();
-                    } else if self.keyboard.is_active {
-                        self.keyboard.deactivate();
-                    } else if self.mode == ShellMode::Recents {
-                        self.mode = ShellMode::Launcher;
-                    }
-                }
-            }
-            GestureAction::NotificationShade { progress } => {
-                self.system_ui.set_pull_progress(progress);
-            }
-            GestureAction::BottomBarScrub { app_shift, .. } => {
-                if !self.recents.cards.is_empty() {
-                    let new_idx = (self.recents.selected_index as i32 + app_shift)
-                        .clamp(0, self.recents.cards.len() as i32 - 1)
-                        as usize;
-                    self.recents.snap_to_index(new_idx);
-                }
-            }
-            GestureAction::Swipe { .. } => {}
-            GestureAction::None => {}
-        }
-    }
-
     /// Update physics and animations for frame presentation
     pub fn update(&mut self, dt: f32) {
-        self.workspace.update(dt);
-        self.drawer.update(dt);
-        self.recents.update(dt);
         self.system_ui.update(dt);
         self.keyboard.update(dt);
 
@@ -233,8 +191,12 @@ impl MobileScene {
             self.hwc
                 .set_layer_display_frame(self.display_id, l, app_rect)?;
 
+            // Only `Application` gets a device-composited plane. `Launcher`
+            // and `LockScreen` have no client surface of their own, so their
+            // grid is painted by the shell into the same primary buffer and
+            // must stay client-composited or it would be double-drawn.
             let comp_type = match self.mode {
-                ShellMode::Application | ShellMode::SplitScreen => CompositionType::Device,
+                ShellMode::Application => CompositionType::Device,
                 _ => CompositionType::Client,
             };
             self.hwc
@@ -326,25 +288,49 @@ mod tests {
     }
 
     #[test]
-    fn test_scene_gesture_mode_transitions() {
+    fn test_lock_state_drives_mode_without_a_gesture_dispatcher() {
         let hwc = HwcComposer::new(HwcVersion::AidlComposer3);
         let mut scene = MobileScene::new(0, 1080, 2400, 90.0, hwc);
 
-        scene.mode = ShellMode::Application;
+        // `LockScreen::new` starts Locked, so the mode is claimed on the
+        // first tick -- not seeded by the constructor.
+        assert_eq!(scene.mode, ShellMode::Launcher, "mode is set by update()");
+        scene.update(0.016);
+        assert_eq!(scene.mode, ShellMode::LockScreen);
 
-        // Home gesture returns to Launcher
-        scene.apply_gesture_action(GestureAction::Home {
-            progress: 1.0,
-            scale: 0.6,
-            window_alpha: 0.7,
-        });
+        // Unlocking hands it back to the launcher.
+        scene.lockscreen.unlock();
+        scene.update(0.016);
         assert_eq!(scene.mode, ShellMode::Launcher);
 
-        // Recents gesture enters Recents
-        scene.apply_gesture_action(GestureAction::Recents {
-            progress: 1.0,
-            trigger_haptic: false,
-        });
-        assert_eq!(scene.mode, ShellMode::Recents);
+        // And re-locking takes it again, idempotently across ticks.
+        scene.lockscreen.lock();
+        for _ in 0..3 {
+            scene.update(0.016);
+        }
+        assert_eq!(scene.mode, ShellMode::LockScreen);
+    }
+
+    #[test]
+    fn test_update_ticks_shade_and_keyboard_springs() {
+        let hwc = HwcComposer::new(HwcVersion::AidlComposer3);
+        let mut scene = MobileScene::new(0, 1080, 2400, 120.0, hwc);
+
+        scene.system_ui.open();
+        scene.keyboard.activate();
+
+        // One tick must actually move both springs, otherwise a dropped
+        // `update` would strand the shade/IME mid-transition.
+        let shade_before = scene.system_ui.pull_spring.current;
+        let kb_before = scene.keyboard.slide_spring.current;
+        scene.update(0.016);
+        assert!(
+            scene.system_ui.pull_spring.current > shade_before,
+            "shade pull spring must advance"
+        );
+        assert!(
+            scene.keyboard.slide_spring.current > kb_before,
+            "IME slide spring must advance"
+        );
     }
 }

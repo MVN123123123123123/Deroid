@@ -7,7 +7,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::time::Instant;
 
-use crate::compositor::launcher::{SpringConfig, SpringOscillator};
+use crate::compositor::spring::{SpringConfig, SpringOscillator};
 
 /// Cellular Radio Access Technology
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
