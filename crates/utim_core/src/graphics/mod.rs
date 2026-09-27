@@ -24,8 +24,7 @@ pub use composer::{
 pub use drm_kms::{
     AppGridItem, DrmInteractiveState, DrmKmsDevice, FontWeight, MaterialYouPalette,
     SpringConfig, SpringSimulation, TerminalTabInfo, apply_frosted_blur,
-    apply_frosted_blur_region, apply_overscroll_resistance, format_apps_count, paint_frame,
-    text_width, text_width_at,
+    apply_frosted_blur_region, format_apps_count, paint_frame, text_width, text_width_at,
 };
 pub use font::{FontWeight as FontWeightAxis, em_px, measure};
 pub use layout::{

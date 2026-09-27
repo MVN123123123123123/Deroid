@@ -36,7 +36,7 @@ use utim_core::graphics::layout::{
 };
 use utim_core::graphics::{
     AppGridItem, DrmInteractiveState, DrmKmsDevice, MaterialYouPalette, RgbaImage,
-    TerminalTabInfo, SpringConfig, SpringSimulation, apply_overscroll_resistance,
+    TerminalTabInfo, SpringConfig, SpringSimulation, damped_scroll,
 };
 
 #[derive(Debug, Clone)]
@@ -1295,14 +1295,19 @@ fn run_daemon() {
                                                                     let last =
                                                                         home_pages.len().saturating_sub(1) as f32;
                                                                     let target = home_scroll_offset + dx;
+                                                                    // Overscroll damping: `max` is the
+                                                                    // container extent on a drag
+                                                                    // (`OverScroll.java:42-54`), which
+                                                                    // for a full-bleed pager is the page
+                                                                    // width, i.e. the panel width.
                                                                     if target > 0.0 && current_home_page == 0 {
                                                                         home_scroll_offset =
-                                                                            apply_overscroll_resistance(target, w);
+                                                                            damped_scroll(target, w);
                                                                     } else if target < -last * w
                                                                         && current_home_page as f32 >= last
                                                                     {
                                                                         home_scroll_offset = -last * w
-                                                                            + apply_overscroll_resistance(
+                                                                            + damped_scroll(
                                                                                 target + last * w,
                                                                                 w,
                                                                             );
@@ -1485,8 +1490,14 @@ fn run_daemon() {
                                                             page_scroll_spring.velocity = -dir as f32 * 250.0;
                                                             page_scroll_spring.set_target(0.0);
                                                         } else {
-                                                            // At a boundary: rubber-band.
-                                                            let resisted = apply_overscroll_resistance(delta_x, w);
+                                                            // At a boundary: rubber-band. On a
+                                                            // *fling* AOSP passes half a page as the
+                                                            // extent, not the container extent
+                                                            // (`PagedView.java:1552`), so the
+                                                            // overscroll saturates at 0.035 * w
+                                                            // rather than 0.07 * w.
+                                                            let resisted =
+                                                                damped_scroll(delta_x, w * 0.5);
                                                             home_scroll_offset = resisted;
                                                             page_scroll_spring.value = resisted;
                                                             page_scroll_spring.velocity = 120.0
