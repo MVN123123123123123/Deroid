@@ -9,15 +9,16 @@
 //! 8-sample motion ring buffer and a motion-pause accumulator. No `String`,
 //! no `Vec`, no `format!` on the touch hot path.
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 // ---------------------------------------------------------------------------
 // Material 3 path interpolators (plan §5.1)
 // ---------------------------------------------------------------------------
 
-/// Bisection steps for the parameter solve. Bounds the error on the recovered
-/// bezier parameter at 2^-20 ~= 9.5e-7, i.e. below one f32 ULP of the output
-/// for every curve used here.
+/// Bisection steps for the parameter solve. Bounds the recovered bezier
+/// parameter to within 2^-20 ~= 9.5e-7. The *output* error is that times the
+/// curve's slope: `EMPHASIZED` peaks near 1.9 around t = 0.15, so worst case
+/// is ~1.8e-6, which is under 0.005 px across a 2400 px panel.
 const BISECTION_STEPS: u32 = 20;
 
 /// Evaluate a cubic bezier easing the way Android's `PathInterpolator` does:
@@ -548,31 +549,29 @@ impl Default for MotionPause {
 // ---------------------------------------------------------------------------
 
 /// Gesture Engine Configuration
+///
+/// Every field here is read by the engine. A constant that only a *future*
+/// consumer would read does not belong in this struct: `recents_hold_time`,
+/// `overview_min_progress` and `max_swipe_ms` were all removed for exactly
+/// that reason -- the first contradicts the motion-pause design outright, and
+/// the other two belong to the shell's swipe-to-drawer commit, which does not
+/// exist yet. Add them back with the consumer, not before.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GestureConfig {
     pub bottom_nav_height: f32, // default 48.0 px
     pub edge_zone_width: f32,   // default 48.0 px
     pub top_bar_height: f32,    // default 48.0 px
     pub home_threshold_y: f32,  // default 60.0 px
-    /// Legacy duration hold. Kept for API compatibility; the engine no longer
-    /// reads it because a Recents hold is now a *motion pause*
-    /// ([`MotionPause`]), not a wall-clock threshold.
-    pub recents_hold_time: Duration, // default 180 ms
     pub back_threshold_x: f32,  // default 40.0 px
     pub scrub_threshold_x: f32, // default 80.0 px
 
     // --- Quickstep-derived constants (plan §7.3) ---
-    /// Overview entry threshold as a fraction of the swipe distance.
-    /// `AbsSwipeUpHandler.java:292` `MIN_PROGRESS_FOR_OVERVIEW`.
-    /// Staged for the shell's Recents consumer: the engine reports raw drag
-    /// progress and lets the shell apply this cut-off.
-    pub overview_min_progress: f32,
-    /// A swipe slower than this is a drag, not a fling.
-    /// `AbsSwipeUpHandler.java:290` `MAX_SWIPE_DURATION` (ms).
-    /// Staged for the shell's fling classifier alongside `fling_threshold`.
-    pub max_swipe_ms: f32,
     /// Fling speed, px/ms. `quickstep/res/values/dimens.xml:152`
     /// `quickstep_fling_threshold_speed`.
+    ///
+    /// A release faster than this is a fling; slower is a deliberate stop.
+    /// Both commit Home, but the branch is explicit so the shell can treat
+    /// them differently once it owns the window transform.
     pub fling_threshold: f32,
     /// Panel touch slop, px. `ViewConfiguration.getScaledTouchSlop()` on a
     /// 1080 px / ~420 dp panel.
@@ -607,11 +606,8 @@ impl Default for GestureConfig {
             edge_zone_width: 48.0,
             top_bar_height: 48.0,
             home_threshold_y: 60.0,
-            recents_hold_time: Duration::from_millis(180),
             back_threshold_x: 40.0,
             scrub_threshold_x: 80.0,
-            overview_min_progress: 0.7,
-            max_swipe_ms: 350.0,
             fling_threshold: 0.5,
             touch_slop: 8.0,
             touch_slop_ratio: 1.414,
@@ -1038,6 +1034,7 @@ impl GestureEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     /// Drive a gesture from the bottom nav bar.
     fn ev(t: Instant, phase: TouchPhase, y: f32) -> RawTouchEvent {
