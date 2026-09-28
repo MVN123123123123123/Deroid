@@ -4,6 +4,7 @@
 
 pub mod composer;
 pub mod drm_kms;
+pub mod drawer_mod;
 pub mod elf_align;
 pub mod font;
 pub mod layout;
@@ -13,6 +14,7 @@ pub mod layout;
 pub mod screenshot;
 pub mod gpu;
 pub mod gralloc;
+pub mod palette;
 pub mod png;
 pub mod raster;
 pub mod ttf;

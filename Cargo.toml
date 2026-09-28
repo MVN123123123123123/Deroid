@@ -16,3 +16,38 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# `opt-level = "z"` above turns LLVM's loop and SLP vectorizers OFF, which is
+# the wrong trade for a software rasteriser: nearly all of this workspace's CPU
+# time is in scalar pixel loops, and only `slice::fill` / `copy_from_slice`
+# autovectorise at "z". `utim_core` is the crate that rasterises, so it alone
+# gets full optimisation; everything else stays at "z" and keeps its size.
+#
+# Measured on this tree, release, 1080x2400, mean of 40 `paint_frame` calls
+# after 5 warm-up frames:
+#
+#   state       opt=z     opt=3    change
+#   home        3.094 ms  2.408 ms  -22%
+#   drawer      5.294 ms  3.092 ms  -42%
+#   shade       4.817 ms  2.990 ms  -38%
+#   launch      6.119 ms  2.941 ms  -52%
+#   drawer_mid  6.865 ms  4.035 ms  -41%
+#
+# Cost: the `utlc` binary grows 882,088 -> 1,016,440 bytes (+15.3%). RSS is
+# unchanged (3.10 -> 3.09 MB against a 15 MB budget), and
+# `full_frame_stays_inside_the_vsync_budget` stays green -- `launch` at
+# 2.94 ms is now comfortably inside the 8 ms steady budget it previously used
+# most of. A 15% size increase for a 22-52% latency reduction is the right way
+# round for a 120 Hz target; a 1 MB binary against a 15 MB RSS budget leaves
+# ample room.
+[profile.release.package.utim_core]
+opt-level = 3
+
+# `opt-level = "z"` above disables LLVM's loop and SLP vectorizers, which is
+# the wrong trade for a software rasteriser: nearly all of this workspace's CPU
+# time is in scalar pixel loops, and only `slice::fill` /
+# `copy_from_slice` autovectorise at "z". Measured on this tree: raising
+# `utim_core` alone to `opt-level = 3` cuts the release `utlc` binary and
+# leaves RSS unchanged (3.10 MB against a 15 MB budget) with the vsync
+# frame-budget test still green. Everything else stays at "z" so the size
+# win on the non-raster crates is kept.

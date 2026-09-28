@@ -2859,6 +2859,23 @@ fn run_daemon() {
                     } else {
                         None
                     },
+                    // Launcher rewrite state. Driven by the shell state
+                    // machine; at-rest values mean "nothing is animating",
+                    // which is also what the damage hash needs so an idle
+                    // shell still issues zero ioctls.
+                    smartspace_phase: 0.0,
+                    folder_morph: 0.0,
+                    folder_scrim: 0.0,
+                    folder_title_alpha: 0.0,
+                    popup_progress: 0.0,
+                    overview_progress: 0.0,
+                    overview_scroll: 0.0,
+                    overview_dismiss: 0.0,
+                    fastscroller_thumb: 0.0,
+                    fastscroller_popup_alpha: 0.0,
+                    page_indicator_frac: 0.0,
+                    workspace_scale: 1.0,
+                    window_alpha: 1.0,
                 };
                 // Unconditional flush() marks the whole 10.4 MB framebuffer
                 // dirty 60x/s; only flush when the damage hash proves a repaint.
@@ -3776,6 +3793,97 @@ fn check_protocols(json: bool) -> bool {
     supported
 }
 
+/// Time one synthetic touch through the **real** dispatch path.
+///
+/// Plan §8.3. The metric used to come from
+/// `WaylandServer::measure_touch_latency`, which built a throwaway
+/// `GestureEngine` and pushed one `Down` at it. That measured the engine in
+/// isolation: it excluded evdev decode, `InputDispatcher::process_event`,
+/// and the `Layout` hit-test, so the reported number was a lower bound being
+/// compared against the real 8 ms budget. A path that got several times
+/// slower would still have "passed".
+///
+/// This drives the same three stages the frame loop does, in the same order
+/// and with the same event shape the kernel produces:
+///
+///   1. `ABS_X` + `ABS_Y` + `SYN_REPORT` into `InputDispatcher`
+///      (ABS, not ABS_MT: the dispatcher's single-touch path, which is what
+///      a mouse or a single finger actually drives)
+///   2. the resulting `InputDispatchResult` into `GestureEngine`
+///   3. the emitted action into the `Layout` hit-test
+///
+/// The **worst** of the probes is returned, not the mean: 8 ms is a per-event
+/// latency target, so the tail is what has to fit in it.
+fn measure_real_touch_latency(w: f32, h: f32) -> f64 {
+    use utim_core::compositor::input as ev;
+    let layout = Layout::plain(w, h);
+    let mut engine = GestureEngine::new(w, h, GestureConfig::default());
+    let mut dispatcher = InputDispatcher::new(w, h);
+    let raw_max = 32767.0f32;
+
+    // Three probes that each take a different path: a grid cell (hits the
+    // hit-test), the bottom nav bar (gesture engine's bottom band), and the
+    // left edge (the back gesture).
+    let cell = layout.grid_cell(layout.grid_cols);
+    let probes = [
+        (cell.center_x(), cell.center_y()),
+        (w * 0.5, h - 10.0),
+        (1.0, h * 0.5),
+    ];
+
+    let mut worst = 0.0f64;
+    for (x, y) in probes {
+        let t0 = Instant::now();
+        let ev_x = LinuxInputEvent {
+            time_sec: 0,
+            time_usec: 0,
+            type_: ev::EV_ABS,
+            code: ev::ABS_X,
+            value: (x / w * raw_max) as i32,
+        };
+        let ev_y = LinuxInputEvent {
+            time_sec: 0,
+            time_usec: 0,
+            type_: ev::EV_ABS,
+            code: ev::ABS_Y,
+            value: (y / h * raw_max) as i32,
+        };
+        let ev_down = LinuxInputEvent {
+            time_sec: 0,
+            time_usec: 0,
+            type_: ev::EV_KEY,
+            code: ev::BTN_LEFT,
+            value: 1,
+        };
+        let ev_syn = LinuxInputEvent {
+            time_sec: 0,
+            time_usec: 0,
+            type_: ev::EV_SYN,
+            code: ev::SYN_REPORT,
+            value: 0,
+        };
+
+        let mut dispatched = InputDispatchResult::None;
+        for e in [&ev_x, &ev_y, &ev_down, &ev_syn] {
+            let r = dispatcher.process_event(e);
+            if r != InputDispatchResult::None {
+                dispatched = r;
+            }
+        }
+        // Feed whatever the dispatcher produced into the gesture engine...
+        if let InputDispatchResult::Touch(t) = dispatched {
+            let _ = engine.process_touch(&t);
+        }
+        // ...then hit-test it, which is the other half of the shell's
+        // per-event work and was entirely missing from the old probe.
+        let _hit = layout.home_grid_hit(x, y, 0.0);
+        let _zone = layout.home_zone(x, y);
+
+        worst = worst.max(t0.elapsed().as_secs_f64() * 1000.0);
+    }
+    worst
+}
+
 fn run_benchmarks(json: bool) -> bool {
     let hwc = HwcComposer::new(HwcVersion::AidlComposer3);
     let socket_path = PathBuf::from(format!("/tmp/utlc-bench-{}.sock", std::process::id()));
@@ -3784,7 +3892,8 @@ fn run_benchmarks(json: bool) -> bool {
     let metrics = server.get_metrics().expect("metrics collection failed");
     let rss_mb = (metrics.resident_memory_bytes as f64) / (1024.0 * 1024.0);
     let boot_ms = metrics.boot_to_launcher_duration.as_secs_f64() * 1000.0;
-    let touch_ms = metrics.touch_processing_latency.as_secs_f64() * 1000.0;
+    // The real path, not the engine-only lower bound.
+    let touch_ms = measure_real_touch_latency(server.scene.width as f32, server.scene.height as f32);
 
     // Zero-allocation fuzzy search benchmark (< 1ms query time)
     let mut catalogue = DesktopCatalogue::new();
@@ -3846,7 +3955,7 @@ fn run_benchmarks(json: bool) -> bool {
             }
         );
         println!(
-            "[*] Touch Gesture Input Latency:  {:.4} ms (Target: < 8.0 ms) -> {}",
+            "[*] Touch Dispatch (evdev->Input->Gesture->Hit): {:.4} ms (Target: < 8.0 ms) -> {}",
             touch_ms,
             if touch_ms < 8.0 { "PASS" } else { "FAIL" }
         );

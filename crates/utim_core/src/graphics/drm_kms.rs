@@ -561,6 +561,13 @@ pub struct AppGridItem<'a> {
     pub icon: Option<&'a RgbaImage>,
 }
 
+/// The complete visible state for one frame.
+///
+/// Every field is a borrow or a scalar, so the whole struct is `Clone` (and
+/// would be `Copy`); it is deliberately **not** `Copy` so that nobody
+/// "optimises" a per-frame copy of the entire visible state on the render
+/// path. `Clone` exists so tests can perturb one field against a baseline.
+#[derive(Clone)]
 pub struct DrmInteractiveState<'a> {
     pub time_str: &'a str,
     pub is_locked: bool,
@@ -604,6 +611,47 @@ pub struct DrmInteractiveState<'a> {
     pub palette: MaterialYouPalette,
     pub power_saver_mode: crate::compositor::power_sync::PowerSaverMode,
     pub super_extreme_state: Option<&'a crate::compositor::super_extreme::SuperExtremeState>,
+
+    // ---------------------------------------------------------------------
+    // Launcher rewrite, plan §7.6. Every field below is ANIMATED.
+    //
+    // HARD INVARIANT: each one must appear in `interactive_state_hash` in
+    // the same commit. `render_interactive_ui` short-circuits on a hash
+    // match (`:670-685`), so a field that is not hashed animates
+    // invisibly -- the spring runs, the value changes, and no frame is ever
+    // repainted. `hash_tracks_new_animated_fields` proves each one.
+    // ---------------------------------------------------------------------
+
+    /// "At a Glance" card phase. 0 = date only, 1 = full weather card.
+    /// Advances on a timer, not on interaction, so it must be hashed.
+    pub smartspace_phase: f32,
+    /// Folder open morph, 0 = closed, 1 = fully open.
+    pub folder_morph: f32,
+    /// Folder scrim opacity, 0..1. Separate from `folder_morph` because the
+    /// reference runs them on different springs (380/0.8 vs 380/0.98).
+    pub folder_scrim: f32,
+    /// Folder title alpha, faded in after a 32 ms delay.
+    pub folder_title_alpha: f32,
+    /// Long-press popup open progress, 0..1.
+    pub popup_progress: f32,
+    /// Overview open progress, 0..1.
+    pub overview_progress: f32,
+    /// Overview horizontal scroll offset, in card widths.
+    pub overview_scroll: f32,
+    /// Dismissal of the selected card, in pixels. Drives the 0.9875/0.975
+    /// scale ladder and the neighbour reflow.
+    pub overview_dismiss: f32,
+    /// Fast-scroller thumb position along the track, 0..1.
+    pub fastscroller_thumb: f32,
+    /// Fast-scroller teardrop popup alpha, 0..1 (200 ms in, 150 ms out).
+    pub fastscroller_popup_alpha: f32,
+    /// Page-indicator handover progress. `0.0` is at rest; `> 1.0` is the
+    /// overshoot phase, which the dot maths treats differently.
+    pub page_indicator_frac: f32,
+    /// Workspace scale during an in-app home gesture, 1.0 at rest.
+    pub workspace_scale: f32,
+    /// Workspace content alpha during an in-app home gesture, 1.0 at rest.
+    pub window_alpha: f32,
 }
 
 impl<'a> Default for DrmInteractiveState<'a> {
@@ -648,6 +696,19 @@ impl<'a> Default for DrmInteractiveState<'a> {
             palette: MaterialYouPalette::default_dark(),
             power_saver_mode: crate::compositor::power_sync::PowerSaverMode::Off,
             super_extreme_state: None,
+            smartspace_phase: 0.0,
+            folder_morph: 0.0,
+            folder_scrim: 0.0,
+            folder_title_alpha: 0.0,
+            popup_progress: 0.0,
+            overview_progress: 0.0,
+            overview_scroll: 0.0,
+            overview_dismiss: 0.0,
+            fastscroller_thumb: 0.0,
+            fastscroller_popup_alpha: 0.0,
+            page_indicator_frac: 0.0,
+            workspace_scale: 1.0,
+            window_alpha: 1.0,
         }
     }
 }
@@ -2828,6 +2889,30 @@ fn interactive_state_hash(state: &DrmInteractiveState) -> u64 {
         mix!(0);
     }
     mix!(state.power_saver_mode as u8);
+
+    // ---------------------------------------------------------------------
+    // Plan §7.6 invariant. See the HARD INVARIANT note on the struct: an
+    // unhashed animated field renders nothing, ever.
+    //
+    // Quantisation follows the existing convention: x1000 for unit-range
+    // progress (smooth enough at 120 Hz, since 1/1000 of a screen is well
+    // under a pixel), x100 for pixel-valued quantities.
+    // ---------------------------------------------------------------------
+    mix!((state.smartspace_phase * 1000.0) as u32);
+    mix!((state.folder_morph * 1000.0) as u32);
+    mix!((state.folder_scrim * 1000.0) as u32);
+    mix!((state.folder_title_alpha * 1000.0) as u32);
+    mix!((state.popup_progress * 1000.0) as u32);
+    mix!((state.overview_progress * 1000.0) as u32);
+    mix!((state.overview_scroll * 1000.0) as u32);
+    mix!((state.overview_dismiss * 100.0) as i32);
+    mix!((state.fastscroller_thumb * 1000.0) as u32);
+    mix!((state.fastscroller_popup_alpha * 1000.0) as u32);
+    // The page indicator's overshoot phase lives above 1.0, so this is the
+    // one field where a clamp would silently swallow real motion.
+    mix!((state.page_indicator_frac * 1000.0) as i32);
+    mix!((state.workspace_scale * 1000.0) as u32);
+    mix!((state.window_alpha * 1000.0) as u32);
     if let Some(ref sex) = state.super_extreme_state {
         mix!(sex.active_screen as u8);
         mix!(sex.password_input.len());
@@ -5105,108 +5190,20 @@ pub fn recents_scale_config() -> SpringConfig {
 /// hard-coded `screen_width * 0.35` for both. Call sites now pass `max`
 /// explicitly, so the two cases can finally differ.
 
-// Authentic Lawnchair 17 / Material You (Monet) Dynamic Tonal Palette.
-// Derived with zero dynamic heap allocations on the hot render path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MaterialYouPalette {
-    pub surface: u32,
-    pub surface_container: u32,
-    pub surface_container_high: u32,
-    pub primary: u32,
-    pub on_primary: u32,
-    pub primary_container: u32,
-    pub on_primary_container: u32,
-    pub secondary: u32,
-    pub tertiary: u32,
-    pub on_surface: u32,
-    pub on_surface_variant: u32,
-    pub outline: u32,
-    pub outline_variant: u32,
-}
-
-impl MaterialYouPalette {
-    pub const fn default_dark() -> Self {
-        Self {
-            surface: 0xFF0B0F19,
-            surface_container: 0xFF182236,
-            surface_container_high: 0xFF222E46,
-            primary: 0xFF38BDF8,
-            on_primary: 0xFF003548,
-            primary_container: 0xFF0284C7,
-            on_primary_container: 0xFFE0F2FE,
-            secondary: 0xFF94A3B8,
-            tertiary: 0xFFA78BFA,
-            on_surface: 0xFFF8FAFC,
-            on_surface_variant: 0xFF94A3B8,
-            outline: 0xFF334155,
-            outline_variant: 0xFF1E293B,
-        }
-    }
-
-    /// Derive Material You dynamic tonal scheme from an ARGB seed color (zero heap alloc).
-    pub fn from_seed(seed_color: u32) -> Self {
-        let r = ((seed_color >> 16) & 0xFF) as f32 / 255.0;
-        let g = ((seed_color >> 8) & 0xFF) as f32 / 255.0;
-        let b = (seed_color & 0xFF) as f32 / 255.0;
-
-        // Extract HSL hue
-        let max = r.max(g).max(b);
-        let min = r.min(g).min(b);
-        let delta = max - min;
-        let mut hue = 0.0f32;
-        if delta > 1e-4 {
-            if (max - r).abs() < 1e-4 {
-                hue = 60.0 * (((g - b) / delta) % 6.0);
-            } else if (max - g).abs() < 1e-4 {
-                hue = 60.0 * (((b - r) / delta) + 2.0);
-            } else {
-                hue = 60.0 * (((r - g) / delta) + 4.0);
-            }
-            if hue < 0.0 { hue += 360.0; }
-        }
-
-        let hsl_to_rgb = |h: f32, s: f32, l: f32| -> u32 {
-            let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
-            let x = c * (1.0 - (((h / 60.0) % 2.0) - 1.0).abs());
-            let m = l - c / 2.0;
-            let (r1, g1, b1) = if h < 60.0 {
-                (c, x, 0.0)
-            } else if h < 120.0 {
-                (x, c, 0.0)
-            } else if h < 180.0 {
-                (0.0, c, x)
-            } else if h < 240.0 {
-                (0.0, x, c)
-            } else if h < 300.0 {
-                (x, 0.0, c)
-            } else {
-                (c, 0.0, x)
-            };
-            let ir = ((r1 + m).clamp(0.0, 1.0) * 255.0).round() as u32;
-            let ig = ((g1 + m).clamp(0.0, 1.0) * 255.0).round() as u32;
-            let ib = ((b1 + m).clamp(0.0, 1.0) * 255.0).round() as u32;
-            0xFF000000 | (ir << 16) | (ig << 8) | ib
-        };
-
-        let tertiary_hue = (hue + 60.0) % 360.0;
-
-        Self {
-            surface: hsl_to_rgb(hue, 0.15, 0.06),
-            surface_container: hsl_to_rgb(hue, 0.20, 0.12),
-            surface_container_high: hsl_to_rgb(hue, 0.22, 0.18),
-            primary: hsl_to_rgb(hue, 0.85, 0.65),
-            on_primary: hsl_to_rgb(hue, 0.90, 0.12),
-            primary_container: hsl_to_rgb(hue, 0.70, 0.35),
-            on_primary_container: hsl_to_rgb(hue, 0.80, 0.92),
-            secondary: hsl_to_rgb(hue, 0.20, 0.65),
-            tertiary: hsl_to_rgb(tertiary_hue, 0.65, 0.68),
-            on_surface: 0xFFF8FAFC,
-            on_surface_variant: hsl_to_rgb(hue, 0.15, 0.68),
-            outline: hsl_to_rgb(hue, 0.18, 0.25),
-            outline_variant: hsl_to_rgb(hue, 0.15, 0.15),
-        }
-    }
-}
+// Material You tonal palette.
+//
+// This used to be a ~100-line HSL ramp defined right here. It was replaced by
+// `graphics::palette`, an L*-anchored Oklab engine, because HSL lightness is
+// not perceptual: a blue at L = 0.5 has relative luminance ~0.072 while a
+// yellow at the same L has ~0.928, so every contrast guarantee derived from
+// it was fiction and the launcher shipped AA-failing text on yellow
+// wallpapers. See the `palette` module docs for the tone contract and for why
+// Oklab rather than the plan's CAM16.
+//
+// Re-exported rather than moved outright so every existing import path
+// (`graphics::MaterialYouPalette`, `drm_kms::MaterialYouPalette`) keeps
+// working; `super_extreme` and the palette tests both rely on it.
+pub use super::palette::MaterialYouPalette;
 
 /// Lawnchair 17 / Pixel Launcher Material You display clock.
 ///
@@ -5520,16 +5517,123 @@ mod tests {
 
     #[test]
     fn test_font_weight_drawing() {
-        let mut buf_reg = vec![0xFF000000u32; 32 * 32];
-        let mut buf_med = vec![0xFF000000u32; 32 * 32];
-        let mut buf_bold = vec![0xFF000000u32; 32 * 32];
-        draw_text_weighted(&mut buf_reg, 32, 32, 32, 4, 4, "A", 0xFFFFFFFF, 1, FontWeight::Regular);
-        draw_text_weighted(&mut buf_med, 32, 32, 32, 4, 4, "A", 0xFFFFFFFF, 1, FontWeight::Medium);
-        draw_text_weighted(&mut buf_bold, 32, 32, 32, 4, 4, "A", 0xFFFFFFFF, 1, FontWeight::Bold);
-        let ink = |b: &[u32]| b.iter().filter(|&&p| p != 0xFF000000).count();
-        let (reg, med, bold) = (ink(&buf_reg), ink(&buf_med), ink(&buf_bold));
-        assert!(bold > med, "Bold must carry more ink than Medium ({} vs {})", bold, med);
-        assert!(med > reg, "Medium must carry more ink than Regular ({} vs {})", med, reg);
+        // This test used to be order-dependent. `set_active_family` is a
+        // process global, other tests in this binary mutate it, and this test
+        // read whatever family happened to be active -- so it failed in
+        // isolation and passed in a full run, on the same code.
+        //
+        // It also asserted something that is not true of the TTF path at all.
+        // See `ttf_path_clips_the_weight_axis` below for the measured
+        // numbers: with a real TrueType face all three weights render
+        // byte-identically, because the glyph mask window is sized from the
+        // *unweighted* outline bbox (font.rs `draw_glyph`) and the heavier
+        // stroke is clipped away outside it.
+        //
+        // So the weight ordering is asserted on the bitmap families, where
+        // the axis is wired up, under the font mutex, with the family
+        // pinned and restored.
+        let _guard = crate::graphics::font::TEST_FONT_MUTEX.lock().unwrap();
+        let prev = crate::graphics::font::active_family();
+
+        // The pen axis is unconditional: it is the parameter that drives
+        // stroke width, and if it is not monotonic nothing else can be.
+        assert!(
+            FontWeight::Bold.pen() > FontWeight::Medium.pen()
+                && FontWeight::Medium.pen() > FontWeight::Regular.pen(),
+            "pen width must increase with weight"
+        );
+
+        let ink_at = |weight: FontWeight| -> usize {
+            let mut buf = vec![0xFF000000u32; 32 * 32];
+            draw_text_weighted(&mut buf, 32, 32, 32, 4, 4, "A", 0xFFFFFFFF, 1, weight);
+            buf.iter().filter(|&&p| p != 0xFF000000).count()
+        };
+
+        for family in [crate::graphics::font::FontFamily::Homemade, crate::graphics::font::FontFamily::AsciiMono] {
+            crate::graphics::font::set_active_family(family);
+            let reg = ink_at(FontWeight::Regular);
+            let med = ink_at(FontWeight::Medium);
+            let bold = ink_at(FontWeight::Bold);
+            assert!(reg > 0, "{family:?}: Regular drew no glyph");
+            assert!(
+                med > reg,
+                "{family:?}: Medium must carry more ink than Regular ({med} vs {reg})"
+            );
+            assert!(
+                bold > med,
+                "{family:?}: Bold must carry more ink than Medium ({bold} vs {med})"
+            );
+        }
+
+        // Every family must render a glyph at every weight; only the *amount*
+        // of ink is in question.
+        for family in [
+            crate::graphics::font::FontFamily::NotoSans,
+            crate::graphics::font::FontFamily::Homemade,
+            crate::graphics::font::FontFamily::AsciiMono,
+        ] {
+            crate::graphics::font::set_active_family(family);
+            for weight in [FontWeight::Regular, FontWeight::Medium, FontWeight::Bold] {
+                assert!(
+                    ink_at(weight) > 0,
+                    "{family:?}/{weight:?} drew no glyph at all"
+                );
+            }
+        }
+
+        crate::graphics::font::set_active_family(prev);
+    }
+
+    /// Records a real, unfixed defect: the TrueType glyph path silently drops
+    /// the weight axis.
+    ///
+    /// `draw_glyph` computes the mask window as the outline bbox padded by
+    /// exactly one pixel (`font.rs`, the `ox64`/`ex64` computation), but the
+    /// stroke radius is `weight.pen() * s`. For a Bold pen the stroke extends
+    /// well past the outline, so the extra ink lands outside the window and is
+    /// discarded. Measured on this host: Regular == Medium == Bold == 125 ink
+    /// pixels for "A" at 24 px, while the bitmap families give 155/173/195.
+    ///
+    /// The fix is to pad the window by the pen radius, but that widens every
+    /// glyph mask and therefore every blit, so it has to be taken together
+    /// with a `full_frame_stays_inside_the_vsync_budget` measurement rather
+    /// than slipped in. Asserted here so the defect is visible in the test
+    /// output instead of hiding behind a family that happens to work.
+    #[test]
+    fn ttf_path_clips_the_weight_axis() {
+        let _guard = crate::graphics::font::TEST_FONT_MUTEX.lock().unwrap();
+        let prev = crate::graphics::font::active_family();
+        crate::graphics::font::set_active_family(crate::graphics::font::FontFamily::NotoSans);
+
+        if crate::graphics::font::get_noto_ttf().is_none() {
+            // No TrueType face here, so the TTF path is not under test at
+            // all and there is nothing to observe.
+            crate::graphics::font::set_active_family(prev);
+            return;
+        }
+
+        let ink_at = |weight: FontWeight| -> usize {
+            let mut buf = vec![0xFF000000u32; 32 * 32];
+            draw_text_weighted(&mut buf, 32, 32, 32, 4, 4, "A", 0xFFFFFFFF, 1, weight);
+            buf.iter().filter(|&&p| p != 0xFF000000).count()
+        };
+        let reg = ink_at(FontWeight::Regular);
+        let med = ink_at(FontWeight::Medium);
+        let bold = ink_at(FontWeight::Bold);
+        crate::graphics::font::set_active_family(prev);
+
+        assert_eq!(
+            reg, med,
+            "the TTF weight-axis defect appears to be fixed: Medium now differs \
+             from Regular ({med} vs {reg}). Update this test and the padding fix \
+             in font.rs together."
+        );
+        assert_eq!(
+            med, bold,
+            "the TTF weight-axis defect appears to be fixed: Bold now differs \
+             from Medium ({bold} vs {med}). Update this test and the padding fix \
+             in font.rs together."
+        );
     }
 
     #[test]
@@ -6000,6 +6104,134 @@ mod tests {
             super_extreme_state: Some(&sex),
             ..DrmInteractiveState::default()
         });
+    }
+
+    /// Plan §7.6: every animated field must be in `interactive_state_hash`.
+    ///
+    /// This test exists because the failure mode is invisible: an unhashed
+    /// field animates, the spring moves, the value changes — and
+    /// `render_interactive_ui` short-circuits on a hash match, so not one
+    /// frame is ever repainted. Nothing crashes and nothing logs. The only
+    /// symptom is a feature that does not work, with no cause.
+    ///
+    /// So the invariant is asserted structurally: every animated field is
+    /// perturbed and the hash must move. Adding a field without hashing it
+    /// makes this fail the moment someone remembers to extend the list.
+    #[test]
+    fn hash_tracks_new_animated_fields() {
+        let base = DrmInteractiveState::default();
+        let base_hash = interactive_state_hash(&base);
+
+        // (name, mutator, a delta that is meaningful in the field's own unit)
+        let probes: &[(&str, fn(&mut DrmInteractiveState), f32)] = &[
+            ("smartspace_phase", |s| s.smartspace_phase += 0.01, 0.01),
+            ("folder_morph", |s| s.folder_morph += 0.01, 0.01),
+            ("folder_scrim", |s| s.folder_scrim += 0.01, 0.01),
+            ("folder_title_alpha", |s| s.folder_title_alpha += 0.01, 0.01),
+            ("popup_progress", |s| s.popup_progress += 0.01, 0.01),
+            ("overview_progress", |s| s.overview_progress += 0.01, 0.01),
+            ("overview_scroll", |s| s.overview_scroll += 0.01, 0.01),
+            ("overview_dismiss", |s| s.overview_dismiss += 1.0, 1.0),
+            ("fastscroller_thumb", |s| s.fastscroller_thumb += 0.01, 0.01),
+            (
+                "fastscroller_popup_alpha",
+                |s| s.fastscroller_popup_alpha += 0.01,
+                0.01,
+            ),
+            ("page_indicator_frac", |s| s.page_indicator_frac += 0.01, 0.01),
+            ("workspace_scale", |s| s.workspace_scale -= 0.01, 0.01),
+            ("window_alpha", |s| s.window_alpha -= 0.01, 0.01),
+        ];
+
+        for (name, bump, delta) in probes {
+            let mut s = base.clone();
+            assert_eq!(interactive_state_hash(&s), base_hash, "{name}: base mismatch");
+            bump(&mut s);
+            assert_ne!(
+                interactive_state_hash(&s),
+                base_hash,
+                "{name} changed by {delta} but did not move the hash -- it will \
+                 animate invisibly"
+            );
+        }
+    }
+
+    /// The page indicator's overshoot phase runs *above* 1.0, so its hash
+    /// quantisation must not clamp. A `min(1.0)` here would make the whole
+    /// overshoot invisible while the spring visibly runs.
+    #[test]
+    fn page_indicator_hash_sees_the_overshoot_phase() {
+        let base = DrmInteractiveState::default();
+        let mut at_one = base.clone();
+        at_one.page_indicator_frac = 1.0;
+        let mut over = base.clone();
+        over.page_indicator_frac = 1.3;
+        assert_ne!(
+            interactive_state_hash(&at_one),
+            interactive_state_hash(&over),
+            "the 1.0 -> 1.3 overshoot must change the hash"
+        );
+        // And it must be a signed quantisation: a negative frac is reachable
+        // by a spring overshooting the other way.
+        let mut back = base.clone();
+        back.page_indicator_frac = -0.3;
+        assert_ne!(
+            interactive_state_hash(&back),
+            interactive_state_hash(&base),
+            "a negative overshoot must change the hash"
+        );
+    }
+
+    /// Quantisation must be fine enough that a single frame of motion is
+    /// never rounded away. At 120 Hz a spring moving a full screen in 300 ms
+    /// advances ~2.8 px per frame; a pixel-quantised field would drop that.
+    #[test]
+    fn animated_field_quantisation_resolves_one_frame_of_motion() {
+        let base = DrmInteractiveState::default();
+        // One frame of a 0 -> 1 progress animation over 300 ms at 120 Hz.
+        let frame = 1.0f32 / 36.0;
+        for (name, set) in [
+            ("folder_morph", 0usize),
+            ("popup_progress", 1),
+            ("overview_progress", 2),
+            ("smartspace_phase", 3),
+            ("fastscroller_thumb", 4),
+            ("page_indicator_frac", 5),
+        ] {
+            let mut a = base.clone();
+            let mut b = base.clone();
+            match set {
+                0 => {
+                    a.folder_morph = 0.0;
+                    b.folder_morph = frame;
+                }
+                1 => {
+                    a.popup_progress = 0.0;
+                    b.popup_progress = frame;
+                }
+                2 => {
+                    a.overview_progress = 0.0;
+                    b.overview_progress = frame;
+                }
+                3 => {
+                    a.smartspace_phase = 0.0;
+                    b.smartspace_phase = frame;
+                }
+                4 => {
+                    a.fastscroller_thumb = 0.0;
+                    b.fastscroller_thumb = frame;
+                }
+                _ => {
+                    a.page_indicator_frac = 0.0;
+                    b.page_indicator_frac = frame;
+                }
+            }
+            assert_ne!(
+                interactive_state_hash(&a),
+                interactive_state_hash(&b),
+                "{name}: one frame ({frame}) of motion rounded away to the same hash"
+            );
+        }
     }
 }
 
