@@ -5626,7 +5626,7 @@ mod tests {
         // So the weight ordering is asserted on the bitmap families, where
         // the axis is wired up, under the font mutex, with the family
         // pinned and restored.
-        let _guard = crate::graphics::font::TEST_FONT_MUTEX.lock().unwrap();
+        let _guard = crate::graphics::font::font_test_lock();
         let prev = crate::graphics::font::active_family();
 
         // The pen axis is unconditional: it is the parameter that drives
@@ -5678,56 +5678,139 @@ mod tests {
         crate::graphics::font::set_active_family(prev);
     }
 
-    /// Records a real, unfixed defect: the TrueType glyph path silently drops
-    /// the weight axis.
+    /// The TrueType path has a working weight axis.
     ///
-    /// `draw_glyph` computes the mask window as the outline bbox padded by
-    /// exactly one pixel (`font.rs`, the `ox64`/`ex64` computation), but the
-    /// stroke radius is `weight.pen() * s`. For a Bold pen the stroke extends
-    /// well past the outline, so the extra ink lands outside the window and is
-    /// discarded. Measured on this host: Regular == Medium == Bold == 125 ink
-    /// pixels for "A" at 24 px, while the bitmap families give 155/173/195.
+    /// This records a defect that was real and is now fixed, so the numbers
+    /// here are a regression guard rather than a note about broken code.
     ///
-    /// The fix is to pad the window by the pen radius, but that widens every
-    /// glyph mask and therefore every blit, so it has to be taken together
-    /// with a `full_frame_stays_inside_the_vsync_budget` measurement rather
-    /// than slipped in. Asserted here so the defect is visible in the test
-    /// output instead of hiding behind a family that happens to work.
+    /// `draw_glyph` computed a pen radius and then never passed it to
+    /// `ttf::rasterize_glyph`, which is a scanline polygon filler and has no
+    /// concept of stroke width: it fills whatever the outline encloses. So
+    /// every weight rendered the raw outline and Regular, Medium and Bold came
+    /// out byte-identical -- measured as *exactly* equal coverage at 8, 16,
+    /// 24, 48 and 96 px, while the bitmap families gave a clean 1.17x / 1.40x
+    /// ramp. The window padding was also inconsistent: the two bitmap paths
+    /// pad by `r + 1`, the TrueType path by `1` alone.
+    ///
+    /// The fix dilates the filled outline by the weight delta from Regular,
+    /// which is what a heavier weight physically is: stems thicken, counters
+    /// shrink, terminals grow. Drop the parameter again and all three columns
+    /// go equal and this fails.
+    ///
+    /// Coverage is the sum of alpha, not a pixel count. A sub-pixel dilation
+    /// adds a whole pixel to a count while adding only a fraction of a pixel
+    /// of ink, and counting pixels made a correct weight axis look like a
+    /// halo -- the ratio here would read 1.9x at 8 px when the real change is
+    /// 4%. Pixel counts are what made the original defect report sound worse
+    /// than it was, and they are also what hid the fix.
     #[test]
-    fn ttf_path_clips_the_weight_axis() {
-        let _guard = crate::graphics::font::TEST_FONT_MUTEX.lock().unwrap();
+    fn ttf_path_has_a_working_weight_axis() {
+        let _guard = crate::graphics::font::font_test_lock();
         let prev = crate::graphics::font::active_family();
-        crate::graphics::font::set_active_family(crate::graphics::font::FontFamily::NotoSans);
 
         if crate::graphics::font::get_noto_ttf().is_none() {
-            // No TrueType face here, so the TTF path is not under test at
-            // all and there is nothing to observe.
-            crate::graphics::font::set_active_family(prev);
+            // No TrueType face on this host, so the outline path is not under
+            // test and there is nothing to observe.
+            return;
+        }
+        crate::graphics::font::set_active_family(crate::graphics::font::FontFamily::NotoSans);
+
+        let coverage_at = |weight: FontWeight, size: f32| -> u32 {
+            let (w, h) = (400usize, 200usize);
+            let mut buf = vec![0xFF000000u32; w * h];
+            crate::graphics::font::draw_glyph(
+                &mut buf, w, w, h, 40.0, 40.0, b'A', 0xFFFFFFFF, size, weight,
+            );
+            buf.iter().map(|&p| p & 0xFF).sum()
+        };
+
+        for size in [8.0f32, 16.0, 24.0, 48.0, 96.0] {
+            let reg = coverage_at(FontWeight::Regular, size);
+            let med = coverage_at(FontWeight::Medium, size);
+            let bold = coverage_at(FontWeight::Bold, size);
+
+            assert!(reg > 0, "size {size}: Regular drew nothing");
+            assert!(
+                med > reg,
+                "size {size}: Medium {med} is not heavier than Regular {reg}"
+            );
+            assert!(
+                bold > med,
+                "size {size}: Bold {bold} is not heavier than Medium {med}"
+            );
+
+            // A weight step is a moderate change, not a repaint. Both ends are
+            // bounded so a dilation bug cannot quietly turn Bold into a filled
+            // blob, which is exactly what happened when an earlier version
+            // overwrote existing coverage instead of taking the max against
+            // it: Medium came out at 0.55x Regular, i.e. bolder rendered
+            // lighter, and the error grew as the glyph shrank.
+            let mr = med as f32 / reg as f32;
+            let br = bold as f32 / reg as f32;
+            assert!(
+                (1.0..1.35).contains(&mr),
+                "size {size}: Medium/Regular = {mr:.3}, outside 1.0..1.35"
+            );
+            assert!(
+                (1.05..1.75).contains(&br),
+                "size {size}: Bold/Regular = {br:.3}, outside 1.05..1.75"
+            );
+        }
+
+        crate::graphics::font::set_active_family(prev);
+    }
+
+    /// The dilated outline and the stroked skeleton have to agree on how much
+    /// heavier each weight looks.
+    ///
+    /// The shell switches font family at runtime, so the two paths are
+    /// rendered through the same UI and a weight step that looks like one
+    /// thing in the outline families and another in the bitmap ones reads as
+    /// the type scale changing under you. They do not agree naturally: a
+    /// dilation thickens stems *and* closes counters *and* grows the outer
+    /// contour, so the raw pen delta measured Bold at 1.64x Regular where the
+    /// shipped skeleton path measures 1.40x. `OUTLINE_WEIGHT_SCALE` is the
+    /// calibration, and this is what holds it to the shipped number.
+    #[test]
+    fn outline_and_skeleton_weights_agree() {
+        let _guard = crate::graphics::font::font_test_lock();
+        let prev = crate::graphics::font::active_family();
+
+        if crate::graphics::font::get_noto_ttf().is_none() {
             return;
         }
 
-        let ink_at = |weight: FontWeight| -> usize {
-            let mut buf = vec![0xFF000000u32; 32 * 32];
-            draw_text_weighted(&mut buf, 32, 32, 32, 4, 4, "A", 0xFFFFFFFF, 1, weight);
-            buf.iter().filter(|&&p| p != 0xFF000000).count()
+        let coverage_at = |family: crate::graphics::font::FontFamily, weight: FontWeight| -> u32 {
+            crate::graphics::font::set_active_family(family);
+            let (w, h) = (400usize, 200usize);
+            let mut buf = vec![0xFF000000u32; w * h];
+            crate::graphics::font::draw_glyph(
+                &mut buf, w, w, h, 40.0, 40.0, b'A', 0xFFFFFFFF, 96.0, weight,
+            );
+            buf.iter().map(|&p| p & 0xFF).sum()
         };
-        let reg = ink_at(FontWeight::Regular);
-        let med = ink_at(FontWeight::Medium);
-        let bold = ink_at(FontWeight::Bold);
-        crate::graphics::font::set_active_family(prev);
 
-        assert_eq!(
-            reg, med,
-            "the TTF weight-axis defect appears to be fixed: Medium now differs \
-             from Regular ({med} vs {reg}). Update this test and the padding fix \
-             in font.rs together."
+        let outline_bold = coverage_at(crate::graphics::font::FontFamily::NotoSans, FontWeight::Bold);
+        let outline_reg = coverage_at(crate::graphics::font::FontFamily::NotoSans, FontWeight::Regular);
+        let skel_bold = coverage_at(
+            crate::graphics::font::FontFamily::Homemade,
+            FontWeight::Bold,
         );
-        assert_eq!(
-            med, bold,
-            "the TTF weight-axis defect appears to be fixed: Bold now differs \
-             from Medium ({bold} vs {med}). Update this test and the padding fix \
-             in font.rs together."
+        let skel_reg = coverage_at(
+            crate::graphics::font::FontFamily::Homemade,
+            FontWeight::Regular,
         );
+
+        let outline = outline_bold as f32 / outline_reg as f32;
+        let skeleton = skel_bold as f32 / skel_reg as f32;
+        assert!(
+            (outline - skeleton).abs() < 0.1,
+            "Bold reads as {outline:.2}x Regular on the dilated outline but \
+             {skeleton:.2}x on the stroked skeleton; they have to match within \
+             10% or a family switch visibly changes the weight"
+        );
+
+        crate::graphics::font::set_active_family(prev);
     }
 
     #[test]
@@ -6176,7 +6259,7 @@ mod tests {
 
     #[test]
     fn test_paint_super_extreme_frame() {
-        let _guard = crate::graphics::font::TEST_FONT_MUTEX.lock().unwrap();
+        let _guard = crate::graphics::font::font_test_lock();
         let (w, h) = (360, 640);
         let mut buf = vec![0u32; w * h];
         let mut sex = crate::compositor::super_extreme::SuperExtremeState::new();

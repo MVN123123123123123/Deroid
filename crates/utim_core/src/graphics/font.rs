@@ -630,10 +630,15 @@ pub fn draw_glyph(
             let max_x = x + bbox.2 * s;
             let min_y = baseline - bbox.3 * s;
             let max_y = baseline - bbox.1 * s;
-            let ox64 = (min_x - 1.0).floor() as i64;
-            let oy64 = (min_y - 1.0).floor() as i64;
-            let ex64 = (max_x + 1.0).ceil() as i64;
-            let ey64 = (max_y + 1.0).ceil() as i64;
+            // Reserve the same room the weight delta can reach, plus the AA
+            // pixel. Only the *delta* is added, for the reason given at the
+            // rasterise call; padding by the full radius would make the mask
+            // two to three times larger for no visual gain.
+            let pad = (r - FontWeight::Regular.pen() * s).max(0.0) + 1.0;
+            let ox64 = (min_x - pad).floor() as i64;
+            let oy64 = (min_y - pad).floor() as i64;
+            let ex64 = (max_x + pad).ceil() as i64;
+            let ey64 = (max_y + pad).ceil() as i64;
             (adv, ox64, oy64, ex64, ey64, true, None)
         } else {
             let g = glyph_for_family(b, family);
@@ -776,7 +781,36 @@ pub fn draw_glyph(
     };
     let touched = if use_ttf {
         if let Some(ttf) = get_noto_ttf() {
-            ttf.rasterize_glyph(b, x, s, baseline, mask, bw, bh, ox, oy)
+            // The TrueType outline already encodes a stem width, so the pen
+            // radius must NOT be added on top of it: at 96 px, Bold's radius
+            // is 7.5 px, and adding that to an outline whose stems are already
+            // ~8% of the em would give ~24%-em stems -- a black blob.
+            //
+            // What a heavier weight actually is, on an already-filled
+            // outline, is the *delta* from the design's nominal stem. So
+            // Regular renders the raw outline untouched and each step up adds
+            // only the difference. (The bitmap path below is different: a
+            // skeleton is a centreline, so it needs the absolute radius.)
+            //
+            // The delta is then scaled by `OUTLINE_WEIGHT_SCALE` so that a
+            // dilated outline and a stroked skeleton agree on how much
+            // heavier each step looks. They do not agree naturally: a
+            // dilation thickens stems *and* closes counters *and* grows the
+            // glyph's outer contour, so applying the raw pen delta measured
+            // Bold at 1.64x Regular's coverage where the shipped bitmap path
+            // measures 1.40x. The shell switches font family at runtime, so
+            // the two have to look like the same type ramp; 0.6 brings them
+            // together and `outline_and_skeleton_weights_agree` holds the
+            // line.
+            //
+            // This is also why `r` was never passed before: with no weight
+            // parameter the path rendered the raw outline for every weight,
+            // which is what made Regular, Medium and Bold byte-identical.
+            let nominal = FontWeight::Regular.pen() * s;
+            ttf.rasterize_glyph(
+                b, x, s, baseline, mask, bw, bh, ox, oy,
+                (r - nominal).max(0.0) * super::ttf::OUTLINE_WEIGHT_SCALE,
+            )
         } else {
             false
         }
@@ -869,7 +903,25 @@ pub fn baseline_drop(size_px: f32) -> f32 {
 }
 
 #[cfg(test)]
+/// Serialises the tests that mutate the process-global font family.
+///
+/// Poison-tolerant on purpose. The lock exists so those tests cannot
+/// interleave, not so a failure in one of them can veto the rest: a plain
+/// `.lock().unwrap()` means any panic while the lock is held poisons it, and
+/// every later test then fails with `PoisonError` instead of its own
+/// assertion. That turns one real failure into a cascade that hides it. The
+/// guard the caller gets is identical either way, because these tests only
+/// serialise.
 pub(crate) static TEST_FONT_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Acquire [`TEST_FONT_MUTEX`], recovering from poisoning.
+#[cfg(test)]
+#[inline]
+pub(crate) fn font_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    TEST_FONT_MUTEX
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 #[cfg(test)]
 mod tests {
@@ -877,7 +929,7 @@ mod tests {
 
     #[test]
     fn metrics_are_proportional_and_tabular() {
-        let _guard = TEST_FONT_MUTEX.lock().unwrap();
+        let _guard = font_test_lock();
         // Every printable ASCII glyph must have a positive, sane advance.
         for c in 0x20u8..0x80 {
             let a = glyph_of(c).a;
@@ -928,7 +980,7 @@ mod tests {
 
     #[test]
     fn coverage_is_analytic_and_never_overshoots_the_pen() {
-        let _guard = TEST_FONT_MUTEX.lock().unwrap();
+        let _guard = font_test_lock();
         let prev = active_family();
         set_active_family(FontFamily::Homemade);
         // A vertical stem of the letter "l" must be exactly two pen radii
@@ -1015,13 +1067,90 @@ mod tests {
         );
     }
 
+    /// Cold-cache weight rasterisation stays bounded.
+    ///
+    /// `rasteriser_stays_inside_the_frame_budget` warms the glyph cache first,
+    /// which is right for a frame budget -- the cache is warm from the second
+    /// frame onwards. It is blind to the first frame, and the TrueType weight
+    /// axis dilates the outline on every cache miss, so that first frame is
+    /// where its cost lands. Measured on this host at 40 lines x 37 characters
+    /// (1480 distinct glyph rasterisations), A/B'd by setting
+    /// `OUTLINE_WEIGHT_SCALE` to 0.6 and to 0.0:
+    ///
+    /// ```text
+    ///          off      on
+    /// Regular  18.6 ms  18.4 ms
+    /// Medium   18.3 ms  22.5 ms
+    /// Bold     17.0 ms  23.7 ms
+    /// ```
+    ///
+    /// So a weight step is about +27% of cold rasterisation, which is the
+    /// honest price of 1-2 extra separable passes over the glyph mask. Regular
+    /// pays nothing, because its delta from itself is zero and the dilation is
+    /// skipped -- and icon labels, the bulk of the text on a launcher screen,
+    /// are Regular.
+    ///
+    /// This asserts only that the cost stays the shape it is, at 2x the
+    /// measured figure. An absolute bound would be flaky across hosts; what is
+    /// worth catching is a dilation that suddenly does a full-mask distance
+    /// transform, or one whose step count is driven by the pen radius instead
+    /// of the weight delta, either of which is an order of magnitude rather
+    /// than a constant factor.
+    #[test]
+    fn cold_weight_rasterisation_stays_bounded() {
+        use std::time::Instant;
+
+        let _guard = font_test_lock();
+        let prev = active_family();
+        if get_noto_ttf().is_none() {
+            return;
+        }
+        set_active_family(FontFamily::NotoSans);
+
+        let (w, h) = (1080usize, 600usize);
+        // Each weight is a distinct glyph-cache key, so measuring them in one
+        // process still measures a cold rasterisation for each.
+        let mut worst = 0u128;
+        for weight in [FontWeight::Medium, FontWeight::Bold] {
+            let mut canvas = vec![0xFF000000u32; w * h];
+            let start = Instant::now();
+            for i in 0..40 {
+                draw_run(
+                    &mut canvas,
+                    w,
+                    w,
+                    h,
+                    10.0,
+                    10.0 + i as f32 * 14.0,
+                    "Settings Clock Calculator Files 10:34 PM",
+                    0xFFFFFFFF,
+                    40.0,
+                    weight,
+                );
+            }
+            let per = start.elapsed().as_micros();
+            worst = worst.max(per);
+        }
+        set_active_family(prev);
+
+        if cfg!(debug_assertions) {
+            return;
+        }
+        // 45 ms is ~2x the measured 23.7 ms.
+        assert!(
+            worst < 45_000,
+            "cold weight rasterisation is {worst}us, more than 2x the measured \
+             23.7ms; the dilation is doing more work than a separable box should"
+        );
+    }
+
     /// A culled glyph must advance exactly like a visible one: draw_run on a
     /// clipped buffer has to agree with measure(), or every following glyph
     /// in the run is displaced (and centring/truncation computed from
     /// measure disagrees with what is drawn).
     #[test]
     fn culled_glyphs_advance_exactly_once() {
-        let _guard = TEST_FONT_MUTEX.lock().unwrap();
+        let _guard = font_test_lock();
         let size = 45.0;
         // Fully above the buffer: every glyph is culled.
         let (w, h) = (200usize, 60usize);
@@ -1044,7 +1173,7 @@ mod tests {
     /// advance, exactly like char_advance says.
     #[test]
     fn non_ascii_bytes_have_no_ink_but_keep_advance() {
-        let _guard = TEST_FONT_MUTEX.lock().unwrap();
+        let _guard = font_test_lock();
         let size = 30.0;
         let (w, h) = (200usize, 120usize);
         for b in [0x00u8, 0x09, 0x0A, 0x1F, 0x7F, 0x80, 0xA9, 0xC3, 0xFF] {
@@ -1060,7 +1189,7 @@ mod tests {
     /// the same inked-pixel set every time.
     #[test]
     fn glyph_cache_hits_reproduce_misses() {
-        let _guard = TEST_FONT_MUTEX.lock().unwrap();
+        let _guard = font_test_lock();
         set_active_family(FontFamily::NotoSans);
         fn inked(buf: &[u32], bg: u32) -> Vec<usize> {
             buf.iter().enumerate().filter(|(_, p)| **p != bg).map(|(i, _)| i).collect()
@@ -1081,7 +1210,7 @@ mod tests {
 
     #[test]
     fn test_font_family_switching_and_metrics() {
-        let _guard = TEST_FONT_MUTEX.lock().unwrap();
+        let _guard = font_test_lock();
         // Noto Sans
         set_active_family(FontFamily::NotoSans);
         assert_eq!(active_family(), FontFamily::NotoSans);
@@ -1161,7 +1290,7 @@ mod tests {
 
     #[test]
     fn test_super_extreme_power_saver_font_strategy() {
-        let _guard = TEST_FONT_MUTEX.lock().unwrap();
+        let _guard = font_test_lock();
 
         // 1. In Normal Mode: NotoSans is active.
         set_active_family(FontFamily::NotoSans);
