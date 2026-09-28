@@ -14,6 +14,7 @@ pub mod screenshot;
 pub mod gpu;
 pub mod gralloc;
 pub mod png;
+pub mod raster;
 pub mod ttf;
 pub mod vsync;
 
