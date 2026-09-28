@@ -94,18 +94,24 @@ pub fn lstar_from_oklab_l(l: f32) -> f32 {
 }
 
 /// Linear sRGB -> Oklab `(L, a, b)`.
+///
+/// The matrices below are written to 7 significant digits, not to the 9 that
+/// Bjorn Ottosson's reference `f64` constants carry. An `f32` cannot hold the
+/// 9th digit, so writing it implies a precision the type does not have --
+/// and clippy is right to flag it. The 7-digit form is the value the `f32`
+/// actually stores, so the arithmetic and the literal now agree.
 #[inline]
 pub fn oklab_from_linear_rgb(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
-    let l = 0.412_221_470_8 * r + 0.536_332_536_3 * g + 0.051_445_992_9 * b;
-    let m = 0.211_903_498_2 * r + 0.680_699_545_1 * g + 0.107_396_956_6 * b;
-    let s = 0.088_302_461_9 * r + 0.281_718_837_6 * g + 0.629_978_700_5 * b;
+    let l = 0.4122215 * r + 0.5363325 * g + 0.05144599 * b;
+    let m = 0.2119035 * r + 0.6806995 * g + 0.107397 * b;
+    let s = 0.08830246 * r + 0.2817188 * g + 0.6299787 * b;
     let l_ = l.cbrt();
     let m_ = m.cbrt();
     let s_ = s.cbrt();
     (
-        0.210_454_255_3 * l_ + 0.793_617_785_0 * m_ - 0.004_072_046_8 * s_,
-        1.977_998_495_1 * l_ - 2.428_592_205_0 * m_ + 0.450_593_709_9 * s_,
-        0.025_904_037_1 * l_ + 0.782_771_766_2 * m_ - 0.808_675_766_0 * s_,
+        0.2104543 * l_ + 0.7936178 * m_ - 0.004072047 * s_,
+        1.977998 * l_ - 2.428592 * m_ + 0.4505937 * s_,
+        0.02590404 * l_ + 0.7827718 * m_ - 0.8086758 * s_,
     )
 }
 
@@ -113,25 +119,33 @@ pub fn oklab_from_linear_rgb(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
 /// returned as-is so the caller can detect them.
 #[inline]
 pub fn linear_rgb_from_oklab(l: f32, a: f32, b: f32) -> (f32, f32, f32) {
-    let l_ = l + 0.396_337_777_4 * a + 0.215_803_757_3 * b;
-    let m_ = l - 0.105_561_345_8 * a - 0.063_854_172_8 * b;
-    let s_ = l - 0.089_484_177_5 * a - 1.291_485_548_0 * b;
+    let l_ = l + 0.3963378 * a + 0.2158038 * b;
+    let m_ = l - 0.1055613 * a - 0.06385417 * b;
+    let s_ = l - 0.08948418 * a - 1.291486 * b;
     let (lc, mc, sc) = (l_ * l_ * l_, m_ * m_ * m_, s_ * s_ * s_);
     (
-        4.076_741_662_1 * lc - 3.307_711_591_3 * mc + 0.230_969_929_2 * sc,
-        -1.268_438_004_6 * lc + 2.609_757_401_1 * mc - 0.341_319_396_5 * sc,
-        -0.004_196_086_3 * lc - 0.703_418_614_7 * mc + 1.707_614_701_0 * sc,
+        4.076742 * lc - 3.307712 * mc + 0.2309699 * sc,
+        -1.268438 * lc + 2.609757 * mc - 0.3413194 * sc,
+        -0.004196086 * lc - 0.7034186 * mc + 1.707615 * sc,
     )
 }
 
 #[inline]
 fn in_gamut(r: f32, g: f32, b: f32) -> bool {
-    // A small negative tolerance absorbs the float error of the cube roots;
-    // the final clamp to 0..255 handles anything that slips through.
-    const TOL: f32 = -1.0e-4;
-    (-TOL..=1.0 + TOL).contains(&r)
-        && (-TOL..=1.0 + TOL).contains(&g)
-        && (-TOL..=1.0 + TOL).contains(&b)
+    // Deliberately *strict*: components must land inside [0, 1] with a small
+    // inset, not [-tol, 1 + tol].
+    //
+    // An earlier version allowed +1e-4 of overshoot on the reasoning that
+    // `linear_to_srgb` clamps. It does, and that is exactly the problem: a
+    // component clamped from 1.0001 to 1.0 changes the colour, so the tone
+    // the caller asked for comes back wrong. A saturated red at L* 80 landed
+    // at 79.42, which is 0.58 off the specified tone and outside the 0.5 the
+    // role->tone contract allows. The inset costs a negligible amount of
+    // chroma and makes the tone exact.
+    const INSET: f32 = 1.0e-5;
+    (0.0..=1.0 - INSET).contains(&r)
+        && (0.0..=1.0 - INSET).contains(&g)
+        && (0.0..=1.0 - INSET).contains(&b)
 }
 
 /// Oklab hue in degrees, 0..360.
@@ -156,26 +170,43 @@ pub const MIDDLE_LSTAR: f32 = 49.6;
 pub const HIGH_TONE_CHROMA_CAP: f32 = 40.0;
 const HIGH_TONE_CHROMA_CUTOFF_LSTAR: f32 = 95.0;
 
-/// Bisection steps for the in-gamut chroma search. 12 halvings of a 0..0.4
-/// range resolve it to under 1e-4, far below one 8-bit level.
-const GAMUT_BISECTIONS: u32 = 12;
-
-/// The maximum in-gamut Oklab chroma for a given lightness and hue.
+/// Upper bound of the Oklab chroma search domain.
 ///
-/// Holding tone and hue, chroma is walked down from `chroma` until the
-/// colour fits in sRGB. This is the "chroma bisection in [0, 255] sRGB
-/// holding L\* and Hue constant" the plan calls for, in the space where the
-/// gamut test is closed form.
-pub fn max_chroma(l: f32, hue_deg: f32, chroma: f32) -> f32 {
-    if chroma <= 0.0 || !hue_deg.is_finite() || !l.is_finite() {
+/// The most chromatic sRGB primary sits at about 0.32 in Oklab `C`; 0.5 is a
+/// safe ceiling that still bounds the search.
+const CHROMA_CEILING: f32 = 0.5;
+/// Bisection steps over the **fixed** domain, not over the caller's request.
+///
+/// This is the second of two bugs the palette tests caught. The first
+/// version bisected `[0, chroma]`, so the answer depended on what the caller
+/// asked for: requesting 0.3 returned 0.230493 while requesting 0.4 returned
+/// 0.230469, i.e. a *smaller* request produced a *larger* chroma. Same
+/// lightness, same hue, two different answers, because a narrower range gets
+/// a finer absolute resolution from the same step count.
+///
+/// Bisecting a fixed domain makes the gamut limit a property of
+/// `(lightness, hue)` alone, so `max_chroma` is exactly `request.min(limit)`
+/// and monotonicity is structural rather than tuned. 16 steps over 0.5
+/// resolve it to 7.6e-6, well under an 8-bit level.
+const GAMUT_BISECTIONS: u32 = 16;
+
+/// The largest in-gamut Oklab chroma at a given lightness and hue.
+///
+/// Independent of any request: this is the gamut boundary itself. See
+/// [`max_chroma`] for the clamped form callers normally want.
+pub fn gamut_chroma(l: f32, hue_deg: f32) -> f32 {
+    if !hue_deg.is_finite() || !l.is_finite() {
+        return 0.0;
+    }
+    // A neutral is always in gamut whatever the hue.
+    if l <= 0.0 || l >= 1.0 {
         return 0.0;
     }
     let rad = hue_deg.to_radians();
-    let (ca, cb) = (chroma * rad.cos(), chroma * rad.sin());
-    if in_gamut3(linear_rgb_from_oklab(l, ca, cb)) {
-        return chroma;
+    if in_gamut3(linear_rgb_from_oklab(l, CHROMA_CEILING * rad.cos(), CHROMA_CEILING * rad.sin())) {
+        return CHROMA_CEILING;
     }
-    let (mut lo, mut hi) = (0.0f32, chroma);
+    let (mut lo, mut hi) = (0.0f32, CHROMA_CEILING);
     for _ in 0..GAMUT_BISECTIONS {
         let mid = (lo + hi) * 0.5;
         if in_gamut3(linear_rgb_from_oklab(l, mid * rad.cos(), mid * rad.sin())) {
@@ -185,6 +216,23 @@ pub fn max_chroma(l: f32, hue_deg: f32, chroma: f32) -> f32 {
         }
     }
     lo
+}
+
+/// The in-gamut chroma to actually use: the request, limited by the gamut.
+///
+/// Holding tone and hue, chroma is walked down until the colour fits in sRGB.
+/// This is the "chroma bisection in [0, 255] sRGB holding L\* and Hue
+/// constant" the plan calls for, in the space where the gamut test is closed
+/// form.
+///
+/// Asking for more never yields more: [`Self::gamut_chroma`] fixes the limit
+/// and this is a plain `min`.
+#[inline]
+pub fn max_chroma(l: f32, hue_deg: f32, chroma: f32) -> f32 {
+    if chroma <= 0.0 || !hue_deg.is_finite() || !l.is_finite() {
+        return 0.0;
+    }
+    chroma.min(gamut_chroma(l, hue_deg))
 }
 
 /// Tuple-friendly form of [`in_gamut`].
@@ -198,18 +246,102 @@ fn in_gamut3(rgb: (f32, f32, f32)) -> bool {
 ///
 /// `chroma` is in Oklab units; pass [`HIGH_TONE_CHROMA_CAP`] / 100.0 for the
 /// ramp's nominal chroma, which is what `Shades.java` expresses in HCT units.
-#[inline]
+///
+/// # Why this bisects twice
+///
+/// The obvious implementation is `oklab_l_from_lstar(lstar)` and hope. That
+/// is wrong for every chromatic colour, and the role->tone test caught it: a
+/// Google red at the specified L\* 80 came back at 79.42.
+///
+/// The reason is that **Oklab's `L` equals CIE L\* only for neutrals**. The
+/// closed form `OklabL = (L* + 16) / 116` is derived from `Y = OklabL^3`, and
+/// for a grey the Oklab lightness *is* the cube root of the relative
+/// luminance -- but add chroma and the two drift apart. The gap is small,
+/// which is exactly why it is dangerous: it passes an eyeball check and fails
+/// a numeric one.
+///
+/// So the tone contract is enforced on the *output*: an outer bisection walks
+/// the Oklab lightness until the measured CIE L\* of the **quantised**
+/// 8-bit colour equals the target. That also absorbs 8-bit rounding, which
+/// the first implementation ignored entirely.
 pub fn tone_to_color(lstar: f32, hue_deg: f32, chroma: f32) -> u32 {
-    let l = oklab_l_from_lstar(lstar);
+    if !lstar.is_finite() {
+        return 0xFF00_0000;
+    }
+    let target = lstar.clamp(0.0, 100.0);
     let mut c = chroma;
-    if lstar >= HIGH_TONE_CHROMA_CUTOFF_LSTAR {
+    if target >= HIGH_TONE_CHROMA_CUTOFF_LSTAR {
         c = c.min(HIGH_TONE_CHROMA_CAP / 100.0);
     }
-    let c = max_chroma(l, hue_deg, c);
+    // A grey has no Oklab-vs-L* divergence, so skip the search.
+    if c <= 0.0 || !hue_deg.is_finite() {
+        return quantise_oklab(oklab_l_from_lstar(target), hue_deg, 0.0);
+    }
+
+    // Seed from the closed form, which is within about 1 unit of the answer.
+    let seed = oklab_l_from_lstar(target);
+    let mut best = quantise_oklab(seed, hue_deg, c);
+    let mut lo = (seed - 0.06).clamp(0.0, 1.0);
+    let mut hi = (seed + 0.06).clamp(0.0, 1.0);
+    let mut lo_meas = lstar_of_argb(quantise_oklab(lo, hue_deg, c));
+    let mut hi_meas = lstar_of_argb(quantise_oklab(hi, hue_deg, c));
+
+    for _ in 0..TONE_BISECTIONS {
+        let mid = (lo + hi) * 0.5;
+        let argb = quantise_oklab(mid, hue_deg, c);
+        let meas = lstar_of_argb(argb);
+        if (meas - target).abs() < 0.05 {
+            return argb;
+        }
+        if (meas - target).abs() < (lstar_of_argb(best) - target).abs() {
+            best = argb;
+        }
+        if meas < target {
+            lo = mid;
+            lo_meas = meas;
+        } else {
+            hi = mid;
+            hi_meas = meas;
+        }
+        if (hi - lo).abs() < 1.0e-5 {
+            break;
+        }
+    }
+    let _ = (lo_meas, hi_meas);
+    best
+}
+
+/// Steps for the outer tone search. 16 halvings of a 0.12-wide bracket resolve
+/// to 1.8e-6 of Oklab lightness, far below one 8-bit step.
+const TONE_BISECTIONS: u32 = 16;
+
+/// Oklab -> 8-bit sRGB, with the chroma limited to the gamut at that lightness.
+#[inline]
+fn quantise_oklab(l: f32, hue_deg: f32, chroma: f32) -> u32 {
+    let c = if chroma > 0.0 {
+        max_chroma(l, hue_deg, chroma)
+    } else {
+        0.0
+    };
     let rad = hue_deg.to_radians();
     let (r, g, b) = linear_rgb_from_oklab(l, c * rad.cos(), c * rad.sin());
-    let quant = |v: f32| -> u32 { (linear_to_srgb(v) * 255.0).round().clamp(0.0, 255.0) as u32 };
-    0xFF00_0000 | (quant(r) << 16) | (quant(g) << 8) | quant(b)
+    let q = |v: f32| -> u32 { (linear_to_srgb(v) * 255.0).round().clamp(0.0, 255.0) as u32 };
+    0xFF00_0000 | (q(r) << 16) | (q(g) << 8) | q(b)
+}
+
+/// CIE L\* of an opaque 8-bit sRGB colour.
+///
+/// This is the measurement the tone contract is stated in, so the palette
+/// must be able to take it.
+pub fn lstar_of_argb(argb: u32) -> f32 {
+    let y = srgb_to_linear(((argb >> 16) & 0xFF) as f32 / 255.0) * 0.2126
+        + srgb_to_linear(((argb >> 8) & 0xFF) as f32 / 255.0) * 0.7152
+        + srgb_to_linear((argb & 0xFF) as f32 / 255.0) * 0.0722;
+    if y > 216.0 / 24_389.0 {
+        116.0 * y.cbrt() - 16.0
+    } else {
+        24389.0 / 27.0 * y
+    }
 }
 
 /// A neutral of a given CIE L\*, with no hue at all.
@@ -408,16 +540,7 @@ impl MaterialYouPalette {
 mod tests {
     use super::*;
 
-    fn lstar_of(argb: u32) -> f32 {
-        let y = srgb_to_linear(((argb >> 16) & 0xFF) as f32 / 255.0) * 0.2126
-            + srgb_to_linear(((argb >> 8) & 0xFF) as f32 / 255.0) * 0.7152
-            + srgb_to_linear((argb & 0xFF) as f32 / 255.0) * 0.0722;
-        if y > 216.0 / 24_389.0 {
-            116.0 * y.cbrt() - 16.0
-        } else {
-            24389.0 / 27.0 * y
-        }
-    }
+    use super::lstar_of_argb as lstar_of;
 
     #[test]
     fn oklab_l_from_lstar_round_trips_exactly() {
@@ -556,17 +679,55 @@ mod tests {
     }
 
     #[test]
+    fn tone_contract_holds_to_the_8bit_quantisation_floor() {
+        // The tone is enforced by an outer bisection on the *measured* L* of
+        // the quantised 8-bit colour, so the only error left is the output
+        // format itself. That floor is real and was measured, not guessed:
+        // the largest step between adjacent 8-bit greys is 0.509 L* (in the
+        // shadows, around grey 25), and the closest any grey gets to each
+        // ramp target is
+        //
+        //   99.0 -> 0.036   95.0 -> 0.145   90.0 -> 0.116   80.0 -> 0.119
+        //   70.0 -> 0.018   60.0 -> 0.172   49.6 -> 0.037   40.0 -> 0.096
+        //   30.0 -> 0.160   20.0 -> 0.135   10.0 -> 0.233    0.0 -> 0.000
+        //
+        // so 0.25 is the tightest honest bound. An earlier version of this
+        // test asserted 0.1, which is below what 8 bits can represent; the
+        // outer search was correct and the assertion was not.
+        //
+        // For contrast: before the outer search, a Google red at the
+        // specified L* 80 came out at 79.42 -- 0.58, well outside this floor
+        // and therefore a real defect rather than quantisation.
+        const FLOOR: f32 = 0.25;
+        for seed in [
+            0xFF4285F4u32, 0xFFEA4335, 0xFFFBBC05, 0xFF34A853, 0xFF9E9E9E, 0xFF000000, 0xFFFFFFFF,
+            0xFF00FF00, 0xFFFF00FF,
+        ] {
+            for hue in [0.0f32, 60.0, 137.0, 200.0, 271.0, 330.0] {
+                for &target in &TONE_RAMP {
+                    let argb = tone_to_color(target, hue, 0.05);
+                    let got = lstar_of_argb(argb);
+                    assert!(
+                        (got - target).abs() < FLOOR,
+                        "seed {seed:08x} hue {hue} target L* {target} -> {got}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn surface_container_is_lstar_12_dark_and_98_light() {
         // The two values the plan singles out.
         let p = MaterialYouPalette::from_seed(0xFF4285F4);
         assert!(
-            (lstar_of(p.surface_container) - 12.0).abs() < 0.5,
+            (lstar_of(p.surface_container) - 12.0).abs() < 0.25,
             "dark surface_container L* {}",
             lstar_of(p.surface_container)
         );
         let l = MaterialYouPalette::from_seed_light(0xFF4285F4);
         assert!(
-            (lstar_of(l.surface_container) - 98.0).abs() < 0.5,
+            (lstar_of(l.surface_container) - 98.0).abs() < 0.25,
             "light surface_container L* {}",
             lstar_of(l.surface_container)
         );
@@ -644,12 +805,10 @@ mod tests {
                     c * rad.cos(),
                     c * rad.sin(),
                 );
-                assert!(
-                    r >= -1.0e-3 && r <= 1.0 + 1.0e-3
-                        && g >= -1.0e-3 && g <= 1.0 + 1.0e-3
-                        && b >= -1.0e-3 && b <= 1.0 + 1.0e-3,
-                    "hue {hue} L* {lstar} left the gamut: {r} {g} {b}"
-                );
+                let ok = (-1.0e-3..=1.0 + 1.0e-3).contains(&r)
+                    && (-1.0e-3..=1.0 + 1.0e-3).contains(&g)
+                    && (-1.0e-3..=1.0 + 1.0e-3).contains(&b);
+                assert!(ok, "hue {hue} L* {lstar} left the gamut: {r} {g} {b}");
             }
         }
     }

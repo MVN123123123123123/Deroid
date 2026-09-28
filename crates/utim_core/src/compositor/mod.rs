@@ -13,6 +13,7 @@ pub mod input;
 pub mod lockscreen;
 pub mod power_sync;
 pub mod protocols;
+pub mod recents;
 pub mod scene;
 pub mod server;
 pub mod spring;
@@ -34,6 +35,10 @@ pub use power_sync::{oom_roles, UtimPowerSync};
 pub use protocols::{
     drm_formats, toplevel_state, ProtocolGlobal, ProtocolRegistry, WaylandInterface, WlHeader,
     WlMessage, WlMessageBuilder, WlrLayer,
+};
+pub use recents::{
+    dismiss_recents_scale, DismissOutcome, FolderOpen, KillAction, KillQueue, KillState,
+    PopupItem, PopupItems, Recents, TaskCard, MAX_DEEP_SHORTCUTS, MAX_TASKS, NO_THUMB,
 };
 pub use scene::{plane_z_order, MobileScene, ShellMode};
 pub use server::{CompositorMetrics, WaylandServer};

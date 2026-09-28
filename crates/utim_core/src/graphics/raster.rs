@@ -65,7 +65,7 @@ pub fn isqrt(v: u32) -> u32 {
         return 0;
     }
     let mut x = v;
-    let mut y = (x + 1) / 2;
+    let mut y = x.div_ceil(2);
     while y < x {
         x = y;
         y = (x + v / x) / 2;
@@ -446,8 +446,12 @@ pub fn squircle_mask_row(row: &mut [u8], edge: usize, row_y: isize) -> Option<(u
     let cy = r as isize;
     let dy = (row_y - cy).unsigned_abs() as u32;
     let half = squircle_span(r as u32, dy) as usize;
+    // `as_chunks_mut` rather than `chunks_exact_mut(4)`: a fixed 4-byte RGBA
+    // stride is a property of the format, not an accident of the loop, and
+    // expressing it that way keeps the two loops below identical in shape.
+    let (pixels, _) = row.as_chunks_mut::<4>();
     if half == 0 {
-        for px in row.chunks_exact_mut(4) {
+        for px in pixels.iter_mut() {
             px[3] = 0;
         }
         return None;
@@ -456,7 +460,7 @@ pub fn squircle_mask_row(row: &mut [u8], edge: usize, row_y: isize) -> Option<(u
     let lo = center.saturating_sub(half);
     let hi = (center + half).min(edge);
     // Zero everything outside [lo, hi).
-    for (i, px) in row.chunks_exact_mut(4).enumerate() {
+    for (i, px) in pixels.iter_mut().enumerate() {
         if i < lo || i >= hi {
             px[3] = 0;
         }
@@ -522,8 +526,8 @@ fn blur_row_8(row: &mut [u8], tmp: &mut [u8]) {
     if n < 3 || tmp.len() < n {
         return;
     }
-    tmp[0] = ((row[0] as u16 + row[1] as u16 + 1) / 2) as u8;
-    tmp[n - 1] = ((row[n - 2] as u16 + row[n - 1] as u16 + 1) / 2) as u8;
+    tmp[0] = (row[0] as u16 + row[1] as u16).div_ceil(2) as u8;
+    tmp[n - 1] = (row[n - 2] as u16 + row[n - 1] as u16).div_ceil(2) as u8;
     for i in 1..n - 1 {
         let sum = row[i - 1] as u16 + row[i] as u16 + row[i + 1] as u16;
         tmp[i] = ((sum + 1) / 3) as u8;

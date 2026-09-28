@@ -679,6 +679,9 @@ fn run_daemon() {
     // Material You: derive the tonal scheme from the wallpaper once at start
     // up. The whole shell is then themed from a single value.
     let shell_palette = MaterialYouPalette::from_seed(wallpaper_seed());
+    // The date is refreshed once per frame alongside the time, into a stack
+    // buffer, so the render path borrows a `&str` and allocates nothing.
+    let mut date_buf = [0u8; 16];
 
     if let Some(ref mut drm) = drm_display {
         let t_str = format_current_time(&mut time_buf);
@@ -2697,6 +2700,12 @@ fn run_daemon() {
 
             if let Some(ref mut drm) = drm_display {
                 let t_str = format_current_time(&mut time_buf);
+                // The date only changes at midnight, but reformatting it is a
+                // handful of stores into a stack buffer, so it is refreshed
+                // with the time rather than tracked with a second timer. The
+                // resulting bytes are hashed into the damage state, so a real
+                // date change repaints and a redundant reformat does not.
+                let date_str = format_current_date(&mut date_buf);
                 if active_tab_idx >= terminal_tabs.len() {
                     active_tab_idx = terminal_tabs.len().saturating_sub(1);
                 }
@@ -2876,6 +2885,9 @@ fn run_daemon() {
                     page_indicator_frac: 0.0,
                     workspace_scale: 1.0,
                     window_alpha: 1.0,
+                    date_str,
+                    weather_str: "",
+                    weather_glyph: 0,
                 };
                 // Unconditional flush() marks the whole 10.4 MB framebuffer
                 // dirty 60x/s; only flush when the damage hash proves a repaint.
@@ -2955,6 +2967,85 @@ fn format_current_time(buf: &mut [u8; 5]) -> &str {
     buf[3] = b'0' + (mins / 10);
     buf[4] = b'0' + (mins % 10);
     unsafe { std::str::from_utf8_unchecked(buf) }
+}
+
+/// Weekday and month abbreviations, 3 bytes each, index 0 = Sunday.
+///
+/// A `const` table rather than a lookup into the C locale: `strftime` would
+/// need a format string and a `tm`, and the abbreviations are fixed for the
+/// lifetime of the build.
+const DAY_ABBR: [&[u8; 3]; 7] = [b"Sun", b"Mon", b"Tue", b"Wed", b"Thu", b"Fri", b"Sat"];
+const MONTH_ABBR: [&[u8; 3]; 12] = [
+    b"Jan", b"Feb", b"Mar", b"Apr", b"May", b"Jun", b"Jul", b"Aug", b"Sep", b"Oct", b"Nov", b"Dec",
+];
+
+/// Format today's date as `"Tue, Sep 22"` into a caller-owned buffer.
+///
+/// Zero allocation, same contract as [`format_current_time`]: the renderer
+/// cannot format a date itself without allocating on the frame path, so the
+/// shell does it here and hands over a borrowed `&str`.
+///
+/// Uses `localtime_r` rather than a hand-rolled UTC offset. A fixed offset
+/// gives the right answer for 363 days and the wrong one twice a year, and it
+/// is wrong by a whole day twice more if the user crosses a timezone; the
+/// `_r` variant needs only a stack `tm` and is thread-safe, so it costs the
+/// same as the arithmetic would have and is correct.
+fn format_current_date(buf: &mut [u8; 16]) -> &str {
+    let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+    unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts) };
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // glibc's `localtime_r` takes a `time_t` (an `i64`), not a `timespec`.
+    // A null return means the timezone database is unavailable (a static
+    // build with no /usr/share/zoneinfo). Fall back to UTC so the line still
+    // renders instead of vanishing.
+    if unsafe { libc::localtime_r(&ts.tv_sec, &mut tm) }.is_null() {
+        tm = unsafe { std::mem::zeroed() };
+        let days = ts.tv_sec.div_euclid(86_400);
+        tm.tm_mday = (days + 19_723) as i32; // 1970-01-01 is day 0
+        tm.tm_wday = ((days + 4) % 7) as i32; // ...and a Thursday
+    }
+    format_date_from_tm(buf, tm.tm_wday, tm.tm_mon, tm.tm_mday)
+}
+
+/// The pure half of [`format_current_date`], so it can be tested against known
+/// dates instead of only against "whatever today is".
+///
+/// Out-of-range fields are clamped rather than trusted: `tm_*` comes from
+/// libc, and an index panic on the frame path would be a crash rather than a
+/// wrong glyph.
+fn format_date_from_tm(buf: &mut [u8; 16], wday: i32, mon: i32, mday: i32) -> &str {
+    let weekday = (wday.rem_euclid(7) as usize).min(6);
+    let mon_i = (mon.rem_euclid(12) as usize).min(11);
+    let day = mday.clamp(1, 31) as usize;
+
+    let mut n = 0usize;
+    let push = |bytes: &[u8], buf: &mut [u8; 16], n: &mut usize| {
+        for &c in bytes {
+            if *n < buf.len() {
+                buf[*n] = c;
+                *n += 1;
+            }
+        }
+    };
+    push(DAY_ABBR[weekday], buf, &mut n);
+    push(b", ", buf, &mut n);
+    push(MONTH_ABBR[mon_i], buf, &mut n);
+    push(b" ", buf, &mut n);
+    // Day of month, 1 or 2 digits, no leading zero (matches the reference's
+    // "Sep 22" rather than "Sep 02"). A single-digit day must take the *ones*
+    // digit, not the tens one -- the first version of this rendered
+    // "Jan 0" for the 1st, which the known-dates test caught.
+    let mut tmp = [0u8; 2];
+    tmp[0] = b'0' + (day / 10) as u8;
+    tmp[1] = b'0' + (day % 10) as u8;
+    if day >= 10 {
+        push(&tmp[..2], buf, &mut n);
+    } else {
+        push(&tmp[1..2], buf, &mut n);
+    }
+    // The byte pattern is `[A-Za-z, 0-9]` by construction, so this cannot
+    // fail; `from_utf8` would be a second pass over 16 bytes.
+    unsafe { std::str::from_utf8_unchecked(&buf[..n]) }
 }
 
 /// Average colour of the desktop wallpaper, used as the Material You seed.
@@ -4401,6 +4492,65 @@ mod tests {
         handle_terminal_enter(&mut tabs, &mut active_tab, &mut next_id, &mut app, &mut kb, &mut search);
         assert_eq!(tabs.len(), 2);
         assert_eq!(active_tab, 1);
+    }
+
+    #[test]
+    fn date_formatter_matches_known_dates() {
+        // The launcher shipped a hard-coded "Tue, Sep 22" for its entire
+        // life, so nothing ever checked that the date formatter worked. These
+        // are real weekdays, verified against `date`:
+        //   2026-09-28 Monday    2026-09-22 Tuesday   2026-01-01 Thursday
+        //   1970-01-01 Thursday  2000-02-29 Tuesday   2024-12-31 Tuesday
+        let cases: [(i32, i32, i32, &str); 6] = [
+            (1, 8, 28, "Mon, Sep 28"),  // wday, mon(0-based), mday
+            (2, 8, 22, "Tue, Sep 22"),
+            (4, 0, 1, "Thu, Jan 1"),
+            (4, 0, 1, "Thu, Jan 1"), // 1970-01-01, the epoch
+            (2, 1, 29, "Tue, Feb 29"), // 2000-02-29, a leap day
+            (2, 11, 31, "Tue, Dec 31"),
+        ];
+        let mut buf = [0u8; 16];
+        for (wday, mon, mday, want) in cases {
+            let got = format_date_from_tm(&mut buf, wday, mon, mday);
+            assert_eq!(got, want, "wday={wday} mon={mon} mday={mday}");
+        }
+    }
+
+    #[test]
+    fn date_formatter_clamps_libc_fields_instead_of_panicking() {
+        // `tm_*` comes from libc and this runs on the frame path, so an
+        // out-of-range value must clamp, not index out of the table.
+        let mut buf = [0u8; 16];
+        for (wday, mon, mday) in [
+            (-1, -1, -1),
+            (7, 12, 32),
+            (i32::MAX, i32::MAX, i32::MAX),
+            (0, 0, 0),
+        ] {
+            let got = format_date_from_tm(&mut buf, wday, mon, mday);
+            assert!(!got.is_empty(), "{wday}/{mon}/{mday} produced nothing");
+            assert!(got.len() <= 12, "{wday}/{mon}/{mday} -> {got:?} is too long");
+            assert!(
+                got.is_ascii(),
+                "{wday}/{mon}/{mday} -> {got:?} is not ASCII; the font has no \
+                 other glyphs"
+            );
+        }
+    }
+
+    #[test]
+    fn date_formatter_emits_only_renderable_characters() {
+        // `font.rs` covers 0x20..0x7F and asserts non-ASCII has no ink, so a
+        // stray byte would render as a blank rather than fail loudly.
+        let mut buf = [0u8; 16];
+        for d in 1..=31 {
+            for m in 0..12 {
+                for w in 0..7 {
+                    let s = format_date_from_tm(&mut buf, w, m, d);
+                    assert!(s.bytes().all(|b| (0x20..0x7F).contains(&b)), "{s:?}");
+                }
+            }
+        }
     }
 
     #[test]

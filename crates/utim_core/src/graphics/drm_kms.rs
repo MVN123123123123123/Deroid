@@ -652,6 +652,33 @@ pub struct DrmInteractiveState<'a> {
     pub workspace_scale: f32,
     /// Workspace content alpha during an in-app home gesture, 1.0 at rest.
     pub window_alpha: f32,
+
+    // ---------------------------------------------------------------------
+    // Smartspace text. The renderer cannot format a date: doing so here
+    // would allocate on the frame path, which `paint_frame_does_not_allocate`
+    // forbids. The shell formats into a stack buffer and hands over a
+    // borrowed `&str` instead -- `format_current_time` in main.rs is already
+    // that shape.
+    // ---------------------------------------------------------------------
+
+    /// Localised date line, e.g. "Tue, Sep 22". Empty means "no data", and
+    /// the renderer draws nothing rather than a placeholder.
+    ///
+    /// This replaced a hard-coded `"Tue, Sep 22  |  28 C Sunny"` that shipped
+    /// for the lifetime of the launcher, so the home screen showed a date from
+    /// whenever the string was written regardless of the real clock.
+    pub date_str: &'a str,
+    /// Temperature and condition, e.g. "28C Sunny". Empty when no weather
+    /// source is available, which selects the date-only layout.
+    ///
+    /// Note the absent degree sign: `font.rs` only covers `0x20..0x7F` and
+    /// asserts that non-ASCII bytes have no ink, so a real `°` would render as
+    /// a blank. The unit is written inline instead.
+    pub weather_str: &'a str,
+    /// Index into the weather glyph table, 0 = none. Distinct from a
+    /// non-empty `weather_str` so "28C but the icon failed to load" is
+    /// expressible.
+    pub weather_glyph: u8,
 }
 
 impl<'a> Default for DrmInteractiveState<'a> {
@@ -709,6 +736,9 @@ impl<'a> Default for DrmInteractiveState<'a> {
             page_indicator_frac: 0.0,
             workspace_scale: 1.0,
             window_alpha: 1.0,
+            date_str: "",
+            weather_str: "",
+            weather_glyph: 0,
         }
     }
 }
@@ -1066,6 +1096,12 @@ pub fn paint_frame(buf: &mut [u32], stride: usize, w: usize, h: usize, state: &D
         return;
     }
 
+    // Scratch for the composed date/weather lines. Stack, fixed size, reused
+    // by both the home smartspace and the shade header; the `&str` these back
+    // has to outlive its own scope, so they cannot be function-local.
+    let mut smartspace_buf = [0u8; 96];
+    let mut shade_buf = [0u8; 96];
+
     if state.power_saver_mode == crate::compositor::power_sync::PowerSaverMode::SuperExtreme {
         paint_super_extreme_frame(buf, stride, w, h, state);
         return;
@@ -1107,7 +1143,14 @@ pub fn paint_frame(buf: &mut [u32], stride: usize, w: usize, h: usize, state: &D
             cx,
             (clock_cy as f32 + cap * 0.5 + hf * 0.016) as usize,
             wf * 0.9,
-            "Tuesday, Sep 22",
+            // Real date from the shell, not a literal. Falls back to the time
+            // when no date has been supplied, so the lock screen is never
+            // missing a line entirely.
+            if state.date_str.is_empty() {
+                state.time_str
+            } else {
+                state.date_str
+            },
             state.palette.on_surface_variant,
             2,
             FontWeight::Medium,
@@ -1157,9 +1200,12 @@ pub fn paint_frame(buf: &mut [u32], stride: usize, w: usize, h: usize, state: &D
             state.time_str, state.palette.primary, sl.clock_size as usize,
         );
         let date_x = pad + clock_w + em1;
+        // Shade header: the real date, then the build name. The build string
+        // is a genuine constant; the date is not.
+        let shade_line = join_smartspace(&mut shade_buf, state.date_str, "Universal");
         draw_text_clipped(
             buf, stride, w, h, date_x, sl.date_y, wf - date_x - pad,
-            "Tue, Sep 22  |  Universal Treble GSI", state.palette.on_surface_variant, 1,
+            shade_line, state.palette.on_surface_variant, 1,
             FontWeight::Medium,
         );
 
@@ -2042,18 +2088,27 @@ pub fn paint_frame(buf: &mut [u32], stride: usize, w: usize, h: usize, state: &D
             l.clock_h as usize,
         );
         let date_y = l.clock_y + l.clock_h + hf * 0.008;
-        draw_text_centered_weighted(
-            buf,
-            stride,
-            w,
-            h,
-            w / 2,
-            date_y as usize,
-            "Tue, Sep 22  |  28 C Sunny",
-            state.palette.on_surface_variant,
-            if hf >= 1200.0 { 2 } else { 1 },
-            FontWeight::Medium,
+        // Real clock, real date. The separator and the weather block appear
+        // only when there is weather, which is the plan's date-only fallback.
+        let line = join_smartspace(
+            &mut smartspace_buf,
+            state.date_str,
+            state.weather_str,
         );
+        if !line.is_empty() {
+            draw_text_centered_weighted(
+                buf,
+                stride,
+                w,
+                h,
+                w / 2,
+                date_y as usize,
+                line,
+                state.palette.on_surface_variant,
+                if hf >= 1200.0 { 2 } else { 1 },
+                FontWeight::Medium,
+            );
+        }
 
         // 5b. Search pill: outlined when idle, filled and accented when active.
         let s = l.search;
@@ -2913,6 +2968,18 @@ fn interactive_state_hash(state: &DrmInteractiveState) -> u64 {
     mix!((state.page_indicator_frac * 1000.0) as i32);
     mix!((state.workspace_scale * 1000.0) as u32);
     mix!((state.window_alpha * 1000.0) as u32);
+
+    // The smartspace line is a function of the wall clock, not of any user
+    // interaction, so nothing else in this hash would change when the minute
+    // rolls over. Without these the clock would freeze at whatever it showed
+    // when the shell last happened to repaint.
+    for b in state.date_str.bytes() {
+        mix!(b);
+    }
+    for b in state.weather_str.bytes() {
+        mix!(b);
+    }
+    mix!(state.weather_glyph as u64);
     if let Some(ref sex) = state.super_extreme_state {
         mix!(sex.active_screen as u8);
         mix!(sex.password_input.len());
@@ -4089,6 +4156,33 @@ pub fn draw_circle_glyph(
 }
 
 /// Split a packed RGB triple out of an ARGB colour.
+/// Join the date and weather into one line, in a caller-owned buffer.
+///
+/// Either half may be empty, which selects the plan's date-only layout: no
+/// separator, no trailing gap. Zero allocation and no `format!` -- this runs
+/// every frame, and `paint_frame_does_not_allocate` is the guard.
+#[inline]
+fn join_smartspace<'a>(buf: &'a mut [u8; 96], date: &'a str, weather: &'a str) -> &'a str {
+    match (date.is_empty(), weather.is_empty()) {
+        (true, true) => "",
+        (true, false) => weather,
+        (false, true) => date,
+        (false, false) => {
+            let mut n = 0usize;
+            for src in [date.as_bytes(), b"  |  ", weather.as_bytes()] {
+                for &c in src {
+                    if n < buf.len() {
+                        buf[n] = c;
+                        n += 1;
+                    }
+                }
+            }
+            // Every byte came from a `&str` or a literal, so this is UTF-8.
+            unsafe { std::str::from_utf8_unchecked(&buf[..n]) }
+        }
+    }
+}
+
 #[inline]
 fn rgb_of(c: u32) -> (u8, u8, u8) {
     (((c >> 16) & 0xFF) as u8, ((c >> 8) & 0xFF) as u8, (c & 0xFF) as u8)
@@ -5175,20 +5269,20 @@ pub fn recents_scale_config() -> SpringConfig {
     SpringConfig::recents_scale()
 }
 
-/// Boundary overscroll resistance lives in [`super::layout::damped_scroll`].
-///
-/// It used to also live here, as `apply_overscroll_resistance(drag, screen_w)`.
-/// That duplication was removed rather than kept in sync: two copies of the
-/// same curve with a bit-equality test between them is strictly worse than one
-/// copy, and it had already proven the point -- the copy in this file was
-/// written as a `1 / (1 + x / 100)` rational while its own doc comment
-/// claimed it was "Authentic Android/Lawnchair 17".
-///
-/// The only thing the shell lost is the `max` convenience, and that was
-/// hiding an invented constant. AOSP passes the *container extent* on a drag
-/// and `page_width * 0.5` on a fling (`PagedView.java:1552`); this function
-/// hard-coded `screen_width * 0.35` for both. Call sites now pass `max`
-/// explicitly, so the two cases can finally differ.
+// Boundary overscroll resistance lives in `super::layout::damped_scroll`.
+//
+// It used to also live here, as `apply_overscroll_resistance(drag, screen_w)`.
+// That duplication was removed rather than kept in sync: two copies of the
+// same curve with a bit-equality test between them is strictly worse than one
+// copy, and it had already proven the point -- the copy in this file was
+// written as a `1 / (1 + x / 100)` rational while its own doc comment
+// claimed it was "Authentic Android/Lawnchair 17".
+//
+// The only thing the shell lost is the `max` convenience, and that was
+// hiding an invented constant. AOSP passes the *container extent* on a drag
+// and `page_width * 0.5` on a fling (`PagedView.java:1552`); this function
+// hard-coded `screen_width * 0.35` for both. Call sites now pass `max`
+// explicitly, so the two cases can finally differ.
 
 // Material You tonal palette.
 //
@@ -5693,17 +5787,43 @@ mod tests {
 
     #[test]
     fn test_material_you_palette_derivation() {
+        use super::super::palette::lstar_of_argb;
+
         let palette_blue = MaterialYouPalette::from_seed(0xFF3B82F6);
-        assert_eq!(palette_blue.on_surface, 0xFFF8FAFC);
+        // This used to assert `on_surface == 0xFFF8FAFC`, a literal copied out
+        // of the HSL ramp this replaced. That pinned the *old implementation*
+        // rather than the contract: the value was not derived from anything
+        // checkable, so it could not fail for a real reason and could not
+        // detect a real regression either.
+        //
+        // The contract is the §1.9 tone table, so assert the tone.
+        assert!(
+            (lstar_of_argb(palette_blue.on_surface) - 90.0).abs() < 0.25,
+            "on_surface must sit at L* 90, got {}",
+            lstar_of_argb(palette_blue.on_surface)
+        );
         assert_ne!(palette_blue.surface, 0x00000000);
         assert_ne!(palette_blue.primary, 0x00000000);
+        assert_eq!(palette_blue.surface >> 24, 0xFF, "surface must be opaque");
 
         let palette_green = MaterialYouPalette::from_seed(0xFF10B981);
-        assert_ne!(palette_blue.primary, palette_green.primary, "Different seeds must produce distinct palettes");
+        assert_ne!(
+            palette_blue.primary, palette_green.primary,
+            "Different seeds must produce distinct palettes"
+        );
+        // ...and the same tone, which is what makes them one system rather
+        // than two palettes that happen to coexist.
+        assert!(
+            (lstar_of_argb(palette_green.primary) - 80.0).abs() < 0.25,
+            "green primary L* {}",
+            lstar_of_argb(palette_green.primary)
+        );
 
-        // Verify default dark
+        // The hand-tuned default is unchanged: it is the boot-time fallback
+        // before a wallpaper exists and is deliberately not seed-derived.
         let def = MaterialYouPalette::default_dark();
         assert_eq!(def.primary, 0xFF38BDF8);
+        assert_eq!(def.on_surface, 0xFFF8FAFC);
     }
 
     // -----------------------------------------------------------------
@@ -6123,7 +6243,8 @@ mod tests {
         let base_hash = interactive_state_hash(&base);
 
         // (name, mutator, a delta that is meaningful in the field's own unit)
-        let probes: &[(&str, fn(&mut DrmInteractiveState), f32)] = &[
+        type Probe = (&'static str, fn(&mut DrmInteractiveState), f32);
+        let probes: &[Probe] = &[
             ("smartspace_phase", |s| s.smartspace_phase += 0.01, 0.01),
             ("folder_morph", |s| s.folder_morph += 0.01, 0.01),
             ("folder_scrim", |s| s.folder_scrim += 0.01, 0.01),
