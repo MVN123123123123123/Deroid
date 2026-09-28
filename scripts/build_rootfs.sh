@@ -72,6 +72,7 @@ EOF
     chmod 700 "${R}/run/user/1000"
     # Least-privilege sudoers (B-22): utlc/utimctl/reboot only, never ALL.
     mkdir -p "${R}/etc/sudoers.d"
+    rm -f "${R}/etc/sudoers.d/99-universal-treble"
     printf 'user ALL=(ALL:ALL) NOPASSWD: /usr/bin/utlc, /usr/bin/utimctl, /usr/sbin/reboot\n' \
         > "${R}/etc/sudoers.d/99-universal-treble"
     chmod 0440 "${R}/etc/sudoers.d/99-universal-treble"

@@ -28,7 +28,7 @@ truncate -s "${IMAGE_SIZE_BYTES}" "${REL_RAW_IMG}"
 
 echo "[*] Formatting ext4 filesystem with 4096-byte blocks..."
 mke2fs -F -q -t ext4 -O ^metadata_csum_seed,^orphan_file -b 4096 -m 0 \
-    -E errors=remount-ro,root_owner=0:0 "${REL_RAW_IMG}"
+    -e remount-ro -E root_owner=0:0 "${REL_RAW_IMG}"
 
 command -v e2fsdroid >/dev/null 2>&1 || { echo "FATAL: e2fsdroid required to populate ${REL_RAW_IMG}" >&2; exit 1; }
 echo "[*] Populating ext4 filesystem using e2fsdroid from ${REL_ROOTFS}..."
