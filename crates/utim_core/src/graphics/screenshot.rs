@@ -7,7 +7,7 @@
 //!
 //! Enabled with UTLC_SCREENSHOT=<dir> cargo test -p utim_core screenshot.
 
-use super::drm_kms::{AppGridItem, DrmInteractiveState, MaterialYouPalette};
+use super::drm_kms::{AppGridItem, DrmInteractiveState, MaterialYouPalette, RecentsCard};
 use super::png::RgbaImage;
 
 /// Everything a snapshot needs, kept flat so callers cannot drift from the
@@ -35,6 +35,85 @@ pub struct Snapshot<'a> {
     pub drawer: Vec<AppGridItem<'a>>,
     pub dock: Vec<AppGridItem<'a>>,
     pub active_app: Option<&'a str>,
+    pub catalogue: Vec<AppGridItem<'a>>,
+    pub recents_cards: Vec<RecentsCard>,
+    pub folder_apps: Vec<AppGridItem<'a>>,
+    pub folder_title: &'a str,
+    pub popup_items: Vec<crate::compositor::PopupItem>,
+    pub popup_anchor: (f32, f32),
+    pub smartspace_phase: f32,
+    pub folder_morph: f32,
+    pub folder_scrim: f32,
+    pub folder_title_alpha: f32,
+    pub popup_progress: f32,
+    pub overview_progress: f32,
+    pub overview_scroll: f32,
+    pub overview_dismiss: f32,
+    pub fastscroller_thumb: f32,
+    pub fastscroller_popup_alpha: f32,
+    pub fastscroller_letter: u8,
+    pub page_indicator_frac: f32,
+    pub workspace_scale: f32,
+    pub window_alpha: f32,
+}
+
+impl Default for Snapshot<'_> {
+    /// Every field at rest, and *only* that.
+    ///
+    /// The point is that "at rest" is expressible in one place. A snapshot
+    /// built from `Default` plus content renders the launcher home screen and
+    /// nothing else, which is the baseline the render guards measure against
+    /// -- so a regression has to be an actual change to a state, not an
+    /// artefact of how a fixture was assembled.
+    ///
+    /// `press_scale` is 1.0, not 0.0: it *multiplies* icon size, and 0.0 would
+    /// draw no icons at all.
+    fn default() -> Self {
+        Self {
+            w: 0,
+            h: 0,
+            time: "10:34",
+            locked: false,
+            shade: false,
+            drawer_progress: 0.0,
+            drawer_open: false,
+            launch_progress: 0.0,
+            launch_origin: None,
+            launch_color: 0xFF2563EB,
+            press_scale: 1.0,
+            pressed_icon: None,
+            home_page: 0,
+            home_scroll: 0.0,
+            selected: None,
+            search_query: "",
+            search_active: false,
+            keyboard: false,
+            grid: Vec::new(),
+            drawer: Vec::new(),
+            dock: Vec::new(),
+            active_app: None,
+            catalogue: Vec::new(),
+            recents_cards: Vec::new(),
+            folder_apps: Vec::new(),
+            folder_title: "",
+            popup_items: Vec::new(),
+            popup_anchor: (0.0, 0.0),
+            smartspace_phase: 0.0,
+            folder_morph: 0.0,
+            folder_scrim: 0.0,
+            folder_title_alpha: 0.0,
+            popup_progress: 0.0,
+            overview_progress: 0.0,
+            overview_scroll: 0.0,
+            overview_dismiss: 0.0,
+            fastscroller_thumb: 0.0,
+            fastscroller_popup_alpha: 0.0,
+            fastscroller_letter: 0,
+            page_indicator_frac: 0.0,
+            workspace_scale: 1.0,
+            window_alpha: 1.0,
+        }
+    }
 }
 
 impl<'a> Clone for Snapshot<'a> {
@@ -62,6 +141,26 @@ impl<'a> Clone for Snapshot<'a> {
             drawer: self.drawer.clone(),
             dock: self.dock.clone(),
             active_app: self.active_app,
+            catalogue: self.catalogue.clone(),
+            recents_cards: self.recents_cards.clone(),
+            folder_apps: self.folder_apps.clone(),
+            folder_title: self.folder_title,
+            popup_items: self.popup_items.clone(),
+            popup_anchor: self.popup_anchor,
+            smartspace_phase: self.smartspace_phase,
+            folder_morph: self.folder_morph,
+            folder_scrim: self.folder_scrim,
+            folder_title_alpha: self.folder_title_alpha,
+            popup_progress: self.popup_progress,
+            overview_progress: self.overview_progress,
+            overview_scroll: self.overview_scroll,
+            overview_dismiss: self.overview_dismiss,
+            fastscroller_thumb: self.fastscroller_thumb,
+            fastscroller_popup_alpha: self.fastscroller_popup_alpha,
+            fastscroller_letter: self.fastscroller_letter,
+            page_indicator_frac: self.page_indicator_frac,
+            workspace_scale: self.workspace_scale,
+            window_alpha: self.window_alpha,
         }
     }
 }
@@ -90,6 +189,26 @@ impl<'a> Snapshot<'a> {
             dock_apps: &self.dock,
             active_app: self.active_app,
             palette: MaterialYouPalette::default_dark(),
+            catalogue_apps: &self.catalogue,
+            recents_cards: &self.recents_cards,
+            folder_apps: &self.folder_apps,
+            folder_title: self.folder_title,
+            popup_items: &self.popup_items,
+            popup_anchor: self.popup_anchor,
+            smartspace_phase: self.smartspace_phase,
+            folder_morph: self.folder_morph,
+            folder_scrim: self.folder_scrim,
+            folder_title_alpha: self.folder_title_alpha,
+            popup_progress: self.popup_progress,
+            overview_progress: self.overview_progress,
+            overview_scroll: self.overview_scroll,
+            overview_dismiss: self.overview_dismiss,
+            fastscroller_thumb: self.fastscroller_thumb,
+            fastscroller_popup_alpha: self.fastscroller_popup_alpha,
+            fastscroller_letter: self.fastscroller_letter,
+            page_indicator_frac: self.page_indicator_frac,
+            workspace_scale: self.workspace_scale,
+            window_alpha: self.window_alpha,
             ..Default::default()
         }
     }
@@ -159,6 +278,61 @@ pub fn stub_icon_sized(colour: [u8; 3], edge: u32) -> RgbaImage {
     }
 }
 
+/// A counting global allocator, shared by every allocation guard in this
+/// binary.
+///
+/// A crate has exactly one `#[global_allocator]`, so this cannot be defined
+/// per test: a second definition is a compile error, and a second *counter*
+/// next to the installed shim would stay at zero and make its test pass
+/// vacuously. Hoisting it here means a new guard adds a test and nothing else.
+mod alloc_probe {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    // Per-thread, so tests running in parallel cannot pollute each other's
+    // count, and const-initialised so touching it from inside the allocator
+    // cannot itself allocate.
+    std::thread_local! {
+        static COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub struct Counting;
+
+    // SAFETY: forwards to the system allocator unchanged and only bumps a
+    // thread-local counter.
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+            bump();
+            System.alloc(l)
+        }
+        unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+            System.dealloc(p, l)
+        }
+        unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 {
+            bump();
+            System.realloc(p, l, n)
+        }
+        unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
+            bump();
+            System.alloc_zeroed(l)
+        }
+    }
+
+    #[global_allocator]
+    static ALLOC: Counting = Counting;
+
+    /// Called from the allocator, including during thread teardown, so it must
+    /// never panic.
+    fn bump() {
+        let _ = COUNT.try_with(|c| c.set(c.get() + 1));
+    }
+
+    /// Allocations on this thread so far.
+    pub fn allocations() -> usize {
+        COUNT.try_with(|c| c.get()).unwrap_or(0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,6 +349,113 @@ mod tests {
                 icon: Some(icon),
             })
             .collect()
+    }
+
+    /// The launcher-rewrite fixtures, as a set of states that each enter one
+    /// new surface.
+    ///
+    /// Shared by the two render guards so they cannot disagree about what
+    /// "the overview" means -- an allocation guard and a budget guard covering
+    /// different states would each pass while leaving a hole, which is exactly
+    /// how the previous generation of these guards ended up measuring only
+    /// `home` while `drawer` cost 20.7 ms.
+    ///
+    /// Each state is at a *mid-animation* value rather than at rest: at rest
+    /// every one of these fields is 0.0 and the draw functions early-out, so a
+    /// guard driven at rest measures the early-out and nothing else.
+    fn rewrite_states<'a>(
+        icon: &'a RgbaImage,
+        catalogue: &[AppGridItem<'a>],
+    ) -> Vec<(&'static str, Snapshot<'a>)> {
+        let base = Snapshot {
+            grid: catalogue.to_vec(),
+            catalogue: catalogue.to_vec(),
+            // Two pages, so the page indicator is a real strip rather than the
+            // single-page no-op.
+            home_page: 0,
+            ..Default::default()
+        };
+
+        // Recents strip, one card mid-dismiss and one selected.
+        let cards = vec![
+            RecentsCard { app_id: 0, dismiss: 0.0, selected: true },
+            RecentsCard { app_id: 1, dismiss: -180.0, selected: false },
+            RecentsCard { app_id: 2, dismiss: 0.0, selected: false },
+        ];
+
+        let mut folder = base.clone();
+        folder.folder_morph = 1.0;
+        folder.folder_scrim = 0.32;
+        folder.folder_title_alpha = 1.0;
+        folder.folder_title = "Tools";
+        folder.folder_apps = vec![
+            AppGridItem { id: "a", name: "Files", color: 0xFF10B981, glyph: "F", icon: Some(icon) },
+            AppGridItem { id: "b", name: "Notes", color: 0xFFF59E0B, glyph: "N", icon: Some(icon) },
+            AppGridItem { id: "c", name: "Clock", color: 0xFF38BDF8, glyph: "C", icon: Some(icon) },
+            AppGridItem { id: "d", name: "Music", color: 0xFFEF4444, glyph: "M", icon: Some(icon) },
+            AppGridItem { id: "e", name: "Maps", color: 0xFF22C55E, glyph: "P", icon: Some(icon) },
+        ];
+
+        let mut overview = base.clone();
+        overview.overview_progress = 1.0;
+        overview.overview_scroll = 40.0;
+        overview.recents_cards = cards;
+
+        let mut overview_dismiss = overview.clone();
+        overview_dismiss.overview_dismiss = -420.0;
+        overview_dismiss.recents_cards = vec![
+            RecentsCard { app_id: 0, dismiss: -420.0, selected: true },
+            RecentsCard { app_id: 1, dismiss: 0.0, selected: false },
+        ];
+
+        let mut popup = base.clone();
+        popup.popup_progress = 1.0;
+        popup.popup_anchor = (540.0, 1200.0);
+        popup.popup_items = vec![
+            crate::compositor::PopupItem::Wallpapers,
+            crate::compositor::PopupItem::Widgets,
+            crate::compositor::PopupItem::AllApps,
+            crate::compositor::PopupItem::HomeSettings,
+        ];
+
+        let mut fastscroller = base.clone();
+        fastscroller.drawer_open = true;
+        fastscroller.drawer_progress = 1.0;
+        fastscroller.fastscroller_thumb = 0.42;
+        fastscroller.fastscroller_popup_alpha = 1.0;
+        // `'M'` as 1..=26, the encoding `FastScrollerState::letter` uses.
+        fastscroller.fastscroller_letter = 13;
+
+        let mut smartspace = base.clone();
+        smartspace.smartspace_phase = 1.0;
+
+        let mut indicator = base.clone();
+        indicator.home_page = 1;
+        // Mid-swipe towards page 2, including the overshoot phase, which is the
+        // one value a clamp would silently flatten.
+        indicator.page_indicator_frac = 0.62;
+        indicator.home_scroll = -0.62 * 1080.0;
+
+        let mut indicator_overshoot = indicator.clone();
+        indicator_overshoot.page_indicator_frac = 1.3;
+        indicator_overshoot.home_scroll = -1.3 * 1080.0;
+
+        let mut morph = base.clone();
+        morph.active_app = Some("Settings");
+        morph.workspace_scale = 0.55;
+        morph.window_alpha = 0.4;
+
+        vec![
+            ("folder_open", folder),
+            ("overview", overview),
+            ("overview_dismiss", overview_dismiss),
+            ("popup_open", popup),
+            ("fastscroller", fastscroller),
+            ("smartspace", smartspace),
+            ("page_indicator", indicator),
+            ("page_indicator_overshoot", indicator_overshoot),
+            ("workspace_morph", morph),
+        ]
     }
 
     /// The guard for the original bug: a tappable region with no pixels in it
@@ -217,8 +498,7 @@ mod tests {
                     drawer_open: false, launch_progress: 0.0, launch_origin: None, pressed_icon: None, press_scale: 1.0,
                     home_page: 0, home_scroll: 0.0, selected: None, search_query: "", search_active: false,
                     keyboard: false, grid: grid.clone(), drawer: Vec::new(), dock: dock.clone(),
-                    active_app: None,
-                },
+                    active_app: None, ..Default::default() },
             ),
             (
                 "selected",
@@ -230,8 +510,8 @@ mod tests {
                         home_page: 0, home_scroll: 0.0, selected: None, search_query: "",
                         search_active: false, keyboard: false, grid: grid.clone(), drawer: Vec::new(),
                         dock: dock.clone(), active_app: None,
-                    }
-                },
+                     ..Default::default()
+                    } },
             ),
         ];
 
@@ -366,46 +646,7 @@ mod tests {
     /// then asserts that composing frames allocates nothing at all.
     #[test]
     fn paint_frame_does_not_allocate() {
-        use std::alloc::{GlobalAlloc, Layout, System};
-        use std::cell::Cell;
-
-        // Per-thread, so the other tests running in parallel cannot pollute
-        // the count, and const-initialised so touching it from inside the
-        // allocator cannot itself allocate.
-        std::thread_local! {
-            static COUNT: Cell<usize> = const { Cell::new(0) };
-        }
-        struct Counting;
-        // SAFETY: the shim forwards to the system allocator unchanged and only
-        // bumps a thread-local counter.
-        unsafe impl GlobalAlloc for Counting {
-            unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-                bump();
-                System.alloc(l)
-            }
-            unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-                System.dealloc(p, l)
-            }
-            unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 {
-                bump();
-                System.realloc(p, l, n)
-            }
-            unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
-                bump();
-                System.alloc_zeroed(l)
-            }
-        }
-        #[global_allocator]
-        static ALLOC: Counting = Counting;
-
-        // Called from the allocator, including during thread teardown, so it
-        // must never panic.
-        fn bump() {
-            let _ = COUNT.try_with(|c| c.set(c.get() + 1));
-        }
-        fn allocations() -> usize {
-            COUNT.try_with(|c| c.get()).unwrap_or(0)
-        }
+        use alloc_probe::allocations;
 
         let icon = stub_icon_sized([80, 160, 240], 121);
         let names = ["Phone", "Messages", "Camera", "Maps", "Music", "Store"];
@@ -424,8 +665,7 @@ mod tests {
             drawer_open: false, launch_progress: 0.0, launch_origin: None, pressed_icon: None, press_scale: 1.0,
             home_page: 0, home_scroll: 0.0, selected: None, search_query: "pho",
             search_active: true, keyboard: false, grid, drawer: Vec::new(), dock: Vec::new(),
-            active_app: None,
-        };
+            active_app: None, ..Default::default() };
         let mut c = Canvas::new(1080, 2400);
         // Warm: the very first frame touches lazily initialised state.
         c.draw(&snap);
@@ -487,6 +727,168 @@ mod tests {
         );
     }
 
+    /// A full-screen translucent composite is the one thing a CPU rasteriser
+    /// cannot afford on a steady-state path, and the two places the launcher
+    /// does it -- the folder scrim and the workspace-morph dim -- are both
+    /// mid-gesture surfaces.
+    ///
+    /// Measured, on this host, release, 1080x2400: one full-panel alpha blend
+    /// over an already-composed frame is **1.37 ms**, on a 2.04 ms base frame.
+    /// That is a sixth of a 120 Hz period for a single `read + blend + write`
+    /// per pixel, which is why the reference keeps its scrims to bounded
+    /// surfaces wherever it can get away with it. (The first version of this
+    /// comment claimed 2.2 ms from a guess; the test prints the real number on
+    /// every run so the guess cannot come back.)
+    ///
+    /// So this test does two things. It measures the cost, so the number above
+    /// is a measurement rather than a claim. And it pins the consequence: a
+    /// state that composites a full-screen alpha layer has to be a
+    /// *transient*, allowed the two 120 Hz periods the budget guard grants
+    /// mid-animation frames. A full-screen blend on a steady state would be a
+    /// frame drop on every frame the user sat and looked at it.
+    ///
+    /// It earned its keep immediately: it caught `workspace_morph` missing from
+    /// the budget guard's transient list while this comment was being written.
+    #[test]
+    fn no_full_screen_translucent_blend() {
+        use std::time::Instant;
+
+        let icon = stub_icon_sized([80, 160, 240], 121);
+        let names = ["Phone", "Messages", "Camera"];
+        let catalogue: Vec<AppGridItem> = names
+            .iter()
+            .map(|n| AppGridItem {
+                id: n,
+                name: n,
+                color: 0xFF2563EB,
+                glyph: "A",
+                icon: Some(&icon),
+            })
+            .collect();
+        let (w, h) = (1080usize, 2400usize);
+        let mut c = Canvas::new(w, h);
+
+        // Baseline: the same frame with no scrim, so the difference is the
+        // blend and nothing else.
+        let plain = Snapshot {
+            grid: catalogue.clone(),
+            catalogue,
+            ..Default::default()
+        };
+        // A folder scrim is a genuine full-panel `draw_rect` at alpha.
+        let scrimmed = Snapshot {
+            folder_scrim: 0.32,
+            ..plain.clone()
+        };
+
+        const FRAMES: u32 = 10;
+        c.draw(&plain);
+        let t0 = Instant::now();
+        for _ in 0..FRAMES {
+            c.draw(&plain);
+        }
+        let base = t0.elapsed() / FRAMES;
+        c.draw(&scrimmed);
+        let t1 = Instant::now();
+        for _ in 0..FRAMES {
+            c.draw(&scrimmed);
+        }
+        let with_scrim = t1.elapsed() / FRAMES;
+        let cost = with_scrim.saturating_sub(base);
+        eprintln!(
+            "full-screen scrim: {:?} over a {:?} base frame",
+            cost, base
+        );
+        if cfg!(debug_assertions) {
+            return;
+        }
+        // Generous against the measured 1.37 ms, but well under a 120 Hz period:
+        // if a single full-panel blend ever costs more than 4 ms it is no longer
+        // something to put on any frame, transient or not.
+        assert!(
+            cost.as_micros() < 4_000,
+            "one full-screen translucent composite costs {cost:?}, which is not \\
+             affordable on any frame"
+        );
+
+        // And the consequence: the states that do carry a full-screen scrim are
+        // exactly the ones the budget guard treats as transient. If a future
+        // change adds a scrim to a steady state, this is the assertion that
+        // catches it -- the budget guard alone would not, because a transient
+        // budget of 16.7 ms still passes at 9 ms.
+        let scrim_states = ["folder_open", "workspace_morph", "rewrite_all_combined"];
+        let transient = [
+            "drawer_mid",
+            "page_swipe",
+            "launch",
+            "all_combined",
+            "folder_open",
+            "overview",
+            "overview_dismiss",
+            "popup_open",
+            "fastscroller",
+            "page_indicator",
+            "page_indicator_overshoot",
+            "workspace_morph",
+            "rewrite_all_combined",
+        ];
+        for name in scrim_states {
+            assert!(
+                transient.contains(&name),
+                "{name} composites a full-screen scrim but is not classified \\
+                 transient in full_frame_stays_inside_the_vsync_budget, so it is \\
+                 being held to the 8 ms steady budget -- and paying 2-4 ms of \\
+                 blend for the privilege"
+            );
+        }
+        assert!(
+            !transient.contains(&"home") && !transient.contains(&"app"),
+            "the plain home and app frames are steady states; classifying them \\
+             transient would quietly double their budget"
+        );
+    }
+
+    /// The launcher-rewrite surfaces must not allocate either.
+    ///
+    /// Split out from `paint_frame_does_not_allocate` because the counting
+    /// allocator has to be installed once per binary, so it now lives in
+    /// `alloc_probe`; what is split is the *state list*, and both tests drive the
+    /// same `rewrite_states`. That sharing is the point: a surface that
+    /// allocates and a surface that is slow are independent failures, and
+    /// neither guard can see the other's.
+    #[test]
+    fn rewrite_surfaces_do_not_allocate() {
+        use alloc_probe::allocations;
+
+        let icon = stub_icon_sized([80, 160, 240], 121);
+        let names = ["Phone", "Messages", "Camera", "Maps", "Music", "Store"];
+        let catalogue: Vec<AppGridItem> = names
+            .iter()
+            .map(|n| AppGridItem {
+                id: n,
+                name: n,
+                color: 0xFF2563EB,
+                glyph: "A",
+                icon: Some(&icon),
+            })
+            .collect();
+        let mut c = Canvas::new(1080, 2400);
+        for (label, s) in rewrite_states(&icon, &catalogue) {
+            c.draw(&s); // warm per-state caches outside the bracket
+            let before = allocations();
+            for _ in 0..3 {
+                c.draw(&s);
+            }
+            let after = allocations();
+            assert_eq!(
+                before,
+                after,
+                "paint_frame allocated {} times in state {label}",
+                after - before
+            );
+        }
+    }
+
     /// The app launch transform: the expanding card starts on the icon it was
     /// launched from and ends covering the panel.
     #[test]
@@ -516,8 +918,7 @@ mod tests {
                 launch_color: 0xFFF03030,
                 pressed_icon: None, press_scale: 1.0, home_page: 0, home_scroll: 0.0, selected: None,
                 search_query: "", search_active: false, keyboard: false, grid: grid.clone(),
-                drawer: Vec::new(), dock: Vec::new(), active_app: None,
-            };
+                drawer: Vec::new(), dock: Vec::new(), active_app: None, ..Default::default() };
             let mut c = Canvas::new(w, h);
             c.draw(&snap);
             let mut min_x = w;
@@ -614,8 +1015,7 @@ mod tests {
             drawer_open: false, launch_progress: 0.0, launch_origin: None, launch_color: 0xFF2563EB, press_scale: scale,
             home_page: 0, home_scroll: 0.0, selected: None, search_query: "", search_active: false,
             keyboard: false, grid: grid.to_vec(), drawer: Vec::new(), dock: dock.to_vec(),
-            active_app: None, pressed_icon: pressed,
-            }
+            active_app: None, pressed_icon: pressed, ..Default::default() }
         }
         let mut idle = Canvas::new(1080, 2400);
         idle.draw(&base(1.0, None, &grid, &dock));
@@ -722,8 +1122,7 @@ mod tests {
             w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 1.0,
             drawer_open: true, launch_progress: 0.0, launch_origin: None, pressed_icon: None, press_scale: 1.0,
             home_page: 0, home_scroll: 0.0, selected: None, search_query: "", search_active: false,
-            keyboard: false, grid: Vec::new(), drawer, dock: Vec::new(), active_app: None,
-        };
+            keyboard: false, grid: Vec::new(), drawer, dock: Vec::new(), active_app: None, ..Default::default() };
         let (w, h) = (1080usize, 2400usize);
         let mut c = Canvas::new(w, h);
         c.draw(&snap);
@@ -827,8 +1226,7 @@ mod tests {
             w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 0.0,
             drawer_open: false, launch_progress: 0.0, launch_origin: None, pressed_icon: None, press_scale: 1.0,
             home_page: 0, home_scroll: 0.0, selected: None, search_query: "", search_active: false,
-            keyboard: false, grid, drawer: Vec::new(), dock, active_app: None,
-        };
+            keyboard: false, grid, drawer: Vec::new(), dock, active_app: None, ..Default::default() };
         let mut c = Canvas::new(1080, 2400);
         // Table-drive EVERY state, not just the cheapest. Timing only `home`
         // is a guard that cannot fail in the states a user actually lives in
@@ -872,8 +1270,8 @@ mod tests {
         all.drawer_progress = 1.0;
         all.shade = true;
         all.keyboard = true;
-        let states: Vec<(&str, Snapshot)> = vec![
-            ("home", snap),
+        let mut states: Vec<(&str, Snapshot)> = vec![
+            ("home", snap.clone()),
             ("home_selected", selected),
             ("home_pressed", pressed),
             ("search", search),
@@ -887,6 +1285,40 @@ mod tests {
             ("launch", launch_snap),
             ("all_combined", all),
         ];
+        // The launcher-rewrite surfaces, each driven to a mid-animation value.
+        // At rest every one of their fields is 0.0 and the draw functions
+        // early-out, so leaving them out of this list would leave the most
+        // recently added code entirely unmeasured while the test still read
+        // "13 states, all inside budget".
+        let catalogue: Vec<AppGridItem> = names
+            .iter()
+            .map(|n| AppGridItem {
+                id: n,
+                name: n,
+                color: 0xFF2563EB,
+                glyph: "A",
+                icon: Some(&icon),
+            })
+            .collect();
+        states.extend(rewrite_states(&icon, &catalogue));
+        // And the worst case of the new surfaces together: an open overview
+        // with the workspace morph running under it is the frame a user sees
+        // for the whole duration of an in-app home gesture that overshoots
+        // into the carousel.
+        let mut worst = states
+            .iter()
+            .find(|(n, _)| *n == "overview")
+            .map(|(_, s)| s.clone())
+            .expect("rewrite_states always yields an overview");
+        worst.overview_dismiss = -300.0;
+        worst.folder_morph = 0.0;
+        worst.popup_progress = 1.0;
+        worst.popup_items = vec![crate::compositor::PopupItem::AppInfo];
+        worst.page_indicator_frac = 1.3;
+        worst.smartspace_phase = 1.0;
+        worst.workspace_scale = 0.6;
+        worst.window_alpha = 0.5;
+        states.push(("rewrite_all_combined", worst));
         const FRAMES: u32 = 10;
         for (name, s) in &states {
             c.draw(s); // warm the caches
@@ -923,7 +1355,22 @@ mod tests {
             // 60/90/120/144 Hz panels, and 16.67 ms is the floor of that
             // range. (In debug this test is `ignore`d; the verify scripts
             // must run it with `--release`.)
-            let transient = matches!(*name, "drawer_mid" | "page_swipe" | "launch" | "all_combined");
+            let transient = matches!(
+                *name,
+                "drawer_mid"
+                    | "page_swipe"
+                    | "launch"
+                    | "all_combined"
+                    | "folder_open"
+                    | "overview"
+                    | "overview_dismiss"
+                    | "popup_open"
+                    | "fastscroller"
+                    | "page_indicator"
+                    | "page_indicator_overshoot"
+                    | "workspace_morph"
+                    | "rewrite_all_combined"
+            );
             let steady_budget_us: u128 = if transient { 16_667 } else { 8_000 };
             assert!(
                 per.as_micros() < steady_budget_us,
@@ -950,18 +1397,18 @@ mod tests {
         let drawer = apps(&icon, &["Settings", "Terminal", "Recorder", "Podcast", "Weather", "Wallet", "Translate", "Contacts", "Files", "Fitness", "Drive", "Photos", "Clock", "Calculator", "Calendar", "Mail"], 0xFFF59E0B);
 
         let cases: Vec<(&str, Snapshot)> = vec![
-            ("home", Snapshot { w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 0.0, drawer_open: false, launch_progress: 0.0, launch_color: 0xFF2563EB, launch_origin: None, pressed_icon: None, press_scale: 1.0, home_page: 0, home_scroll: 0.0, selected: None, search_query: "", search_active: false, keyboard: false, grid: grid.clone(), drawer: drawer.clone(), dock: dock.clone(), active_app: None }),
-            ("home_selected", Snapshot { selected: Some("Phone"), ..Snapshot { w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 0.0, drawer_open: false, launch_progress: 0.0, launch_color: 0xFF2563EB, launch_origin: None, pressed_icon: None, press_scale: 1.0, home_page: 0, home_scroll: 0.0, selected: None, search_query: "", search_active: false, keyboard: false, grid: grid.clone(), drawer: drawer.clone(), dock: dock.clone(), active_app: None } }),
-            ("home_pressed", Snapshot { selected: Some("Music"), press_scale: 0.88, pressed_icon: Some("Music"), ..Snapshot { w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 0.0, drawer_open: false, launch_progress: 0.0, launch_origin: None, launch_color: 0xFF2563EB, press_scale: 1.0, pressed_icon: None, home_page: 0, home_scroll: 0.0, selected: None, search_query: "", search_active: false, keyboard: false, grid: grid.clone(), drawer: drawer.clone(), dock: dock.clone(), active_app: None } }),
-            ("search", Snapshot { search_active: true, search_query: "pho", ..Snapshot { w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 0.0, drawer_open: false, launch_progress: 0.0, launch_color: 0xFF2563EB, launch_origin: None, pressed_icon: None, press_scale: 1.0, home_page: 0, home_scroll: 0.0, selected: None, search_query: "", search_active: false, keyboard: false, grid: grid.clone(), drawer: drawer.clone(), dock: dock.clone(), active_app: None } }),
-            ("drawer", Snapshot { drawer_progress: 1.0, drawer_open: true, ..Snapshot { w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 0.0, drawer_open: false, launch_progress: 0.0, launch_color: 0xFF2563EB, launch_origin: None, pressed_icon: None, press_scale: 1.0, home_page: 0, home_scroll: 0.0, selected: None, search_query: "", search_active: false, keyboard: false, grid: grid.clone(), drawer: drawer.clone(), dock: dock.clone(), active_app: None } }),
-            ("drawer_mid", Snapshot { drawer_progress: 0.45, ..Snapshot { w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 0.0, drawer_open: false, launch_progress: 0.0, launch_color: 0xFF2563EB, launch_origin: None, pressed_icon: None, press_scale: 1.0, home_page: 0, home_scroll: 0.0, selected: None, search_query: "", search_active: false, keyboard: false, grid: grid.clone(), drawer: drawer.clone(), dock: dock.clone(), active_app: None } }),
-            ("page_swipe", Snapshot { home_page: 1, home_scroll: 90.0, ..Snapshot { w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 0.0, drawer_open: false, launch_progress: 0.0, launch_color: 0xFF2563EB, launch_origin: None, pressed_icon: None, press_scale: 1.0, home_page: 0, home_scroll: 0.0, selected: None, search_query: "", search_active: false, keyboard: false, grid: grid.clone(), drawer: drawer.clone(), dock: dock.clone(), active_app: None } }),
-            ("launch", Snapshot { launch_progress: 0.42, launch_color: 0xFF2563EB, launch_origin: Some((540.0, 980.0)), ..Snapshot { launch_color: 0xFF2563EB, w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 0.0, drawer_open: false, launch_progress: 0.0, launch_origin: None, pressed_icon: None, press_scale: 1.0, home_page: 0, home_scroll: 0.0, selected: None, search_query: "", search_active: false, keyboard: false, grid: grid.clone(), drawer: drawer.clone(), dock: dock.clone(), active_app: None } }),
-            ("keyboard", Snapshot { keyboard: true, ..Snapshot { w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 0.0, drawer_open: false, launch_progress: 0.0, launch_color: 0xFF2563EB, launch_origin: None, pressed_icon: None, press_scale: 1.0, home_page: 0, home_scroll: 0.0, selected: None, search_query: "", search_active: false, keyboard: false, grid: grid.clone(), drawer: drawer.clone(), dock: dock.clone(), active_app: None } }),
-            ("lockscreen", Snapshot { locked: true, ..Snapshot { w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 0.0, drawer_open: false, launch_progress: 0.0, launch_color: 0xFF2563EB, launch_origin: None, pressed_icon: None, press_scale: 1.0, home_page: 0, home_scroll: 0.0, selected: None, search_query: "", search_active: false, keyboard: false, grid: grid.clone(), drawer: drawer.clone(), dock: dock.clone(), active_app: None } }),
-            ("shade", Snapshot { shade: true, ..Snapshot { w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 0.0, drawer_open: false, launch_progress: 0.0, launch_color: 0xFF2563EB, launch_origin: None, pressed_icon: None, press_scale: 1.0, home_page: 0, home_scroll: 0.0, selected: None, search_query: "", search_active: false, keyboard: false, grid: grid.clone(), drawer: drawer.clone(), dock: dock.clone(), active_app: None } }),
-            ("app", Snapshot { active_app: Some("Settings"), ..Snapshot { w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 0.0, drawer_open: false, launch_progress: 0.0, launch_color: 0xFF2563EB, launch_origin: None, pressed_icon: None, press_scale: 1.0, home_page: 0, home_scroll: 0.0, selected: None, search_query: "", search_active: false, keyboard: false, grid: grid.clone(), drawer: drawer.clone(), dock: dock.clone(), active_app: None } }),
+            ("home", Snapshot { w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 0.0, drawer_open: false, launch_progress: 0.0, launch_color: 0xFF2563EB, launch_origin: None, pressed_icon: None, press_scale: 1.0, home_page: 0, home_scroll: 0.0, selected: None, search_query: "", search_active: false, keyboard: false, grid: grid.clone(), drawer: drawer.clone(), dock: dock.clone(), active_app: None, ..Default::default() }),
+            ("home_selected", Snapshot { selected: Some("Phone"), ..Snapshot { w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 0.0, drawer_open: false, launch_progress: 0.0, launch_color: 0xFF2563EB, launch_origin: None, pressed_icon: None, press_scale: 1.0, home_page: 0, home_scroll: 0.0, selected: None, search_query: "", search_active: false, keyboard: false, grid: grid.clone(), drawer: drawer.clone(), dock: dock.clone(), active_app: None, ..Default::default() } }),
+            ("home_pressed", Snapshot { selected: Some("Music"), press_scale: 0.88, pressed_icon: Some("Music"), ..Snapshot { w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 0.0, drawer_open: false, launch_progress: 0.0, launch_origin: None, launch_color: 0xFF2563EB, press_scale: 1.0, pressed_icon: None, home_page: 0, home_scroll: 0.0, selected: None, search_query: "", search_active: false, keyboard: false, grid: grid.clone(), drawer: drawer.clone(), dock: dock.clone(), active_app: None, ..Default::default() } }),
+            ("search", Snapshot { search_active: true, search_query: "pho", ..Snapshot { w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 0.0, drawer_open: false, launch_progress: 0.0, launch_color: 0xFF2563EB, launch_origin: None, pressed_icon: None, press_scale: 1.0, home_page: 0, home_scroll: 0.0, selected: None, search_query: "", search_active: false, keyboard: false, grid: grid.clone(), drawer: drawer.clone(), dock: dock.clone(), active_app: None, ..Default::default() } }),
+            ("drawer", Snapshot { drawer_progress: 1.0, drawer_open: true, ..Snapshot { w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 0.0, drawer_open: false, launch_progress: 0.0, launch_color: 0xFF2563EB, launch_origin: None, pressed_icon: None, press_scale: 1.0, home_page: 0, home_scroll: 0.0, selected: None, search_query: "", search_active: false, keyboard: false, grid: grid.clone(), drawer: drawer.clone(), dock: dock.clone(), active_app: None, ..Default::default() } }),
+            ("drawer_mid", Snapshot { drawer_progress: 0.45, ..Snapshot { w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 0.0, drawer_open: false, launch_progress: 0.0, launch_color: 0xFF2563EB, launch_origin: None, pressed_icon: None, press_scale: 1.0, home_page: 0, home_scroll: 0.0, selected: None, search_query: "", search_active: false, keyboard: false, grid: grid.clone(), drawer: drawer.clone(), dock: dock.clone(), active_app: None, ..Default::default() } }),
+            ("page_swipe", Snapshot { home_page: 1, home_scroll: 90.0, ..Snapshot { w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 0.0, drawer_open: false, launch_progress: 0.0, launch_color: 0xFF2563EB, launch_origin: None, pressed_icon: None, press_scale: 1.0, home_page: 0, home_scroll: 0.0, selected: None, search_query: "", search_active: false, keyboard: false, grid: grid.clone(), drawer: drawer.clone(), dock: dock.clone(), active_app: None, ..Default::default() } }),
+            ("launch", Snapshot { launch_progress: 0.42, launch_color: 0xFF2563EB, launch_origin: Some((540.0, 980.0)), ..Snapshot { launch_color: 0xFF2563EB, w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 0.0, drawer_open: false, launch_progress: 0.0, launch_origin: None, pressed_icon: None, press_scale: 1.0, home_page: 0, home_scroll: 0.0, selected: None, search_query: "", search_active: false, keyboard: false, grid: grid.clone(), drawer: drawer.clone(), dock: dock.clone(), active_app: None, ..Default::default() } }),
+            ("keyboard", Snapshot { keyboard: true, ..Snapshot { w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 0.0, drawer_open: false, launch_progress: 0.0, launch_color: 0xFF2563EB, launch_origin: None, pressed_icon: None, press_scale: 1.0, home_page: 0, home_scroll: 0.0, selected: None, search_query: "", search_active: false, keyboard: false, grid: grid.clone(), drawer: drawer.clone(), dock: dock.clone(), active_app: None, ..Default::default() } }),
+            ("lockscreen", Snapshot { locked: true, ..Snapshot { w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 0.0, drawer_open: false, launch_progress: 0.0, launch_color: 0xFF2563EB, launch_origin: None, pressed_icon: None, press_scale: 1.0, home_page: 0, home_scroll: 0.0, selected: None, search_query: "", search_active: false, keyboard: false, grid: grid.clone(), drawer: drawer.clone(), dock: dock.clone(), active_app: None, ..Default::default() } }),
+            ("shade", Snapshot { shade: true, ..Snapshot { w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 0.0, drawer_open: false, launch_progress: 0.0, launch_color: 0xFF2563EB, launch_origin: None, pressed_icon: None, press_scale: 1.0, home_page: 0, home_scroll: 0.0, selected: None, search_query: "", search_active: false, keyboard: false, grid: grid.clone(), drawer: drawer.clone(), dock: dock.clone(), active_app: None, ..Default::default() } }),
+            ("app", Snapshot { active_app: Some("Settings"), ..Snapshot { w: 0, h: 0, time: "10:34", locked: false, shade: false, drawer_progress: 0.0, drawer_open: false, launch_progress: 0.0, launch_color: 0xFF2563EB, launch_origin: None, pressed_icon: None, press_scale: 1.0, home_page: 0, home_scroll: 0.0, selected: None, search_query: "", search_active: false, keyboard: false, grid: grid.clone(), drawer: drawer.clone(), dock: dock.clone(), active_app: None, ..Default::default() } }),
         ];
 
         // Also render a full page of a long label to check clipping/ellipsis.

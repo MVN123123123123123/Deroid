@@ -679,6 +679,69 @@ pub struct DrmInteractiveState<'a> {
     /// non-empty `weather_str` so "28C but the icon failed to load" is
     /// expressible.
     pub weather_glyph: u8,
+
+    // ---------------------------------------------------------------------
+    // Content the new surfaces draw. All of it is borrowed and all of it is
+    // built by the shell, because `paint_frame` must not allocate.
+    // ---------------------------------------------------------------------
+
+    /// The **full** app catalogue, always populated, in a stable order.
+    ///
+    /// [`Self::recents_cards`] hold a `u32` catalogue index, so the renderer
+    /// needs a list that does not change order underneath it.
+    /// [`Self::drawer_apps`] cannot serve: it is the *filtered* drawer list and
+    /// is empty whenever the drawer is closed, which is exactly when the
+    /// overview is reachable.
+    pub catalogue_apps: &'a [AppGridItem<'a>],
+
+    /// Recents cards, most recent first, bounded by `recents::MAX_TASKS`.
+    /// Empty means "no recent tasks", which the overview renders as an empty
+    /// state rather than a blank panel.
+    pub recents_cards: &'a [RecentsCard],
+
+    /// Fast-scroller section showing in the popup: `0` = none, else `'A'` as
+    /// `1..=26`. Distinct from `fastscroller_popup_alpha` because the letter
+    /// outlives the fade -- a released drag keeps the last letter on screen
+    /// while the popup fades.
+    pub fastscroller_letter: u8,
+
+    /// Long-press popup anchor, panel coordinates. The popup positions itself
+    /// around this and flips side near an edge.
+    pub popup_anchor: (f32, f32),
+    /// Long-press popup rows, in order.
+    ///
+    /// The compositor's own [`crate::compositor::PopupItem`] enum, not a
+    /// parallel "row kind" number: the shell already had to pick a variant to
+    /// build the menu, and re-encoding it for the renderer is a place the two
+    /// could disagree. Fixed capacity, never a `Vec` -- this is on the frame
+    /// path.
+    pub popup_items: &'a [crate::compositor::PopupItem],
+
+    /// Contents of the open folder, and its title. Empty selects the
+    /// "no folder" path, so a stale `folder_morph` with an emptied list draws
+    /// an empty folder rather than reading past the end of anything.
+    pub folder_apps: &'a [AppGridItem<'a>],
+    pub folder_title: &'a str,
+}
+
+/// One row of the recents strip, as the renderer sees it.
+///
+/// The shell owns the animation state ([`crate::compositor::recents::Recents`]
+/// holds a spring per card); this is a flattened view of it, so `paint_frame`
+/// needs no knowledge of the model and the two cannot drift.
+///
+/// No lifetime: a card carries no borrowed data of its own, it names an app by
+/// index into [`DrmInteractiveState::catalogue_apps`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RecentsCard {
+    /// Index into [`DrmInteractiveState::catalogue_apps`]. Out of range draws
+    /// a placeholder tile rather than indexing off the end: a catalogue rescan
+    /// can shrink between the shell building this and the frame drawing it.
+    pub app_id: u32,
+    /// Dismiss offset in px. 0 = at rest, negative = dragged up.
+    pub dismiss: f32,
+    /// Whether this is the card the scrub gesture has selected.
+    pub selected: bool,
 }
 
 impl<'a> Default for DrmInteractiveState<'a> {
@@ -739,6 +802,13 @@ impl<'a> Default for DrmInteractiveState<'a> {
             date_str: "",
             weather_str: "",
             weather_glyph: 0,
+            catalogue_apps: &[],
+            recents_cards: &[],
+            fastscroller_letter: 0,
+            popup_anchor: (0.0, 0.0),
+            popup_items: &[],
+            folder_apps: &[],
+            folder_title: "",
         }
     }
 }
@@ -1202,7 +1272,10 @@ pub fn paint_frame(buf: &mut [u32], stride: usize, w: usize, h: usize, state: &D
         let date_x = pad + clock_w + em1;
         // Shade header: the real date, then the build name. The build string
         // is a genuine constant; the date is not.
-        let shade_line = join_smartspace(&mut shade_buf, state.date_str, "Universal");
+        // The shade header always shows both halves: it is a fixed layout, not
+        // the cross-fading smartspace, so it passes phase 1 explicitly rather
+        // than inheriting the home card's animation.
+        let shade_line = join_smartspace(&mut shade_buf, state.date_str, "Universal", 1.0);
         draw_text_clipped(
             buf, stride, w, h, date_x, sl.date_y, wf - date_x - pad,
             shade_line, state.palette.on_surface_variant, 1,
@@ -2094,6 +2167,7 @@ pub fn paint_frame(buf: &mut [u32], stride: usize, w: usize, h: usize, state: &D
             &mut smartspace_buf,
             state.date_str,
             state.weather_str,
+            state.smartspace_phase,
         );
         if !line.is_empty() {
             draw_text_centered_weighted(
@@ -2769,6 +2843,535 @@ pub fn paint_frame(buf: &mut [u32], stride: usize, w: usize, h: usize, state: &D
             draw_text_centered(buf, stride, w, h, cx, (8.0 + em1 * 0.4) as usize, &bar, 0xFF38BDF8, 1);
         }
     }
+
+    // 15. Launcher-rewrite surfaces.
+    //
+    // All of these are layered over whatever is underneath (workspace, drawer
+    // sheet, an open app) and every one is gated on a progress field that is
+    // 0.0 at rest, so an idle shell reaches none of them and pays nothing.
+    // Order is the reference's: the scrim-darkened workspace first, then
+    // folder, then overview, then the two floating affordances that sit above
+    // both, then the popup.
+    if !state.is_locked && state.power_saver_mode != crate::compositor::power_sync::PowerSaverMode::SuperExtreme {
+        draw_page_indicator(buf, stride, w, h, state);
+        draw_workspace_morph(buf, stride, w, h, state);
+        if state.folder_morph > 0.0 || state.folder_scrim > 0.0 {
+            draw_folder(buf, stride, w, h, state);
+        }
+        if state.overview_progress > 0.0 {
+            draw_overview(buf, stride, w, h, state);
+        }
+        if state.fastscroller_thumb > 0.0 || state.fastscroller_popup_alpha > 0.0 {
+            draw_fast_scroller_rail(buf, stride, w, h, state);
+        }
+        if state.popup_progress > 0.0 {
+            draw_popup(buf, stride, w, h, state);
+        }
+    }
+}
+
+/// The drawer's fast scroller: track, thumb, and the letter popup.
+///
+/// `draw_fast_scroller` reads four fields off the state, so it is rebuilt here
+/// from the three hashed scalars plus the layout. It is a fixed-size struct
+/// with no heap, so this costs nothing -- and keeping the hashed interface as
+/// scalars means the damage hash does not have to walk a struct whose interior
+/// is mostly drag bookkeeping the renderer never looks at.
+fn draw_fast_scroller_rail(
+    buf: &mut [u32],
+    stride: usize,
+    w: usize,
+    h: usize,
+    state: &DrmInteractiveState,
+) {
+    let l = Layout::plain(w as f32, h as f32);
+    let fs_layout = l.fast_scroller();
+    let mut st = super::drawer_mod::FastScrollerState::new();
+    // `fastscroller_thumb` is the thumb's position along the track, 0..1;
+    // `thumb_y` is the same quantity in track-local pixels, which is what the
+    // model stores. The thumb is a fixed 52 dp, so the travel is the track
+    // minus the thumb and a taller track only buys range.
+    let travel = (fs_layout.track.h - fs_layout.thumb_h).max(0.0);
+    st.thumb_y = state.fastscroller_thumb.clamp(0.0, 1.0) * travel;
+    st.track_h = fs_layout.track.h;
+    st.letter = state.fastscroller_letter;
+    st.popup_alpha = state.fastscroller_popup_alpha.clamp(0.0, 1.0);
+    st.popup_y = 0.0;
+    super::drawer_mod::draw_fast_scroller(
+        buf, stride, w, h, &fs_layout, &st,
+        state.palette.primary,
+        super::drawer_mod::TRACK_ALPHA,
+        state.palette.on_primary,
+    );
+}
+
+/// Page indicator dots, from the page swipe's own progress.
+///
+/// `page_indicator_frac` is 0 at rest, an integer while settling, and above
+/// 1.0 during the overshoot phase, which is why the dot maths treats it as a
+/// signed value rather than a page index. The geometry is
+/// `layout::page_indicator_dots`' -- a transliteration of
+/// `PageIndicatorDots.java:553-635` -- and only the fill is here.
+fn draw_page_indicator(
+    buf: &mut [u32],
+    stride: usize,
+    w: usize,
+    h: usize,
+    state: &DrmInteractiveState,
+) {
+    let frac = state.page_indicator_frac;
+    let pages = state.total_home_pages;
+    // One page has nothing to indicate. A settled multi-page strip still
+    // draws: the dots are chrome, not a transition effect, and gating on
+    // `frac` would make the indicator appear only while moving.
+    if pages < 2 {
+        return;
+    }
+    let l = Layout::plain(w as f32, h as f32);
+    let pi = l.page_indicator();
+    // `page_indicator_dots` wants the page being *left* and the page being
+    // moved *towards*, plus a progress that may exceed 1 during the snap. The
+    // sign of `frac` carries the direction, which is why the field is signed
+    // rather than two separate numbers.
+    let p = frac.abs();
+    let dir: i64 = if frac < 0.0 { -1 } else { 1 };
+    let last = state.home_page.min(pages - 1);
+    let final_page = (last as i64 + dir).clamp(0, pages as i64 - 1) as usize;
+    let dots = super::layout::page_indicator_dots(&pi, pages, last, final_page, p);
+    // The dots are a fixed 6 dp edge, vertically centred in the 24 dp band, and
+    // only their *width* and *alpha* animate -- the reference scales the active
+    // dot and fades the rest rather than resizing the row.
+    let dot_h = pi.dot_d;
+    let dot_y = pi.band.center_y() - dot_h * 0.5;
+    for d in dots.iter() {
+        if d.alpha <= 0.004 || d.w <= 0.0 {
+            continue;
+        }
+        // The active dot is the accent; the rest are on-surface at low alpha,
+        // which is the reference's two-tone treatment rather than a single
+        // colour that has to be dimmed by hand.
+        let color = if d.alpha > 0.55 {
+            ((d.alpha * 255.0) as u32) << 24 | (state.palette.primary & 0x00FF_FFFF)
+        } else {
+            ((d.alpha * 255.0) as u32) << 24
+                | (state.palette.on_surface_variant & 0x00FF_FFFF)
+        };
+        draw_rounded_rect_f(
+            buf, stride, w, h, d.x, dot_y, d.w, dot_h, dot_h * 0.5, color,
+        );
+    }
+}
+
+/// The in-app home gesture: the app panel shrinks and fades toward the
+/// workspace card while the workspace is revealed underneath.
+///
+/// `workspace_scale` is 1.0 at rest and `window_alpha` is 1.0 at rest, which
+/// is what keeps an idle frame out of this function entirely. The transform is
+/// a geometric scale of the app panel about its centre -- there is no resample,
+/// so no scratch buffer and no per-frame allocation. That is also why the
+/// panel's *content* scale follows: `AppLayout` is constructed for the scaled
+/// panel, so the whole app view shrinks with it rather than being clipped.
+fn draw_workspace_morph(
+    buf: &mut [u32],
+    stride: usize,
+    w: usize,
+    h: usize,
+    state: &DrmInteractiveState,
+) {
+    let scale = state.workspace_scale;
+    let alpha = state.window_alpha;
+    // At rest this is a no-op, and `paint_frame_does_not_allocate` is what
+    // keeps it one.
+    if (scale - 1.0).abs() < 0.0005 && (alpha - 1.0).abs() < 0.0005 {
+        return;
+    }
+    let s = scale.clamp(0.0, 1.0);
+    let a = alpha.clamp(0.0, 1.0);
+    // A scrim over the workspace, so the panel reads as lifting off it rather
+    // than fading into the wallpaper. Depth is proportional to how far the
+    // panel has travelled, so it is invisible at the start of the gesture.
+    let dim = (1.0 - a) * 0.5;
+    if dim > 0.004 {
+        // Black at `dim`, with no colour component: a dim is a darkening,
+        // not a tint, so the RGB stays zero rather than inheriting the palette.
+        let layer = ((dim * 255.0) as u32) << 24;
+        draw_rect(buf, stride, w, h, 0, 0, w, h, layer);
+    }
+    // The workspace card the panel is shrinking into. Drawn as a rounded rect
+    // at the panel's own centre, growing in inverse proportion to the panel's
+    // scale so the two always meet at the same edge.
+    if s < 0.999 {
+        let l = Layout::plain(w as f32, h as f32);
+        let card_w = (l.w * 0.86) * (1.0 - s);
+        let card_h = (h as f32 * 0.42) * (1.0 - s);
+        if card_w > 1.0 && card_h > 1.0 {
+            let layer = (((1.0 - s) * 0.85 * 255.0) as u32) << 24
+                | (state.palette.surface_container_high & 0x00FF_FFFF);
+            draw_rounded_rect_f(
+                buf, stride, w, h,
+                (l.w * 0.5 - card_w * 0.5).max(0.0),
+                (h as f32 * 0.5 - card_h * 0.5).max(0.0),
+                card_w.min(l.w), card_h.min(h as f32),
+                (l.w * 0.06 * (1.0 - s) + 4.0).min(card_w * 0.5),
+                layer,
+            );
+        }
+    }
+}
+
+/// Recents / overview: a scrim, the card strip, and the action band.
+///
+/// Card geometry comes from `RecentsLayout`, the same struct the shell's
+/// [`crate::compositor::recents::Recents`] hit-tests against, so a card is
+/// drawn exactly where a drag on it starts.
+#[allow(clippy::too_many_lines)]
+fn draw_overview(
+    buf: &mut [u32],
+    stride: usize,
+    w: usize,
+    h: usize,
+    state: &DrmInteractiveState,
+) {
+    let p = state.overview_progress.clamp(0.0, 1.0);
+    let l = Layout::plain(w as f32, h as f32);
+    let rl = l.recents();
+    let wf = w as f32;
+    let hf = h as f32;
+
+    // Scrim first, so the workspace underneath is dimmed for the whole morph.
+    // `#99000000`-ish, matching `RecentsView`'s scrim rather than the
+    // launcher's own 0xEE panel scrim, which is opaque.
+    let scrim = ((p * 0.55 * 255.0) as u32) << 24;
+    draw_rect(buf, stride, w, h, 0, 0, w, h, scrim);
+
+    if state.recents_cards.is_empty() {
+        // Empty state, not a blank panel: "No recent items".
+        let em = super::font::em_px_at(2, w);
+        draw_text_centered(
+            buf, stride, w, h, w / 2, (hf * 0.47) as usize,
+            "No recent items", state.palette.on_surface_variant, 2,
+        );
+        let _ = em;
+        return;
+    }
+
+    let pitch = rl.card_w + rl.spacing;
+    // The strip is centred on the panel and scrolled by `overview_scroll` in
+    // card widths, so a card's x is `centre + (i - scroll) * pitch`.
+    let first_x = wf * 0.5 - state.overview_scroll * pitch - pitch * 0.5;
+
+    for (i, card) in state.recents_cards.iter().enumerate() {
+        let x = first_x + i as f32 * pitch;
+        if x > wf || x + rl.card_w < 0.0 {
+            continue; // Off-panel: skipped without touching the buffer.
+        }
+        // Dismiss: the card tracks the drag up, scaling on the 5-arm ladder
+        // that `dismiss_recents_scale` implements, so the renderer and the
+        // shell agree on the shape of the fall-off.
+        let dismiss = card.dismiss;
+        let y = (hf * 0.5 - rl.card_h * 0.5) + dismiss;
+        let scale = crate::compositor::dismiss_recents_scale((dismiss / rl.dismiss_undershoot.max(1.0)).abs());
+        let cw = rl.card_w * scale;
+        let ch = rl.card_h * scale;
+        let cx = x + rl.card_w * 0.5 - cw * 0.5;
+        let cy = y + rl.card_h * 0.5 - ch * 0.5;
+        // Cards below the dismiss threshold are on their way out, so they fade
+        // with it rather than popping.
+        let fade = if dismiss.abs() > rl.detach_dp {
+            (1.0 - (dismiss.abs() - rl.detach_dp) / rl.card_h).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        if fade <= 0.01 {
+            continue;
+        }
+        let a = (fade * if card.selected { 255.0 } else { 235.0 }) as u32;
+        // Selected card gets the primary-coloured border the reference draws
+        // on the focused task, and only that card.
+        let card_bg = if card.selected {
+            state.palette.surface_container_high
+        } else {
+            state.palette.surface_container
+        };
+        draw_rounded_rect_f(
+            buf, stride, w, h, cx, cy, cw, ch, rl.corner_r * scale,
+            (a << 24) | (card_bg & 0x00FF_FFFF),
+        );
+        if card.selected {
+            let ring = (wf * 0.0035).max(1.0);
+            let edge = ((p * 0.9 * 255.0) as u32) << 24 | (state.palette.primary & 0x00FF_FFFF);
+            draw_rect_f(buf, stride, w, h, cx, cy, cw, ring, edge);
+            draw_rect_f(buf, stride, w, h, cx, cy + ch - ring, cw, ring, edge);
+            draw_rect_f(buf, stride, w, h, cx, cy, ring, ch, edge);
+            draw_rect_f(buf, stride, w, h, cx + cw - ring, cy, ring, ch, edge);
+        }
+        // App identity: the catalogue entry, or a neutral tile if a rescan
+        // shrank the catalogue out from under the index.
+        let entry = state.catalogue_apps.get(card.app_id as usize);
+        if let Some(app) = entry {
+            // Icon square on the app's own colour, then the decoded icon over
+            // it, exactly as the home grid and the dock draw one: a coloured
+            // rounded rect with the bitmap composited on top, or the monogram
+            // glyph when the decode failed.
+            let side = (cw * 0.30).round().max(8.0);
+            let ix = (cx + cw * 0.5 - side * 0.5).round() as i32;
+            let iy = (cy + ch * 0.30 - side * 0.5).round() as i32;
+            let isz = side as usize;
+            let irad = (side * ICON_RADIUS).round() as usize;
+            draw_rounded_rect_i32(
+                buf, stride, w, h, ix, iy, isz, isz, irad,
+                (a << 24) | (app.color & 0x00FF_FFFF),
+            );
+            match app.icon {
+                Some(icon_img) => {
+                    draw_icon_bitmap_i32(buf, stride, w, h, ix, iy, isz, isz, irad, icon_img);
+                }
+                None => {
+                    let em = super::font::em_px_at(2, w);
+                    draw_text_centered_i32(
+                        buf, stride, w, h,
+                        ix + isz as i32 / 2, (iy + isz as i32 / 2) - (em * 0.30) as i32,
+                        app.glyph, (a << 24) | 0x00FF_FFFF, 2,
+                    );
+                }
+            }
+            draw_text_centered_clipped(
+                buf, stride, w, h, (cx + cw * 0.5) as usize,
+                (cy + ch * 0.66) as usize, cw * 0.86,
+                app.name, state.palette.on_surface, 1, FontWeight::Medium,
+            );
+        } else {
+            draw_rounded_rect_f(
+                buf, stride, w, h, cx + cw * 0.5 - cw * 0.15, cy + ch * 0.30 - cw * 0.15,
+                cw * 0.30, cw * 0.30, cw * 0.08,
+                (a << 24) | (state.palette.surface_container_high & 0x00FF_FFFF),
+            );
+        }
+    }
+
+    // Action band: the 48 dp strip with the two action pills, fading in with
+    // the overview rather than being present from the first frame.
+    let band_a = ((p * 255.0) as u32) << 24;
+    if band_a > 8 {
+        let ay = rl.actions.y;
+        let pill_w = (rl.actions.w - rl.actions_gap) * 0.5;
+        for (k, label) in ["Clear all", "Close"].iter().enumerate() {
+            let px = if k == 0 { rl.actions.x } else { rl.actions.x + pill_w + rl.actions_gap };
+            draw_rounded_rect_f(
+                buf, stride, w, h, px, ay, pill_w, rl.actions.h, rl.actions_radius,
+                (band_a >> 8 << 8) | (state.palette.surface_container_high & 0x00FF_FFFF),
+            );
+            draw_text_centered(
+                buf, stride, w, h, (px + pill_w * 0.5) as usize,
+                (ay + rl.actions.h * 0.5 - super::font::em_px_at(1, w) * 0.31) as usize,
+                label, state.palette.on_surface_variant, 1,
+            );
+        }
+    }
+}
+
+/// Open folder: scrim, the folder surface, its grid, and its title.
+///
+/// The title is a separate field from the morph because the reference fades it
+/// in *after* a 32 ms delay (`FolderLayout::title_delay_ms`), so it must not
+/// be a function of `folder_morph` or it would appear in the same frame.
+fn draw_folder(
+    buf: &mut [u32],
+    stride: usize,
+    w: usize,
+    h: usize,
+    state: &DrmInteractiveState,
+) {
+    let l = Layout::plain(w as f32, h as f32);
+    let fl = l.folder();
+    let wf = w as f32;
+    let hf = h as f32;
+    let m = state.folder_morph.clamp(0.0, 1.0);
+
+    let scrim = ((state.folder_scrim * 255.0) as u32) << 24;
+    if scrim > 4 {
+        draw_rect(buf, stride, w, h, 0, 0, w, h, scrim);
+    }
+
+    // The full-size surface, from `FolderLayout`: the grid plus its padding and
+    // the footer row. `cell` is `Rect`, so the grid is `cols` wide by `rows`
+    // tall with no gap field -- the gap is baked into the cell pitch.
+    let cols = fl.cols.max(1) as f32;
+    let grid_w = fl.cell.w * cols;
+    let grid_h = fl.cell.h * fl.rows.max(1) as f32;
+    let full_w = (grid_w + fl.pad_lr * 2.0).min(wf);
+    let full_h = (fl.pad_top + grid_h + fl.footer_h).min(hf);
+    let cell = fl.cell;
+
+    // The surface grows out of the tapped folder icon, so its size and corner
+    // radius interpolate rather than cross-fading between two rectangles.
+    let s = m * m * (3.0 - 2.0 * m);
+    let sw = (l.icon_size + (full_w - l.icon_size) * s).min(wf);
+    let sh = (l.icon_size + (full_h - l.icon_size) * s).min(hf);
+    let sx = (wf * 0.5 - sw * 0.5).max(0.0);
+    let sy = (hf * 0.5 - sh * 0.5).max(0.0);
+    let a = ((m * 255.0) as u32) << 24;
+    if a <= 4 {
+        return;
+    }
+    // Corner radius: an icon's on the way out, the container's on the way in.
+    // The container radius is the footer height, which is the reference's
+    // sheet-like proportion rather than an arbitrary 24 dp.
+    let full_r = fl.footer_h * 0.5;
+    draw_rounded_rect_f(
+        buf, stride, w, h, sx, sy, sw, sh,
+        l.icon_radius + (full_r - l.icon_radius) * s,
+        (a >> 8 << 8) | (state.palette.surface_container_high & 0x00FF_FFFF),
+    );
+
+    // Title, on its own alpha so the reference's delay is expressible.
+    let ta = state.folder_title_alpha.clamp(0.0, 1.0);
+    if ta > 0.01 && !state.folder_title.is_empty() {
+        let em = super::font::em_px_at(1, w);
+        draw_text_centered(
+            buf, stride, w, h, w / 2, (sy + sh - fl.footer_h * 0.62 - em * 0.31) as usize,
+            state.folder_title, state.palette.on_surface, 1,
+        );
+    }
+
+    // Contents on the `FolderLayout` grid. The cells fade and shrink with the
+    // morph, so a folder opening does not pop its contents in at full size on
+    // the frame the surface reaches its final geometry.
+    if state.folder_apps.is_empty() {
+        return;
+    }
+    // The grid's own origin, once the container has finished growing.
+    let gx = wf * 0.5 - grid_w * 0.5;
+    let gy = sy + fl.pad_top;
+    for (i, app) in state.folder_apps.iter().take(fl.cols * fl.rows).enumerate() {
+        let col = i as f32 % cols;
+        let row = (i as f32 / cols).floor();
+        let cx = gx + col * cell.w;
+        let cy = gy + row * cell.h;
+        if cx < 0.0 || cy < 0.0 || cx + cell.w > wf || cy + cell.h > hf {
+            continue;
+        }
+        let isz = (cell.w * s).max(2.0);
+        let ipx = (cx + cell.w * 0.5 - isz * 0.5).round() as i32;
+        let ipy = (cy + cell.h * 0.12 - isz * 0.5).round() as i32;
+        let iszu = isz as usize;
+        let irad = (isz * ICON_RADIUS).round() as usize;
+        draw_rounded_rect_i32(
+            buf, stride, w, h, ipx, ipy, iszu, iszu, irad,
+            (a >> 8 << 8) | (app.color & 0x00FF_FFFF),
+        );
+        match app.icon {
+            Some(icon_img) => {
+                draw_icon_bitmap_i32(buf, stride, w, h, ipx, ipy, iszu, iszu, irad, icon_img);
+            }
+            None => {
+                let em = super::font::em_px_at(1, w);
+                draw_text_centered_i32(
+                    buf, stride, w, h,
+                    ipx + iszu as i32 / 2, ipy + iszu as i32 / 2 - (em * 0.30) as i32,
+                    app.glyph, (a >> 8 << 8) | 0x00FF_FFFF, 1,
+                );
+            }
+        }
+        if cell.h > 24.0 {
+            draw_text_centered_clipped(
+                buf, stride, w, h, (cx + cell.w * 0.5) as usize,
+                (cy + cell.h * 0.74) as usize, cell.w * 1.2,
+                app.name, state.palette.on_surface_variant, 1, FontWeight::Regular,
+            );
+        }
+    }
+}
+
+/// Label for a popup row.
+///
+/// `crate::compositor::PopupItem` carries no string, deliberately: it is a
+/// semantic tag the shell hit-tests against, and a `&'static str` per variant
+/// is both smaller than a `String` and impossible to get out of sync with the
+/// variant. The strings are the reference's own menu titles from
+/// `LauncherOptionsPopup.kt:18-28` and `SystemShortcut`.
+fn popup_label(item: &crate::compositor::PopupItem) -> &'static str {
+    use crate::compositor::PopupItem as P;
+    match item {
+        P::Wallpapers => "Wallpapers",
+        P::Widgets => "Widgets",
+        P::AllApps => "All apps",
+        P::HomeSettings => "Home settings",
+        P::HomeScreenLock => "Lock screen",
+        P::EditMode => "Edit mode",
+        P::SystemSettings => "System settings",
+        P::DefaultPageForWorkspace => "Set default",
+        P::AppInfo => "App info",
+        P::Install => "Install",
+        P::Remove => "Remove",
+        P::Uninstall => "Uninstall",
+        P::Customize => "Customize",
+        P::OpenInStore => "Open in store",
+        P::PauseApps => "Pause",
+        P::DeepShortcut(_) => "Shortcut",
+    }
+}
+
+/// Long-press popup: a rounded surface with one row per item.
+///
+/// Positioned by `PopupMenuLayout`, which takes the anchor rect and works out
+/// the arrow side from it -- the same struct the shell hit-tests against, so a
+/// row is tappable where it is drawn.
+fn draw_popup(
+    buf: &mut [u32],
+    stride: usize,
+    w: usize,
+    h: usize,
+    state: &DrmInteractiveState,
+) {
+    if state.popup_items.is_empty() {
+        return;
+    }
+    let l = Layout::plain(w as f32, h as f32);
+    let (ax, ay) = state.popup_anchor;
+    // The anchor is a zero-size rect at the touch point: the layout only reads
+    // its edges, and a zero rect is the honest representation of "a point".
+    let anchor = super::layout::Rect { x: ax, y: ay, w: 0.0, h: 0.0, radius: 0.0 };
+    let pl = l.popup_menu(anchor);
+    let m = state.popup_progress.clamp(0.0, 1.0);
+    let a = ((m * 255.0) as u32) << 24;
+    let rows = state.popup_items.len().min(6);
+
+    // The menu grows from the touch point, so its height and radius are a
+    // function of the open progress rather than being full size from frame one.
+    let rows_h = pl.item_h * rows as f32;
+    let grow = m * m * (3.0 - 2.0 * m);
+    let ph = (rows_h * grow).max(0.0);
+    let pw = (pl.item_w * grow).max(0.0);
+    // Centred on the anchor, then clamped inside the panel.
+    let px = (ax - pw * 0.5).clamp(l.w * 0.02, (l.w * 0.98 - pw).max(l.w * 0.02));
+    let mut py = ay - ph * 0.5;
+    if py + ph > l.h * 0.98 {
+        py = l.h * 0.98 - ph;
+    }
+    py = py.max(0.0);
+    if ph < 1.0 || pw < 1.0 {
+        return;
+    }
+    draw_rounded_rect_f(
+        buf, stride, w, h, px, py, pw, ph, pl.outer_r * grow,
+        (a >> 8 << 8) | (state.palette.surface_container_high & 0x00FF_FFFF),
+    );
+    let em = super::font::em_px_at(1, w);
+    let pad = pl.inner_r.max(8.0);
+    for (i, item) in state.popup_items.iter().take(rows).enumerate() {
+        let ry = py + i as f32 * pl.item_h;
+        // App-info is the affirmative row and takes the accent colour.
+        let fg = if matches!(item, crate::compositor::PopupItem::AppInfo) {
+            state.palette.primary
+        } else {
+            state.palette.on_surface
+        };
+        draw_text_clipped(
+            buf, stride, w, h, px + pad, ry + pl.item_h * 0.5 - em * 0.31,
+            pw - pad * 2.0, popup_label(item), fg, 1, FontWeight::Regular,
+        );
+    }
 }
 
 impl Drop for DrmKmsDevice {
@@ -2980,6 +3583,43 @@ fn interactive_state_hash(state: &DrmInteractiveState) -> u64 {
         mix!(b);
     }
     mix!(state.weather_glyph as u64);
+
+    // ---------------------------------------------------------------------
+    // Content backing the new surfaces. These are lists rather than scalars,
+    // so the count has to be mixed in or a card sliding from index 2 to
+    // index 1 would hash the same as no change at all.
+    // ---------------------------------------------------------------------
+
+    mix!(state.catalogue_apps.len() as u64);
+    // `recents_cards` carries two *animated* fields per card: `dismiss` moves
+    // continuously during a drag and `selected` flips on a scrub. Hashing only
+    // the length would make a card that is being swiped away render as a
+    // frozen card, which is the same invisible-animation bug the struct-level
+    // invariant above warns about, one level down.
+    mix!(state.recents_cards.len() as u64);
+    for card in state.recents_cards {
+        mix!(card.app_id as u64);
+        mix!((card.dismiss * 100.0) as i32);
+        mix!(card.selected as u64);
+    }
+    mix!(state.fastscroller_letter as u64);
+    mix!((state.popup_anchor.0 * 100.0) as i32);
+    mix!((state.popup_anchor.1 * 100.0) as i32);
+    mix!(state.popup_items.len() as u64);
+    for item in state.popup_items {
+        // The label, which is what actually gets drawn and is a pure function
+        // of the variant (`popup_label`). `Discriminant` is not a primitive
+        // and cannot be cast, and the two variants that differ only in a
+        // payload differ only in a label the renderer ignores anyway.
+        for b in popup_label(item).bytes() {
+            mix!(b);
+        }
+    }
+    mix!(state.folder_apps.len() as u64);
+    for b in state.folder_title.bytes() {
+        mix!(b);
+    }
+
     if let Some(ref sex) = state.super_extreme_state {
         mix!(sex.active_screen as u8);
         mix!(sex.password_input.len());
@@ -4162,14 +4802,33 @@ pub fn draw_circle_glyph(
 /// separator, no trailing gap. Zero allocation and no `format!` -- this runs
 /// every frame, and `paint_frame_does_not_allocate` is the guard.
 #[inline]
-fn join_smartspace<'a>(buf: &'a mut [u8; 96], date: &'a str, weather: &'a str) -> &'a str {
+/// Compose the smartspace line: the date, the weather, or both.
+///
+/// `phase` is the cross-fade between the two layouts, 0 = date only and 1 = the
+/// full card. Below 0.5 the separator and the weather are dropped entirely
+/// rather than drawn at low alpha, because half a separator between two
+/// half-visible strings reads as a rendering fault rather than as a
+/// transition. There is no third state to blend *towards*: at rest the line is
+/// the date, and the phase only decides when the weather joins it.
+///
+/// The `date == ""` case is the "no clock data" fallback and always shows the
+/// weather alone, whatever the phase -- an empty first half is not a
+/// transition, it is a missing value.
+fn join_smartspace<'a>(
+    buf: &'a mut [u8; 96],
+    date: &'a str,
+    weather: &'a str,
+    phase: f32,
+) -> &'a str {
+    let with_weather = phase >= 0.5;
     match (date.is_empty(), weather.is_empty()) {
         (true, true) => "",
         (true, false) => weather,
         (false, true) => date,
         (false, false) => {
             let mut n = 0usize;
-            for src in [date.as_bytes(), b"  |  ", weather.as_bytes()] {
+            let sep: &[u8] = if with_weather { b"  |  " } else { b"" };
+            for src in [date.as_bytes(), sep, weather.as_bytes()] {
                 for &c in src {
                     if n < buf.len() {
                         buf[n] = c;

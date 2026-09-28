@@ -29,15 +29,144 @@ use utim_core::compositor::protocols::{ProtocolRegistry, WaylandInterface};
 use utim_core::compositor::server::WaylandServer;
 use utim_core::compositor::super_extreme::{SuperExtremeScreen, SuperExtremeState};
 use utim_core::compositor::systemui::{QuickTileKind, SystemUiShade};
+use utim_core::compositor::{FolderOpen, KillQueue, Recents, TaskCard};
 use utim_core::graphics::font::{FontFamily, set_active_family};
 use utim_core::graphics::composer::{HwcComposer, HwcVersion};
+use utim_core::graphics::drawer_mod::FastScrollerState;
 use utim_core::graphics::layout::{
-    AppLayout, AppPanel, DrawerSearchHit, Key, Keyboard, Layout, ShadeLayout, ShadeZone, TabHit,
+    AppLayout, AppPanel, DrawerSearchHit, FastScrollerLayout, Key, Keyboard, Layout, ShadeLayout,
+    ShadeZone, TabHit,
 };
 use utim_core::graphics::{
-    AppGridItem, DrmInteractiveState, DrmKmsDevice, MaterialYouPalette, RgbaImage,
-    TerminalTabInfo, SpringConfig, SpringSimulation, damped_scroll,
+    AppGridItem, DrmInteractiveState, DrmKmsDevice, MaterialYouPalette, RecentsCard, RgbaImage,
+    SpringConfig, SpringSimulation, TerminalTabInfo, damped_scroll,
 };
+
+/// Commit threshold for the recents gesture.
+///
+/// The reference commits on the *release* past a fraction of the screen rather
+/// than on the hold alone (`AbsSwipeUpHandler.java:756`), so this is a progress
+/// value the gesture layer produces, not a pixel distance the shell invents.
+const RECENTS_COMMIT_PROGRESS: f32 = 0.5;
+
+/// Dismiss every modal surface and return the workspace morph to rest.
+///
+/// Shared by the Home and Back paths, which differ only in what else they tear
+/// down. Kept as one function because the failure mode of getting it wrong is
+/// silent and sticky: a leftover `Overview` makes every subsequent workspace
+/// swipe inert (the `is_modal` guard), and a leftover `workspace_scale` leaves
+/// the app panel permanently shrunk with nothing driving it.
+fn close_modal_surfaces(
+    shell_state: &mut ShellState,
+    folder: &mut FolderOpen,
+    popup_spring: &mut SpringSimulation,
+    workspace_scale_spring: &mut SpringSimulation,
+    window_alpha_spring: &mut SpringSimulation,
+) {
+    *shell_state = ShellState::Normal;
+    folder.close();
+    popup_spring.set_target(0.0);
+    workspace_scale_spring.set_target(1.0);
+    window_alpha_spring.set_target(1.0);
+}
+
+/// What the shell does with one `GestureAction`, decided with no state at all.
+///
+/// This exists so the wiring is testable. The defect it fixes was that the
+/// gesture match in the input loop ended in `_ => {}` and both
+/// `GestureAction::Recents` and `GestureAction::BottomBarScrub` fell into it:
+/// the overview could not be opened and a task scrub did nothing. Both were
+/// produced by the gesture engine and both were tested *there*, so nothing
+/// failed -- the actions simply had no consumer. Extracting the decision means
+/// "this action has an effect" is an assertion about a pure function instead of
+/// a line of code in a 5000-line `match` inside an event loop.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ShellEffect {
+    /// Nothing to do.
+    None,
+    /// Open the recents carousel.
+    OpenOverview,
+    /// Move the selection by one card pitch, in card widths.
+    ScrubTasks(f32),
+    /// An in-app home gesture is in flight: the panel's scale and opacity.
+    MorphWorkspace { scale: f32, window_alpha: f32 },
+    /// Close every modal surface and return the workspace morph to rest.
+    CloseAll,
+}
+
+/// Decide a gesture's effect. Pure: no shell state is read or written.
+fn plan_gesture(a: &GestureAction) -> ShellEffect {
+    match *a {
+        // The two arms that used to be dropped.
+        GestureAction::Recents { progress, .. } => {
+            if progress >= RECENTS_COMMIT_PROGRESS {
+                ShellEffect::OpenOverview
+            } else {
+                ShellEffect::None
+            }
+        }
+        GestureAction::BottomBarScrub { app_shift, .. } => {
+            if app_shift != 0 {
+                ShellEffect::ScrubTasks(app_shift as f32)
+            } else {
+                ShellEffect::None
+            }
+        }
+        // A *partial* home gesture: the panel is on its way back to the
+        // workspace and the gesture layer has already computed the scale and
+        // opacity it wants.
+        GestureAction::Home {
+            progress,
+            scale,
+            window_alpha,
+        } => {
+            if progress >= 1.0 {
+                ShellEffect::CloseAll
+            } else {
+                ShellEffect::MorphWorkspace { scale, window_alpha }
+            }
+        }
+        _ => ShellEffect::None,
+    }
+}
+
+/// The launcher's own mode, as distinct from `ShellMode` (which is the HWC
+/// plane set: launcher vs lock screen) and from `app_drawer_open` (which is a
+/// boolean).
+///
+/// Plan §7.6. No `String` and no `Vec`: a popup is named by a `u8` index and an
+/// anchor is two `f32`s, so this stays `Copy` and the per-frame path never has
+/// to clone an identity.
+///
+/// There is deliberately no `FolderOpen` arm. The folder *path* is complete --
+/// `compositor::FolderOpen` models the three springs and the title delay, and
+/// `drm_kms::draw_folder` draws the scrim, surface, grid and footer off
+/// `FolderLayout` -- but the shell has no folders to open: `home_pages` is a
+/// flat list of apps and nothing in the shell groups them. Adding the variant
+/// now would be a state that cannot be entered, which is worse than its
+/// absence: the field would read as "folders are wired" when they are not.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ShellState {
+    /// Home, with the workspace as the root surface.
+    Normal,
+    /// The app drawer is up. `progress` mirrors `drawer_spring`; it is carried
+    /// here so a state *change* is comparable in one `==`, rather than
+    /// reconstructed from a float on the side.
+    AllApps { progress: f32 },
+    /// The recents carousel. `selected` is the index into `recents`, `dismiss`
+    /// the live drag offset of that card in px.
+    Overview { selected: u8, dismiss: f32 },
+    /// A long-press popup is anchored at a panel point.
+    PopupOpen { anchor_x: f32, anchor_y: f32, idx: u8 },
+}
+
+impl ShellState {
+    /// True when a modal surface owns the screen, so a workspace swipe must
+    /// not also page the home screen underneath it.
+    fn is_modal(self) -> bool {
+        matches!(self, Self::Overview { .. } | Self::PopupOpen { .. })
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ManagedApp {
@@ -339,20 +468,27 @@ fn get_app_color(name_or_id: &str) -> u32 {
     }
     PALETTE[(hash as usize) % PALETTE.len()]
 }
-fn launch_desktop_app(exec_cmd: &str, socket_dir: &str) {
+/// Spawn `exec_cmd` against the compositor's Wayland socket.
+///
+/// Returns the child's pid so the recents card can be tied to a real process:
+/// the kill escalation in [`utim_core::compositor::Recents`] signals a pid, and
+/// a card carrying 0 would make "close this task" a no-op that silently
+/// reports success. `None` means nothing was spawned -- an empty command, a
+/// missing binary, or a spawn error; the last two are already logged.
+fn launch_desktop_app(exec_cmd: &str, socket_dir: &str) -> Option<i32> {
     if exec_cmd.is_empty() {
-        return;
+        return None;
     }
     let parts: Vec<&str> = exec_cmd.split_whitespace().collect();
     if parts.is_empty() {
-        return;
+        return None;
     }
     let prog = parts[0];
     let args = &parts[1..];
 
     if !std::path::Path::new(prog).exists() {
         eprintln!("[UTLC] Skipping desktop application launch: binary '{}' does not exist", prog);
-        return;
+        return None;
     }
 
     let sess = utim_core::session::session();
@@ -384,10 +520,25 @@ fn launch_desktop_app(exec_cmd: &str, socket_dir: &str) {
 
     match cmd.spawn() {
         Ok(child) => {
-            let _ = child.id();
+            // The `Child` is dropped here and never waited on, exactly as
+            // before. It is not the parent-waiter for these processes and never
+            // blocks on them; an exited child is reaped by init, because
+            // SIGCHLD is neither blocked nor ignored here.
+            // A pid is a positive `i32` on Linux and `child.id()` is a `u32`,
+            // so the conversion is a checked cast rather than a `From`: a
+            // value above `i32::MAX` cannot be a real pid and would wrap to a
+            // negative one, which `kill` would reject -- better to report no
+            // pid than a wrong one.
+            let pid = child.id();
+            if pid > i32::MAX as u32 {
+                None
+            } else {
+                Some(pid as i32)
+            }
         }
         Err(e) => {
             eprintln!("[UTLC] Error spawning '{}': {}", prog, e);
+            None
         }
     }
 }
@@ -855,6 +1006,94 @@ fn run_daemon() {
     let mut icon_bounce_spring = SpringSimulation::new(1.0, 1.0, SpringConfig::icon_bounce());
     let mut pressed_icon_id: Option<String> = None;
 
+    // ---------------------------------------------------------------------
+    // Launcher-rewrite shell state (plan §7.6).
+    //
+    // These existed as unit-tested models in `utim_core` and nothing drove
+    // them: `main.rs`'s gesture match ended in `_ => {}`, so
+    // `GestureAction::Recents` and `GestureAction::BottomBarScrub` were
+    // dropped on the floor and the overview could not be opened at all. The
+    // states are here so the wiring has somewhere to land.
+    // ---------------------------------------------------------------------
+    let shell_layout = Layout::plain(server.scene.width as f32, server.scene.height as f32);
+    // The fast-scroller geometry, needed per frame to convert the model's
+    // track-local `thumb_y` into the 0..1 position the renderer takes. Held
+    // rather than rebuilt so the two cannot be built from different layouts.
+    let shell_fast_scroller: FastScrollerLayout = shell_layout.fast_scroller();
+    // Monotonic millisecond clock for the models that time their own gestures
+    // (the fast scroller's detent dwell, the folder's title delay). One
+    // `Instant`, not a per-call `SystemTime` read.
+    let shell_start = Instant::now();
+    // `ViewConfiguration.getLongPressTimeout()` is 500 ms
+    // (`ViewConfiguration.java:562`); the launcher uses its own value, which
+    // is 500 ms too.
+    const LONG_PRESS_MS: u64 = 500;
+    let mut shell_state = ShellState::Normal;
+    let mut recents = Recents::new(&shell_layout);
+    let mut fastscroller = FastScrollerState::new();
+    let mut folder = FolderOpen::closed(0);
+    // Contents of the open folder, and its title. Both stay empty: the shell
+    // has no folders -- `home_pages` is a flat list of apps and nothing builds
+    // a folder to open. The renderer treats empty as "no folder" and draws the
+    // scrim and surface with no grid, so wiring the model before there is a
+    // folder to open would mean shipping a popup that opens onto nothing.
+    let folder_items: Vec<AppGridItem<'_>> = Vec::new();
+    let folder_title: &str = "";
+    // Anchor of the long-press popup in panel coordinates.
+    let mut popup_anchor = (0.0f32, 0.0f32);
+    // Rows the popup offers, borrowed by the renderer as `&[PopupItem]`. The
+    // workspace menu is the reference's four-item set
+    // (`LauncherOptionsPopup.kt:18-28`); an icon long-press swaps in the icon
+    // menu, so this is rebuilt per gesture rather than fixed.
+    let mut popup_rows: [utim_core::compositor::PopupItem; 4] = [
+        utim_core::compositor::PopupItem::Wallpapers,
+        utim_core::compositor::PopupItem::Widgets,
+        utim_core::compositor::PopupItem::AllApps,
+        utim_core::compositor::PopupItem::HomeSettings,
+    ];
+    let mut popup_count = 4usize;
+    // Which app the long-press landed on, and where. Held so the popup can be
+    // raised on the *move* that crosses the long-press threshold rather than
+    // needing the touch position again.
+    let mut long_press: Option<(String, f32, f32, Instant)> = None;
+    // Springs for the two overview surfaces. `desktop_slide` is the reference's
+    // own row for the carousel; `recents_attach_alpha` for the scrim.
+    let mut overview_spring = SpringSimulation::new(0.0, 0.0, SpringConfig::desktop_slide());
+    let mut overview_scrim_spring =
+        SpringSimulation::new(0.0, 0.0, SpringConfig::recents_attach_alpha());
+    // Long-press popup: `spring_loaded` is the reference's own row for the
+    // options popup appearing out of the icon.
+    let mut popup_spring = SpringSimulation::new(0.0, 0.0, SpringConfig::spring_loaded());
+    // How often the smartspace advances a phase. The reference cross-fades on a
+    // timer rather than on a transition; 5 s is one cycle of the two states.
+    const SMARTSPACE_TICK_MS: u64 = 5_000;
+    // In-app home gesture: the panel's scale and opacity, both 1.0 at rest.
+    let mut workspace_scale_spring = SpringSimulation::new(1.0, 1.0, SpringConfig::stretch_edge());
+    let mut window_alpha_spring = SpringSimulation::new(1.0, 1.0, SpringConfig::stretch_edge());
+    // Smartspace phases between the date-only and full-weather card. Advanced
+    // on a wall clock, not on interaction, so it is hashed in the renderer.
+    let mut smartspace_phase: f32 = 0.0;
+    let mut last_smartspace_tick = Instant::now();
+    // Flattened recents rows handed to the renderer. Fixed capacity, no `Vec`
+    // on the frame path.
+    let mut recents_rows: [RecentsCard; utim_core::compositor::MAX_TASKS] =
+        [RecentsCard { app_id: 0, dismiss: 0.0, selected: false }; utim_core::compositor::MAX_TASKS];
+    let mut kill_queue = KillQueue::default();
+    // The task the shell believes is foreground, and the pid its most recent
+    // launch produced. A recents card is pushed on the *transition* into an
+    // app, detected centrally rather than at each of the six places that set
+    // `active_app` -- six call sites is six chances to forget one, and the
+    // failure is an app that silently never appears in the overview.
+    let mut recents_foreground: Option<String> = None;
+    // Pid of the most recent launch, consumed by the transition above.
+    //
+    // `take` rather than a read: the pid belongs to exactly one card, and
+    // clearing it in the same step is what stops the *next* app from
+    // inheriting it. An in-app screen the shell drew itself never sets it, so
+    // it reads back as the 0 it was initialised to -- which is the correct
+    // pid for a task with no process behind it.
+    let mut pending_launch_pid: i32 = 0;
+
     // Icons are decoded and resampled once, at the size the layout draws.
     set_icon_edge_px(
         Layout::plain(server.scene.width as f32, server.scene.height as f32)
@@ -873,6 +1112,16 @@ fn run_daemon() {
     icon_cache.set_display_edge(icon_edge_px());
     let mut icon_app_sig = app_set_signature(&all_managed_apps);
     apply_app_icons(&mut all_managed_apps, &mut icon_cache);
+
+    // The full catalogue as renderer rows, rebuilt only on a real rescan.
+    //
+    // A recents card names its app by a `u32` index into this list, and the
+    // index has to mean the same thing when the overview is drawn as it did
+    // when the card was pushed. `drawer_items` cannot serve: it is the
+    // *filtered* list and is empty whenever the drawer is closed, which is
+    // exactly when the overview is reachable.
+    let mut catalogue_items: Vec<AppGridItem<'_>> =
+        all_managed_apps.iter().map(drawer_item_of).collect();
 
     let mut running = true;
     let mut last_frame = Instant::now();
@@ -1181,14 +1430,52 @@ fn run_daemon() {
                                 } else {
                                     match res {
                                         InputDispatchResult::Touch(raw_touch) => {
+                                            // Monotonic ms for the gesture-timed
+                                            // models. One clock read per touch
+                                            // event, not per model.
+                                            let now_ms =
+                                                shell_start.elapsed().as_secs_f32() * 1000.0;
                                             match raw_touch.phase {
                                                 TouchPhase::Down => {
                                                     touch_drag_start = Some((raw_touch.x, raw_touch.y));
                                                     let w = server.scene.width as f32;
                                                     let h = server.scene.height as f32;
+                                                    // Fast scroller: the drawer's
+                                                    // touch target overhangs the
+                                                    // panel edge on purpose, so
+                                                    // the hit test is the layout's
+                                                    // and not a bounds check.
+                                                    // Armed on every down inside
+                                                    // the drawer and *only*
+                                                    // engages once the finger
+                                                    // travels `engage_delta`
+                                                    // within `engage_ms`, which
+                                                    // is what stops a list
+                                                    // scroll from being read as
+                                                    // a scroller drag.
+                                                    if app_drawer_open {
+                                                        fastscroller.on_down(
+                                                            raw_touch.y,
+                                                            now_ms,
+                                                            &shell_fast_scroller,
+                                                        );
+                                                    }
+                                                    // Long-press: record where the
+                                                    // press landed so the *move*
+                                                    // that crosses the threshold
+                                                    // can open the popup without
+                                                    // needing the touch position
+                                                    // again.
+                                                    long_press = Some((
+                                                        String::new(),
+                                                        raw_touch.x,
+                                                        raw_touch.y,
+                                                        Instant::now(),
+                                                    ));
                                                     if active_app.is_none()
                                                         && !server.scene.system_ui.is_open()
                                                         && !server.scene.keyboard.is_active
+                                                        && !shell_state.is_modal()
                                                     {
                                                         // Finger down: the icon compresses
                                                         // toward 0.90 and *stays* there
@@ -1264,11 +1551,60 @@ fn run_daemon() {
                                         d
                                     };
                                     if active_app.is_none()
-                                                        && !server.scene.system_ui.is_open()
-                                                        && !server.scene.keyboard.is_active
-                                                    {
-                                                        let w = server.scene.width as f32;
-                                                        let h = server.scene.height as f32;
+                                        && !server.scene.system_ui.is_open()
+                                        && !server.scene.keyboard.is_active
+                                        && !shell_state.is_modal()
+                                    {
+                                        let w = server.scene.width as f32;
+                                        let h = server.scene.height as f32;
+
+                                        // Fast-scroller drag. The model decides
+                                        // whether the drag has *engaged* and
+                                        // which section it landed on; the shell
+                                        // only feeds it the position and reads
+                                        // the answer. Consuming the returned bool
+                                        // rather than the field is what makes a
+                                        // section change fire once.
+                                        if app_drawer_open {
+                                            fastscroller.on_move(
+                                                raw_touch.y,
+                                                now_ms,
+                                                &shell_fast_scroller,
+                                            );
+                                        }
+
+                                        // Long press: the popup opens on the
+                                        // move that crosses the threshold, so a
+                                        // press that never moves opens it on
+                                        // release instead, and a drag that starts
+                                        // fast never opens it at all.
+                                        if let Some((ref id, px, py, ref since)) = long_press {
+                                            if since.elapsed()
+                                                >= Duration::from_millis(LONG_PRESS_MS)
+                                                && !matches!(
+                                                    shell_state,
+                                                    ShellState::PopupOpen { .. }
+                                                )
+                                            {
+                                                if !id.is_empty() {
+                                                    popup_rows = [
+                                                        utim_core::compositor::PopupItem::AppInfo,
+                                                        utim_core::compositor::PopupItem::Uninstall,
+                                                        utim_core::compositor::PopupItem::Remove,
+                                                        utim_core::compositor::PopupItem::Customize,
+                                                    ];
+                                                }
+                                                popup_count = popup_rows.len();
+                                                popup_anchor = (px, py);
+                                                popup_spring.set_target(1.0);
+                                                shell_state = ShellState::PopupOpen {
+                                                    anchor_x: px,
+                                                    anchor_y: py,
+                                                    idx: 0,
+                                                };
+                                            }
+                                        }
+
                                                         if let Some((sx, sy)) = touch_drag_start {
                                                             let dy = sy - raw_touch.y;
                                                             let dx = sx - raw_touch.x;
@@ -1340,6 +1676,57 @@ fn run_daemon() {
                                                     }
                                                 }
                                                 TouchPhase::Up | TouchPhase::Cancel => {
+                                                    // Fast scroller: release ends the
+                                                    // drag and starts the popup
+                                                    // fade-out. The letter stays on
+                                                    // screen while it fades, which is
+                                                    // what the 150 ms
+                                                    // `SCROLL_BAR_VIS_DURATION`
+                                                    // window is for.
+                                                    if app_drawer_open {
+                                                        fastscroller.on_up(now_ms);
+                                                    }
+
+                                                    // A press that never moved still
+                                                    // counts as a long press on
+                                                    // release -- the reference
+                                                    // accepts either, because a
+                                                    // perfectly still finger
+                                                    // produces no move events at
+                                                    // all. The icon id was
+                                                    // recorded on down, so the
+                                                    // popup knows whether this is
+                                                    // the icon menu or the
+                                                    // workspace menu.
+                                                    if let Some((ref id, px, py, ref since)) = long_press
+                                                    {
+                                                        if since.elapsed()
+                                                            >= Duration::from_millis(LONG_PRESS_MS)
+                                                            && !matches!(
+                                                                shell_state,
+                                                                ShellState::PopupOpen { .. }
+                                                            )
+                                                        {
+                                                            if !id.is_empty() {
+                                                                popup_rows = [
+                                                                    utim_core::compositor::PopupItem::AppInfo,
+                                                                    utim_core::compositor::PopupItem::Uninstall,
+                                                                    utim_core::compositor::PopupItem::Remove,
+                                                                    utim_core::compositor::PopupItem::Customize,
+                                                                ];
+                                                            }
+                                                            popup_count = popup_rows.len();
+                                                            popup_anchor = (px, py);
+                                                            popup_spring.set_target(1.0);
+                                                            shell_state = ShellState::PopupOpen {
+                                                                anchor_x: px,
+                                                                anchor_y: py,
+                                                                idx: 0,
+                                                            };
+                                                        }
+                                                    }
+                                                    long_press = None;
+
                                                     // Set when this release ends a page
                                                     // drag, so the gesture engine still
                                                     // sees the event but the tap is
@@ -1413,8 +1800,54 @@ fn run_daemon() {
                                             }
 
                                             let gesture_act = gesture_engine.process_touch(&raw_touch);
-                                            match gesture_act {
-                                                GestureAction::Home { progress, .. } if progress >= 1.0 => {
+                                            // The three arms that drive the shell state
+                                            // machine come from `plan_gesture`, which is a
+                                            // pure function precisely so that "this
+                                            // action has an effect" is testable. The
+                                            // other arms still match inline because they
+                                            // only poke the shade, the keyboard and the
+                                            // drawer flag.
+                                            match plan_gesture(&gesture_act) {
+                                                ShellEffect::OpenOverview => {
+                                                    shell_state = ShellState::Overview {
+                                                        selected: recents.visible_card,
+                                                        dismiss: 0.0,
+                                                    };
+                                                    // The overview is modal over the
+                                                    // workspace, so a surface that owns
+                                                    // the screen has to give up its own
+                                                    // transient state first.
+                                                    app_drawer_open = false;
+                                                    drawer_search_active = false;
+                                                    selected_home_icon = None;
+                                                    search_active = false;
+                                                    server.scene.keyboard.deactivate();
+                                                    server.scene.system_ui.close();
+                                                }
+                                                ShellEffect::ScrubTasks(cards) => {
+                                                    // The scrub swaps the selected task.
+                                                    // The model owns the clamping, the
+                                                    // half-pitch threshold and the
+                                                    // rubber-band at either end, so the
+                                                    // shell only hands it the delta it
+                                                    // was given and reads the result.
+                                                    let rl = shell_layout.recents();
+                                                    recents.scrub(cards * (rl.card_w + rl.spacing));
+                                                    shell_state = ShellState::Overview {
+                                                        selected: recents.visible_card,
+                                                        dismiss: 0.0,
+                                                    };
+                                                }
+                                                ShellEffect::MorphWorkspace { scale, window_alpha } => {
+                                                    // Handed to springs, so a release
+                                                    // mid-gesture is a settle rather
+                                                    // than a jump and the motion
+                                                    // continues to the endpoint the
+                                                    // finger was already heading for.
+                                                    workspace_scale_spring.set_target(scale);
+                                                    window_alpha_spring.set_target(window_alpha);
+                                                }
+                                                ShellEffect::CloseAll => {
                                                     if active_app.as_deref() == Some("Terminal") {
                                                         for tab in &terminal_tabs {
                                                             tab.cleanup_child();
@@ -1428,7 +1861,17 @@ fn run_daemon() {
                                                     search_active = false;
                                                     server.scene.keyboard.deactivate();
                                                     server.scene.mode = utim_core::compositor::scene::ShellMode::Launcher;
+                                                    close_modal_surfaces(
+                                                        &mut shell_state,
+                                                        &mut folder,
+                                                        &mut popup_spring,
+                                                        &mut workspace_scale_spring,
+                                                        &mut window_alpha_spring,
+                                                    );
                                                 }
+                                                ShellEffect::None => {}
+                                            }
+                                            match gesture_act {
                                                 GestureAction::NotificationShade { progress } => {
                                                     if progress > 0.35 {
                                                         server.scene.system_ui.open();
@@ -1436,7 +1879,21 @@ fn run_daemon() {
                                                     }
                                                 }
                                                 GestureAction::Back { injected, .. } if injected => {
-                                                    if server.scene.system_ui.is_open() {
+                                                    // A modal surface owns Back
+                                                    // before anything else does:
+                                                    // the overview has to close
+                                                    // before the workspace
+                                                    // behind it gets a chance
+                                                    // to.
+                                                    if shell_state.is_modal() {
+                                                        close_modal_surfaces(
+                                                            &mut shell_state,
+                                                            &mut folder,
+                                                            &mut popup_spring,
+                                                            &mut workspace_scale_spring,
+                                                            &mut window_alpha_spring,
+                                                        );
+                                                    } else if server.scene.system_ui.is_open() {
                                                         server.scene.system_ui.close();
                                                     } else if server.scene.keyboard.is_active {
                                                         server.scene.keyboard.deactivate();
@@ -1764,7 +2221,12 @@ fn run_daemon() {
                                                                     }
 
                                                                     if !app_exec.is_empty() {
-                                                                        launch_desktop_app(&app_exec, &socket_dir);
+                                                                        // The pid is recorded so the recents card for this app can be
+                                                                        // killed when the user swipes it away. Discarding it, as this
+                                                                        // used to, made "close task" a no-op that reported success.
+                                                                        if let Some(pid) = launch_desktop_app(&app_exec, &socket_dir) {
+                                                                            pending_launch_pid = pid;
+                                                                        }
                                                                     }
                                                                 }
                                                             } else if y < drawer_y_offset
@@ -1822,7 +2284,12 @@ fn run_daemon() {
                                                             search_active = false;
                                                             server.scene.keyboard.deactivate();
                                                             if !app_exec.is_empty() {
-                                                                launch_desktop_app(&app_exec, &socket_dir);
+                                                                // The pid is recorded so the recents card for this app can be
+                                                                // killed when the user swipes it away. Discarding it, as this
+                                                                // used to, made "close task" a no-op that reported success.
+                                                                if let Some(pid) = launch_desktop_app(&app_exec, &socket_dir) {
+                                                                    pending_launch_pid = pid;
+                                                                }
                                                             }
                                                         }
                                                     } else {
@@ -1970,7 +2437,12 @@ fn run_daemon() {
                                                                     }
 
                                                                     if !app_exec.is_empty() {
-                                                                        launch_desktop_app(&app_exec, &socket_dir);
+                                                                        // The pid is recorded so the recents card for this app can be
+                                                                        // killed when the user swipes it away. Discarding it, as this
+                                                                        // used to, made "close task" a no-op that reported success.
+                                                                        if let Some(pid) = launch_desktop_app(&app_exec, &socket_dir) {
+                                                                            pending_launch_pid = pid;
+                                                                        }
                                                                     }
                                                                 }
                                                             }
@@ -2131,7 +2603,12 @@ fn run_daemon() {
                                                             search_active = false;
                                                             server.scene.keyboard.deactivate();
                                                             if !app_exec.is_empty() {
-                                                                launch_desktop_app(&app_exec, &socket_dir);
+                                                                // The pid is recorded so the recents card for this app can be
+                                                                // killed when the user swipes it away. Discarding it, as this
+                                                                // used to, made "close task" a no-op that reported success.
+                                                                if let Some(pid) = launch_desktop_app(&app_exec, &socket_dir) {
+                                                                    pending_launch_pid = pid;
+                                                                }
                                                             }
                                                         }
                                                     } else if let Some(sel_id) = selected_home_icon.take() {
@@ -2162,7 +2639,12 @@ fn run_daemon() {
                                                                     search_active = false;
                                                                 }
                                                                 if !app_exec.is_empty() {
-                                                                    launch_desktop_app(&app_exec, &socket_dir);
+                                                                    // The pid is recorded so the recents card for this app can be
+                                                                    // killed when the user swipes it away. Discarding it, as this
+                                                                    // used to, made "close task" a no-op that reported success.
+                                                                    if let Some(pid) = launch_desktop_app(&app_exec, &socket_dir) {
+                                                                        pending_launch_pid = pid;
+                                                                    }
                                                                 }
                                                             }
                                                         }
@@ -2622,6 +3104,13 @@ fn run_daemon() {
                 icon_cache.invalidate_misses();
                 all_managed_apps = fresh;
                 apply_app_icons(&mut all_managed_apps, &mut icon_cache);
+                // Rebuilt with the catalogue, not lazily: the rows borrow
+                // `all_managed_apps` by `&str`, so assigning the catalogue
+                // invalidates every one of them at once. A recents card's
+                // `u32` index keeps pointing at the same *position*, which is
+                // what it means -- the renderer falls back to a neutral tile
+                // when the new catalogue is shorter.
+                catalogue_items = all_managed_apps.iter().map(drawer_item_of).collect();
                 refresh_dock_cache(
                     &all_managed_apps,
                     &icon_cache,
@@ -2665,6 +3154,123 @@ fn run_daemon() {
                 if (icon_bounce_spring.value - 1.0).abs() < 0.005 {
                     pressed_icon_id = None;
                 }
+            }
+
+            // The drawer's own state is derived rather than assigned at each of
+            // the fourteen places that flip `app_drawer_open`. That flag is the
+            // source of truth; keeping a second one in step with it would be a
+            // 14-call-site invariant that only fails silently. A modal surface
+            // wins, because the drawer cannot be open behind the overview.
+            if !shell_state.is_modal() {
+                shell_state = if app_drawer_open {
+                    ShellState::AllApps { progress: drawer_progress }
+                } else {
+                    ShellState::Normal
+                };
+            }
+
+            // -------------------------------------------------------------
+            // Launcher-rewrite surfaces (plan §7.6). Each is stepped only while
+            // it is not at rest, so an idle shell integrates nothing.
+            // -------------------------------------------------------------
+
+            // The frame period in ms, for the models that park their springs
+            // against a real frame clock rather than a synthetic one.
+            let frame_ms = (server.scene.refresh_rate.clamp(30.0, 480.0).recip() * 1000.0) as f32;
+
+            // Task bookkeeping: promote the foreground app to the front of the
+            // recents stack the moment it changes.
+            //
+            // Launching an app already in the stack *promotes* it rather than
+            // duplicating it -- `Recents::push` does that, and hands back the
+            // stale entry so its snapshot slot can be released. The catalogue
+            // index is what the card carries, so the renderer can resolve the
+            // name later without a `String` per card.
+            if active_app != recents_foreground {
+                recents_foreground = active_app.clone();
+                let pid = std::mem::take(&mut pending_launch_pid);
+                if let Some(name) = active_app.as_deref() {
+                    if let Some(idx) = all_managed_apps
+                        .iter()
+                        .position(|a| a.name == name || a.id == name)
+                    {
+                        // pid 0 for an in-app screen the shell drew itself
+                        // (Clock, Settings) and for a launch that failed: there
+                        // is no process to signal, and the kill path already
+                        // refuses a pid it does not own, so a zero card is inert
+                        // rather than wrong.
+                        let _ = recents.push(TaskCard::new(idx as u32, pid, 0));
+                    }
+                }
+            }
+
+            // Overview. Two springs, because the reference runs the carousel
+            // and the scrim on different profiles and they do not settle
+            // together: `desktop_slide` for the surface, `recents_attach_alpha`
+            // for the dim behind it.
+            let overview_open = matches!(shell_state, ShellState::Overview { .. });
+            overview_spring.set_target(if overview_open { 1.0 } else { 0.0 });
+            overview_scrim_spring.set_target(if overview_open { 1.0 } else { 0.0 });
+            let overview_live = overview_open
+                || overview_spring.value > 0.0
+                || overview_scrim_spring.value > 0.0;
+            if overview_live {
+                overview_spring.step(dt);
+                overview_scrim_spring.step(dt);
+            }
+            // The card model runs whenever the overview is even partly open, so
+            // a dismiss animation and the kill grace clock both keep time.
+            if overview_live {
+                kill_queue = recents.step(dt, frame_ms);
+                // Park cards whose springs are done, so a settled list stops
+                // re-integrating.
+                recents.park_expired(frame_ms);
+            }
+            // The kill queue is drained here, not in the gesture handler: a
+            // close request raised on a touch must not run a process teardown
+            // inside the input callback.
+            //
+            // `Close` only *describes* the request -- `recents` starts the
+            // grace clock and re-raises it as `Force` once the grace expires,
+            // so the signal is sent on exactly the second pass and a
+            // well-behaved app gets to close itself. A pid the shell does not
+            // own is a no-op, not an error: the card has already left the
+            // stack either way.
+            for action in kill_queue.iter() {
+                if let utim_core::compositor::KillAction::Force(pid) = action {
+                    if *pid > 1 {
+                        // SAFETY: `kill` is async-signal-safe, takes only a pid
+                        // and a signal, and cannot fail in a way that matters
+                        // here -- the process may already be gone, which is the
+                        // outcome we wanted.
+                        unsafe {
+                            libc::kill(*pid, libc::SIGKILL);
+                        }
+                    }
+                }
+            }
+
+            // Folder: the model owns the morph, the scrim and the title's
+            // delayed fade, and reports the workspace scale it wants.
+            if !folder.is_closed() {
+                folder.step(dt, frame_ms);
+            }
+
+            // Popup and fast-scroller fades, both wall-clock driven.
+            if !popup_spring.is_at_rest() {
+                popup_spring.step(dt);
+            }
+            if fastscroller.dragging || !fastscroller.popup_visible() {
+                fastscroller.step(dt);
+            }
+
+            // Smartspace: a wall-clock phase, not an interaction, so it is
+            // stepped on time rather than on touch. Advancing it on a timer is
+            // what makes the damage hash see it -- nothing else in the state
+            // changes when a minute passes.
+            if last_smartspace_tick.elapsed() >= Duration::from_millis(SMARTSPACE_TICK_MS) {
+                last_smartspace_tick = Instant::now();
+                smartspace_phase = (smartspace_phase + 1.0).min(1.0);
             }
 
             if app_launch_progress > 0.0 {
@@ -2824,6 +3430,26 @@ fn run_daemon() {
                     super_extreme_state.camera_preview.update_preview();
                 }
 
+                // Flatten the recents model into the renderer's row view. Fixed
+                // capacity and no `Vec`: this runs on the frame path, where
+                // `paint_frame_does_not_allocate` is the invariant.
+                //
+                // `dismiss` comes from the model's spring, not from
+                // `TaskCard::dismiss_y`, which is the *live drag* position --
+                // the raw finger. After a release the card springs on from
+                // there, and reading the raw value would snap it back the
+                // instant the finger lifted.
+                //
+                // `visible_card` is the model's own cull hint, so the renderer
+                // and the hit-test agree on which card is live.
+                let recents_row_count = recents.iter().count().min(recents_rows.len());
+                for (i, row) in recents_rows.iter_mut().enumerate().take(recents_row_count) {
+                    let card = recents.cards[i];
+                    row.app_id = card.app_id;
+                    row.dismiss = recents.dismiss[i].value;
+                    row.selected = i as u8 == recents.visible_card;
+                }
+
                 let drm_state = DrmInteractiveState {
                     time_str: t_str,
                     is_locked: server.scene.mode == utim_core::compositor::scene::ShellMode::LockScreen,
@@ -2868,26 +3494,66 @@ fn run_daemon() {
                     } else {
                         None
                     },
-                    // Launcher rewrite state. Driven by the shell state
-                    // machine; at-rest values mean "nothing is animating",
-                    // which is also what the damage hash needs so an idle
-                    // shell still issues zero ioctls.
-                    smartspace_phase: 0.0,
-                    folder_morph: 0.0,
-                    folder_scrim: 0.0,
-                    folder_title_alpha: 0.0,
-                    popup_progress: 0.0,
-                    overview_progress: 0.0,
-                    overview_scroll: 0.0,
-                    overview_dismiss: 0.0,
-                    fastscroller_thumb: 0.0,
-                    fastscroller_popup_alpha: 0.0,
-                    page_indicator_frac: 0.0,
-                    workspace_scale: 1.0,
-                    window_alpha: 1.0,
+                    // Launcher rewrite state, driven by the shell state
+                    // machine above. At-rest values mean "nothing is
+                    // animating", which is also what the damage hash needs so
+                    // an idle shell still issues zero ioctls.
+                    smartspace_phase,
+                    folder_morph: folder.morph.value,
+                    folder_scrim: folder.scrim.value,
+                    folder_title_alpha: folder.title_alpha.value,
+                    popup_progress: popup_spring.value,
+                    overview_progress: overview_spring.value,
+                    // The scrim is the second spring's value, not the
+                    // carousel's: the reference dims the workspace on a
+                    // different profile, and driving both from one number
+                    // would make the dim and the surface arrive together.
+                    overview_scroll: recents.drag_px,
+                    overview_dismiss: recents.dismiss[recents.visible_card as usize].value,
+                    // The thumb's position along the track. `travel` is the
+                    // same quantity the model clamps against, so the renderer
+                    // cannot place the thumb where the model would not.
+                    fastscroller_thumb: if fastscroller.track_h > 0.0 {
+                        let travel =
+                            (fastscroller.track_h - shell_fast_scroller.thumb_h).max(0.0);
+                        if travel > 0.0 { fastscroller.thumb_y / travel } else { 0.0 }
+                    } else {
+                        0.0
+                    },
+                    fastscroller_popup_alpha: fastscroller.popup_alpha,
+                    // Page indicator: signed page progress. The magnitude is
+                    // how far the strip has travelled, in page widths; the
+                    // sign is the direction, which the renderer needs because
+                    // the dot maths takes "the page being left" and "the page
+                    // being moved towards" as two separate indices.
+                    //
+                    // Not clamped: the settle spring overshoots past a page, and
+                    // that phase lives above 1.0. A clamp here would flatten
+                    // exactly the motion the field exists to carry.
+                    page_indicator_frac: {
+                        let pw = server.scene.width as f32;
+                        if pw > 0.0 { -home_scroll_offset / pw } else { 0.0 }
+                    },
+                    // The in-app home gesture and the folder both scale the
+                    // workspace. The folder wins while it is open: it is the
+                    // nearer surface and its scale is the reference's
+                    // `FOLDER_LAUNCHER_SCALE` (0.975).
+                    workspace_scale: if folder.is_closed() {
+                        workspace_scale_spring.value
+                    } else {
+                        folder.workspace_scale()
+                    },
+                    window_alpha: window_alpha_spring.value,
                     date_str,
                     weather_str: "",
                     weather_glyph: 0,
+                    catalogue_apps: &catalogue_items,
+                    recents_cards: &recents_rows[..recents_row_count],
+                    fastscroller_letter: fastscroller.letter,
+                    popup_anchor,
+                    popup_items: &popup_rows[..popup_count.min(popup_rows.len())],
+                    folder_apps: &folder_items,
+                    folder_title,
                 };
                 // Unconditional flush() marks the whole 10.4 MB framebuffer
                 // dirty 60x/s; only flush when the damage hash proves a repaint.
@@ -4415,6 +5081,187 @@ fn run_all_checks(json: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------
+    // The shell state machine (plan §7.6).
+    //
+    // These guard the defect this whole change set exists for: the input
+    // loop's gesture match ended in `_ => {}`, and both `Recents` and
+    // `BottomBarScrub` fell into it. The gesture engine produced and tested
+    // both actions; nothing consumed them, so the overview could not open and
+    // a task scrub did nothing -- with every test in the workspace green.
+    //
+    // The lesson is that a producer-side test is not a wiring test. Asserting
+    // the *effect* is what catches a consumer that was never written.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn the_two_dropped_gestures_now_have_an_effect() {
+        use utim_core::compositor::gestures::EdgeSide;
+
+        // Exactly the two that used to be swallowed.
+        assert_eq!(
+            plan_gesture(&GestureAction::Recents {
+                progress: 1.0,
+                trigger_haptic: true,
+            }),
+            ShellEffect::OpenOverview,
+            "the recents gesture still has no effect: the overview cannot open"
+        );
+        assert_eq!(
+            plan_gesture(&GestureAction::BottomBarScrub {
+                delta_x: 40.0,
+                app_shift: 1,
+            }),
+            ShellEffect::ScrubTasks(1.0),
+            "a bottom-bar scrub still has no effect: the task list cannot be scrubbed"
+        );
+        assert_eq!(
+            plan_gesture(&GestureAction::BottomBarScrub {
+                delta_x: -40.0,
+                app_shift: -1,
+            }),
+            ShellEffect::ScrubTasks(-1.0),
+        );
+        // A zero shift is the gesture engine's "no detent crossed", and must
+        // not be treated as a scrub -- it would otherwise move a card on every
+        // move event while the finger sat inside one detent.
+        assert_eq!(
+            plan_gesture(&GestureAction::BottomBarScrub {
+                delta_x: 3.0,
+                app_shift: 0,
+            }),
+            ShellEffect::None,
+        );
+        // The other actions are handled by inline arms and must not be
+        // double-handled by the planner.
+        for a in [
+            GestureAction::None,
+            GestureAction::NotificationShade { progress: 0.5 },
+            GestureAction::Back {
+                side: EdgeSide::Left,
+                progress: 1.0,
+                injected: true,
+            },
+            GestureAction::Swipe {
+                delta_x: 0.0,
+                delta_y: -80.0,
+            },
+        ] {
+            assert_eq!(plan_gesture(&a), ShellEffect::None, "{a:?} is not the planner's");
+        }
+    }
+
+    #[test]
+    fn recents_only_commits_past_the_threshold() {
+        // Below the commit threshold the overview must not open, or a
+        // half-hearted rise from the bottom edge would yank the user into the
+        // carousel and then straight back out.
+        assert_eq!(
+            plan_gesture(&GestureAction::Recents {
+                progress: RECENTS_COMMIT_PROGRESS - 0.01,
+                trigger_haptic: false,
+            }),
+            ShellEffect::None,
+        );
+        assert_eq!(
+            plan_gesture(&GestureAction::Recents {
+                progress: RECENTS_COMMIT_PROGRESS,
+                trigger_haptic: false,
+            }),
+            ShellEffect::OpenOverview,
+            "the threshold must be inclusive: a release exactly at it commits"
+        );
+        // A rise that has not reached half screen is a Home gesture, not a
+        // recents one, and must not open the overview either.
+        assert_eq!(
+            plan_gesture(&GestureAction::Recents {
+                progress: 0.0,
+                trigger_haptic: false,
+            }),
+            ShellEffect::None,
+        );
+    }
+
+    #[test]
+    fn a_full_home_gesture_closes_and_a_partial_one_morphs() {
+        // The two are different effects, and conflating them is the bug that
+        // made the in-app home gesture unusable: at progress 1.0 the panel
+        // must be *torn down* (which also releases the morph), and below it the
+        // panel must be *driven* by the gesture's own scale and opacity.
+        assert_eq!(
+            plan_gesture(&GestureAction::Home {
+                progress: 1.0,
+                scale: 0.4,
+                window_alpha: 0.2,
+            }),
+            ShellEffect::CloseAll,
+        );
+        assert_eq!(
+            plan_gesture(&GestureAction::Home {
+                progress: 0.5,
+                scale: 0.8,
+                window_alpha: 0.9,
+            }),
+            ShellEffect::MorphWorkspace {
+                scale: 0.8,
+                window_alpha: 0.9,
+            },
+        );
+    }
+
+    #[test]
+    fn closing_modal_surfaces_leaves_nothing_sticky() {
+        // The reason this is a function and not four inline lines: a leftover
+        // modal state makes every later workspace swipe inert (the `is_modal`
+        // guard skips them) and a leftover morph target leaves the app panel
+        // shrunk with nothing driving it. Both are silent, so both are asserted.
+        let mut state = ShellState::Overview {
+            selected: 2,
+            dismiss: -40.0,
+        };
+        assert!(state.is_modal());
+
+        let mut folder = FolderOpen::closed(0);
+        folder.open(3);
+        let mut popup = SpringSimulation::new(1.0, 1.0, SpringConfig::spring_loaded());
+        popup.set_target(0.0);
+        let mut scale = SpringSimulation::new(0.5, 0.5, SpringConfig::stretch_edge());
+        scale.set_target(1.0);
+        let mut alpha = SpringSimulation::new(0.3, 0.3, SpringConfig::stretch_edge());
+        alpha.set_target(1.0);
+
+        close_modal_surfaces(&mut state, &mut folder, &mut popup, &mut scale, &mut alpha);
+
+        assert_eq!(state, ShellState::Normal);
+        assert!(!state.is_modal(), "Normal must not block a workspace swipe");
+        assert_eq!(folder.folder_idx, 3, "closing must not lose which folder it was");
+        assert_eq!(scale.target, 1.0, "the workspace morph must return to rest");
+        assert_eq!(alpha.target, 1.0);
+        assert_eq!(popup.target, 0.0, "the popup must be dismissed, not left open");
+    }
+
+    #[test]
+    fn only_a_modal_state_blocks_a_workspace_swipe() {
+        // The guard this assertion exists for. If `Normal` or `AllApps` were
+        // modal, the home screen could never be paged again; if `Overview` were
+        // not, a swipe behind the carousel would page the workspace under it.
+        assert!(!ShellState::Normal.is_modal());
+        assert!(!ShellState::AllApps { progress: 1.0 }.is_modal());
+        assert!(ShellState::Overview {
+            selected: 0,
+            dismiss: 0.0
+        }
+        .is_modal());
+        assert!(
+            ShellState::PopupOpen {
+                anchor_x: 0.0,
+                anchor_y: 0.0,
+                idx: 0
+            }
+            .is_modal()
+        );
+    }
 
     #[test]
     fn test_terminal_command_execution() {

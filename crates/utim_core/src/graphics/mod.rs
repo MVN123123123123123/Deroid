@@ -25,7 +25,7 @@ pub use composer::{
     Rect, Transform,
 };
 pub use drm_kms::{
-    AppGridItem, DrmInteractiveState, DrmKmsDevice, FontWeight, MaterialYouPalette,
+    AppGridItem, DrmInteractiveState, DrmKmsDevice, FontWeight, MaterialYouPalette, RecentsCard,
     SpringConfig, SpringSimulation, TerminalTabInfo, apply_frosted_blur,
     apply_frosted_blur_region, format_apps_count, paint_frame, text_width, text_width_at,
 };
