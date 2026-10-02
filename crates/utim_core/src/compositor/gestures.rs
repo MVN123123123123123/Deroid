@@ -548,6 +548,82 @@ impl Default for MotionPause {
 // Configuration
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Density reference values (plan §7.3, Task 2.5)
+// ---------------------------------------------------------------------------
+//
+// Every *spatial* threshold below is a dp figure quoted straight out of the
+// AOSP resources it came from, and the *speed* ones are the px/s forms of
+// those same dp/s figures. The engine consumes all of them as pixels, so a
+// config built from raw dp constants is wrong on every panel that is not
+// density 1.0: on a 1080x2400 panel (2.5714 px/dp) an 11.3 px gesture slop
+// fires on a finger wobble, a 36 px minimum displacement is inside the noise
+// floor of a capacitive digitiser, and a 48 px edge zone is 4.4% of the
+// width instead of the 11% a `48dp` back gesture is supposed to be.
+//
+// These are the density-1.0 reference values. `Default` uses them verbatim,
+// so the shipped behaviour is unchanged; `GestureConfig::for_density`
+// multiplies every length and every speed by the panel density and leaves the
+// dimensionless ones alone.
+
+/// `navigation_bar_height` = 48dp.
+const DP_BOTTOM_NAV_HEIGHT: f32 = 48.0;
+/// Back-gesture inset = 48dp.
+const DP_EDGE_ZONE_WIDTH: f32 = 48.0;
+/// Status bar height = 48dp.
+const DP_TOP_BAR_HEIGHT: f32 = 48.0;
+/// `quickstep_home_threshold_y` = 60dp.
+const DP_HOME_THRESHOLD_Y: f32 = 60.0;
+/// Back-gesture trigger travel = 40dp.
+const DP_BACK_THRESHOLD_X: f32 = 40.0;
+/// One task-switch step along the nav bar = 80dp.
+const DP_SCRUB_THRESHOLD_X: f32 = 80.0;
+/// `ViewConfiguration.getScaledTouchSlop()` base = 8dp.
+const DP_TOUCH_SLOP: f32 = 8.0;
+/// `dimens.xml:151` `quickstep_min_displacement_from_app` = 36dp.
+const DP_MIN_DISPLACEMENT: f32 = 36.0;
+/// `dimens.xml:152` `quickstep_fling_threshold_speed` = 0.5 px/ms = 500 px/s.
+const SPEED_FLING_PX_PER_MS: f32 = 0.5;
+const SPEED_FLING_PX_PER_S: f32 = 500.0;
+/// `dimens.xml:147` `quickstep_motion_pause_slow`.
+const SPEED_MOTION_PAUSE_SLOW: f32 = 0.15;
+/// `dimens.xml:146` `quickstep_motion_pause_very_slow`.
+const SPEED_MOTION_PAUSE_VERY_SLOW: f32 = 0.0285;
+/// `dimens.xml:150` `quickstep_motion_pause_fast`.
+const SPEED_MOTION_PAUSE_FAST: f32 = 1.4;
+
+/// `RecentsAnimationDeviceState.java:106`
+/// `QUICKSTEP_TOUCH_SLOP_RATIO_GESTURAL`. Dimensionless, so density never
+/// touches it.
+const GESTURAL_SLOP_RATIO: f32 = 1.414;
+
+/// How much further the horizontal axis must beat the vertical one before a
+/// drag along the nav bar is read as a task switch (plan §7.3, Task 2.6).
+///
+/// This replaces a fixed `|dy| < 30 px` dead zone, which is the wrong shape
+/// for the job twice over: it is a raw pixel count, so it silently meant
+/// something different on every panel, and it is a *box* rather than a
+/// *dominance* rule, so a 45-degree drag that starts almost horizontal still
+/// scrubs the task list while the user is plainly reaching for the shade.
+const SCRUB_AXIS_DOMINANCE: f32 = 1.5;
+
+/// Fraction of the panel a drag-up has to cover for the release to commit Home
+/// even when the finger had already stopped.
+///
+/// AOSP's `SwipeUpToHomeHandler` compares against a fixed `mUpThresholdY`
+/// pixel count, but a fixed pixel count cannot be right on a panel of unknown
+/// size, so the commit distance is a fraction of the panel instead. 25% sits
+/// below the 50% the MOVE path needs for full progress and far above the
+/// gesture slop, so a short nudge cannot reach it and only a deliberate drag
+/// or a real fling does.
+const HOME_COMMIT_FRACTION: f32 = 0.25;
+
+/// Terminal window pose a committed Home animation lands on: the same
+/// scale-down the MOVE path ends at, so the shell runs one curve for a drag
+/// release and a fling release alike.
+const HOME_COMMIT_SCALE: f32 = 0.6;
+const HOME_COMMIT_ALPHA: f32 = 0.7;
+
 /// Gesture Engine Configuration
 ///
 /// Every field here is read by the engine. A constant that only a *future*
@@ -556,14 +632,22 @@ impl Default for MotionPause {
 /// that reason -- the first contradicts the motion-pause design outright, and
 /// the other two belong to the shell's swipe-to-drawer commit, which does not
 /// exist yet. Add them back with the consumer, not before.
+///
+/// Build this with [`GestureConfig::for_density`], not with a struct literal:
+/// the dp figures in the docs below are only meaningful once they have been
+/// multiplied by the panel's px/dp.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GestureConfig {
-    pub bottom_nav_height: f32, // default 48.0 px
-    pub edge_zone_width: f32,   // default 48.0 px
-    pub top_bar_height: f32,    // default 48.0 px
-    pub home_threshold_y: f32,  // default 60.0 px
-    pub back_threshold_x: f32,  // default 40.0 px
-    pub scrub_threshold_x: f32, // default 80.0 px
+    /// Panel density in px/dp, as in `DisplayMetrics.density` (density 1.0 =
+    /// 160 dpi baseline). Everything spatial or speed-like below is already
+    /// multiplied by it, so the shell only has to set this once.
+    pub density: f32,
+    pub bottom_nav_height: f32, // default 48.0 dp
+    pub edge_zone_width: f32,   // default 48.0 dp
+    pub top_bar_height: f32,    // default 48.0 dp
+    pub home_threshold_y: f32,  // default 60.0 dp
+    pub back_threshold_x: f32,  // default 40.0 dp
+    pub scrub_threshold_x: f32, // default 80.0 dp
 
     // --- Quickstep-derived constants (plan §7.3) ---
     /// Fling speed, px/ms. `quickstep/res/values/dimens.xml:152`
@@ -573,6 +657,15 @@ pub struct GestureConfig {
     /// Both commit Home, but the branch is explicit so the shell can treat
     /// them differently once it owns the window transform.
     pub fling_threshold: f32,
+    /// The same fling speed in px/s, which is the unit
+    /// [`GestureAction::Home`]'s commit path works in: velocity there is
+    /// `dy / dt` over a release, not a per-millisecond ring delta.
+    ///
+    /// Kept as its own field rather than a `* 1000.0` on `fling_threshold` so
+    /// the two units cannot drift apart when the panel density changes, and
+    /// so a shell that already thinks in px/s (a spring, a fling animation)
+    /// reads the value it means.
+    pub fling_threshold_px: f32,
     /// Panel touch slop, px. `ViewConfiguration.getScaledTouchSlop()` on a
     /// 1080 px / ~420 dp panel.
     pub touch_slop: f32,
@@ -601,33 +694,93 @@ pub struct GestureConfig {
 
 impl Default for GestureConfig {
     fn default() -> Self {
+        // Density 1.0: the dp figures are their own pixel values here, which
+        // is what every caller that predates `for_density` was written
+        // against.
         Self {
-            bottom_nav_height: 48.0,
-            edge_zone_width: 48.0,
-            top_bar_height: 48.0,
-            home_threshold_y: 60.0,
-            back_threshold_x: 40.0,
-            scrub_threshold_x: 80.0,
-            fling_threshold: 0.5,
-            touch_slop: 8.0,
-            touch_slop_ratio: 1.414,
-            motion_pause_slow: 0.15,
-            motion_pause_very_slow: 0.0285,
-            motion_pause_fast: 1.4,
+            density: 1.0,
+            bottom_nav_height: DP_BOTTOM_NAV_HEIGHT,
+            edge_zone_width: DP_EDGE_ZONE_WIDTH,
+            top_bar_height: DP_TOP_BAR_HEIGHT,
+            home_threshold_y: DP_HOME_THRESHOLD_Y,
+            back_threshold_x: DP_BACK_THRESHOLD_X,
+            scrub_threshold_x: DP_SCRUB_THRESHOLD_X,
+            fling_threshold: SPEED_FLING_PX_PER_MS,
+            fling_threshold_px: SPEED_FLING_PX_PER_S,
+            touch_slop: DP_TOUCH_SLOP,
+            touch_slop_ratio: GESTURAL_SLOP_RATIO,
+            motion_pause_slow: SPEED_MOTION_PAUSE_SLOW,
+            motion_pause_very_slow: SPEED_MOTION_PAUSE_VERY_SLOW,
+            motion_pause_fast: SPEED_MOTION_PAUSE_FAST,
             force_pause_ms: 300.0,
             harder_trigger_ms: 400.0,
             rapid_decel_factor: 0.6,
-            min_displacement: 36.0,
+            min_displacement: DP_MIN_DISPLACEMENT,
         }
     }
 }
 
 impl GestureConfig {
+    /// Thresholds for a panel of `density` px/dp.
+    ///
+    /// The rule is mechanical and total: every length (px) and every speed
+    /// (px/ms, px/s) is multiplied by the density, and every dimensionless
+    /// ratio, factor and timeout is left alone. `8dp` becomes 20.6 px at
+    /// 2.5714 px/dp, `36dp` becomes 92.6 px, and the gestural slop becomes
+    /// 29.1 px -- the point of the whole exercise. Forgetting one field is
+    /// exactly the bug this constructor exists to make impossible.
+    ///
+    /// A non-finite or non-positive density collapses to 1.0 rather than
+    /// propagating: a zero gate fires on the first pixel of travel and a NaN
+    /// gate never fires at all, and both are far worse than being
+    /// unscaled.
+    pub fn for_density(density: f32) -> Self {
+        let d = if density.is_finite() && density > 0.0 {
+            density
+        } else {
+            1.0
+        };
+        Self {
+            density: d,
+            bottom_nav_height: DP_BOTTOM_NAV_HEIGHT * d,
+            edge_zone_width: DP_EDGE_ZONE_WIDTH * d,
+            top_bar_height: DP_TOP_BAR_HEIGHT * d,
+            home_threshold_y: DP_HOME_THRESHOLD_Y * d,
+            back_threshold_x: DP_BACK_THRESHOLD_X * d,
+            scrub_threshold_x: DP_SCRUB_THRESHOLD_X * d,
+            fling_threshold: SPEED_FLING_PX_PER_MS * d,
+            fling_threshold_px: SPEED_FLING_PX_PER_S * d,
+            touch_slop: DP_TOUCH_SLOP * d,
+            min_displacement: DP_MIN_DISPLACEMENT * d,
+            motion_pause_slow: SPEED_MOTION_PAUSE_SLOW * d,
+            motion_pause_very_slow: SPEED_MOTION_PAUSE_VERY_SLOW * d,
+            motion_pause_fast: SPEED_MOTION_PAUSE_FAST * d,
+            ..Self::default()
+        }
+    }
+
     /// Effective touch slop: Quickstep scales the panel slop up for gestural
     /// navigation (`QUICKSTEP_TOUCH_SLOP_RATIO_GESTURAL`).
     #[inline]
     pub fn gesture_slop(&self) -> f32 {
         self.touch_slop * self.touch_slop_ratio
+    }
+
+    /// True when a drag is axis-locked to the horizontal and has travelled far
+    /// enough to shift a task along the nav bar.
+    ///
+    /// Both conditions are needed. The dominance ratio is what makes this a
+    /// *gesture* rather than a *box*; the distance is what keeps a single
+    /// stray sample from switching apps. See [`SCRUB_AXIS_DOMINANCE`].
+    #[inline]
+    pub fn is_scrub_dominant(&self, dx: f32, dy: f32) -> bool {
+        dx.abs() > dy.abs() * SCRUB_AXIS_DOMINANCE && dx.abs() >= self.scrub_threshold_x
+    }
+
+    /// Commit distance for a swipe-up released over the app surface, in px.
+    #[inline]
+    pub fn home_commit_distance(&self, display_height: f32) -> f32 {
+        display_height * HOME_COMMIT_FRACTION
     }
 }
 
@@ -776,7 +929,10 @@ impl GestureEngine {
 
                         // Horizontal scrub along bottom bar: one app shift per
                         // scrub_threshold_x of additional travel (re-armed).
-                        if dy.abs() < 30.0 && dx.abs() >= self.config.scrub_threshold_x {
+                        // The axis is claimed by dominance, so a diagonal that
+                        // has started pulling towards the shade is not read as
+                        // a task switch (plan §7.3, Task 2.6).
+                        if self.config.is_scrub_dominant(dx, dy) {
                             let steps = (dx.abs() / self.config.scrub_threshold_x) as i32;
                             let last = ((*last_scrub_x - *start_x).abs()
                                 / self.config.scrub_threshold_x)
@@ -941,13 +1097,13 @@ impl GestureEngine {
                             {
                                 GestureAction::Home {
                                     progress: 1.0,
-                                    scale: 0.6,
-                                    window_alpha: 0.7,
+                                    scale: HOME_COMMIT_SCALE,
+                                    window_alpha: HOME_COMMIT_ALPHA,
                                 }
                             } else {
                                 GestureAction::None
                             }
-                        } else if dy.abs() < 30.0 && dx.abs() >= self.config.scrub_threshold_x {
+                        } else if self.config.is_scrub_dominant(dx, dy) {
                             // Commit only a step the MOVE path has not emitted.
                             let steps = (dx.abs() / self.config.scrub_threshold_x) as i32;
                             let last = ((*last_scrub_x - *start_x).abs()
@@ -998,16 +1154,66 @@ impl GestureEngine {
                     }
 
                     GestureState::TrackingCenter {
-                        start_x,
-                        start_y,
-                        current_x,
-                        current_y,
-                        ..
+                        start_x, start_y, ..
                     } => {
-                        let dx = *current_x - *start_x;
-                        let dy = *current_y - *start_y;
+                        // Measure from the *release* point, not from the last
+                        // MOVE sample. `current_*` only ever advances on a
+                        // MOVE, so a fast flick the digitiser reported as
+                        // Down-then-Up with no intermediate frame -- which is
+                        // what a real fling looks like -- would otherwise be
+                        // measured as zero travel and fall through to `None`.
+                        //
+                        // Raw screen convention: +y is down, so an upward
+                        // swipe is a negative dy and a negative velocity.
+                        let dx = event.x - *start_x;
+                        let dy = event.y - *start_y;
                         let slop = self.config.gesture_slop();
-                        if dx.abs() >= slop || dy.abs() >= slop {
+
+                        // A hard swipe up over the app surface is a Home
+                        // commit, not a leftover page scroll. AOSP's
+                        // `SwipeUpToHomeHandler` accepts either branch -- a
+                        // fling past `fling_threshold_px`, or travel past
+                        // `home_commit_distance` for a finger that had
+                        // already stopped -- and so does this, so a slow
+                        // deliberate drag and a hard flick both land Home.
+                        //
+                        // Both branches require the vertical axis to be
+                        // claimed first: past the slop, and beating the
+                        // horizontal by more than the MOVE path's 1:1 rule.
+                        // Without that, a diagonal flick would tear the app
+                        // down while the user was swiping sideways, and the
+                        // release would commit a Home the MOVE path never
+                        // reported.
+                        //
+                        // The velocity is the ring's instantaneous px/ms
+                        // across the last two samples -- the frame pair that
+                        // actually contains the release -- rather than an
+                        // average over the whole gesture: a slow drag that
+                        // ends in a flick is a flick, and averaging would
+                        // misread it as a stop.
+                        let up = -dy; // px travelled upward
+                        let axis_claimed = up > slop && up > dx.abs();
+                        let (_, vy) = self.motion.velocity();
+                        let v_up = -vy * 1000.0; // px/s, positive upward
+                        let flung = v_up > self.config.fling_threshold_px;
+                        let dragged = up >= self.config.home_commit_distance(self.display_height);
+                        // A NaN from a degenerate coordinate or a repeated
+                        // timestamp must never reach the shell as a commit,
+                        // so the distance branch is guarded on finiteness
+                        // even though every comparison above is already
+                        // false for it.
+                        if axis_claimed && up.is_finite() && (flung || dragged) {
+                            // The same terminal pose the drag path ends at, so
+                            // the shell animates a flick and a drag with one
+                            // curve.
+                            GestureAction::Home {
+                                progress: 1.0,
+                                scale: HOME_COMMIT_SCALE,
+                                window_alpha: HOME_COMMIT_ALPHA,
+                            }
+                        } else if dx.abs() >= slop || dy.abs() >= slop {
+                            // Otherwise this is the app's own scroll, handed
+                            // back untouched.
                             GestureAction::Swipe {
                                 delta_x: dx,
                                 delta_y: dy,
@@ -1519,11 +1725,59 @@ mod tests {
         );
 
         // Drag past the threshold but travelling downwards at 6 px/ms: cancel.
+        // This is the *nav bar* version of that: rise 80 px (past
+        // `home_threshold_y`, so the MOVE path claims Home), fall back to 60 px,
+        // and lift while still crawling downwards. Nothing may commit.
+        let mut engine = GestureEngine::new(1080.0, 2400.0, GestureConfig::default());
+        engine.process_touch(&ev(t0, TouchPhase::Down, 2380.0));
+        let claimed = engine.process_touch(&ev(
+            t0 + Duration::from_millis(10),
+            TouchPhase::Move,
+            2300.0,
+        ));
+        assert!(
+            matches!(claimed, GestureAction::Home { progress, .. } if progress > 0.0),
+            "the rise must have claimed Home first, got {:?}",
+            claimed
+        );
+        engine.process_touch(&ev(
+            t0 + Duration::from_millis(20),
+            TouchPhase::Move,
+            2310.0,
+        ));
+        let down =
+            engine.process_touch(&ev(t0 + Duration::from_millis(30), TouchPhase::Up, 2320.0));
+        assert_eq!(
+            down,
+            GestureAction::None,
+            "a nav-bar drag released while falling back is a cancel, got {:?}",
+            down
+        );
+
+        // The same "downwards must not exit" rule over the app surface. This
+        // case is a *centre* gesture, not a nav-bar one: y = 2000 is well
+        // above the 2352 px nav bar, so it is measured by `TrackingCenter`.
+        // It used to assert `None`, and that only held because the release
+        // arm measured travel from the last MOVE sample -- a Down/Up pair
+        // with no MOVE between them reported zero travel for a real 180 px
+        // drag. Measuring from the release point (Task 2.1.3) turns that
+        // phantom cancel into the real thing: the app's own scroll, handed
+        // back with its true displacement and, crucially, not a Home.
         let mut engine = GestureEngine::new(1080.0, 2400.0, GestureConfig::default());
         engine.process_touch(&ev(t0, TouchPhase::Down, 2000.0));
         let down =
             engine.process_touch(&ev(t0 + Duration::from_millis(30), TouchPhase::Up, 2180.0));
-        assert_eq!(down, GestureAction::None);
+        assert!(
+            !matches!(down, GestureAction::Home { .. }),
+            "a 6 px/ms downward drag must never commit Home, got {:?}",
+            down
+        );
+        assert!(
+            matches!(down, GestureAction::Swipe { delta_x, delta_y }
+                if delta_x.abs() < 1e-3 && (delta_y - 180.0).abs() < 1e-3),
+            "a downward drag is the app scrolling back: got {:?}",
+            down
+        );
     }
 
     #[test]
@@ -1708,11 +1962,26 @@ mod tests {
         assert_eq!(up, GestureAction::None, "cancelled hold must not commit");
     }
 
+    /// 1080 px / 420 dp is the panel every other test in this file uses, and
+    /// 2.5714 px/dp is what its dp thresholds have to be scaled by.
+    const DENSITY_1080P: f32 = 1080.0 / 420.0;
+
     #[test]
     fn tracking_center_emits_home_on_vertical_drag() {
         let cfg = GestureConfig::default();
         let slop = cfg.gesture_slop();
+        // Density 1.0: 8dp * 1.414.
         assert!((slop - 11.312).abs() < 1e-3, "slop = {}", slop);
+        // The same 8dp slop on the panel this file actually drives, which is
+        // 2.5714 px/dp: 8 * 2.5714 = 20.57 px, * 1.414 = 29.09 px. Asserting
+        // this here is the point of `for_density` -- an engine shipped on
+        // 1080p with the unscaled 11.3 px slop fires on a finger wobble.
+        let dslop = GestureConfig::for_density(DENSITY_1080P).gesture_slop();
+        assert!(
+            (dslop - 29.088).abs() < 5e-3,
+            "density-scaled slop = {}",
+            dslop
+        );
         let mut engine = GestureEngine::new(1080.0, 2400.0, cfg);
         let t0 = Instant::now();
 
@@ -1845,5 +2114,736 @@ mod tests {
             GestureAction::Back { injected, .. } => assert!(injected),
             _ => panic!("Expected Back injection"),
         }
+    }
+
+    // -- Task 2.5: density-scaled thresholds ---------------------------------
+
+    /// Every threshold is a dp (or dp/s) figure that the engine reads as
+    /// pixels. `for_density` has to scale *all* of them, not just the two
+    /// that happened to be named, or the engine is half-correct on a 1080p
+    /// panel: a 2.57x-correct gesture slop next to a still-48px edge zone and
+    /// a still-60px home threshold.
+    #[test]
+    fn for_density_scales_every_px_denominated_threshold() {
+        let d = DENSITY_1080P; // 2.5714 px/dp
+        let base = GestureConfig::default();
+        let cfg = GestureConfig::for_density(d);
+
+        assert!((cfg.density - d).abs() < 1e-6, "density = {}", cfg.density);
+
+        // The two the plan calls out by name.
+        assert!(
+            (cfg.touch_slop - 20.5714).abs() < 5e-3,
+            "{}",
+            cfg.touch_slop
+        );
+        assert!(
+            (cfg.min_displacement - 92.5714).abs() < 5e-3,
+            "{}",
+            cfg.min_displacement
+        );
+        assert!(
+            (cfg.fling_threshold_px - 1285.714).abs() < 1e-2,
+            "{}",
+            cfg.fling_threshold_px
+        );
+        assert!((cfg.touch_slop_ratio - 1.414).abs() < 1e-6);
+
+        // Every other length the engine consumes: the nav bar, the back edge,
+        // the status bar, the home drag, the back drag and the scrub step are
+        // all dp in the AOSP resources, so all of them are wrong unscaled.
+        for (got, want_dp, name) in [
+            (
+                cfg.bottom_nav_height,
+                DP_BOTTOM_NAV_HEIGHT,
+                "bottom_nav_height",
+            ),
+            (cfg.edge_zone_width, DP_EDGE_ZONE_WIDTH, "edge_zone_width"),
+            (cfg.top_bar_height, DP_TOP_BAR_HEIGHT, "top_bar_height"),
+            (
+                cfg.home_threshold_y,
+                DP_HOME_THRESHOLD_Y,
+                "home_threshold_y",
+            ),
+            (
+                cfg.back_threshold_x,
+                DP_BACK_THRESHOLD_X,
+                "back_threshold_x",
+            ),
+            (
+                cfg.scrub_threshold_x,
+                DP_SCRUB_THRESHOLD_X,
+                "scrub_threshold_x",
+            ),
+        ] {
+            assert!(
+                (got - want_dp * d).abs() < 5e-3,
+                "{} = {} want {}",
+                name,
+                got,
+                want_dp * d
+            );
+        }
+        // And the speeds, which are px/s in disguise: a physical gesture maps
+        // to proportionally more pixels on a denser panel, so the threshold
+        // has to move with it or every fling reads as a stop.
+        assert!(
+            (cfg.fling_threshold - SPEED_FLING_PX_PER_MS * d).abs() < 5e-4,
+            "{}",
+            cfg.fling_threshold
+        );
+        assert!(
+            (cfg.motion_pause_slow - SPEED_MOTION_PAUSE_SLOW * d).abs() < 5e-4,
+            "{}",
+            cfg.motion_pause_slow
+        );
+        assert!((cfg.motion_pause_very_slow - SPEED_MOTION_PAUSE_VERY_SLOW * d).abs() < 5e-4);
+        assert!((cfg.motion_pause_fast - SPEED_MOTION_PAUSE_FAST * d).abs() < 5e-4);
+
+        // The two speed fields must not drift: same threshold, two units.
+        assert!(
+            (cfg.fling_threshold_px - cfg.fling_threshold * 1000.0).abs() < 1e-2,
+            "px/s and px/ms disagree: {} vs {}",
+            cfg.fling_threshold_px,
+            cfg.fling_threshold
+        );
+
+        // Dimensionless inputs are untouched.
+        assert_eq!(cfg.force_pause_ms, base.force_pause_ms);
+        assert_eq!(cfg.harder_trigger_ms, base.harder_trigger_ms);
+        assert_eq!(cfg.rapid_decel_factor, base.rapid_decel_factor);
+        assert_eq!(cfg.touch_slop_ratio, base.touch_slop_ratio);
+
+        // `Default` is density 1.0, so every caller written before
+        // `for_density` existed keeps byte-identical thresholds.
+        assert_eq!(base, GestureConfig::for_density(1.0));
+        assert!((base.gesture_slop() - 11.312).abs() < 1e-3);
+
+        // A degenerate density must not produce a config where every gate is
+        // either always-true (0 px) or never-true (NaN).
+        for bad in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            let c = GestureConfig::for_density(bad);
+            assert_eq!(c.density, 1.0, "bad density {:?} must collapse", bad);
+            assert_eq!(c, base, "bad density {:?} must not change a gate", bad);
+        }
+    }
+
+    /// A finger that wobbles inside the slop must not commit anything. On
+    /// 1080p the unscaled slop was 11.3 px, well inside the noise floor of a
+    /// capacitive panel; scaled, it is 20.6 px, and a 19 px wobble is
+    /// nothing at all.
+    #[test]
+    fn a_sub_slop_wobble_does_not_commit_a_gesture() {
+        let cfg = GestureConfig::for_density(DENSITY_1080P);
+        let slop = cfg.gesture_slop();
+        assert!((slop - 20.5714 * 1.414).abs() < 5e-3, "slop = {}", slop);
+
+        // 1. Over the app surface: 19 px of noise in both axes, in every
+        //    direction, and nothing is claimed at any point.
+        let mut engine = GestureEngine::new(1080.0, 2400.0, cfg.clone());
+        let t0 = Instant::now();
+        engine.process_touch(&RawTouchEvent {
+            touch_id: 1,
+            phase: TouchPhase::Down,
+            x: 540.0,
+            y: 1200.0,
+            timestamp: t0,
+        });
+        let mut t = t0;
+        for i in 0..12i32 {
+            t += Duration::from_millis(8);
+            let swing = if i % 2 == 0 { 19.0 } else { -19.0 };
+            let a = engine.process_touch(&RawTouchEvent {
+                touch_id: 1,
+                phase: TouchPhase::Move,
+                x: 540.0 + swing,
+                y: 1200.0 - swing,
+                timestamp: t,
+            });
+            assert_eq!(a, GestureAction::None, "frame {} claimed {:?}", i, a);
+        }
+        let up = engine.process_touch(&RawTouchEvent {
+            touch_id: 1,
+            phase: TouchPhase::Up,
+            x: 540.0,
+            y: 1200.0,
+            timestamp: t + Duration::from_millis(8),
+        });
+        assert_eq!(up, GestureAction::None, "a wobble is a tap, got {:?}", up);
+
+        // 2. From the nav bar, where the same wobble would otherwise be
+        //    measured against home_threshold_y (60dp = 154 px scaled).
+        let mut engine = GestureEngine::new(1080.0, 2400.0, cfg.clone());
+        let t0 = Instant::now();
+        engine.process_touch(&ev(t0, TouchPhase::Down, 2380.0));
+        let mut t = t0;
+        let mut y = 2380.0f32;
+        for i in 0..12i32 {
+            t += Duration::from_millis(8);
+            y += if i % 2 == 0 { -19.0 } else { 19.0 };
+            let a = engine.process_touch(&ev(t, TouchPhase::Move, y));
+            assert!(
+                matches!(a, GestureAction::None),
+                "a 19 px wobble must not claim the nav-bar gesture, got {:?}",
+                a
+            );
+        }
+        assert_eq!(
+            engine.process_touch(&ev(t, TouchPhase::Up, y)),
+            GestureAction::None
+        );
+
+        // 3. The control: the slop is a live gate, not an inert number. The
+        //    same 19 px would have been over half the *unscaled* 11.3 px slop,
+        //    and a genuinely vertical 40 px drag is a gesture again.
+        let mut engine = GestureEngine::new(1080.0, 2400.0, cfg.clone());
+        let t0 = Instant::now();
+        engine.process_touch(&RawTouchEvent {
+            touch_id: 1,
+            phase: TouchPhase::Down,
+            x: 540.0,
+            y: 1200.0,
+            timestamp: t0,
+        });
+        let a = engine.process_touch(&RawTouchEvent {
+            touch_id: 1,
+            phase: TouchPhase::Move,
+            x: 540.0,
+            y: 1200.0 - 40.0,
+            timestamp: t0 + Duration::from_millis(16),
+        });
+        assert!(
+            matches!(a, GestureAction::Home { progress, .. } if progress > 0.0),
+            "a 40 px vertical drag is past the 20.6 px slop and must claim Home, got {:?}",
+            a
+        );
+
+        // 4. And just under the scaled slop the MOVE path stays silent, so
+        //    the slop boundary itself is pinned from both sides.
+        let mut engine = GestureEngine::new(1080.0, 2400.0, cfg);
+        let t0 = Instant::now();
+        engine.process_touch(&RawTouchEvent {
+            touch_id: 1,
+            phase: TouchPhase::Down,
+            x: 540.0,
+            y: 1200.0,
+            timestamp: t0,
+        });
+        let a = engine.process_touch(&RawTouchEvent {
+            touch_id: 1,
+            phase: TouchPhase::Move,
+            x: 540.0,
+            y: 1200.0 - slop + 1.0,
+            timestamp: t0 + Duration::from_millis(16),
+        });
+        assert_eq!(
+            a,
+            GestureAction::None,
+            "one px under the slop claims nothing"
+        );
+    }
+
+    // -- Task 2.1.3: swipe-up-to-home on release ----------------------------
+
+    /// A hard upward flick over the app surface must commit Home on release.
+    /// Before this, the `TrackingCenter` release arm had exactly one exit --
+    /// `Swipe` -- so a swipe the MOVE path never got to sample (or one the
+    /// shell had already been morphing) resolved to a page scroll and the
+    /// app never closed.
+    #[test]
+    fn center_release_commits_home_on_an_upward_fling() {
+        let mut engine = GestureEngine::new(1080.0, 2400.0, GestureConfig::default());
+        let t0 = Instant::now();
+        engine.process_touch(&RawTouchEvent {
+            touch_id: 1,
+            phase: TouchPhase::Down,
+            x: 540.0,
+            y: 1200.0,
+            timestamp: t0,
+        });
+        // 60 px per 8 ms frame = 7.5 px/ms = 7500 px/s upward, which is 15x
+        // `fling_threshold_px` (500 px/s at density 1.0).
+        engine.process_touch(&RawTouchEvent {
+            touch_id: 1,
+            phase: TouchPhase::Move,
+            x: 540.0,
+            y: 1140.0,
+            timestamp: t0 + Duration::from_millis(8),
+        });
+        let up = engine.process_touch(&RawTouchEvent {
+            touch_id: 1,
+            phase: TouchPhase::Up,
+            x: 540.0,
+            y: 1080.0,
+            timestamp: t0 + Duration::from_millis(16),
+        });
+        match up {
+            GestureAction::Home {
+                progress,
+                scale,
+                window_alpha,
+            } => {
+                assert_eq!(progress, 1.0, "a commit is a commit, not a partial");
+                // The same terminal pose the drag path lands on, so the shell
+                // runs one curve for a flick and a drag alike.
+                assert_eq!(scale, HOME_COMMIT_SCALE);
+                assert_eq!(window_alpha, HOME_COMMIT_ALPHA);
+            }
+            other => panic!("an upward fling must commit Home, got {:?}", other),
+        }
+
+        // The same fling reported as a single Down/Up pair -- no MOVE frame at
+        // all -- must also commit. This is the case the old
+        // `current_x/current_y` measurement silently dropped on the floor,
+        // because those only advance on a MOVE.
+        let mut engine = GestureEngine::new(1080.0, 2400.0, GestureConfig::default());
+        engine.process_touch(&RawTouchEvent {
+            touch_id: 1,
+            phase: TouchPhase::Down,
+            x: 540.0,
+            y: 1200.0,
+            timestamp: t0,
+        });
+        let up = engine.process_touch(&RawTouchEvent {
+            touch_id: 1,
+            phase: TouchPhase::Up,
+            x: 540.0,
+            y: 1080.0,
+            timestamp: t0 + Duration::from_millis(16),
+        });
+        assert!(
+            matches!(up, GestureAction::Home { progress: 1.0, .. }),
+            "a frame-less fling must still commit, got {:?}",
+            up
+        );
+
+        // And the distance branch: a slow drag past a quarter of the panel
+        // commits too, so a deliberate drag is not penalised for lacking a
+        // flick at the end. 700 px of 2400 is 29% (the gate is 25% = 600 px),
+        // taken over 2 s so the release speed is 350 px/s -- under the 500 px/s
+        // fling gate, which is what makes this the *distance* branch rather
+        // than the fling branch arriving again by the back door.
+        let mut engine = GestureEngine::new(1080.0, 2400.0, GestureConfig::default());
+        engine.process_touch(&RawTouchEvent {
+            touch_id: 1,
+            phase: TouchPhase::Down,
+            x: 540.0,
+            y: 1200.0,
+            timestamp: t0,
+        });
+        let up = engine.process_touch(&RawTouchEvent {
+            touch_id: 1,
+            phase: TouchPhase::Up,
+            x: 540.0,
+            y: 500.0,
+            timestamp: t0 + Duration::from_millis(2000),
+        });
+        assert!(
+            matches!(up, GestureAction::Home { progress: 1.0, .. }),
+            "a long slow drag past a quarter of the panel must commit, got {:?}",
+            up
+        );
+    }
+
+    /// The negative cases for the same gate. A nudge is not a gesture, and a
+    /// downward drag is the app scrolling back, never an exit.
+    #[test]
+    fn center_release_only_commits_home_for_a_real_upward_throw() {
+        let cfg = GestureConfig::default();
+        let slop = cfg.gesture_slop();
+        let t0 = Instant::now();
+
+        // 1. A small upward nudge, slow. 40 px over 400 ms = 0.1 px/ms = 100
+        //    px/s, an order of magnitude under the 500 px/s fling gate, and
+        //    40 px is nowhere near the 600 px distance gate. The app's own
+        //    scroll gets it back verbatim.
+        let mut engine = GestureEngine::new(1080.0, 2400.0, cfg.clone());
+        engine.process_touch(&RawTouchEvent {
+            touch_id: 1,
+            phase: TouchPhase::Down,
+            x: 540.0,
+            y: 1200.0,
+            timestamp: t0,
+        });
+        engine.process_touch(&RawTouchEvent {
+            touch_id: 1,
+            phase: TouchPhase::Move,
+            x: 540.0,
+            y: 1160.0,
+            timestamp: t0 + Duration::from_millis(50),
+        });
+        let up = engine.process_touch(&RawTouchEvent {
+            touch_id: 1,
+            phase: TouchPhase::Up,
+            x: 540.0,
+            y: 1160.0,
+            timestamp: t0 + Duration::from_millis(400),
+        });
+        match up {
+            GestureAction::Swipe { delta_x, delta_y } => {
+                assert!(delta_x.abs() < 1e-3, "delta_x = {}", delta_x);
+                assert!((delta_y - (-40.0)).abs() < 1e-3, "delta_y = {}", delta_y);
+            }
+            other => panic!("a nudge must stay a Swipe, got {:?}", other),
+        }
+
+        // 2. A downward drag: positive dy, no Home under any circumstances.
+        let mut engine = GestureEngine::new(1080.0, 2400.0, cfg.clone());
+        engine.process_touch(&RawTouchEvent {
+            touch_id: 1,
+            phase: TouchPhase::Down,
+            x: 540.0,
+            y: 1200.0,
+            timestamp: t0,
+        });
+        engine.process_touch(&RawTouchEvent {
+            touch_id: 1,
+            phase: TouchPhase::Move,
+            x: 540.0,
+            y: 1300.0,
+            timestamp: t0 + Duration::from_millis(8),
+        });
+        let up = engine.process_touch(&RawTouchEvent {
+            touch_id: 1,
+            phase: TouchPhase::Up,
+            x: 540.0,
+            y: 1400.0,
+            timestamp: t0 + Duration::from_millis(16),
+        });
+        match up {
+            GestureAction::Swipe { delta_x, delta_y } => {
+                assert!(delta_x.abs() < 1e-3, "delta_x = {}", delta_x);
+                assert!(
+                    (delta_y - 200.0).abs() < 1e-3,
+                    "a downward drag has positive dy, got {}",
+                    delta_y
+                );
+            }
+            other => panic!("a downward drag must be a Swipe, got {:?}", other),
+        }
+
+        // 3. Fast, but sideways. A horizontal flick is the pager's, and the
+        //    axis must be claimed before the release can tear the app down
+        //    even though the velocity is far past the fling gate.
+        let mut engine = GestureEngine::new(1080.0, 2400.0, cfg.clone());
+        engine.process_touch(&RawTouchEvent {
+            touch_id: 1,
+            phase: TouchPhase::Down,
+            x: 300.0,
+            y: 1200.0,
+            timestamp: t0,
+        });
+        let up = engine.process_touch(&RawTouchEvent {
+            touch_id: 1,
+            phase: TouchPhase::Up,
+            x: 900.0,
+            y: 1180.0,
+            timestamp: t0 + Duration::from_millis(16),
+        });
+        assert!(
+            !matches!(up, GestureAction::Home { .. }),
+            "a horizontal flick must not commit Home, got {:?}",
+            up
+        );
+
+        // 4. A tap: no travel at all, so there is nothing to hand back and
+        //    nothing to commit.
+        let mut engine = GestureEngine::new(1080.0, 2400.0, cfg.clone());
+        engine.process_touch(&RawTouchEvent {
+            touch_id: 1,
+            phase: TouchPhase::Down,
+            x: 540.0,
+            y: 1200.0,
+            timestamp: t0,
+        });
+        let up = engine.process_touch(&RawTouchEvent {
+            touch_id: 1,
+            phase: TouchPhase::Up,
+            x: 540.0,
+            y: 1200.0,
+            timestamp: t0 + Duration::from_millis(120),
+        });
+        assert_eq!(
+            up,
+            GestureAction::None,
+            "a tap is not a gesture, got {:?}",
+            up
+        );
+
+        // 5. The distance gate is exactly a quarter of the panel, pinned from
+        //    both sides. 601 px is just over the 600 px gate; 599 px is just
+        //    under. Both are taken over 3 s (~200 px/s) so the fling branch is
+        //    definitively closed and the distance branch is the only thing
+        //    that can decide.
+        for (travel, want_home) in [(601.0f32, true), (599.0, false)] {
+            let mut e = GestureEngine::new(1080.0, 2400.0, cfg.clone());
+            e.process_touch(&RawTouchEvent {
+                touch_id: 1,
+                phase: TouchPhase::Down,
+                x: 540.0,
+                y: 1200.0,
+                timestamp: t0,
+            });
+            let a = e.process_touch(&RawTouchEvent {
+                touch_id: 1,
+                phase: TouchPhase::Up,
+                x: 540.0,
+                y: 1200.0 - travel,
+                timestamp: t0 + Duration::from_millis(3000),
+            });
+            assert_eq!(
+                matches!(a, GestureAction::Home { .. }),
+                want_home,
+                "{} px of a 2400 px panel: {:?}",
+                travel,
+                a
+            );
+        }
+
+        // ...and the gate follows the panel rather than a hard-coded pixel
+        // count: the same 300 px is 12.5% of a 2400 px panel (no commit) but
+        // 27.8% of a 1080 px one (commit).
+        for (height, want_home) in [(2400.0f32, false), (1080.0, true)] {
+            let mut e = GestureEngine::new(540.0, height, cfg.clone());
+            e.process_touch(&RawTouchEvent {
+                touch_id: 1,
+                phase: TouchPhase::Down,
+                x: 270.0,
+                y: 540.0,
+                timestamp: t0,
+            });
+            let a = e.process_touch(&RawTouchEvent {
+                touch_id: 1,
+                phase: TouchPhase::Up,
+                x: 270.0,
+                y: 240.0,
+                timestamp: t0 + Duration::from_millis(3000),
+            });
+            assert_eq!(
+                matches!(a, GestureAction::Home { .. }),
+                want_home,
+                "300 px of a {} px panel: {:?}",
+                height,
+                a
+            );
+        }
+
+        // 6. The MOVE path's slop rule is unchanged by any of this: a drag
+        //    inside the slop still reports nothing.
+        let mut engine = GestureEngine::new(1080.0, 2400.0, cfg);
+        let t0 = Instant::now();
+        engine.process_touch(&RawTouchEvent {
+            touch_id: 1,
+            phase: TouchPhase::Down,
+            x: 540.0,
+            y: 1200.0,
+            timestamp: t0,
+        });
+        let a = engine.process_touch(&RawTouchEvent {
+            touch_id: 1,
+            phase: TouchPhase::Move,
+            x: 540.0,
+            y: 1200.0 - slop + 1.0,
+            timestamp: t0 + Duration::from_millis(16),
+        });
+        assert_eq!(a, GestureAction::None);
+    }
+
+    // -- Task 2.6: scrub axis dominance --------------------------------------
+
+    /// The nav-bar scrub used to be gated on a fixed `|dy| < 30 px` box,
+    /// which is a dead zone in the wrong units and the wrong shape. The
+    /// horizontal axis has to *dominate* instead.
+    #[test]
+    fn bottom_scrub_needs_a_horizontally_dominant_drag() {
+        let cfg = GestureConfig::default();
+        let t0 = Instant::now();
+
+        // 1. Horizontal-dominant: 120 px right against 40 px up is a 3:1
+        //    ratio, so it is unambiguously a task switch.
+        let mut engine = GestureEngine::new(1080.0, 2400.0, cfg.clone());
+        engine.process_touch(&ev(t0, TouchPhase::Down, 2380.0));
+        let a = engine.process_touch(&RawTouchEvent {
+            touch_id: 1,
+            phase: TouchPhase::Move,
+            x: 660.0,
+            y: 2340.0,
+            timestamp: t0 + Duration::from_millis(16),
+        });
+        assert!(
+            matches!(
+                a,
+                GestureAction::BottomBarScrub {
+                    delta_x,
+                    app_shift: 1
+                } if (delta_x - 120.0).abs() < 1e-3
+            ),
+            "a 3:1 horizontal drag must scrub, got {:?}",
+            a
+        );
+
+        // ...and back the other way.
+        let mut engine = GestureEngine::new(1080.0, 2400.0, cfg.clone());
+        engine.process_touch(&ev(t0, TouchPhase::Down, 2380.0));
+        let a = engine.process_touch(&RawTouchEvent {
+            touch_id: 1,
+            phase: TouchPhase::Move,
+            x: 420.0,
+            y: 2340.0,
+            timestamp: t0 + Duration::from_millis(16),
+        });
+        assert!(
+            matches!(a, GestureAction::BottomBarScrub { app_shift: -1, .. }),
+            "a leftward scrub must shift back, got {:?}",
+            a
+        );
+
+        // 2. Vertical-dominant: 100 px right against 80 px up is only 1.25:1,
+        //    which is not a clear win for the horizontal axis. The old dead
+        //    zone let this through (|dy| = 80 was over its 30 px box) and
+        //    switched apps while the user was reaching for the shade. Now it
+        //    belongs to the Home drag instead.
+        let mut engine = GestureEngine::new(1080.0, 2400.0, cfg.clone());
+        engine.process_touch(&ev(t0, TouchPhase::Down, 2380.0));
+        let a = engine.process_touch(&RawTouchEvent {
+            touch_id: 1,
+            phase: TouchPhase::Move,
+            x: 640.0,
+            y: 2300.0,
+            timestamp: t0 + Duration::from_millis(16),
+        });
+        assert!(
+            !matches!(a, GestureAction::BottomBarScrub { .. }),
+            "a 1.25:1 drag is not a scrub, got {:?}",
+            a
+        );
+        assert!(
+            matches!(a, GestureAction::Home { progress, .. } if progress > 0.0),
+            "it is a Home drag instead, got {:?}",
+            a
+        );
+
+        // 3. A purely vertical drag is never a scrub, on either path.
+        let mut engine = GestureEngine::new(1080.0, 2400.0, cfg.clone());
+        engine.process_touch(&ev(t0, TouchPhase::Down, 2380.0));
+        let a = engine.process_touch(&RawTouchEvent {
+            touch_id: 1,
+            phase: TouchPhase::Move,
+            x: 540.0,
+            y: 2300.0,
+            timestamp: t0 + Duration::from_millis(16),
+        });
+        assert!(
+            !matches!(a, GestureAction::BottomBarScrub { .. }),
+            "a vertical drag must not scrub, got {:?}",
+            a
+        );
+
+        // 4. The dominance ratio is 1.5, pinned from both sides. dx = 120
+        //    against dy = 79 is 1.519:1 and scrubs; against dy = 81 it is
+        //    1.481:1 and does not. (Both are under the old 30 px dead zone
+        //    only for the second, which is exactly the asymmetry the
+        //    dominance rule removes.)
+        for (dy, want_scrub) in [(79.0f32, true), (81.0, false)] {
+            let mut e = GestureEngine::new(1080.0, 2400.0, cfg.clone());
+            e.process_touch(&ev(t0, TouchPhase::Down, 2380.0));
+            let a = e.process_touch(&RawTouchEvent {
+                touch_id: 1,
+                phase: TouchPhase::Move,
+                x: 660.0,
+                y: 2380.0 - dy,
+                timestamp: t0 + Duration::from_millis(16),
+            });
+            assert_eq!(
+                matches!(a, GestureAction::BottomBarScrub { .. }),
+                want_scrub,
+                "dx 120 vs dy {} must be a scrub = {}, got {:?}",
+                dy,
+                want_scrub,
+                a
+            );
+        }
+
+        // 5. Dominance is not enough on its own: the drag still has to travel
+        //    a full step (80 px by default). 79 px right is short of it, so
+        //    this is not a scrub even though 79/0 is infinitely dominant.
+        let mut engine = GestureEngine::new(1080.0, 2400.0, cfg.clone());
+        engine.process_touch(&ev(t0, TouchPhase::Down, 2380.0));
+        let a = engine.process_touch(&RawTouchEvent {
+            touch_id: 1,
+            phase: TouchPhase::Move,
+            x: 619.0,
+            y: 2380.0,
+            timestamp: t0 + Duration::from_millis(16),
+        });
+        assert!(
+            !matches!(a, GestureAction::BottomBarScrub { .. }),
+            "a sub-threshold drag must not scrub, got {:?}",
+            a
+        );
+
+        // 6. The release path shares the same rule: a vertical-dominant
+        //    release commits no step, a horizontal-dominant one does.
+        let mut engine = GestureEngine::new(1080.0, 2400.0, cfg.clone());
+        engine.process_touch(&ev(t0, TouchPhase::Down, 2380.0));
+        let a = engine.process_touch(&RawTouchEvent {
+            touch_id: 1,
+            phase: TouchPhase::Up,
+            x: 640.0,
+            y: 2300.0,
+            timestamp: t0 + Duration::from_millis(120),
+        });
+        assert!(
+            !matches!(a, GestureAction::BottomBarScrub { .. }),
+            "a vertical-dominant release must not scrub, got {:?}",
+            a
+        );
+
+        let mut engine = GestureEngine::new(1080.0, 2400.0, cfg);
+        engine.process_touch(&ev(t0, TouchPhase::Down, 2380.0));
+        let a = engine.process_touch(&RawTouchEvent {
+            touch_id: 1,
+            phase: TouchPhase::Up,
+            x: 700.0,
+            y: 2360.0,
+            timestamp: t0 + Duration::from_millis(120),
+        });
+        assert!(
+            matches!(
+                a,
+                GestureAction::BottomBarScrub {
+                    delta_x,
+                    app_shift: 1
+                } if (delta_x - 160.0).abs() < 1e-3
+            ),
+            "a horizontal-dominant release commits the step, got {:?}",
+            a
+        );
+    }
+
+    /// The dominance rule is a property of the config, so it is unit-tested
+    /// away from the state machine too: the sign of the drag must not matter,
+    /// and a NaN must never come out dominant.
+    #[test]
+    fn scrub_dominance_is_sign_symmetric_and_nan_safe() {
+        let cfg = GestureConfig::default();
+        let t = cfg.scrub_threshold_x;
+        assert!(cfg.is_scrub_dominant(t, 0.0));
+        assert!(cfg.is_scrub_dominant(-t, 0.0));
+        assert!(cfg.is_scrub_dominant(t, -t / SCRUB_AXIS_DOMINANCE * 0.99));
+        assert!(!cfg.is_scrub_dominant(t, -t / SCRUB_AXIS_DOMINANCE * 1.01));
+        assert!(!cfg.is_scrub_dominant(0.0, 0.0));
+        assert!(!cfg.is_scrub_dominant(t * 0.5, 0.0), "short of one step");
+        // Every comparison with NaN is false, so a degenerate sample cannot
+        // fire a task switch.
+        assert!(!cfg.is_scrub_dominant(f32::NAN, 0.0));
+        assert!(!cfg.is_scrub_dominant(t, f32::NAN));
+        assert!(!cfg.is_scrub_dominant(f32::INFINITY, f32::INFINITY));
+
+        // A density-scaled config scales the step but not the ratio, so the
+        // same physical drag scrubs on any panel.
+        let d = GestureConfig::for_density(DENSITY_1080P);
+        assert!(d.is_scrub_dominant(d.scrub_threshold_x, 0.0));
+        assert!(!d.is_scrub_dominant(d.scrub_threshold_x * 0.99, 0.0));
     }
 }

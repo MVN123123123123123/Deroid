@@ -1,9 +1,9 @@
 //! Integrated Virtual Keyboard (IME - Gboard Style).
 //! Conforms to Wayland text-input-v3 and zwp_input_method_v2 protocols.
 //! Provides smooth viewport push animation, QWERTY/symbols/numeric layouts,
-//! commit_string, delete_surrounding_text, and haptic feedback triggers.
+//! commit_string, delete_surrounding_text.
 
-use crate::compositor::spring::{SpringConfig, SpringOscillator};
+use crate::graphics::drm_kms::{SpringConfig, SpringSimulation};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyboardLayout {
@@ -28,37 +28,33 @@ pub enum ImeAction {
 
 /// Gboard-Style On-Screen Virtual Keyboard
 pub struct VirtualKeyboard {
-    pub display_width: f32,
-    pub display_height: f32,
     pub keyboard_height: f32, // e.g. 320.0 px
     pub layout: KeyboardLayout,
     pub is_shift_active: bool,
     pub is_caps_lock: bool,
     pub is_active: bool,
-    pub slide_spring: SpringOscillator, // 0.0 = Hidden, 1.0 = Fully visible
-    pub last_haptic_trigger: bool,
+    /// 0.0 = Hidden, 1.0 = Fully visible. The canonical analytical
+    /// [`SpringSimulation`]: this crate has exactly one spring model, and the
+    /// IME uses it rather than a private integrator.
+    pub slide_spring: SpringSimulation,
+}
+
+impl Default for VirtualKeyboard {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl VirtualKeyboard {
-    pub fn new(display_width: f32, display_height: f32) -> Self {
+    pub fn new() -> Self {
         let keyboard_height = 320.0;
         Self {
-            display_width,
-            display_height,
             keyboard_height,
             layout: KeyboardLayout::Qwerty,
             is_shift_active: false,
             is_caps_lock: false,
             is_active: false,
-            slide_spring: SpringOscillator::new(
-                0.0,
-                SpringConfig {
-                    stiffness: 260.0,
-                    damping: 26.0,
-                    mass: 1.0,
-                },
-            ),
-            last_haptic_trigger: false,
+            slide_spring: SpringSimulation::new(0.0, 0.0, SpringConfig::ime_slide()),
         }
     }
 
@@ -85,14 +81,12 @@ impl VirtualKeyboard {
     /// Calculates smooth viewport push translation for active app window
     /// so the text cursor remains visible above the keyboard
     pub fn window_viewport_push_y(&self) -> f32 {
-        let progress = self.slide_spring.current.clamp(0.0, 1.0);
+        let progress = self.slide_spring.value.clamp(0.0, 1.0);
         progress * self.keyboard_height
     }
 
     /// Key tap handler
     pub fn handle_key_tap(&mut self, key: &str) -> ImeAction {
-        self.last_haptic_trigger = true;
-
         match key {
             "SHIFT" => {
                 self.is_shift_active = !self.is_shift_active;
@@ -158,7 +152,10 @@ impl VirtualKeyboard {
     }
 
     pub fn update(&mut self, dt: f32) {
-        self.slide_spring.step(dt);
+        // `step_clamped`, not `step`: the IME advances from whatever clock the
+        // compositor is handed, and a non-finite delta must not be able to park
+        // NaN in `slide_spring.value`, which the viewport push reads.
+        self.slide_spring.step_clamped(dt);
     }
 }
 
@@ -168,7 +165,7 @@ mod tests {
 
     #[test]
     fn test_virtual_keyboard_animation_and_viewport_push() {
-        let mut ime = VirtualKeyboard::new(1080.0, 2400.0);
+        let mut ime = VirtualKeyboard::new();
         assert_eq!(ime.window_viewport_push_y(), 0.0);
 
         ime.activate();
@@ -189,7 +186,7 @@ mod tests {
 
     #[test]
     fn test_ime_key_actions_and_shift() {
-        let mut ime = VirtualKeyboard::new(1080.0, 2400.0);
+        let mut ime = VirtualKeyboard::new();
 
         // Lowercase typing
         let act1 = ime.handle_key_tap("a");

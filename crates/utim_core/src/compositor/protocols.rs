@@ -1,7 +1,11 @@
 //! Wayland protocol engine and mobile protocol extensions.
-//! Provides zero-copy wire protocol parsing, serializing, and mobile interface definitions
+//! Provides zero-copy wire protocol parsing and mobile interface definitions
 //! conforming to xdg-shell, wlr-layer-shell, linux-dmabuf, presentation-time, wp-viewporter,
 //! ext-idle-notify, text-input-v3, and zwp-tablet-v2.
+//!
+//! Parsing only. The outgoing-event serializer (`WlMessageBuilder`) had no
+//! production call site -- the compositor never emits a Wayland event, it only
+//! consumes them -- so it was deleted rather than kept alive by its own tests.
 
 pub const WAYLAND_VERSION_MAJOR: u32 = 1;
 pub const WAYLAND_VERSION_MINOR: u32 = 22;
@@ -139,103 +143,6 @@ impl<'a> WlMessage<'a> {
             return None;
         }
         Some((s, next_offset))
-    }
-}
-
-/// Wayland Message Builder for serializing outgoing events.
-///
-/// Allocation note (P26): `build()` allocates the exact wire buffer once.
-/// Hot paths emitting many events should reuse a caller-owned buffer with
-/// [`WlMessageBuilder::build_into`] instead, which appends the framed
-/// message without allocating a fresh `Vec` per event.
-pub struct WlMessageBuilder {
-    buf: Vec<u8>,
-}
-
-impl WlMessageBuilder {
-    pub fn new(object_id: u32, opcode: u16) -> Self {
-        let mut builder = Self {
-            buf: Vec::with_capacity(64),
-        };
-        builder.buf.extend_from_slice(&object_id.to_le_bytes());
-        builder.buf.extend_from_slice(&opcode.to_le_bytes());
-        builder.buf.extend_from_slice(&0u16.to_le_bytes()); // placeholder for length
-        builder
-    }
-
-    pub fn put_u32(&mut self, val: u32) -> &mut Self {
-        self.buf.extend_from_slice(&val.to_le_bytes());
-        self
-    }
-
-    pub fn put_i32(&mut self, val: i32) -> &mut Self {
-        self.buf.extend_from_slice(&val.to_le_bytes());
-        self
-    }
-
-    /// Append a Wayland 24.8 fixed-point value.
-    ///
-    /// Returns `Err` on NaN/inf (which previously saturated silently via
-    /// `as` casts, P25). Finite out-of-range values are clamped to the
-    /// exactly representable 24.8 span `[-8388608.0, 8388607.996]`.
-    pub fn put_fixed(&mut self, val: f32) -> Result<&mut Self, &'static str> {
-        if !val.is_finite() {
-            return Err("non-finite fixed-point value");
-        }
-        // i32::MAX / 256 = 8388607.99609375; clamp so the scaled value
-        // always fits i32 without `as`-cast saturation.
-        let clamped = val.clamp(-8_388_608.0, 8_388_607.996);
-        let fixed = (clamped * 256.0).round() as i32;
-        self.put_i32(fixed);
-        Ok(self)
-    }
-
-    pub fn put_string(&mut self, s: &str) -> &mut Self {
-        let bytes = s.as_bytes();
-        let len_with_null = (bytes.len() + 1) as u32;
-        self.put_u32(len_with_null);
-        self.buf.extend_from_slice(bytes);
-        self.buf.push(0); // null terminator
-        let rem = (bytes.len() + 1) % 4;
-        if rem != 0 {
-            let padding = 4 - rem;
-            for _ in 0..padding {
-                self.buf.push(0);
-            }
-        }
-        self
-    }
-
-    pub fn put_array(&mut self, data: &[u8]) -> &mut Self {
-        self.put_u32(data.len() as u32);
-        self.buf.extend_from_slice(data);
-        let rem = data.len() % 4;
-        if rem != 0 {
-            for _ in 0..(4 - rem) {
-                self.buf.push(0);
-            }
-        }
-        self
-    }
-
-    /// Frame the message and append it to a caller-owned buffer, patching
-    /// the 16-bit length field in place. Prefer this on hot paths to avoid
-    /// one `Vec` allocation per emitted event (P26).
-    pub fn build_into(mut self, out: &mut Vec<u8>) -> Result<(), &'static str> {
-        let total_len = u16::try_from(self.buf.len()).map_err(|_| "message exceeds u16 length")?;
-        self.buf[6..8].copy_from_slice(&total_len.to_le_bytes());
-        out.extend_from_slice(&self.buf);
-        Ok(())
-    }
-
-    /// Frame the message, returning the exact wire buffer.
-    /// Fails if the framed length does not fit the 16-bit wire field
-    /// instead of silently truncating (P4).
-    pub fn build(mut self) -> Result<Vec<u8>, &'static str> {
-        let total_len =
-            u16::try_from(self.buf.len()).map_err(|_| "message exceeds u16 length")?;
-        self.buf[6..8].copy_from_slice(&total_len.to_le_bytes());
-        Ok(self.buf)
     }
 }
 
@@ -464,47 +371,6 @@ mod tests {
         let bytes = header.to_bytes();
         let parsed = WlHeader::from_bytes(&bytes).expect("Failed to parse header");
         assert_eq!(header, parsed);
-    }
-
-    #[test]
-    fn test_message_builder_and_parser() {
-        let mut builder = WlMessageBuilder::new(100, 2);
-        builder.put_u32(12345);
-        builder.put_fixed(2.5).expect("finite fixed");
-        builder.put_string("org.freedesktop.wayland");
-        let wire = builder.build().expect("fits u16");
-
-        assert_eq!(wire.len() % 4, 0);
-
-        let (msg, len) = WlMessage::parse(&wire).unwrap().unwrap();
-        assert_eq!(len, wire.len());
-        assert_eq!(msg.header.object_id, 100);
-        assert_eq!(msg.header.opcode, 2);
-
-        assert_eq!(msg.read_u32(0), Some(12345));
-        assert_eq!(msg.read_fixed(4), Some(2.5));
-
-        let (s, _) = msg.read_string(8).expect("String failed");
-        assert_eq!(s, "org.freedesktop.wayland");
-    }
-
-    #[test]
-    fn test_builder_rejects_overflow_and_nonfinite() {
-        // Length overflow: force a buffer larger than u16::MAX.
-        let mut builder = WlMessageBuilder::new(1, 0);
-        builder.put_array(&vec![0u8; u16::MAX as usize]);
-        assert!(builder.build().is_err());
-
-        let mut b2 = WlMessageBuilder::new(1, 0);
-        assert!(b2.put_fixed(f32::NAN).is_err());
-        assert!(b2.put_fixed(f32::INFINITY).is_err());
-        // Clamp extremes instead of saturating.
-        b2.put_fixed(1e30).expect("clamped");
-        b2.put_fixed(-1e30).expect("clamped");
-        let wire = b2.build().expect("fits");
-        let (msg, _) = WlMessage::parse(&wire).unwrap().unwrap();
-        assert_eq!(msg.read_i32(0), Some(i32::MAX));
-        assert_eq!(msg.read_i32(4), Some(i32::MIN));
     }
 
     #[test]

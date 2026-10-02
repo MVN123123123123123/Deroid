@@ -90,8 +90,8 @@ impl MobileScene {
             height,
             refresh_rate,
             mode: ShellMode::Launcher,
-            system_ui: SystemUiShade::new(width as f32, height as f32),
-            keyboard: VirtualKeyboard::new(width as f32, height as f32),
+            system_ui: SystemUiShade::new(),
+            keyboard: VirtualKeyboard::new(),
             lockscreen: LockScreen::new(None),
             active_app_surface_id: None,
             active_app_buffer_fd: None,
@@ -321,15 +321,15 @@ mod tests {
 
         // One tick must actually move both springs, otherwise a dropped
         // `update` would strand the shade/IME mid-transition.
-        let shade_before = scene.system_ui.pull_spring.current;
-        let kb_before = scene.keyboard.slide_spring.current;
+        let shade_before = scene.system_ui.pull_spring.value;
+        let kb_before = scene.keyboard.slide_spring.value;
         scene.update(0.016);
         assert!(
-            scene.system_ui.pull_spring.current > shade_before,
+            scene.system_ui.pull_spring.value > shade_before,
             "shade pull spring must advance"
         );
         assert!(
-            scene.keyboard.slide_spring.current > kb_before,
+            scene.keyboard.slide_spring.value > kb_before,
             "IME slide spring must advance"
         );
     }

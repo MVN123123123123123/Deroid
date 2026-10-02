@@ -212,10 +212,7 @@ pub fn inspect_elf_bytes(
                 if let Ok(s) = usize::try_from(p_offset) {
                     if let Some(e) = s.checked_add(p_filesz as usize) {
                         if e <= bytes.len() {
-                            let z = bytes[s..e]
-                                .iter()
-                                .position(|&b| b == 0)
-                                .unwrap_or(e - s);
+                            let z = bytes[s..e].iter().position(|&b| b == 0).unwrap_or(e - s);
                             interpreter =
                                 Some(String::from_utf8_lossy(&bytes[s..s + z]).into_owned());
                         }
@@ -292,12 +289,17 @@ pub fn inspect_elf_file<P: AsRef<Path>>(path: P) -> Result<ElfAlignmentReport, E
     f.read_exact(&mut ehdr)
         .map_err(|e| ElfAlignError::IoError(e.to_string()))?;
     let u16at = |b: &[u8], o: usize| u16::from_le_bytes([b[o], b[o + 1]]);
-    let u32at = |b: &[u8], o: usize| {
-        u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
-    };
+    let u32at = |b: &[u8], o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
     let u64at = |b: &[u8], o: usize| {
         u64::from_le_bytes([
-            b[o], b[o + 1], b[o + 2], b[o + 3], b[o + 4], b[o + 5], b[o + 6], b[o + 7],
+            b[o],
+            b[o + 1],
+            b[o + 2],
+            b[o + 3],
+            b[o + 4],
+            b[o + 5],
+            b[o + 6],
+            b[o + 7],
         ])
     };
     let e_phoff = u64at(&ehdr, 32) as usize;
@@ -376,8 +378,7 @@ pub fn inspect_elf_file<P: AsRef<Path>>(path: P) -> Result<ElfAlignmentReport, E
                 continue;
             }
             let z = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-            report.interpreter =
-                Some(String::from_utf8_lossy(&buf[..z]).into_owned());
+            report.interpreter = Some(String::from_utf8_lossy(&buf[..z]).into_owned());
             break;
         }
     }
@@ -520,7 +521,8 @@ mod tests {
     }
 
     #[test]
-    fn test_elf_verify_64k_rejects_empty_load_segments() {        let temp = std::env::temp_dir().join("utim_test_empty_elf");
+    fn test_elf_verify_64k_rejects_empty_load_segments() {
+        let temp = std::env::temp_dir().join("utim_test_empty_elf");
         let mock_elf = create_mock_elf64(&[]);
         std::fs::write(&temp, mock_elf).unwrap();
 

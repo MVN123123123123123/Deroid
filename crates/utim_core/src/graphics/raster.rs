@@ -146,13 +146,7 @@ pub fn draw_opaque_rect(
 /// Returning a span rather than a per-pixel predicate is what keeps the
 /// corner cost at O(rows).
 #[inline]
-pub fn rounded_span_f(
-    dy: f32,
-    x: f32,
-    rw: f32,
-    rh: f32,
-    radius: f32,
-) -> Option<(f32, f32)> {
+pub fn rounded_span_f(dy: f32, x: f32, rw: f32, rh: f32, radius: f32) -> Option<(f32, f32)> {
     if rw <= 0.0 || rh <= 0.0 {
         return None;
     }
@@ -217,10 +211,18 @@ pub fn draw_rounded_rect_outline_f(
             continue;
         };
         let row = cy * stride;
+        // The inner rect's top edge is `s` below the outer's, so this row is
+        // `dy - s` into the *inner* shape, not `dy`. Sampling it at `dy` slid
+        // the hole `s` rows up: the top of the stroke lost its band entirely
+        // (the inner span already existed on the outer's first row, so only
+        // two slivers were left) and the bottom gained one -- the stroke was
+        // `2 * s` thicker at the bottom than at the top, which is the
+        // non-uniformity `outlined_rounded_rect_stroke_is_uniform` measures.
+        let inner_dy = dy - s;
         // A row with no inner span is entirely within the stroke band: either
         // the inset collapsed (thick stroke on a thin shape) or this row sits
         // in the rounded cap above/below the inner rect.
-        match rounded_span_f(dy, x + s, inner_w, inner_h, ir) {
+        match rounded_span_f(inner_dy, x + s, inner_w, inner_h, ir) {
             None => fill_span(buf, row, w, olo, ohi, color, alpha),
             Some((ili, ihi)) => {
                 fill_span(buf, row, w, olo, ili, color, alpha);
@@ -237,10 +239,20 @@ fn fill_span(buf: &mut [u32], row: usize, w: usize, a: f32, b: f32, color: u32, 
     if hi <= lo {
         return;
     }
+    // `hi` is clamped to the *width*, not to the buffer, so a caller whose
+    // `buf` is shorter than `h * stride` would otherwise index past the end.
+    // The old `.take(row + hi).skip(row + lo)` hid that by silently
+    // truncating at `buf.len()`; clamping once here keeps the same effective
+    // range while making the bound explicit for both the fill and the blend.
+    let end = row.saturating_add(hi).min(buf.len());
+    let start = row.saturating_add(lo);
+    if end <= start {
+        return;
+    }
     if alpha == 255 {
-        buf[row + lo..row + hi].fill(color);
+        buf[start..end].fill(color);
     } else {
-        for px in buf.iter_mut().take(row + hi).skip(row + lo) {
+        for px in &mut buf[start..end] {
             *px = blend_alpha(*px, color, alpha);
         }
     }
@@ -255,14 +267,21 @@ fn fill_span(buf: &mut [u32], row: usize, w: usize, a: f32, b: f32, color: u32, 
 ///
 /// ```java
 /// r  = bounds.height() * 0.5f;              // :53
+/// // "The path represents a rotate tear-drop shape, with radius of one
+/// //  corner is 1/5th of the other 3 corners."   // :54-55
 /// r2 = r / 5;                               // :57
 /// mPath.addRoundRect(..., {r,r, r,r, r2,r2, r,r}, CCW);   // :58-60
 /// sMatrix.setRotate(-45, l + r, t + r);      // :62
 /// ```
 ///
-/// So the two *right* corners are `r/5` and the left two are `r`; the whole
-/// thing is then rotated by -45 degrees. `is_teardrop_1` is the pair that
-/// shrinks, used to name which corner is which without re-deriving it.
+/// `addRoundRect`'s radii array is **two floats per corner**, in the order
+/// `[TL, TR, BR, BL]`, so the eight literals above read
+/// `TL = (r, r)`, `TR = (r, r)`, `BR = (r2, r2)`, `BL = (r, r)`: **one**
+/// corner is small, and it is bottom-right. The source comment says the same
+/// thing in prose ("one corner is 1/5th of the other 3 corners", `:54-55`) --
+/// the earlier reading of a `r/5` *pair* came from miscounting the array as
+/// four entries instead of four *pairs*. The whole shape is then rotated by
+/// -45 degrees, which puts that small corner at the teardrop's point.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TeardropRadii {
     pub big: f32,
@@ -272,7 +291,10 @@ pub struct TeardropRadii {
 #[inline]
 pub fn teardrop_radii(height: f32) -> TeardropRadii {
     let r = height * 0.5;
-    TeardropRadii { big: r, small: r / 5.0 }
+    TeardropRadii {
+        big: r,
+        small: r / 5.0,
+    }
 }
 
 /// Rotated rounded rectangle, rasterised with a signed-distance test.
@@ -322,12 +344,18 @@ pub fn draw_rotated_rounded_rect(
         return;
     }
 
-    // Per-corner radii clamped to half the side they sit on.
+    // Per-corner radii clamped to half the side they sit on. Both halves, not
+    // just the width: a corner radius larger than the half-*height* is not
+    // representable by the SDF below (`qy = |ly| - (hh - cr)` goes negative
+    // for the whole row and the arc degenerates into a straight cut), and the
+    // teardrop's `big` radius is exactly `rh / 2`, so on a shape narrower
+    // than it is tall the width alone would let it through unclamped.
+    let rmax = hw.min(hh);
     let r = [
-        radii[0].clamp(0.0, hw),
-        radii[1].clamp(0.0, hw),
-        radii[2].clamp(0.0, hw),
-        radii[3].clamp(0.0, hw),
+        radii[0].clamp(0.0, rmax),
+        radii[1].clamp(0.0, rmax),
+        radii[2].clamp(0.0, rmax),
+        radii[3].clamp(0.0, rmax),
     ];
 
     for py in y0..y1 {
@@ -340,7 +368,11 @@ pub fn draw_rotated_rounded_rect(
             let ly = -fx * sin_a + fy * cos_a;
             // Pick the corner this sample is nearest in the rotated frame.
             let cr = if lx >= 0.0 {
-                if ly >= 0.0 { r[2] } else { r[1] }
+                if ly >= 0.0 {
+                    r[2]
+                } else {
+                    r[1]
+                }
             } else if ly >= 0.0 {
                 r[3]
             } else {
@@ -368,7 +400,15 @@ pub fn draw_rotated_rounded_rect(
 }
 
 /// The teardrop popup, drawn as `draw_rotated_rounded_rect` rotated -45 deg
-/// with the `r/5` pair on the right, per `FastScrollThumbDrawable.java:58-62`.
+/// with **one** `r/5` corner, per `FastScrollThumbDrawable.java:58-62`.
+///
+/// The radii are `[tl, tr, br, bl]` (the order
+/// [`draw_rotated_rounded_rect`] documents), so the source's
+/// `{r,r, r,r, r2,r2, r,r}` is `[big, big, small, big]`: the *bottom-right*
+/// corner alone is `r/5`. The -45 deg rotation at `:62` carries it to the
+/// shape's right-hand tip, which is the point the popup's tail points at.
+///
+/// [`teardrop_corner_radii`] is the assertable form of this configuration.
 #[inline]
 #[allow(clippy::too_many_arguments)]
 pub fn draw_teardrop(
@@ -382,13 +422,33 @@ pub fn draw_teardrop(
     rh: f32,
     color: u32,
 ) {
-    let t = teardrop_radii(rh);
     draw_rotated_rounded_rect(
-        buf, stride, w, h, cx, cy, rw, rh,
-        [t.big, t.small, t.small, t.big],
+        buf,
+        stride,
+        w,
+        h,
+        cx,
+        cy,
+        rw,
+        rh,
+        teardrop_corner_radii(rh),
         -45.0f32.to_radians(),
         color,
     );
+}
+
+/// The teardrop's four corner radii in `[tl, tr, br, bl]` order, from
+/// [`teardrop_radii`]: exactly one corner is `r/5`.
+///
+/// Split out of [`draw_teardrop`] so the configuration is assertable without
+/// rasterising and reverse-engineering it from pixels -- which is what the
+/// caller-facing shape contract is actually about.
+#[inline]
+pub fn teardrop_corner_radii(height: f32) -> [f32; 4] {
+    let t = teardrop_radii(height);
+    // TL, TR, BR, BL -- `FastScrollThumbDrawable.java:58-60`, whose radii
+    // array is two floats per corner, not one.
+    [t.big, t.big, t.small, t.big]
 }
 
 // ===========================================================================
@@ -419,15 +479,57 @@ pub fn squircle_span(r: u32, dy: u32) -> u32 {
     if dy >= r {
         return 0;
     }
-    let r2 = r * r;
-    let dy2 = dy * dy;
-    let rem = r2.saturating_sub(dy2); // r^2 - dy^2
+    // Every intermediate is u64, and that is load-bearing rather than
+    // defensive: `r^4 - dy^4` overflows a u32 at `r == 256` exactly
+    // (256^4 == 2^32 == 4_294_967_296, one past `u32::MAX`), and it is a
+    // *silent* wrap in release, not a panic. A wrapped quartic makes
+    // `isqrt(isqrt(..))` too small, which shortens the span and clips the
+    // icon's silhouette rather than failing.
+    //
+    // `ICON_MASK_MIN_EDGE` is 32 so no icon ever gets near that today, but
+    // this is a `pub fn` in a rasteriser: the next caller that passes a panel
+    // edge, or a `u32` width read from an untrusted PNG IHDR, would get wrong
+    // pixels instead of a wrong-sized allocation.
+    let r64 = r as u64;
+    let dy64 = dy as u64;
+    let r2 = r64 * r64;
+    let dy2 = dy64 * dy64;
+    let rem = r2 - dy2; // dy < r, so this cannot underflow
     if rem == 0 {
         return r;
     }
     // r^4 - dy^4 = (r^2 - dy^2)(r^2 + dy^2)
     let quartic = rem * (r2 + dy2);
-    isqrt(isqrt(quartic))
+    isqrt64(isqrt64(quartic)) as u32
+}
+
+/// Integer square root of a `u64`, floor.
+///
+/// The `u32` `isqrt` cannot take the quartic without wrapping, so this is the
+/// 64-bit form. Newton's method with an integer seed: it converges in a few
+/// iterations for every `u64` and, unlike a float `sqrt`, is exact at the
+/// boundary -- a squircle span that is off by one is a visibly wrong corner.
+#[inline]
+fn isqrt64(n: u64) -> u64 {
+    if n == 0 {
+        return 0;
+    }
+    if n < 4 {
+        return 1;
+    }
+    // `n.leading_zeros()` gives a seed within one bit of the root.
+    let mut x: u64 = 1u64 << (64 - n.leading_zeros()).div_ceil(2);
+    loop {
+        // `x + n/x` cannot overflow: `x` starts at most 2x the root and each
+        // step moves it strictly down, and the intermediate is bounded by the
+        // invariant.
+        let y = (x + n / x) >> 1;
+        if y >= x {
+            break;
+        }
+        x = y;
+    }
+    x
 }
 
 /// Mask a contiguous RGBA row in place to a squircle of edge `edge`.
@@ -535,7 +637,7 @@ fn blur_row_8(row: &mut [u8], tmp: &mut [u8]) {
     row.copy_from_slice(&tmp[..n]);
 }
 
-/// Darken the framebuffer under `mask`, offset by `(dx, dy)`.
+/// Darken the framebuffer under `mask`, offset by `(dx, dy)`, blurring first.
 ///
 /// This is the two-layer shadow from `DoubleShadowIconDrawable.kt:35-53`
 /// collapsed into one call: the caller supplies a coverage mask (a glyph run
@@ -549,6 +651,15 @@ fn blur_row_8(row: &mut [u8], tmp: &mut [u8]) {
 /// **Both shadow layers are disabled in the dark theme**
 /// (`styles.xml:111-113`), so a dark-mode caller must not call this at all
 /// rather than passing `alpha == 0`.
+///
+/// # Per-frame cost
+///
+/// The blur is `2 * mask_pixels` and needs a caller-owned scratch, which is
+/// fine for a label that changes rarely and wrong for anything cached: a
+/// cached mask would be re-blurred on every frame it is drawn. A caller whose
+/// mask is computed once should use
+/// [`draw_preblurred_shadow_from_mask`] instead, which takes no scratch and
+/// does the same composite.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_shadow_from_mask(
     buf: &mut [u32],
@@ -566,21 +677,106 @@ pub fn draw_shadow_from_mask(
     alpha: u8,
     scratch: &mut [u8],
 ) {
-    if alpha == 0 || mask.is_empty() || mask_w == 0 || mask_h == 0 {
+    let Some(cells) = mask_w.checked_mul(mask_h) else {
+        return;
+    };
+    if alpha == 0 || cells == 0 || mask.len() < cells {
         return;
     }
     // Blur a caller-owned copy so the caller's cached mask stays pristine.
     // A scratch of the mask size is required; the caller owns it, so this
     // stays allocation-free.
-    debug_assert!(scratch.len() >= mask_w * mask_h + mask_w + 2 * mask_h);
-    if scratch.len() < mask_w * mask_h + mask_w + 2 * mask_h {
+    debug_assert!(scratch.len() >= cells + mask_w + 2 * mask_h);
+    if scratch.len() < cells + mask_w + 2 * mask_h {
         return;
     }
-    let (work, bl) = scratch.split_at_mut(mask_w * mask_h);
-    let work = &mut work[..mask_w * mask_h];
-    work.copy_from_slice(&mask[..mask_w * mask_h]);
+    let (work, bl) = scratch.split_at_mut(cells);
+    let work = &mut work[..cells];
+    work.copy_from_slice(&mask[..cells]);
     blur_mask_8(work, mask_w, mask_h, bl);
+    composite_shadow_mask(
+        buf, stride, w, h, work, mask_w, mask_h, origin_x, origin_y, offset_x, offset_y,
+        shadow_rgb, alpha,
+    );
+}
 
+/// Composite an **already blurred** coverage mask, offset by `(dx, dy)`.
+///
+/// Same composite as [`draw_shadow_from_mask`] minus the blur pass, which
+/// moves the per-draw cost from `2 * mask_pixels` to `mask_pixels` and
+/// removes the scratch requirement entirely: a cached mask needs no copy, so
+/// the only allocation on this path is the one that built the mask.
+///
+/// That is the whole reason this exists. The reference applies
+/// `IconShapeModel.shapeRadius` and its two shadow layers once per
+/// drawable, because a drawable caches its own blur
+/// (`DoubleShadowIconDrawable.kt:35-53`); UTLC's icons are cache *entries*
+/// (`compositor::icons::IconShadow`), so the blur belongs to the entry and
+/// this is the call that draws it. Blurring here as well would double-blur
+/// every icon on screen every frame.
+///
+/// `mask` is the coverage in `0..=255`; `alpha` is the layer's peak opacity
+/// and coverage modulates it, so full coverage is `alpha` and zero coverage is
+/// nothing. A mask with more padding than the blur can reach keeps the
+/// composite's edge off the tile — see
+/// [`compositor::icons::shadow_coverage`](crate::compositor::icons::shadow_coverage).
+///
+/// **Both shadow layers are disabled in the dark theme** in the reference
+/// (`styles.xml:111-113`), so a dark-mode caller must not call this at all
+/// rather than passing `alpha == 0`.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_preblurred_shadow_from_mask(
+    buf: &mut [u32],
+    stride: usize,
+    w: usize,
+    h: usize,
+    mask: &[u8],
+    mask_w: usize,
+    mask_h: usize,
+    origin_x: i32,
+    origin_y: i32,
+    offset_x: i32,
+    offset_y: i32,
+    shadow_rgb: u32,
+    alpha: u8,
+) {
+    composite_shadow_mask(
+        buf, stride, w, h, mask, mask_w, mask_h, origin_x, origin_y, offset_x, offset_y,
+        shadow_rgb, alpha,
+    );
+}
+
+/// The offset + alpha composite both shadow entry points share.
+///
+/// O(rows) clip tests plus one blend per covered mask pixel; the mask itself is
+/// never modified, so the same cached mask can back any number of frames.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn composite_shadow_mask(
+    buf: &mut [u32],
+    stride: usize,
+    w: usize,
+    h: usize,
+    mask: &[u8],
+    mask_w: usize,
+    mask_h: usize,
+    origin_x: i32,
+    origin_y: i32,
+    offset_x: i32,
+    offset_y: i32,
+    shadow_rgb: u32,
+    alpha: u8,
+) {
+    // `checked_mul` rather than `mask_w * mask_h`: this is a `pub fn` taking
+    // two `usize`s from a caller, and a wrapped cell count would index past
+    // the mask instead of bailing out.
+    if alpha == 0
+        || mask_w
+            .checked_mul(mask_h)
+            .is_none_or(|cells| cells == 0 || mask.len() < cells)
+    {
+        return;
+    }
     let src = shadow_rgb & 0x00FF_FFFF;
     for my in 0..mask_h as i32 {
         let py = origin_y + offset_y + my;
@@ -589,7 +785,7 @@ pub fn draw_shadow_from_mask(
         }
         let row = py as usize * stride;
         for mx in 0..mask_w as i32 {
-            let cov = work[my as usize * mask_w + mx as usize];
+            let cov = mask[my as usize * mask_w + mx as usize];
             if cov == 0 {
                 continue;
             }
@@ -625,7 +821,10 @@ mod tests {
             // integer sqrt floors, so the contract is floor(v^(1/4)) -- not
             // "within half a pixel", which a floored value cannot satisfy
             // when the exact value sits just under an integer.
-            let want = r as f64 * (1.0f64 - (dy as f64 / r as f64).powi(4)).max(0.0).powf(0.25);
+            let want = r as f64
+                * (1.0f64 - (dy as f64 / r as f64).powi(4))
+                    .max(0.0)
+                    .powf(0.25);
             assert_eq!(
                 got as f64,
                 want.floor(),
@@ -636,6 +835,46 @@ mod tests {
         assert_eq!(squircle_span(r, r), 0, "must vanish at the edge");
         assert_eq!(squircle_span(r, 0), r, "must be full width on the axis");
         assert_eq!(squircle_span(0, 0), 0, "degenerate radius");
+    }
+
+    /// `r^4` overflows a `u32` at `r == 256`, exactly.
+    ///
+    /// `256^4 == 4_294_967_296`, one past `u32::MAX`. The old `u32` arithmetic
+    /// wrapped silently in release -- not a panic -- and a wrapped quartic
+    /// makes `isqrt(isqrt(..))` too small, which *shortens* the span and clips
+    /// the icon's silhouette. So the regression is a wrong number, not a
+    /// crash, and it has to be asserted against the exact superellipse value
+    /// for a radius that overflows.
+    #[test]
+    fn squircle_span_does_not_overflow_at_r_256() {
+        for r in [255u32, 256, 257, 1024, 4096] {
+            // The axis is exact at every radius: full width.
+            assert_eq!(
+                squircle_span(r, 0),
+                r,
+                "r={r} must be full width on the axis"
+            );
+            assert_eq!(squircle_span(r, r), 0, "r={r} must vanish at the edge");
+            for dy in [1u32, r / 4, r / 2, 3 * r / 4, r - 1] {
+                if dy >= r {
+                    continue;
+                }
+                let got = squircle_span(r, dy);
+                let want = r as f64
+                    * (1.0f64 - (dy as f64 / r as f64).powi(4))
+                        .max(0.0)
+                        .powf(0.25);
+                assert_eq!(
+                    got as f64,
+                    want.floor(),
+                    "r={r} dy={dy}: {got} vs floor(superellipse) = {}",
+                    want.floor()
+                );
+                // And a wrapped u32 would show up as a span *smaller* than the
+                // r-1 row above it, i.e. non-monotonic.
+                assert!(got <= r, "r={r} dy={dy}: span {got} exceeds r");
+            }
+        }
     }
 
     #[test]
@@ -665,7 +904,10 @@ mod tests {
         // says nothing about the shape.
         for r in [4u32, 8, 16, 32, 64, 128] {
             for dy in 0..=r {
-                let exact = r as f64 * (1.0f64 - (dy as f64 / r as f64).powi(4)).max(0.0).powf(0.25);
+                let exact = r as f64
+                    * (1.0f64 - (dy as f64 / r as f64).powi(4))
+                        .max(0.0)
+                        .powf(0.25);
                 let got = squircle_span(r, dy) as f64;
                 assert!(
                     exact - 1.0 < got && got <= exact + 1e-9,
@@ -720,7 +962,200 @@ mod tests {
     fn teardrop_radii_match_fast_scroll_thumb_drawable() {
         let t = teardrop_radii(62.0);
         assert!(near(t.big, 31.0, 1e-4), "r must be height/2, got {}", t.big);
-        assert!(near(t.small, 31.0 / 5.0, 1e-4), "r2 must be r/5, got {}", t.small);
+        assert!(
+            near(t.small, 31.0 / 5.0, 1e-4),
+            "r2 must be r/5, got {}",
+            t.small
+        );
+    }
+
+    #[test]
+    fn teardrop_has_exactly_one_small_corner() {
+        // `FastScrollThumbDrawable.java:54-60`. The radii array passed to
+        // `addRoundRect` is `{r,r, r,r, r2,r2, r,r}`: EIGHT floats, two per
+        // corner, in `[TL, TR, BR, BL]` order. So exactly one corner -- BR --
+        // is `r/5`; the source says the same in prose at `:54-55` ("radius of
+        // one corner is 1/5th of the other 3 corners"). Reading it as four
+        // entries gave `[big, small, small, big]`, two small corners.
+        for height in [10.0f32, 62.0, 128.0] {
+            let radii = teardrop_corner_radii(height);
+            let t = teardrop_radii(height);
+            assert_eq!(radii.len(), 4, "one radius per corner");
+            assert!(
+                near(radii[0], t.big, 1e-4)
+                    && near(radii[1], t.big, 1e-4)
+                    && near(radii[3], t.big, 1e-4),
+                "height {height}: TL, TR and BL are r, got {radii:?}"
+            );
+            assert!(
+                near(radii[2], t.small, 1e-4),
+                "height {height}: BR alone is r/5, got {radii:?}",
+            );
+            assert_eq!(
+                radii.iter().filter(|v| near(**v, t.small, 1e-4)).count(),
+                1,
+                "height {height}: exactly one small corner, got {radii:?}"
+            );
+            // And the small one really is smaller, so the test above is not
+            // trivially satisfiable by a constant array.
+            assert!(t.big > t.small, "r must exceed r/5");
+        }
+        // The configuration the pixels are actually drawn with, not a
+        // re-derivation of it: `draw_teardrop` must route through this.
+        assert_eq!(teardrop_corner_radii(62.0), [31.0, 31.0, 6.2, 31.0]);
+    }
+
+    // -- uniform stroke ----------------------------------------------------
+
+    /// Contiguous run length of ink along row `y`, starting at the first inked
+    /// pixel at or after `from` (walking right).
+    fn run_right(buf: &[u32], stride: usize, w: usize, y: usize, from: usize) -> usize {
+        let mut n = 0usize;
+        let mut x = from;
+        while x < w && buf[y * stride + x] != 0 {
+            n += 1;
+            x += 1;
+        }
+        n
+    }
+
+    /// Contiguous run length of ink down column `x`, starting at the first
+    /// inked pixel at or after `from` (walking down).
+    fn run_down(buf: &[u32], stride: usize, h: usize, x: usize, from: usize) -> usize {
+        let mut n = 0usize;
+        let mut y = from;
+        while y < h && buf[y * stride + x] != 0 {
+            n += 1;
+            y += 1;
+        }
+        n
+    }
+
+    /// Contiguous run length of ink up column `x`, starting at row `from`
+    /// inclusive (walking up). The bottom edge's band is measured this way.
+    fn run_up(buf: &[u32], stride: usize, x: usize, from: usize) -> usize {
+        let mut n = 0usize;
+        let mut y = from as isize;
+        while y >= 0 && buf[y as usize * stride + x] != 0 {
+            n += 1;
+            y -= 1;
+        }
+        n
+    }
+
+    #[test]
+    fn outlined_rounded_rect_stroke_is_uniform() {
+        // The real proof the arc-sampling fix works. Draw a stroked rounded
+        // rect and measure the ink run on each of the four sides, at a
+        // cross-section well inside the straight part of each side so the
+        // measurement is the stroke width and not a corner chord.
+        //
+        // Before the fix the inner span was sampled at `dy` instead of
+        // `dy - s`, sliding the hole `s` rows up: the top of the stroke was
+        // `s` rows *thinner* than the bottom and the top-left/top-right
+        // corner arcs were wrong by the same amount.
+        let w = 96usize;
+        let h = 72usize;
+        let x = 12.0f32;
+        let y = 12.0f32;
+        let rw = 60.0f32;
+        let rh = 40.0f32;
+        let radius = 10.0f32;
+        let stroke = 4.0f32;
+        let mut buf = vec![0u32; w * h];
+        draw_rounded_rect_outline_f(&mut buf, w, w, h, x, y, rw, rh, radius, stroke, 0xFFFFFFFF);
+
+        // Cross-sections: mid-span on the top and bottom edges, mid-span on
+        // the left and right edges. Each is `floor/ceil` of an integer
+        // geometry, so the exact answer is `stroke` (+/-1 for the rounding).
+        let xm = (x + rw * 0.5) as usize; // 42, mid-width
+        let ym = (y + rh * 0.5) as usize; // 32, mid-height
+        let top_run = run_down(&buf, w, h, xm, y as usize);
+        let bot_run = run_up(&buf, w, xm, (y + rh) as usize - 1);
+        // The left and right runs are the *outer* runs at mid-height, walking
+        // inward from each edge to the hole.
+        let left_run = run_right(&buf, w, w, ym, x as usize);
+        let right_run = {
+            let mut n = 0usize;
+            let mut xx = (x + rw) as usize;
+            while xx > 0 && buf[ym * w + xx - 1] != 0 {
+                n += 1;
+                xx -= 1;
+            }
+            n
+        };
+
+        let runs = [
+            ("top", top_run),
+            ("bottom", bot_run),
+            ("left", left_run),
+            ("right", right_run),
+        ];
+        for (name, got) in runs {
+            assert!(
+                got.abs_diff(stroke as usize) <= 1,
+                "{name} stroke is {got} px, expected {stroke} (runs: {runs:?})"
+            );
+        }
+        // And they must agree *with each other*, which is the uniformity claim
+        // itself: any arc-sampling error is a differential error.
+        let max = runs.iter().map(|(_, v)| *v).max().unwrap();
+        let min = runs.iter().map(|(_, v)| *v).min().unwrap();
+        assert!(
+            max - min <= 1,
+            "stroke is not uniform across sides: {runs:?}"
+        );
+
+        // The hole really is a hole: the centre of the rect is untouched.
+        assert_eq!(buf[ym * w + xm], 0, "the interior must not be painted");
+    }
+
+    #[test]
+    fn outlined_rounded_rect_corners_carry_the_full_stroke() {
+        // The complement of the uniformity test: at a corner cross-section,
+        // the ink on each side of the diagonal must be the same thickness as
+        // on the straight edges. A wrong inner `dy` shows up here as a corner
+        // that is thinner on its upper side than its lower one.
+        let w = 96usize;
+        let h = 72usize;
+        let x = 12.0f32;
+        let y = 12.0f32;
+        let rw = 60.0f32;
+        let rh = 40.0f32;
+        let radius = 10.0f32;
+        let stroke = 4.0f32;
+        let mut buf = vec![0u32; w * h];
+        draw_rounded_rect_outline_f(&mut buf, w, w, h, x, y, rw, rh, radius, stroke, 0xFFFFFFFF);
+
+        // Walk the top-left corner: for each inked row in the cap, the ink run
+        // from the shape's left edge must never exceed the straight-edge run
+        // by more than the corner's own arc allowance, and must never be
+        // *shorter* than it -- the latter is what a hole sampled `s` rows too
+        // high produces.
+        let edge = run_right(&buf, w, w, (y + rh * 0.5) as usize, x as usize);
+        let cap_rows = radius.ceil() as usize;
+        for yy in 0..cap_rows {
+            let row = y as usize + yy;
+            let mut first = None;
+            for xx in 0..w {
+                if buf[row * w + xx] != 0 {
+                    first = Some(xx);
+                    break;
+                }
+            }
+            let Some(first) = first else { continue };
+            // Near the very top of the cap the row is legitimately short (it
+            // is the arc itself), so only assert the rows below the first
+            // full-width row.
+            if yy == 0 {
+                continue;
+            }
+            let run = run_right(&buf, w, w, row, first);
+            assert!(
+                run + 1 >= edge,
+                "corner row {yy}: ink run {run} is thinner than the straight edge's {edge}"
+            );
+        }
     }
 
     // -- blend ------------------------------------------------------------
@@ -731,10 +1166,20 @@ mod tests {
         assert_eq!(blend_alpha(0xFF00_0000, 0xFFFFFFFF, 0), 0xFF00_0000);
         // Mid grey over mid grey, 50%.
         let got = blend_alpha(0xFF808080, 0xFF808080, 128);
-        assert_eq!(got & 0x00FF_FFFF, 0x00808080, "same colour must be identity");
+        assert_eq!(
+            got & 0x00FF_FFFF,
+            0x00808080,
+            "same colour must be identity"
+        );
         // Black over white at 0% stays white; at 100% becomes black.
-        assert_eq!(blend_alpha(0xFFFFFFFF, 0xFF000000, 0) & 0x00FF_FFFF, 0x00FFFFFF);
-        assert_eq!(blend_alpha(0xFFFFFFFF, 0xFF000000, 255) & 0x00FF_FFFF, 0x00000000);
+        assert_eq!(
+            blend_alpha(0xFFFFFFFF, 0xFF000000, 0) & 0x00FF_FFFF,
+            0x00FFFFFF
+        );
+        assert_eq!(
+            blend_alpha(0xFFFFFFFF, 0xFF000000, 255) & 0x00FF_FFFF,
+            0x00000000
+        );
     }
 
     #[test]
@@ -750,7 +1195,24 @@ mod tests {
 
     #[test]
     fn isqrt_matches_the_float_sqrt() {
-        for v in [0u32, 1, 2, 3, 4, 8, 9, 15, 16, 17, 99, 100, 101, 65_535, 65_536, 1 << 30] {
+        for v in [
+            0u32,
+            1,
+            2,
+            3,
+            4,
+            8,
+            9,
+            15,
+            16,
+            17,
+            99,
+            100,
+            101,
+            65_535,
+            65_536,
+            1 << 30,
+        ] {
             let f = (v as f64).sqrt().floor() as u32;
             assert_eq!(isqrt(v), f, "isqrt({v})");
         }
@@ -881,7 +1343,20 @@ mod tests {
         let mut scratch = vec![0u8; 16 + 16 + 32];
         let before = buf.clone();
         draw_shadow_from_mask(
-            &mut buf, 16, 16, 16, &mask, 4, 4, 0, 0, 0, 0, 0, 0, &mut scratch,
+            &mut buf,
+            16,
+            16,
+            16,
+            &mask,
+            4,
+            4,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            &mut scratch,
         );
         assert_eq!(buf, before, "alpha 0 must not touch the framebuffer");
     }
@@ -893,9 +1368,175 @@ mod tests {
         let mut scratch = vec![0u8; 16 + 16 + 32];
         // Origin far off the left/top edge and an offset pushing further out.
         draw_shadow_from_mask(
-            &mut buf, 16, 16, 16, &mask, 4, 4, -10, -10, 0, 0, 0x000000, 200, &mut scratch,
+            &mut buf,
+            16,
+            16,
+            16,
+            &mask,
+            4,
+            4,
+            -10,
+            -10,
+            0,
+            0,
+            0x000000,
+            200,
+            &mut scratch,
         );
         // Must not panic, and must not have wrapped around to the far side.
-        assert!(buf.iter().all(|p| (*p >> 24) == 0xFF), "alpha byte corrupted");
+        assert!(
+            buf.iter().all(|p| (*p >> 24) == 0xFF),
+            "alpha byte corrupted"
+        );
+    }
+
+    // -- pre-blurred shadow (the cached-icon path) ------------------------
+
+    /// A `w`x`h` coverage mask of one opaque `edge`-square centred in `pad`
+    /// transparent rows, blurred with [`blur_mask_8`]. The same shape
+    /// `compositor::icons::shadow_coverage` caches.
+    fn preblurred_icon_mask(w: usize, h: usize, edge: usize, pad: usize) -> Vec<u8> {
+        let mut m = vec![0u8; w * h];
+        for y in pad..pad + edge {
+            for x in pad..pad + edge {
+                m[y * w + x] = 255;
+            }
+        }
+        let mut scratch = vec![0u8; w + 2 * h];
+        blur_mask_8(&mut m, w, h, &mut scratch);
+        m
+    }
+
+    #[test]
+    fn preblurred_shadow_matches_the_blurring_entry_point() {
+        // The contract that lets the shell cache a blurred mask: blurring here
+        // and blurring inside `draw_shadow_from_mask` must land the same
+        // pixels. If they diverge, the cached path is a different shadow.
+        let (mw, mh, pad) = (16usize, 16usize, 3usize);
+        let raw = {
+            let mut m = vec![0u8; mw * mh];
+            for y in pad..pad + 10 {
+                for x in pad..pad + 10 {
+                    m[y * mw + x] = 255;
+                }
+            }
+            m
+        };
+        let blurred = preblurred_icon_mask(mw, mh, 10, pad);
+        assert_ne!(
+            raw, blurred,
+            "the fixture must actually differ from its blur"
+        );
+
+        let mut a = vec![0xFF808080u32; 40 * 40];
+        let mut b = a.clone();
+        let mut scratch = vec![0u8; mw * mh + mw + 2 * mh];
+        draw_shadow_from_mask(
+            &mut a,
+            40,
+            40,
+            40,
+            &raw,
+            mw,
+            mh,
+            6,
+            6,
+            1,
+            2,
+            0x001018,
+            170,
+            &mut scratch,
+        );
+        draw_preblurred_shadow_from_mask(
+            &mut b, 40, 40, 40, &blurred, mw, mh, 6, 6, 1, 2, 0x001018, 170,
+        );
+        assert_eq!(a, b, "the pre-blurred path is not the same shadow");
+        // And it is not a no-op: the two differ from the untouched backdrop.
+        assert!(a.iter().any(|p| (*p & 0xFF) < 0x80), "no shadow was drawn");
+    }
+
+    #[test]
+    fn preblurred_shadow_does_not_modify_the_cached_mask() {
+        // The reason the entry point exists: the caller owns the mask for the
+        // process lifetime, so a draw that blurred it in place would degrade
+        // the shadow on every subsequent frame.
+        let (mw, mh) = (14usize, 14usize);
+        let mask = preblurred_icon_mask(mw, mh, 8, 3);
+        let before = mask.clone();
+        let draw_once = || {
+            let mut b = vec![0xFF808080u32; 32 * 32];
+            draw_preblurred_shadow_from_mask(
+                &mut b, 32, 32, 32, &mask, mw, mh, 4, 4, 0, 1, 0x000000, 120,
+            );
+            b
+        };
+        // Purity is the property a cached mask needs: the same mask and the
+        // same geometry must composite identically every frame.
+        assert_eq!(
+            draw_once(),
+            draw_once(),
+            "the same draw produced different pixels"
+        );
+        assert_eq!(mask, before, "the mask was blurred again by a draw");
+        assert!(
+            draw_once().iter().any(|p| (*p & 0xFF) < 0x80),
+            "no shadow was drawn"
+        );
+    }
+
+    #[test]
+    fn preblurred_shadow_refuses_a_short_mask_instead_of_panicking() {
+        // A `pub fn` taking `mask_w`/`mask_h` from a caller must not index
+        // past the slice when those two disagree with the buffer: the wrapped
+        // cell count is the only thing that would save it, and it does not.
+        let mut buf = vec![0xFF808080u32; 16 * 16];
+        let before = buf.clone();
+        let mask = vec![255u8; 15]; // claims 4x4 = 16 cells
+        draw_preblurred_shadow_from_mask(
+            &mut buf, 16, 16, 16, &mask, 4, 4, 0, 0, 0, 0, 0x000000, 200,
+        );
+        assert_eq!(buf, before, "a short mask must be refused, not truncated");
+        // Same for the blurring entry point, whose scratch check used to be
+        // the only guard: it now bails on the mask before touching the scratch.
+        let mut scratch = vec![0u8; 16 + 4 + 8];
+        draw_shadow_from_mask(
+            &mut buf,
+            16,
+            16,
+            16,
+            &mask,
+            4,
+            4,
+            0,
+            0,
+            0,
+            0,
+            0x000000,
+            200,
+            &mut scratch,
+        );
+        assert_eq!(buf, before, "a short mask must be refused before the copy");
+        // A zero dimension and a cell count that would overflow a 32-bit usize
+        // are both no-ops, not wraps.
+        draw_preblurred_shadow_from_mask(
+            &mut buf, 16, 16, 16, &mask, 0, 4, 0, 0, 0, 0, 0x000000, 200,
+        );
+        #[cfg(target_pointer_width = "32")]
+        draw_preblurred_shadow_from_mask(
+            &mut buf,
+            16,
+            16,
+            16,
+            &mask,
+            usize::MAX,
+            2,
+            0,
+            0,
+            0,
+            0,
+            0x000000,
+            200,
+        );
+        assert_eq!(buf, before, "degenerate geometry drew something");
     }
 }

@@ -55,18 +55,26 @@ echo "==========================================================================
 header "1. Workspace Unit & Integration Tests (Phase 3 Compositor Coverage)"
 # ------------------------------------------------------------------------------
 
-echo "[*] Running entire workspace test suite..."
-if cargo test --workspace; then
-    pass "All unit and integration tests passed across all workspace crates"
+echo "[*] Running entire workspace test suite in RELEASE mode..."
+# Release, not debug. The whole point of this tree's budget guards is the
+# absolute frame time: `full_frame_stays_inside_the_vsync_budget` is
+# `#[cfg_attr(debug_assertions, ignore)]`, so a debug run silently measures
+# nothing and reports "all green" for a launcher that would drop every frame
+# on the device. Running `--release` here is what makes the run mean anything.
+if cargo test --workspace --release; then
+    pass "All unit and integration tests passed across all workspace crates (release)"
 else
-    fail "Workspace test suite reported test failures"
+    fail "Workspace test suite reported test failures (release)"
 fi
 
-echo "[*] Running dedicated Phase 3 compositor integration test suite..."
-if cargo test --test compositor_test; then
-    pass "Dedicated compositor test suite passed (Milestones 3.1 - 3.6)"
+echo "[*] Running dedicated Phase 3 compositor integration test suite (release)..."
+# `-p utim_core` because `compositor_test` is utim_core's integration target;
+# a bare `cargo test --test compositor_test` at the workspace root matches no
+# target at all and runs nothing.
+if cargo test -p utim_core --release --test compositor_test; then
+    pass "Dedicated compositor test suite passed (Milestones 3.1 - 3.6, release)"
 else
-    fail "Dedicated compositor test suite failed"
+    fail "Dedicated compositor test suite failed (release)"
 fi
 
 # ------------------------------------------------------------------------------
@@ -82,6 +90,56 @@ fi
 
 # Build host diagnostics tools
 cargo build --bin utim-graphics-check --bin utlc >/dev/null 2>&1 || true
+
+# ------------------------------------------------------------------------------
+header "1b. Release Optimisation Profile Assertion (rasteriser must not be at -Oz)"
+# ------------------------------------------------------------------------------
+
+# `opt-level = "z"` (below) switches LLVM's loop and SLP vectorizers OFF, which
+# is the wrong trade for a software rasteriser: nearly all of this workspace's
+# CPU time is scalar per-pixel loops, and only `slice::fill` /
+# `copy_from_slice` autovectorise at "z". `utim_core` is the crate that
+# rasterises, so it alone must be exempted with
+# `[profile.release.package.utim_core] opt-level = 3`.
+#
+# Asserted here, and not left to a comment, because the failure mode is
+# invisible: deleting the package override does not break the build, does not
+# fail a single unit test, and only shows up as a launcher that missed the
+# 8.33 ms vsync period on real hardware. A grep turns that into a build-time
+# failure with a message that names the fix.
+#
+# The section body is matched up to the next `[` table header, so an
+# `opt-level` belonging to some *other* profile section cannot satisfy this.
+CARGO_TOML="${WORKSPACE_ROOT}/Cargo.toml"
+PROFILE_BLOCK="$(awk '
+    /^\[profile\.release\.package\.utim_core\][[:space:]]*$/ { inblock = 1; print; next }
+    inblock && /^\[/ { exit }
+    inblock { print }
+' "${CARGO_TOML}")"
+
+if [[ -z "${PROFILE_BLOCK}" ]]; then
+    fail "Cargo.toml has no [profile.release.package.utim_core] section; the rasteriser is being built at opt-level=\"z\""
+elif grep -qE '^[[:space:]]*opt-level[[:space:]]*=[[:space:]]*3[[:space:]]*$' <<< "${PROFILE_BLOCK}"; then
+    pass "Cargo.toml pins [profile.release.package.utim_core] opt-level = 3 (rasteriser keeps its vectorizers)"
+else
+    fail "Cargo.toml [profile.release.package.utim_core] exists but does not set opt-level = 3; the renderer is compiled at the workspace default"
+fi
+
+# The budget guard must actually EXECUTE, not be skipped. It is
+# `#[cfg_attr(debug_assertions, ignore)]`, so in a debug run it is reported as
+# `ignored` and the frame numbers below are absent. This check fails loudly if
+# somebody re-adds an unconditional `#[ignore]`, which would turn the frame
+# budget into a test that cannot fail.
+echo "[*] Confirming the release frame-budget guard actually executes (not ignored)..."
+if BUDGET_RUN=$(cargo test --release -p utim_core --lib full_frame_stays_inside_the_vsync_budget -- --nocapture 2>&1); then
+    if grep -q "test result: ok. 1 passed" <<< "${BUDGET_RUN}"; then
+        pass "full_frame_stays_inside_the_vsync_budget executed and passed in release mode"
+    else
+        fail "full_frame_stays_inside_the_vsync_budget did not run (0 passed) - it is probably #[ignore]d"
+    fi
+else
+    fail "full_frame_stays_inside_the_vsync_budget FAILED in release mode"
+fi
 
 # ------------------------------------------------------------------------------
 header "3. Meticulous 64 KB ELF Alignment Inspection (Android 15+ 16KB Pages)"
@@ -136,6 +194,121 @@ if echo "${BENCH_OUT}" | grep -q '"rss_target_met":true'; then
     pass "Resident RAM (RSS) verified (< 15 MB target achieved)"
 else
     fail "Resident RAM footprint exceeded 15 MB"
+fi
+
+# ------------------------------------------------------------------------------
+header "4b. Release Frame Budget: 8.33 ms (120 Hz) / 16.67 ms (60 Hz)"
+# ------------------------------------------------------------------------------
+
+# Two numbers, both hard:
+#
+#   * 8.33 ms  -- one 120 Hz period. A STEADY state (what the screen shows
+#                 when the user is not mid-gesture) that misses this drops
+#                 frames on a 120 Hz panel.
+#   * 16.67 ms -- one 60 Hz period. EVERY state, transient included, must meet
+#                 this: the plan's requirement is zero frame drops across
+#                 60/90/120/144 Hz, and 16.67 ms is the floor of that range.
+#
+# The timings come from `full_frame_stays_inside_the_vsync_budget`, which is
+# the only place the real draw path is timed per state. `utlc --benchmark`
+# reports boot / RSS / input / search latency but NOT per-state frame cost, so
+# it cannot answer this question; the release test run is what can.
+echo "[*] Collecting per-state release frame timings (utlc --benchmark has no frame field)..."
+if BUDGET_OUT=$(cargo test --release -p utim_core --lib full_frame_stays_inside_the_vsync_budget -- --nocapture 2>&1); then
+    pass "Release frame-budget measurement completed"
+else
+    fail "Release frame-budget measurement run failed; timings below are absent"
+fi
+
+# Parse `Duration`'s Debug output, which is a number plus a unit that can be
+# any of ns / us / ms / s depending on magnitude. The budget is in
+# microseconds, so everything is converted to us and compared as integers --
+# a floating-point compare against 8333.0 would make a 8332.6 us frame read as
+# over budget on a different host's rounding.
+dur_to_us() {
+    # $1 = e.g. "5.645773ms", "850us", "1.5s", "900ns"
+    local d="$1" num unit
+    num="${d%%[a-zµ]*}"
+    unit="${d#"${num}"}"
+    case "${unit}" in
+        ns) awk -v n="${num}" 'BEGIN { printf "%d", n / 1000.0 }' ;;
+        us|µs) awk -v n="${num}" 'BEGIN { printf "%d", n }' ;;
+        ms) awk -v n="${num}" 'BEGIN { printf "%d", n * 1000.0 }' ;;
+        s)  awk -v n="${num}" 'BEGIN { printf "%d", n * 1000000.0 }' ;;
+        *)  echo "-1" ;;
+    esac
+}
+
+FRAME_LINES=""
+if [[ -n "${BUDGET_OUT:-}" ]]; then
+    FRAME_LINES="$(grep -E '^[[:alnum:]_]+ frame: .*\(release build\)$' <<< "${BUDGET_OUT}" || true)"
+fi
+
+if [[ -z "${FRAME_LINES}" ]]; then
+    fail "No per-state frame timings were reported - the budget guard did not execute in release mode"
+else
+    REPORTED=0
+    OVER_60HZ=0
+    OVER_120HZ=0
+    SLOWEST_NAME=""
+    SLOWEST_US=0
+    while IFS= read -r line; do
+        [[ -z "${line}" ]] && continue
+        name="${line%% frame:*}"
+        dur="${line#* frame: }"
+        dur="${dur%% (*}"
+        us="$(dur_to_us "${dur}")"
+        if [[ "${us}" == "-1" ]]; then
+            fail "Could not parse the frame duration for state '${name}' (raw: '${dur}')"
+            continue
+        fi
+        REPORTED=$((REPORTED + 1))
+        if (( us > SLOWEST_US )); then
+            SLOWEST_US="${us}"
+            SLOWEST_NAME="${name}"
+        fi
+        if (( us > 16667 )); then
+            OVER_60HZ=$((OVER_60HZ + 1))
+            echo -e "      ${YELLOW}${name}: ${us} us -- OVER the 16667 us (60 Hz) floor${NC}"
+        elif (( us > 8333 )); then
+            OVER_120HZ=$((OVER_120HZ + 1))
+            echo -e "      ${YELLOW}${name}: ${us} us -- over the 8333 us (120 Hz) steady budget (transient states get two periods)${NC}"
+        else
+            echo -e "      ${name}: ${us} us"
+        fi
+    done <<< "${FRAME_LINES}"
+
+    echo "[*] Slowest state: ${SLOWEST_NAME} at ${SLOWEST_US} us; ${REPORTED} states measured."
+    if (( OVER_60HZ == 0 )); then
+        pass "All ${REPORTED} states fit one 60 Hz period (< 16667 us); slowest was ${SLOWEST_NAME} at ${SLOWEST_US} us"
+    else
+        fail "${OVER_60HZ} of ${REPORTED} states exceed the 16667 us (60 Hz) floor; slowest was ${SLOWEST_NAME} at ${SLOWEST_US} us"
+    fi
+    if (( OVER_120HZ == 0 )); then
+        pass "All ${REPORTED} states also fit one 120 Hz period (< 8333 us); no state needs the transient tier"
+    else
+        # Not a failure: the Rust guard classifies those states as transient
+        # and grants them two 120 Hz periods by design. Reported so the count
+        # is visible rather than silently absorbed.
+        pass "${OVER_120HZ} of ${REPORTED} states are over 8333 us and are classified transient (two 120 Hz periods) by full_frame_stays_inside_the_vsync_budget"
+    fi
+fi
+
+# The release binary's own benchmark, for the non-frame latencies.
+echo "[*] Running release utlc --benchmark for boot / RSS / input / search latency..."
+if REL_BENCH=$("${WORKSPACE_ROOT}/target/release/utlc" --benchmark --json 2>/dev/null); then
+    if echo "${REL_BENCH}" | grep -q '"touch_target_met":true'; then
+        pass "Release touch-input latency verified (< 8.0 ms guarantee)"
+    else
+        fail "Release touch-input latency exceeded 8.0 ms"
+    fi
+    if echo "${REL_BENCH}" | grep -q '"rss_target_met":true'; then
+        pass "Release Resident RAM (RSS) verified (< 15 MB target achieved)"
+    else
+        fail "Release Resident RAM footprint exceeded 15 MB"
+    fi
+else
+    fail "Release utlc --benchmark invocation failed (build target/release/utlc first)"
 fi
 
 # ------------------------------------------------------------------------------

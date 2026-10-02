@@ -255,9 +255,7 @@ impl VsyncPresentationValidator {
                     expected_ns: self.last_present_ns.saturating_add(expected),
                     actual_ns: present_timestamp_ns,
                     delta_ns: (present_timestamp_ns as i128)
-                        .saturating_sub(
-                            (self.last_present_ns.saturating_add(expected)) as i128,
-                        )
+                        .saturating_sub((self.last_present_ns.saturating_add(expected)) as i128)
                         .clamp(i64::MIN as i128, i64::MAX as i128)
                         as i64,
                 });

@@ -23,8 +23,8 @@
 //!   flattened on the fly. The hot path allocates nothing, ever; only
 //!   oversize glyphs outside the cache fall back to a transient buffer.
 
-use std::sync::{Mutex, OnceLock};
 use super::ttf::TrueTypeFont;
+use std::sync::{Mutex, OnceLock};
 
 /// Design units per em (the font is authored in this space).
 pub const UNITS_PER_EM: f32 = 1000.0;
@@ -36,9 +36,32 @@ pub const DESCENDER: f32 = -200.0;
 pub const CAP_HEIGHT: f32 = 700.0;
 /// Lowercase x-height, in design units.
 pub const X_HEIGHT: f32 = 520.0;
-/// Em size in pixels for UI scale 1. Scale 2 is the shell's body size
-/// (~30px em, ~21px cap height on a 1080x2400 panel).
-pub const EM_BASE_PX: f32 = 15.0;
+/// Em size in pixels for UI scale 1.
+///
+/// **This is the scale-1 em, not the body size.** The shell draws body text at
+/// scale 2 ([`em_px`] multiplies by `max(scale, 1)`), so the body em on the
+/// reference panel is `2 * EM_BASE_PX`.
+///
+/// The body size is anchored to Lawnchair's `textAppearanceBodyMedium`, which
+/// is 14 sp (`values/styles.xml`, the type scale Android 12+ inherited). At
+/// the calibration density of 1080 px / 420 dp = 2.5714 px/dp, 14 sp is
+/// `14 * 2.5714 = 36.0` px. So `EM_BASE_PX` is 18.0, and `em_px(2)` is 36.0.
+///
+/// It was 15.0, giving a 30 px body em -- 11.7 sp. That is visibly small for a
+/// launcher label on a 1080 px panel: it is the size of a footnote at 12 sp,
+/// and the plan's 6.3 calls it out as "labels and popup menu text render
+/// legibly at true mobile scale without colliding".
+///
+/// A note on the plan's wording, which says to raise *this* constant "from
+/// 15.0 to 36.0 px". 36 is the size of the *body em*, and setting the scale-1
+/// base to 36 would make `em_px(2)` 72 px -- a 28 sp display type, twice the
+/// reference body size, and larger than most of the panel's chrome. The two
+/// numbers are the same measurement at two scales; the base is half of it.
+pub const EM_BASE_PX: f32 = 18.0;
+
+/// The reference body em in pixels on the 1080 px panel: 14 sp at 2.5714
+/// px/dp. Asserted in the tests so the two constants cannot drift apart.
+pub const REFERENCE_BODY_EM_PX: f32 = 36.0;
 
 /// Scanline coverage accumulator width, in pixels. Glyphs wider than this
 /// are rasterised in horizontal chunks, so any size stays correct.
@@ -112,7 +135,9 @@ pub fn get_noto_ttf() -> Option<&'static TrueTypeFont> {
     if FORCE_FALLBACK.load(Ordering::Relaxed) {
         return None;
     }
-    NOTO_TTF.get_or_init(TrueTypeFont::load_system_noto).as_ref()
+    NOTO_TTF
+        .get_or_init(TrueTypeFont::load_system_noto)
+        .as_ref()
 }
 
 /// Check whether the authentic Google Noto Sans TTF is loaded from system packages.
@@ -181,19 +206,175 @@ pub fn em_px_at(scale: usize, panel_w: usize) -> f32 {
 /// Panel width the UI scale is authored against.
 pub const REFERENCE_PANEL_W: f32 = 1080.0;
 
-/// Advance width of one character, in pixels.
+/// The launcher body text size, in sp.
+///
+/// `textAppearanceBodyMedium` in Lawnchair's `values/styles.xml`, and the
+/// Android 12+ type scale's default label size. 14 sp.
+pub const REFERENCE_BODY_SP: f32 = 14.0;
+
+/// Upper bound on the body em, px.
+///
+/// Android clamps `scaledDensity` so that a very large display cannot scale
+/// text without limit; a tablet that is wide because it is a tablet, not
+/// because it is close, must not get display-1 type for a label. 40 px is
+/// roughly 15.5 sp at the 1080p density, which is the largest a launcher
+/// label is normally set.
+pub const MAX_BODY_EM_PX: f32 = 40.0;
+
+/// The dp scale of a panel `w` px wide.
+///
+/// `LAWNCHAIR_PHONE_DP_WIDTH` is the calibration baseline, so this is 1.0 on
+/// the 420 dp reference phone and 2.5714 on a 1080 px panel.
 #[inline]
-pub fn char_advance(b: u8, size_px: f32) -> f32 {
-    let a = if (0x20..0x80).contains(&b) {
-        let fam = active_family();
-        if fam == FontFamily::NotoSans {
+pub fn dp_scale_for(panel_w: f32) -> f32 {
+    (panel_w / crate::graphics::layout::LAWNCHAIR_PHONE_DP_WIDTH).max(0.5)
+}
+
+/// The body em a panel of width `w` px should use, px: 14 sp at the panel's
+/// dp scale, clamped to [`MAX_BODY_EM_PX`].
+///
+/// This is the *target*. The renderer rasterises at an integer rung of the
+/// [`em_px`] ladder, so a caller picks the rung nearest to this and then reads
+/// back `em_px_at(rung, w)` -- which is what the layout does. Keeping the
+/// target and the rung separate is what lets the two agree exactly on the
+/// reference panel (1080 px -> 36.0 px, exactly 14 sp at 2.5714 px/dp) while
+/// degrading to the nearest available rung elsewhere.
+///
+/// The clamp is what stops a 2000 px-wide tablet from asking for
+/// `14 * 4.76 = 66.7` px of label.
+#[inline]
+pub fn body_em_px_for(panel_w: f32) -> f32 {
+    let dp = dp_scale_for(panel_w);
+    (REFERENCE_BODY_SP * dp).clamp(EM_BASE_PX, MAX_BODY_EM_PX)
+}
+
+/// Whether the active face for `family` can actually draw `cp`.
+///
+/// True for printable ASCII (the hand-authored vector tables), and otherwise
+/// only when the loaded TrueType face parsed a glyph for it. This is the
+/// predicate that decides between "draw the glyph" and "draw a placeholder",
+/// so it must agree with what `draw_glyph` would otherwise reach for --
+/// otherwise a codepoint would be announced as missing while a glyph was
+/// silently drawn, or the reverse.
+#[inline]
+pub fn family_has_glyph(family: FontFamily, cp: char) -> bool {
+    if (' '..='\u{7e}').contains(&cp) {
+        return true;
+    }
+    if family == FontFamily::NotoSans {
+        if let Some(ttf) = get_noto_ttf() {
+            // In range, present, *and* its outline assembles. An in-range
+            // entry whose outline we could not build is a glyph the font claims
+            // but cannot draw, which is a missing glyph as far as the user is
+            // concerned. A space passes: drawable, and correctly blank.
+            return ttf.can_draw(cp);
+        }
+    }
+    false
+}
+
+/// The visible placeholder for a codepoint the active face cannot draw.
+///
+/// A hollow box, the universal "tofu". Drawn rather than skipped because the
+/// failure mode it replaces was silent: a CJK app name rendered as blank space
+/// of roughly the right width, which reads as "this launcher is broken" and
+/// gives the user nothing to act on. A box says "this character is missing"
+/// at the exact place it is missing.
+///
+/// Geometry is derived from the advance rather than hard-coded, so a
+/// placeholder for a CJK-width codepoint looks square and one for a narrow
+/// codepoint looks narrow -- the same relationship the real metrics would have.
+/// Returned advance matches [`char_advance`] so `measure()` and `draw_run()`
+/// still agree, which is what keeps centred and clipped text aligned.
+#[allow(clippy::too_many_arguments)]
+fn draw_missing_glyph(
+    buf: &mut [u32],
+    stride: usize,
+    w: usize,
+    h: usize,
+    x: f32,
+    y: f32,
+    size_px: f32,
+    weight: FontWeight,
+    color: u32,
+) -> f32 {
+    let adv_units = FALLBACK_ADVANCE;
+    let adv = adv_units * size_px / UNITS_PER_EM;
+    let s = size_px / UNITS_PER_EM;
+    // Inset by the stroke so the box sits inside its own advance, and keep a
+    // hairline of daylight at small sizes so a 12 px label does not fill solid.
+    let stroke = (weight.pen() * s).max(1.0);
+    let inset = stroke * 0.5;
+    let box_w = (FALLBACK_ADVANCE * s) - inset * 2.0;
+    let box_h = (ASCENDER * 0.66 * s) - inset * 2.0;
+    if box_w < 2.0 * stroke || box_h < 2.0 * stroke {
+        // Too small for a legible outline: the advance alone is the honest
+        // answer, and a filled smear would read as ink where there is none.
+        return adv;
+    }
+    let baseline = y + ASCENDER * s;
+    let top = baseline - ASCENDER * 0.66 * s + inset;
+    let left = x + inset;
+    // Four edges as a stroke, not a fill: a filled box at 0.6 em would be a
+    // solid block, which is exactly the "ink where there is none" this is
+    // avoiding.
+    for (ex, ey, ew, eh) in [
+        (left, top, box_w, stroke),
+        (left, top + box_h - stroke, box_w, stroke),
+        (left, top, stroke, box_h),
+        (left + box_w - stroke, top, stroke, box_h),
+    ] {
+        let ex = ex.floor();
+        let ey = ey.floor();
+        let ew = ew.ceil().max(1.0) as usize;
+        let eh = eh.ceil().max(1.0) as usize;
+        if ex < 0.0 || ey < 0.0 {
+            continue;
+        }
+        let (ex, ey) = (ex as usize, ey as usize);
+        if ex >= w || ey >= h {
+            continue;
+        }
+        for row in ey..(ey + eh).min(h) {
+            let base = row * stride;
+            for col in ex..(ex + ew).min(w) {
+                buf[base + col] = blend_over(buf[base + col], color, 255);
+            }
+        }
+    }
+    adv
+}
+
+/// Advance width of one character, in pixels.
+///
+/// Takes a `char`, not a `u8`. The byte form made this meaningless for
+/// anything but ASCII: a 3-byte CJK ideograph was charged the fallback advance
+/// three times, so the string was laid out at roughly 3x its true width while
+/// painting nothing. A `char` is charged once.
+#[inline]
+pub fn char_advance(cp: char, size_px: f32) -> f32 {
+    char_advance_for(cp, size_px, active_family())
+}
+
+/// [`char_advance`] against an explicit family, for [`measure_with_family`].
+#[inline]
+pub fn char_advance_for(cp: char, size_px: f32, family: FontFamily) -> f32 {
+    let a = if (' '..='\u{7e}').contains(&cp) {
+        let b = cp as u8;
+        if family == FontFamily::NotoSans {
             if let Some(ttf) = get_noto_ttf() {
-                ttf.advance(b)
+                ttf.advance(cp)
             } else {
                 glyph_for_family(b, FontFamily::NotoSans).a
             }
         } else {
-            glyph_for_family(b, fam).a
+            glyph_for_family(b, family).a
+        }
+    } else if family == FontFamily::NotoSans {
+        if let Some(ttf) = get_noto_ttf() {
+            ttf.advance(cp)
+        } else {
+            FALLBACK_ADVANCE
         }
     } else {
         FALLBACK_ADVANCE
@@ -204,8 +385,8 @@ pub fn char_advance(b: u8, size_px: f32) -> f32 {
 /// Total advance width of a string, in pixels.
 pub fn measure(text: &str, size_px: f32) -> f32 {
     let mut total = 0.0;
-    for b in text.bytes() {
-        total += char_advance(b, size_px);
+    for cp in text.chars() {
+        total += char_advance(cp, size_px);
     }
     total
 }
@@ -293,7 +474,19 @@ const GLYPH_HUGE_EDGE: i64 = 1024;
 /// changes coverage. A hit therefore means bit-identical raster inputs.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct GlyphKey {
-    b: u8,
+    /// The **codepoint**, not a byte.
+    ///
+    /// It was a `u8`, which was sufficient while the pipeline was ASCII-only.
+    /// The moment the glyph argument became a `char`, a `u8` key had to be
+    /// synthesised for every non-ASCII codepoint, and the obvious choice -- 0
+    /// -- made every one of them share a cache entry. `\u{416}` then returned
+    /// whatever advance some earlier non-ASCII glyph had cached, and drew that
+    /// glyph's mask: a real cross-contamination bug, observable as Cyrillic
+    /// words rendering as each other.
+    ///
+    /// `u32` costs 3 bytes per key across 96 entries (288 bytes of `.bss`) and
+    /// removes the entire class of bug.
+    cp: u32,
     family: u8,
     weight: u8,
     size_bits: u32,
@@ -303,7 +496,7 @@ struct GlyphKey {
 
 impl GlyphKey {
     const EMPTY: Self = Self {
-        b: 0,
+        cp: 0,
         family: 0,
         weight: 0,
         size_bits: 0,
@@ -366,7 +559,7 @@ impl GlyphCache {
         let mut h = key.size_bits
             ^ key.x_bits
             ^ key.y_bits
-            ^ (key.b as u32).wrapping_mul(0x9E37_79B1)
+            ^ key.cp.wrapping_mul(0x9E37_79B1)
             ^ ((key.weight as u32) << 24)
             ^ ((key.family as u32) << 28);
         h ^= h >> 16;
@@ -602,26 +795,42 @@ pub fn draw_glyph(
     h: usize,
     x: f32,
     y: f32,
-    b: u8,
+    cp: char,
     color: u32,
     size_px: f32,
     weight: FontWeight,
 ) -> f32 {
-    if !(0x20..0x7F).contains(&b) {
-        // No ink for non-printable / non-ASCII bytes (they would otherwise
-        // alias the DEL slot via glyph_of's saturating index); the advance
-        // matches char_advance so measure() and draw_run() agree.
+    let family = active_family();
+    // Control characters are refused before anything else, *including* the
+    // font's opinion. `U+007F` (DEL) and `U+0085` (NEL) are inside the
+    // pre-parsed range and Noto really does carry glyphs for them, so a
+    // "does the font have it" check first would print a box for DEL. Whether a
+    // control has ink is not a question for the font.
+    if cp.is_control() {
         return FALLBACK_ADVANCE * size_px / UNITS_PER_EM;
     }
-    let family = active_family();
+    let b = if (' '..='\u{7e}').contains(&cp) {
+        cp as u8
+    } else {
+        0
+    };
+    // Outside ASCII there is no hand-authored vector glyph, so the only two
+    // honest outcomes are "the loaded TrueType face has it" and "say so". The
+    // old code took a third path -- return the advance and paint nothing --
+    // which is the bug this replaces: a Greek, Cyrillic or CJK string occupied
+    // correct-looking space and was completely invisible. Control characters
+    // keep the old silent behaviour, because a tofu box for `\n` is noise.
+    if !(' '..='\u{7e}').contains(&cp) && !family_has_glyph(family, cp) {
+        return draw_missing_glyph(buf, stride, w, h, x, y, size_px, weight, color);
+    }
     let s = size_px / UNITS_PER_EM;
     let r = weight.pen() * s;
     let baseline = y + ASCENDER * s;
 
     let (adv, ox64, oy64, ex64, ey64, use_ttf, g) = if family == FontFamily::NotoSans {
         if let Some(ttf) = get_noto_ttf() {
-            let adv = ttf.advance(b) * s;
-            let bbox = ttf.bbox(b);
+            let adv = ttf.advance(cp) * s;
+            let bbox = ttf.bbox(cp);
             if bbox.0 == 0.0 && bbox.2 == 0.0 {
                 // No ink at all (e.g. space): advance once.
                 return adv;
@@ -736,7 +945,7 @@ pub fn draw_glyph(
         && ex64 <= w as i64
         && ey64 <= h as i64;
     let key = GlyphKey {
-        b,
+        cp: cp as u32,
         family: family as u8,
         weight: weight_id(weight),
         size_bits: size_px.to_bits(),
@@ -808,7 +1017,15 @@ pub fn draw_glyph(
             // which is what made Regular, Medium and Bold byte-identical.
             let nominal = FontWeight::Regular.pen() * s;
             ttf.rasterize_glyph(
-                b, x, s, baseline, mask, bw, bh, ox, oy,
+                cp,
+                x,
+                s,
+                baseline,
+                mask,
+                bw,
+                bh,
+                ox,
+                oy,
                 (r - nominal).max(0.0) * super::ttf::OUTLINE_WEIGHT_SCALE,
             )
         } else {
@@ -842,11 +1059,11 @@ pub fn draw_run(
     weight: FontWeight,
 ) -> f32 {
     let mut pen = x;
-    for b in text.bytes() {
-        if b == b'\n' {
+    for cp in text.chars() {
+        if cp == '\n' {
             continue;
         }
-        pen += draw_glyph(buf, stride, w, h, pen, y, b, color, size_px, weight);
+        pen += draw_glyph(buf, stride, w, h, pen, y, cp, color, size_px, weight);
     }
     pen - x
 }
@@ -876,21 +1093,8 @@ pub fn draw_run_with_family(
 /// Measure string advance with an explicitly specified font family.
 pub fn measure_with_family(text: &str, size_px: f32, family: FontFamily) -> f32 {
     let mut total = 0.0;
-    for b in text.bytes() {
-        let a = if (0x20..0x80).contains(&b) {
-            if family == FontFamily::NotoSans {
-                if let Some(ttf) = get_noto_ttf() {
-                    ttf.advance(b)
-                } else {
-                    glyph_for_family(b, family).a
-                }
-            } else {
-                glyph_for_family(b, family).a
-            }
-        } else {
-            FALLBACK_ADVANCE
-        };
-        total += a * size_px / UNITS_PER_EM;
+    for cp in text.chars() {
+        total += char_advance_for(cp, size_px, family);
     }
     total
 }
@@ -936,14 +1140,14 @@ mod tests {
             assert!((200.0..=900.0).contains(&a), "glyph {} advance {}", c, a);
         }
         // Digits are tabular: the clock never jitters.
-        let d0 = char_advance(b'0', 100.0);
-        for c in b'1'..=b'9' {
+        let d0 = char_advance('0', 100.0);
+        for c in '1'..='9' {
             assert_eq!(char_advance(c, 100.0), d0);
         }
         // Proportional: an "i" is much narrower than an "m".
-        assert!(char_advance(b'i', 100.0) < char_advance(b'm', 100.0) * 0.5);
+        assert!(char_advance('i', 100.0) < char_advance('m', 100.0) * 0.5);
         // And the table sums to the measured string.
-        assert!((measure("ill", 100.0) - 3.0 * char_advance(b'i', 100.0)).abs() < 0.001);
+        assert!((measure("ill", 100.0) - 3.0 * char_advance('i', 100.0)).abs() < 0.001);
     }
 
     #[test]
@@ -958,7 +1162,12 @@ mod tests {
                     min_y = min_y.min(sub.s.1).min(q.1).min(q.3);
                 }
             }
-            assert!(min_y < -100.0, "{} must descend (min y {})", c as char, min_y);
+            assert!(
+                min_y < -100.0,
+                "{} must descend (min y {})",
+                c as char,
+                min_y
+            );
         }
         for c in *b"bdhkltf" {
             let g = glyph_of(c);
@@ -968,7 +1177,12 @@ mod tests {
                     max_y = max_y.max(sub.s.1).max(q.1).max(q.3);
                 }
             }
-            assert!(max_y > X_HEIGHT + 100.0, "{} must ascend (max y {})", c as char, max_y);
+            assert!(
+                max_y > X_HEIGHT + 100.0,
+                "{} must ascend (max y {})",
+                c as char,
+                max_y
+            );
         }
     }
 
@@ -988,7 +1202,18 @@ mod tests {
         let size = 60.0;
         let (w, h) = (80usize, 120usize);
         let mut buf = vec![0xFF000000u32; w * h];
-        let adv = draw_run(&mut buf, w, w, h, 20.0, 10.0, "l", 0xFFFFFFFF, size, FontWeight::Regular);
+        let adv = draw_run(
+            &mut buf,
+            w,
+            w,
+            h,
+            20.0,
+            10.0,
+            "l",
+            0xFFFFFFFF,
+            size,
+            FontWeight::Regular,
+        );
         let y = 10 + (baseline_drop(size) - 300.0 * size / UNITS_PER_EM) as usize;
         let row: Vec<u8> = (0..w)
             .map(|x| ((buf[y * w + x] >> 16) & 0xFF) as u8)
@@ -1019,13 +1244,32 @@ mod tests {
         let lines = [
             ("All Applications", 2usize, FontWeight::Bold),
             ("Settings", 1, FontWeight::Medium),
-            ("Tap to search apps, web and settings", 1, FontWeight::Regular),
-            ("The quick brown fox jumps over the lazy dog", 1, FontWeight::Regular),
+            (
+                "Tap to search apps, web and settings",
+                1,
+                FontWeight::Regular,
+            ),
+            (
+                "The quick brown fox jumps over the lazy dog",
+                1,
+                FontWeight::Regular,
+            ),
             ("10:34", 3, FontWeight::Medium),
         ];
         // Warm up so the measurement is not dominated by first-touch faults.
         for (text, scale, weight) in lines {
-            draw_run(&mut buf, w, w, h, 10.0, 10.0, text, 0xFFFFFFFF, em_px(scale), weight);
+            draw_run(
+                &mut buf,
+                w,
+                w,
+                h,
+                10.0,
+                10.0,
+                text,
+                0xFFFFFFFF,
+                em_px(scale),
+                weight,
+            );
         }
         let start = std::time::Instant::now();
         const FRAMES: u32 = 20;
@@ -1050,7 +1294,11 @@ mod tests {
             "type: {:?} per frame ({} lines, build {})",
             per_frame,
             lines.len(),
-            if cfg!(debug_assertions) { "debug" } else { "release" }
+            if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            }
         );
         // Absolute timings only mean something for an optimised build; a debug
         // build of the same code is ~6x slower and is used for correctness.
@@ -1155,33 +1403,275 @@ mod tests {
         // Fully above the buffer: every glyph is culled.
         let (w, h) = (200usize, 60usize);
         let mut buf = vec![0xFF000000u32; w * h];
-        let drawn = draw_run(&mut buf, w, w, h, 10.0, -200.0, "00000", 0xFFFFFFFF, size, FontWeight::Regular);
-        assert!((drawn - measure("00000", size)).abs() < 0.001, "culled run {drawn} vs measured {}", measure("00000", size));
+        let drawn = draw_run(
+            &mut buf,
+            w,
+            w,
+            h,
+            10.0,
+            -200.0,
+            "00000",
+            0xFFFFFFFF,
+            size,
+            FontWeight::Regular,
+        );
+        assert!(
+            (drawn - measure("00000", size)).abs() < 0.001,
+            "culled run {drawn} vs measured {}",
+            measure("00000", size)
+        );
         // Culled glyphs ink nothing.
         assert!(buf.iter().all(|&p| p == 0xFF000000));
         // A single culled glyph matches char_advance, like a visible one.
         let mut one = vec![0xFF000000u32; w * h];
-        let a = draw_glyph(&mut one, w, w, h, 10.0, -200.0, b'2', 0xFFFFFFFF, size, FontWeight::Regular);
-        assert!((a - char_advance(b'2', size)).abs() < 0.0001);
+        let a = draw_glyph(
+            &mut one,
+            w,
+            w,
+            h,
+            10.0,
+            -200.0,
+            '2',
+            0xFFFFFFFF,
+            size,
+            FontWeight::Regular,
+        );
+        assert!((a - char_advance('2', size)).abs() < 0.0001);
         // Multi-subpath culled glyphs ('!' has several) advance once too.
         let mut bang = vec![0xFF000000u32; w * h];
-        let ab = draw_glyph(&mut bang, w, w, h, -500.0, 10.0, b'!', 0xFFFFFFFF, size, FontWeight::Regular);
-        assert!((ab - char_advance(b'!', size)).abs() < 0.0001);
+        let ab = draw_glyph(
+            &mut bang,
+            w,
+            w,
+            h,
+            -500.0,
+            10.0,
+            '!',
+            0xFFFFFFFF,
+            size,
+            FontWeight::Regular,
+        );
+        assert!((ab - char_advance('!', size)).abs() < 0.0001);
     }
 
     /// Bytes outside printable ASCII carry no ink but keep the fallback
-    /// advance, exactly like char_advance says.
+    /// A codepoint the face cannot draw is *announced*, not silently dropped.
+    ///
+    /// This test used to assert the opposite -- that `0x80`, `0xC3`, `0xFF` and
+    /// friends have no ink -- and that assertion is what the defect looked like
+    /// from inside the codebase: a Greek, Cyrillic or CJK string occupied
+    /// plausible space and drew nothing at all, so a launcher in a non-Latin
+    /// locale rendered app names and message senders as blank gaps.
+    ///
+    /// The contract is now split by *intent*:
+    ///
+    /// * a control character is skipped (a tofu box for `\n` would be noise);
+    /// * anything else printable gets a visible placeholder, so the user can see
+    ///   that a character is missing, and where.
+    ///
+    /// Control characters are fed as `char`, not as the raw byte: `0x0A` and
+    /// `0x85` are different characters, and `0x80` is `U+0080` (a control),
+    /// which is precisely the case that must stay silent. `U+00E9` (`é`),
+    /// `U+0416` (Cyrillic) and `U+4E2D` (CJK) are the visible half.
     #[test]
-    fn non_ascii_bytes_have_no_ink_but_keep_advance() {
+    fn an_undrawable_codepoint_is_announced_but_a_control_is_not() {
         let _guard = font_test_lock();
         let size = 30.0;
         let (w, h) = (200usize, 120usize);
-        for b in [0x00u8, 0x09, 0x0A, 0x1F, 0x7F, 0x80, 0xA9, 0xC3, 0xFF] {
+
+        for cp in ['\u{0}', '\u{9}', '\u{a}', '\u{1f}', '\u{7f}', '\u{85}'] {
             let mut buf = vec![0xFF000000u32; w * h];
-            let a = draw_glyph(&mut buf, w, w, h, 20.0, 10.0, b, 0xFFFFFFFF, size, FontWeight::Regular);
-            assert!((a - char_advance(b, size)).abs() < 0.0001, "byte {b:#04x}");
-            assert!(buf.iter().all(|&p| p == 0xFF000000), "byte {b:#04x} inked pixels");
+            let a = draw_glyph(
+                &mut buf,
+                w,
+                w,
+                h,
+                20.0,
+                10.0,
+                cp,
+                0xFFFFFFFF,
+                size,
+                FontWeight::Regular,
+            );
+            assert!(
+                (a - char_advance(cp, size)).abs() < 0.0001,
+                "control {cp:?}: advance must still match char_advance"
+            );
+            assert!(
+                buf.iter().all(|&p| p == 0xFF000000),
+                "control {cp:?} must stay silent, but it inked {} px",
+                buf.iter().filter(|&&p| p != 0xFF000000).count()
+            );
         }
+
+        for cp in ['\u{e9}', '\u{416}', '\u{4e2d}', '\u{1f600}'] {
+            let mut buf = vec![0xFF000000u32; w * h];
+            let a = draw_glyph(
+                &mut buf,
+                w,
+                w,
+                h,
+                20.0,
+                10.0,
+                cp,
+                0xFFFFFFFF,
+                size,
+                FontWeight::Regular,
+            );
+            assert!(
+                (a - char_advance(cp, size)).abs() < 0.0001,
+                "{cp:?}: the drawn advance must equal the measured one"
+            );
+            let inked = buf.iter().filter(|&&p| p != 0xFF000000).count();
+            assert!(
+                inked > 0,
+                "{cp:?} must draw a visible placeholder; it drew nothing, which is \
+                 the silent-blank-text defect"
+            );
+            // A placeholder is an outline, not a block: a filled box would be
+            // "ink where there is none" at display scale.
+            let filled = inked as f64 / (w * h) as f64;
+            assert!(
+                filled < 0.35,
+                "{cp:?}: placeholder covers {pct:.1} of the frame, too solid to be an outline",
+                pct = filled * 100.0
+            );
+        }
+    }
+
+    /// Two different non-ASCII characters must not share a cached raster.
+    ///
+    /// The glyph cache is keyed on the glyph argument, which was a `u8` when
+    /// the pipeline was ASCII-only. Once it became a `char`, a `u8` key had to
+    /// be synthesised for non-ASCII codepoints and every one of them hashed
+    /// and compared equal -- so `\u{416}` could be served the mask and advance
+    /// that some earlier non-ASCII glyph had cached, and Cyrillic words rendered
+    /// as each other. The symptom is a *wrong advance*, not a wrong glyph index,
+    /// so the assertion is on the advance: two characters with different metrics
+    /// must not be interchangeable.
+    #[test]
+    fn distinct_non_ascii_characters_do_not_share_a_cached_raster() {
+        let _guard = font_test_lock();
+        set_active_family(FontFamily::NotoSans);
+        let size = 40.0;
+        // The collision only ever affected *non-ASCII* codepoints: ASCII has a
+        // real byte to key on, so an ASCII pair cannot demonstrate it. These
+        // two are both drawable from Noto and differ by more than 3x (Cyriс
+        // Zhe 905 units against Ukrainian i 258).
+        let wide = '\u{416}';
+        let narrow = '\u{456}';
+        let (aw, bw) = (char_advance(narrow, size), char_advance(wide, size));
+        assert!(
+            bw > aw * 2.0,
+            "fixture unusable: {narrow:?}={aw}, {wide:?}={bw} -- needs a \
+             drawable face with two clearly different non-ASCII advances"
+        );
+
+        let (w, h) = (200usize, 140usize);
+        // Draw the wide one first, so a colliding narrow lookup inherits the
+        // wide advance rather than the other way round.
+        let mut buf = vec![0xFF000000u32; w * h];
+        let a_wide = draw_glyph(
+            &mut buf,
+            w,
+            w,
+            h,
+            10.0,
+            10.0,
+            wide,
+            0xFFFFFFFF,
+            size,
+            FontWeight::Regular,
+        );
+        assert!(
+            (a_wide - bw).abs() < 0.001,
+            "first draw of {wide:?}: {a_wide} vs {bw}"
+        );
+
+        let a_narrow = draw_glyph(
+            &mut buf,
+            w,
+            w,
+            h,
+            10.0,
+            10.0,
+            narrow,
+            0xFFFFFFFF,
+            size,
+            FontWeight::Regular,
+        );
+        assert!(
+            (a_narrow - aw).abs() < 0.001,
+            "{narrow:?} was served a cached advance of {a_narrow}, expected {aw}"
+        );
+
+        // And the reverse order, for a 2-way cache: whichever slot is evicted,
+        // neither advance may leak into the other.
+        let mut buf2 = vec![0xFF000000u32; w * h];
+        let a_n2 = draw_glyph(
+            &mut buf2,
+            w,
+            w,
+            h,
+            10.0,
+            10.0,
+            narrow,
+            0xFFFFFFFF,
+            size,
+            FontWeight::Regular,
+        );
+        assert!(
+            (a_n2 - aw).abs() < 0.001,
+            "first draw of {narrow:?}: {a_n2} vs {aw}"
+        );
+        let a_w2 = draw_glyph(
+            &mut buf2,
+            w,
+            w,
+            h,
+            10.0,
+            10.0,
+            wide,
+            0xFFFFFFFF,
+            size,
+            FontWeight::Regular,
+        );
+        assert!(
+            (a_w2 - bw).abs() < 0.001,
+            "{wide:?} was served a cached advance of {a_w2}, expected {bw}"
+        );
+    }
+
+    /// A multi-byte character is charged and drawn once, not once per byte.
+    ///
+    /// The byte pipeline made this impossible to get right: a 3-byte CJK
+    /// ideograph accumulated three fallback advances, so the string measured
+    /// ~3x too wide *and* painted nothing.
+    #[test]
+    fn a_multi_byte_character_advances_once() {
+        let _guard = font_test_lock();
+        let size = 100.0;
+        let one = char_advance('\u{4e2d}', size);
+        // Three CJK characters must measure the same as three of anything else
+        // that the font also cannot draw -- and, critically, three times one,
+        // not nine times.
+        let three = measure("\u{4e2d}\u{4e2d}\u{4e2d}", size);
+        assert!(
+            (three - 3.0 * one).abs() < 0.001,
+            "three CJK characters measured {three}, expected {}",
+            3.0 * one
+        );
+        // A 3-byte string is not 3 glyphs: the byte length must not leak into
+        // the width.
+        assert_eq!(
+            "\u{4e2d}".len(),
+            3,
+            "the test premise: this character is 3 bytes"
+        );
+        assert!(
+            (three - measure("\u{fffd}\u{fffd}\u{fffd}", size)).abs() < 0.001,
+            "byte length must not affect the advance"
+        );
     }
 
     /// Cache hits must reproduce misses exactly, on any background: draw once
@@ -1192,18 +1682,44 @@ mod tests {
         let _guard = font_test_lock();
         set_active_family(FontFamily::NotoSans);
         fn inked(buf: &[u32], bg: u32) -> Vec<usize> {
-            buf.iter().enumerate().filter(|(_, p)| **p != bg).map(|(i, _)| i).collect()
+            buf.iter()
+                .enumerate()
+                .filter(|(_, p)| **p != bg)
+                .map(|(i, _)| i)
+                .collect()
         }
         let size = 30.0;
         let (w, h) = (300usize, 120usize);
         let text = "Agc@e08";
         let mut buf1 = vec![0xFF000000u32; w * h];
-        draw_run(&mut buf1, w, w, h, 20.0, 10.0, text, 0xFFFFFFFF, size, FontWeight::Bold);
+        draw_run(
+            &mut buf1,
+            w,
+            w,
+            h,
+            20.0,
+            10.0,
+            text,
+            0xFFFFFFFF,
+            size,
+            FontWeight::Bold,
+        );
         let set1 = inked(&buf1, 0xFF000000);
         assert!(!set1.is_empty(), "expected ink");
         // Second run over a different background: all hits, same ink shape.
         let mut buf2 = vec![0xFF101725u32; w * h];
-        let adv = draw_run(&mut buf2, w, w, h, 20.0, 10.0, text, 0xFFFFFFFF, size, FontWeight::Bold);
+        let adv = draw_run(
+            &mut buf2,
+            w,
+            w,
+            h,
+            20.0,
+            10.0,
+            text,
+            0xFFFFFFFF,
+            size,
+            FontWeight::Bold,
+        );
         assert_eq!(inked(&buf2, 0xFF101725), set1);
         assert!((adv - measure(text, size)).abs() < 0.01);
     }
@@ -1214,33 +1730,39 @@ mod tests {
         // Noto Sans
         set_active_family(FontFamily::NotoSans);
         assert_eq!(active_family(), FontFamily::NotoSans);
-        let d0_noto = char_advance(b'0', 100.0);
+        let d0_noto = char_advance('0', 100.0);
         if is_noto_ttf_loaded() {
-            assert!((d0_noto - 57.2).abs() < 0.1, "TTF Noto Sans advance expected 57.2, got {d0_noto}");
+            assert!(
+                (d0_noto - 57.2).abs() < 0.1,
+                "TTF Noto Sans advance expected 57.2, got {d0_noto}"
+            );
         } else {
-            assert!((d0_noto - 56.0).abs() < 0.01, "Fallback Noto advance expected 56.0, got {d0_noto}");
+            assert!(
+                (d0_noto - 56.0).abs() < 0.01,
+                "Fallback Noto advance expected 56.0, got {d0_noto}"
+            );
         }
-        for c in b'1'..=b'9' {
+        for c in '1'..='9' {
             assert_eq!(char_advance(c, 100.0), d0_noto);
         }
 
         // Test forced fallback to ensure fallback path works deterministically
         set_force_fallback(true);
-        let d0_noto_fallback = char_advance(b'0', 100.0);
+        let d0_noto_fallback = char_advance('0', 100.0);
         assert!((d0_noto_fallback - 56.0).abs() < 0.01);
         set_force_fallback(false);
 
         // Homemade (used in Super Extreme power saver mode)
         set_active_family(FontFamily::Homemade);
         assert_eq!(active_family(), FontFamily::Homemade);
-        let d0_home = char_advance(b'0', 100.0);
+        let d0_home = char_advance('0', 100.0);
         assert!((d0_home - 62.0).abs() < 0.01);
 
         // AsciiMono: strictly fixed 60.0px advance for all ASCII chars
         set_active_family(FontFamily::AsciiMono);
         assert_eq!(active_family(), FontFamily::AsciiMono);
         for c in 0x20u8..0x7F {
-            assert_eq!(char_advance(c, 100.0), 60.0);
+            assert_eq!(char_advance(c as char, 100.0), 60.0);
         }
 
         // Revert to NotoSans
@@ -1315,7 +1837,7 @@ mod tests {
         set_active_family(FontFamily::AsciiMono);
         assert_eq!(active_family(), FontFamily::AsciiMono);
         let mono_adv = measure("######", 24.0);
-        assert!((mono_adv - 6.0 * char_advance(b'#', 24.0)).abs() < 1e-4);
+        assert!((mono_adv - 6.0 * char_advance('#', 24.0)).abs() < 1e-4);
 
         // 4. Return to Super Extreme Mode:
         set_active_family(FontFamily::Homemade);

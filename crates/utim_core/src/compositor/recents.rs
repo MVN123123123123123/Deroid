@@ -28,7 +28,7 @@
 //! passes. See [`PARK_UNARMED`] for the arming rule, and
 //! `recents_springs_park_within_bounded_time` for the proof.
 
-use crate::graphics::drm_kms::{RECENTS_SCALE_MULTIPLIER, SpringConfig, SpringSimulation};
+use crate::graphics::drm_kms::{SpringConfig, SpringSimulation, RECENTS_SCALE_MULTIPLIER};
 use crate::graphics::layout::{damped_scroll, Layout, RecentsLayout, Rect};
 
 /// Cards the overview keeps. `QuickstepTransitionManager.MAX_NUM_TASKS`
@@ -299,12 +299,7 @@ const PARK_UNARMED: f32 = f32::NEG_INFINITY;
 /// `settle_duration` is evaluated exactly once per animation, here at the arm
 /// point, because it walks the response segment by segment and running it per
 /// frame would put a bisection search on the hot path.
-fn settle_expired(
-    spring: &SpringSimulation,
-    slot: &mut f32,
-    now_ms: f32,
-    frame_ms: f32,
-) -> bool {
+fn settle_expired(spring: &SpringSimulation, slot: &mut f32, now_ms: f32, frame_ms: f32) -> bool {
     if spring.is_at_rest() {
         *slot = PARK_UNARMED;
         return false;
@@ -429,10 +424,18 @@ pub struct Recents {
     /// Cull hint: the card the renderer must draw. Always
     /// `min(selected, len - 1)`.
     pub visible_card: u8,
-    /// Horizontal residue of an in-flight scrub, px. The renderer adds this
-    /// on top of [`Self::card_rect`]. It is finger tracking, not an animation,
+    /// Horizontal residue of an in-flight scrub, px, reported by
+    /// [`Self::carousel_scroll`]. The renderer applies it through
+    /// [`Self::card_rect_centered`]. It is finger tracking, not an animation,
     /// so it is deliberately not a spring.
     pub drag_px: f32,
+    /// Card width, px, copied from this panel's [`RecentsLayout`] at
+    /// construction. See [`Self::card_box`] for why the box is carried here.
+    pub card_w: f32,
+    /// Card height, px. See [`Self::card_box`].
+    pub card_h: f32,
+    /// Card corner radius, px. See [`Self::card_box`].
+    pub card_radius: f32,
     /// Index of the card currently under a vertical dismiss drag, or
     /// [`NO_CARD`].
     pub dragging: u8,
@@ -484,9 +487,10 @@ impl Recents {
         let rl = l.recents();
         let profile = l.profile();
         // The card is centred on the panel, so its bottom edge is the panel
-        // midpoint plus half the card height. Recovered from the action chip,
-        // which `RecentsLayout` documents as centred on the card.
-        let card_bottom = rl.chip.center_y() + rl.card_h * 0.5;
+        // midpoint plus half the card height. Read from the layout's own card
+        // centre rather than recomputed from the panel, so the two cannot
+        // disagree about where the strip sits.
+        let card_bottom = rl.card_center.1 + rl.card_h * 0.5;
         Self {
             cards: [TaskCard::new(0, 0, 0); MAX_TASKS],
             len: 0,
@@ -501,6 +505,9 @@ impl Recents {
             effects: [SpringSimulation::new(0.0, 0.0, SpringConfig::dismiss_effects()); MAX_TASKS],
             visible_card: 0,
             drag_px: 0.0,
+            card_w: rl.card_w,
+            card_h: rl.card_h,
+            card_radius: rl.corner_r,
             dragging: NO_CARD,
             threshold_haptic_done: false,
             dismiss_length: card_bottom / DISMISS_SCALE_ON_SUCCESS,
@@ -585,13 +592,19 @@ impl Recents {
     /// why [`Self::park_expired`] disarms the scale while a drag is live.
     ///
     /// Release speed is not derived here; see [`TaskCard::dismiss_v`].
-    pub fn on_card_drag(&mut self, i: usize, dy: f32) {
+    ///
+    /// Returns `true` on the single `ACTION_MOVE` that first carries the drag
+    /// into the dismiss-threshold haptic band, and `false` on every other
+    /// frame and on every no-op. The caller pulses on `true`; see
+    /// [`Self::note_threshold_haptic`] for why the return value is the edge and
+    /// not [`Self::threshold_haptic_done`].
+    pub fn on_card_drag(&mut self, i: usize, dy: f32) -> bool {
         if i >= self.len as usize {
-            return;
+            return false;
         }
         if self.dragging != NO_CARD && self.dragging as usize != i {
             // A second finger is not a second dismiss; the first one owns it.
-            return;
+            return false;
         }
         let live = {
             let card = &self.cards[i];
@@ -600,7 +613,7 @@ impl Recents {
         if live {
             // Already dying or pinned: dragging it again must change nothing
             // and, critically, must not take ownership of the drag.
-            return;
+            return false;
         }
         if self.dragging == NO_CARD {
             // A vertical dismiss supersedes any horizontal residue, and starts
@@ -631,7 +644,7 @@ impl Recents {
         self.scale.value = dismiss_recents_scale(self.dismiss_fraction(i));
         self.scale.target = self.scale.value;
         self.scale.velocity = 0.0;
-        self.note_threshold_haptic(i);
+        self.note_threshold_haptic(i)
     }
 
     /// Release card `i` and say what happened.
@@ -846,25 +859,92 @@ impl Recents {
     /// Where card `i` is drawn this frame, including its dismiss and reflow
     /// offsets and the leftover scrub residue. `None` if `i` is not live.
     ///
-    /// `l` supplies the card box and radius; the pitch comes from the panel
-    /// this [`Recents`] was built for, so `l` must be that panel's
-    /// [`RecentsLayout`]. The overview scale is deliberately *not* applied
-    /// here -- it is the same for every card, so the renderer applies it once
-    /// to the whole stack rather than once per card.
+    /// `l` supplies the card centre. `l` must be that panel's
+    /// [`RecentsLayout`], and its card box must match this panel's -- both are
+    /// the same values either way, so this is the
+    /// [`Self::card_rect_centered`] spelling of the same rect rather than a
+    /// second implementation of it. The overview scale is deliberately *not*
+    /// applied here -- it is the same for every card, so the renderer applies it
+    /// once to the whole stack rather than once per card.
     pub fn card_rect(&self, i: usize, l: &RecentsLayout) -> Option<Rect> {
+        self.card_box(i, l.card_center.0, l.card_center.1)
+    }
+
+    /// The rect this [`Recents`] draws for card `i`, around the card centre
+    /// `(cx, cy)`. `None` if `i` is not live.
+    ///
+    /// The single source of truth for both [`Self::card_rect`] and
+    /// [`Self::card_rect_centered`], which differ only in where they read the
+    /// centre from: the layout's own card centre, or half the framebuffer.
+    /// Those are the same point on the panel `RecentsLayout` builds, so the
+    /// two spellings cannot drift apart horizontally or vertically.
+    ///
+    /// The card box (`w`, `h`, `radius`) is read from this struct's own copy of
+    /// that layout rather than from a caller's, which is what lets the renderer
+    /// ask for a rect in framebuffer pixels without being handed a layout at
+    /// all. The overview scale is deliberately *not* applied here -- it is the
+    /// same for every card, so the renderer applies it once to the whole stack
+    /// rather than once per card.
+    #[inline]
+    fn card_box(&self, i: usize, cx: f32, cy: f32) -> Option<Rect> {
         if i >= self.len as usize {
             return None;
         }
-        // The action chip is documented as centred on the card, so the card
-        // centre is the chip centre. No dp is re-derived here.
+        // The slot is measured from the *selected* card, and the reflow spring
+        // carries whatever animation the model is running. `drag_px` is the
+        // scrub residue, applied to the whole strip.
         let slot = (i as f32 - self.selected as f32) * self.pitch + self.reflow[i].value;
         Some(Rect {
-            x: l.chip.center_x() + self.drag_px + slot - l.card_w * 0.5,
-            y: l.chip.center_y() + self.dismiss[i].value - l.card_h * 0.5,
-            w: l.card_w,
-            h: l.card_h,
-            radius: l.corner_r,
+            x: cx + self.drag_px + slot - self.card_w * 0.5,
+            y: cy + self.dismiss[i].value - self.card_h * 0.5,
+            w: self.card_w,
+            h: self.card_h,
+            radius: self.card_radius,
         })
+    }
+
+    /// Screen rect of card `i` in the overview carousel, or `None` if `i` is
+    /// out of range. Card `self.visible_card` is centered on the viewport.
+    ///
+    /// `wf`/`hf` are the viewport's pixel size, so the caller does not have to
+    /// hold a [`RecentsLayout`] to place a card: the frame loop passes the
+    /// framebuffer dimensions straight through. The card is centred by its
+    /// *centre* x on `wf * 0.5` -- not its left edge, which is the error the
+    /// ad-hoc `first_x = wf*0.5 - scroll*pitch - pitch*0.5` form makes, because
+    /// a card whose left edge is at `wf * 0.5` puts the whole card to the right
+    /// of centre. Card `i` then sits one [`Self::pitch`] per index away from
+    /// the focused card, and the scrub residue ([`Self::carousel_scroll`]) is
+    /// honoured so the strip tracks the finger while the user drags.
+    ///
+    /// Centring is on [`Self::selected`], which every mutation of this struct
+    /// keeps equal to [`Self::visible_card`] -- the focused card and the card
+    /// the renderer must draw are the same card, so the two names cannot
+    /// disagree about which one is in the middle.
+    ///
+    /// `None` for any `i >= len`, so a stale index from a stack that has since
+    /// shrunk is a miss, not a panic.
+    pub fn card_rect_centered(&self, i: usize, wf: f32, hf: f32) -> Option<Rect> {
+        self.card_box(i, wf * 0.5, hf * 0.5)
+    }
+
+    /// The carousel's horizontal scroll offset, px, as already applied by
+    /// [`Self::card_rect_centered`].
+    ///
+    /// This is the live scrub residue ([`Self::drag_px`]): it is finger
+    /// tracking, not an animation, so it is zero at rest and non-zero only
+    /// mid-drag. It is in **pixels**, not card widths.
+    ///
+    /// A renderer that places cards itself must add it to the card centre
+    /// *unmultiplied*. Scaling it by the pitch again is how a scroll residue
+    /// becomes a screen-width jump: `drag_px` already counts pixels, so
+    /// `drag_px * pitch` is a square of the distance travelled.
+    ///
+    /// [`Self::card_rect_centered`] folds this in already. Read this only for a
+    /// caller that composes its own offset *on top of* a rect the model
+    /// returned, and never alongside `card_rect_centered`'s own output.
+    #[inline]
+    pub fn carousel_scroll(&self) -> f32 {
+        self.drag_px
     }
 
     /// Signed dismiss fraction of card `i`, -1..=1, positive when dragging up.
@@ -932,12 +1012,7 @@ impl Recents {
         // Focus follows the card, not the index: a card before the selected
         // one shifts down, and losing the selected card clamps.
         let prev = self.selected;
-        let next = if (at as u8) < prev {
-            prev - 1
-        } else {
-            prev
-        }
-        .min(self.len.saturating_sub(1));
+        let next = if (at as u8) < prev { prev - 1 } else { prev }.min(self.len.saturating_sub(1));
         self.selected = next;
         self.arm_reflow_remove(at, prev, next);
         self.visible_card = next;
@@ -987,9 +1062,28 @@ impl Recents {
         evicted
     }
 
-    /// Start -- or refuse to start -- a graceful close on card `i`. `true` if
-    /// the card moved to [`KillState::Grace`] because of this call.
-    fn arm_close(&mut self, i: usize) -> bool {
+    /// Begin the kill grace clock for card `i`. Returns true if the close
+    /// request was armed (i.e. the card crossed the dismiss threshold), false
+    /// if it snapped back.
+    ///
+    /// On success the card is [`KillState::Grace`] with
+    /// [`TaskCard::grace_started_ms`] set to [`Self::now_ms`], so [`Self::step`]
+    /// escalates it to [`KillState::Forced`] and a [`KillAction::Force`] after
+    /// [`KILL_GRACE_MS`] whether or not the shell acknowledges the close. The
+    /// call is refused -- `false`, no state touched -- for an index past
+    /// [`Self::len`], a pinned card ([`TaskCard::dismissable`] is `false`), and
+    /// a card that is already closing. Refusing rather than re-arming is what
+    /// keeps a card's grace clock monotonic and its close request issued once.
+    ///
+    /// Arming is deliberately *not* the threshold test. The threshold belongs
+    /// to the release ([`Self::on_card_release`], `dismissLength * 0.5` at
+    /// `TaskViewDismissTouchController.kt:315`), which is the only place that
+    /// knows the finger's travel; [`Self::clear_all`] arms every card with no
+    /// drag at all. What lives here is the transition both of those share.
+    ///
+    /// A card cannot be closing and being dragged, so arming also drops any
+    /// live vertical drag and the scrub residue with it.
+    pub fn arm_close(&mut self, i: usize) -> bool {
         if i >= self.len as usize {
             return false;
         }
@@ -1010,8 +1104,7 @@ impl Recents {
     fn escalate(&mut self, out: &mut KillQueue) {
         for i in 0..self.len as usize {
             let card = &mut self.cards[i];
-            if card.kill == KillState::Grace
-                && self.now_ms - card.grace_started_ms >= KILL_GRACE_MS
+            if card.kill == KillState::Grace && self.now_ms - card.grace_started_ms >= KILL_GRACE_MS
             {
                 card.kill = KillState::Forced;
                 out.push(KillAction::Force(card.pid));
@@ -1087,14 +1180,22 @@ impl Recents {
 
     /// Set `threshold_haptic_done` when the drag is inside the haptic band
     /// around the dismiss threshold and has not fired yet.
-    fn note_threshold_haptic(&mut self, i: usize) {
+    ///
+    /// Returns **the rising edge**, not the latch. The latch is what makes the
+    /// pulse fire once; the edge is what tells the caller *this call* was the
+    /// one that fired it. Conflating the two is how a caller polling the latch
+    /// buzzes once per `ACTION_MOVE` -- a 30-frame drag is 30 pulses, which is
+    /// both a 30x battery cost and a buzz train no user reads as a threshold.
+    fn note_threshold_haptic(&mut self, i: usize) -> bool {
         if self.threshold_haptic_done {
-            return;
+            return false;
         }
         let threshold = DISMISS_THRESHOLD_FRACTION * self.dismiss_length;
         if (self.dismiss_travel(i) * self.dismiss_length - threshold).abs() <= self.haptic_range {
             self.threshold_haptic_done = true;
+            return true;
         }
+        false
     }
 }
 
@@ -1126,14 +1227,121 @@ pub const FOLDER_SCRIM_ALPHA_DARK: f32 = 0.32;
 /// `FolderSpringAnimatorSet.LAUNCHER_SCALE` (`:51`).
 pub const FOLDER_LAUNCHER_SCALE: f32 = 0.975;
 
+/// Items an open folder can hold.
+///
+/// Ours, and for the reason every capacity in this file is ours: a `Vec` on
+/// the touch path is what the plan forbids. The reference holds its folder
+/// contents in views it inflates from the model
+/// (`FolderPagedView.inflateChildren`, driven by `mOrganizer`'s
+/// `getMaxItemsPerPage()` = `cols * rows`, `FolderGridOrganizer.java:92`) and
+/// pages them without an upper bound; the pager is what makes an unbounded
+/// count reachable rather than being a cap in disguise. 64 is the same bound
+/// `launcher_state::MAX_FOLDER_ITEMS` uses, and the two must agree -- a folder
+/// that the model can hold but the state file cannot is a folder whose last
+/// item vanishes on the next boot.
+pub const FOLDER_ITEMS: usize = 64;
+
+/// Bytes of an inline app id.
+///
+/// The longest thing that reaches this is a catalogue id or a component key
+/// (`com.android.providers.calendar/…`), and 31 covers those with room to
+/// spare. An id that does not fit is **refused**, not truncated: a truncated
+/// id would be a different app, and a folder holding a different app under a
+/// name that looks right is worse than a folder that declined the add.
+pub const FOLDER_ID_BYTES: usize = 32;
+
+/// One folder member, inline.
+///
+/// A `[u8; 32]` rather than a `&str` because the container must stay `Copy`
+/// with no lifetime and no allocation: `main.rs` holds the `FolderOpen`
+/// across the whole daemon loop and hands `DrmInteractiveState::folder_apps`
+/// a borrowed slice every frame, so a self-referential or owning string would
+/// either pin a borrow into the render path or allocate per mutation.
+///
+/// The loss against `&str` is one thing only -- a caller that wants the
+/// catalogue entry for item `i` has to look it up by id. That lookup is what
+/// the shell already does per frame to build `folder_apps`, so it is not new
+/// work.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct FolderItem {
+    buf: [u8; FOLDER_ID_BYTES],
+    len: u8,
+}
+
+impl FolderItem {
+    /// An empty slot. `folder_idx`-style: what a pre-filled array holds.
+    pub const EMPTY: Self = Self {
+        buf: [0; FOLDER_ID_BYTES],
+        len: 0,
+    };
+
+    /// Borrow the id. `""` for an [`Self::EMPTY`] slot.
+    #[inline]
+    pub fn id(&self) -> &str {
+        // Written only through [`Self::new`], which takes a `&str` and so
+        // always leaves a whole number of whole characters behind, and by
+        // [`Self::from_raw`] which is fed bytes that came from one. Safe
+        // without a UTF-8 validation pass on every frame read.
+        std::str::from_utf8(&self.buf[..self.len as usize]).unwrap_or("")
+    }
+
+    /// Copy `id` in, or refuse it if it is empty or too long.
+    #[inline]
+    pub fn new(id: &str) -> Option<Self> {
+        let b = id.as_bytes();
+        if b.is_empty() || b.len() > FOLDER_ID_BYTES {
+            return None;
+        }
+        let mut buf = [0u8; FOLDER_ID_BYTES];
+        buf[..b.len()].copy_from_slice(b);
+        Some(Self {
+            buf,
+            len: b.len() as u8,
+        })
+    }
+}
+
+impl core::fmt::Debug for FolderItem {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "FolderItem({:?})", self.id())
+    }
+}
+
+/// What dropping to `items.len() <= 1` means for the folder, as a value.
+///
+/// The reference makes this a side effect of three separate call sites --
+/// `Folder.java:1129` (after an update), `:1331` (after a drop completes) and
+/// `:1757` (after a removal) -- each of which calls
+/// `replaceFolderWithFinalItem()` when `getItemCount() <= 1`. Returning the
+/// decision instead of performing it keeps the mutation in the shell, where
+/// the page cell and the folder record both live; a model that deleted the
+/// folder itself could not express "and put the survivor *in that cell*",
+/// which is half of what the reference's call does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FolderCollapse {
+    /// The folder becomes its one remaining item. The shell must write
+    /// `app_id` into the cell the folder occupied and delete the record.
+    ///
+    /// An **empty** folder cannot produce this: there is no survivor to put
+    /// in the cell, and the reference's own
+    /// `LauncherDelegate.replaceFolderWithFinalItem` bails on an empty
+    /// folder rather than inventing an item.
+    IntoApp { app_id: FolderItem },
+    /// More than one item, or none at all: leave the folder alone.
+    Keep,
+}
+
 /// An opening, or closing, folder.
 ///
-/// Pure state: three springs and the index they belong to. The scrim spring
-/// doubles as the workspace-scale spring because the reference runs both with
-/// the *same* `STIFFNESS_LAUNCHER_SCRIM` / `DAMPING_LAUNCHER_SCRIM` and the
-/// same zero start delay (`FolderSpringAnimatorSet.kt:340-375`) -- only the
-/// endpoints differ, which makes one spring plus a normalisation exact rather
-/// than approximate.
+/// Pure state: three springs, the index they belong to, and the folder's
+/// contents. The scrim spring doubles as the workspace-scale spring because
+/// the reference runs both with the *same* `STIFFNESS_LAUNCHER_SCRIM` /
+/// `DAMPING_LAUNCHER_SCRIM` and the same zero start delay
+/// (`FolderSpringAnimatorSet.kt:340-375`) -- only the endpoints differ, which
+/// makes one spring plus a normalisation exact rather than approximate.
+///
+/// Fixed capacity and `Copy`, like everything else in this module: the
+/// contents are a `[FolderItem; FOLDER_ITEMS]` and a length, not a `Vec`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FolderOpen {
     /// Which folder of the workspace is open.
@@ -1153,6 +1361,24 @@ pub struct FolderOpen {
     pub park: [f32; 3],
     /// Animation clock, ms. Advanced only by [`Self::step`].
     now_ms: f32,
+    /// Members, rank order, live in `[0, item_count)`. Beyond that the array is
+    /// stale and must not be read.
+    items: [FolderItem; FOLDER_ITEMS],
+    /// Live prefix length of [`Self::items`].
+    item_count: u8,
+    /// Which page of `items` the grid is showing. The reference's
+    /// `FolderPagedView.getCurrentPage()`; `open` starts at page 0 and only
+    /// `Folder.java:823`, `animateOpen(items, rank / itemsPerPage())`, ever
+    /// opens onto another one.
+    pub page: u8,
+    /// Horizontal drag offset within the page, px, 0..=page width. Signed,
+    /// because the reference's pager drags both ways before it commits.
+    pub page_offset_x: f32,
+    /// `cols * rows` of the grid showing this folder, from
+    /// `FolderGridOrganizer.getMaxItemsPerPage()` (`FolderGridOrganizer.java:92`).
+    /// Zero until the shell tells the model how big the grid is, which is why
+    /// every paging accessor below treats it as at least 1.
+    pub items_per_page: u8,
 }
 
 const F_MORPH: usize = 0;
@@ -1171,6 +1397,11 @@ impl FolderOpen {
             title_delay_ms: 0.0,
             park: [PARK_UNARMED; 3],
             now_ms: 0.0,
+            items: [FolderItem::EMPTY; FOLDER_ITEMS],
+            item_count: 0,
+            page: 0,
+            page_offset_x: 0.0,
+            items_per_page: 1,
         }
     }
 
@@ -1178,6 +1409,13 @@ impl FolderOpen {
     ///
     /// The title's start delay is armed here and nowhere else; the reference
     /// delays it only when *opening* (`:278`), and closing is immediate.
+    ///
+    /// Contents are **not** cleared: [`Self::set_contents`] is how the shell
+    /// fills a folder before opening it, and clearing here would throw that
+    /// away. What *is* reset is the page state, because the reference's
+    /// `FolderPagedView` calls `setCurrentPage(0)` whenever it drops its
+    /// children (`FolderPagedView.java:483-490`) and a folder re-opened onto a
+    /// stale page is a folder whose first tap hits nothing.
     pub fn open(&mut self, folder_idx: u8) {
         self.folder_idx = folder_idx;
         self.morph.set_target(1.0);
@@ -1185,6 +1423,8 @@ impl FolderOpen {
         self.title_alpha.set_target(1.0);
         self.title_delay_ms = FOLDER_TITLE_DELAY_MS;
         self.park = [PARK_UNARMED; 3];
+        self.page = 0;
+        self.page_offset_x = 0.0;
     }
 
     /// Start closing. No title delay: the footer goes with the container.
@@ -1245,6 +1485,249 @@ impl FolderOpen {
     pub fn workspace_scale(&self) -> f32 {
         let p = (self.scrim.value / FOLDER_SCRIM_ALPHA_DARK).clamp(0.0, 1.0);
         FOLDER_LAUNCHER_SCALE + (1.0 - FOLDER_LAUNCHER_SCALE) * (1.0 - p)
+    }
+
+    // -------------------------------------------------------------- contents
+    //
+    // Uncalled outside their tests in this pass. In `main.rs`:
+    // `set_contents` where `folder_items` is built today (`main.rs:2228`)
+    // from `state.folder(idx).items`; `add_item` / `remove_item` in the
+    // drop-into-folder and drag-out-of-folder handlers; `collapse` at the end
+    // of both, to decide whether to `folder_delete` and write the survivor
+    // into the cell; `item_count` / `items` to fill
+    // `DrmInteractiveState::folder_apps`; `items_per_page` from
+    // `FolderLayout::items_per_page()` on open; and the paging methods from
+    // the folder's touch handler.
+
+    /// Replace the contents with `ids`, in rank order.
+    ///
+    /// The whole-list setter rather than only an appender, because that is
+    /// what the reference does: `FolderService.updateFolderWithItems`
+    /// (`data/folder/service/FolderService.kt:38-46`) *replaces* membership --
+    /// `replaceFolderItems` deletes every row for the folder and re-inserts --
+    /// and `FolderPagedView`'s `bindItems` (`FolderPagedView.java:460-492`)
+    /// tears its children down and rebuilds them. A drag is therefore a
+    /// read-modify-write of the list, not an edit, and a model that only
+    /// appended could not express a reorder at all.
+    ///
+    /// Overflow is *dropped*, not grown: `ids` past [`FOLDER_ITEMS`] are
+    /// ignored. `launcher_state::MAX_FOLDER_ITEMS` is the same number, so a
+    /// folder the state file can hold is a folder this can hold.
+    pub fn set_contents(&mut self, ids: &[&str]) {
+        // Compacted into the front of the array rather than written at
+        // `enumerate`'s index: an id that cannot be represented is *skipped*,
+        // and leaving its slot holding the previous call's item would make a
+        // stale app appear in the live prefix. Rank must stay dense for the
+        // same reason `remove_item` shifts -- the pager divides it.
+        let mut w = 0usize;
+        for id in ids {
+            // An id this model cannot represent is skipped rather than stored
+            // truncated: see `FOLDER_ID_BYTES`.
+            if w == FOLDER_ITEMS {
+                break;
+            }
+            if let Some(item) = FolderItem::new(id) {
+                self.items[w] = item;
+                w += 1;
+            }
+        }
+        for item in &mut self.items[w..] {
+            *item = FolderItem::EMPTY;
+        }
+        self.item_count = w as u8;
+        self.page = 0;
+        self.page_offset_x = 0.0;
+    }
+
+    /// Append one app id. `false` if the folder is full or `id` cannot be
+    /// represented.
+    ///
+    /// Appended, which is `rank = index`
+    /// (`data/folder/service/FolderService.kt:39-43`) and is why a drop lands
+    /// at the end of the visible grid rather than at the touch point.
+    pub fn add_item(&mut self, id: &str) -> bool {
+        let n = self.item_count as usize;
+        if n >= FOLDER_ITEMS {
+            return false;
+        }
+        let Some(item) = FolderItem::new(id) else {
+            return false;
+        };
+        self.items[n] = item;
+        self.item_count = n as u8 + 1;
+        true
+    }
+
+    /// Remove the member at `index`, shifting the tail down.
+    ///
+    /// Shifting rather than blanking keeps rank dense, because rank *is* the
+    /// index: the pager computes the page from
+    /// `rank / mOrganizer.getMaxItemsPerPage()` (`FolderPagedView.java:327`)
+    /// and a hole would put the wrong items on the wrong page.
+    ///
+    /// `false` if `index` is past the end -- an empty or full-width drag can
+    /// produce one and it must not index the array.
+    pub fn remove_item(&mut self, index: usize) -> bool {
+        let n = self.item_count as usize;
+        if index >= n {
+            return false;
+        }
+        for i in index..n - 1 {
+            self.items[i] = self.items[i + 1];
+        }
+        self.items[n - 1] = FolderItem::EMPTY;
+        self.item_count = n as u8 - 1;
+        // The last page can vanish, and then the current page is past the end.
+        let last = self.page_count();
+        if self.page as usize >= last {
+            self.page = last.saturating_sub(1) as u8;
+            self.page_offset_x = 0.0;
+        }
+        true
+    }
+
+    /// How many items the folder holds.
+    #[inline]
+    pub fn item_count(&self) -> usize {
+        self.item_count as usize
+    }
+
+    /// The live members, in rank order. Never longer than
+    /// [`Self::item_count`], and free of allocation.
+    #[inline]
+    pub fn items(&self) -> &[FolderItem] {
+        &self.items[..self.item_count as usize]
+    }
+
+    /// The item at `index`, if it exists.
+    #[inline]
+    pub fn item(&self, index: usize) -> Option<FolderItem> {
+        self.items().get(index).copied()
+    }
+
+    /// Whether the folder should collapse into its last item.
+    ///
+    /// The reference's rule, `getItemCount() <= 1`, at all three of its call
+    /// sites (`Folder.java:1129`, `:1331`, `:1757`). It is `<=` and not `==`
+    /// because a folder can reach one item by removal *or* by a completed
+    /// drag, and both paths check the count rather than a flag.
+    ///
+    /// An empty folder returns [`FolderCollapse::Keep`]: the rule fires, but
+    /// `replaceFolderWithFinalItem` has no "final item" to substitute, and
+    /// `LauncherDelegate.replaceFolderWithFinalItem`
+    /// (`folder/LauncherDelegate.java:160-162`) returns without doing
+    /// anything for a folder it cannot reduce. Guessing a survivor here would
+    /// put an app in a cell the user never chose.
+    pub fn collapse(&self) -> FolderCollapse {
+        match self.item_count {
+            1 => FolderCollapse::IntoApp {
+                app_id: self.items[0],
+            },
+            _ => FolderCollapse::Keep,
+        }
+    }
+
+    // ---------------------------------------------------------------- paging
+    //
+    // Uncalled outside their tests in this pass. In `main.rs`: `page_count` /
+    // `shows_page_indicator` to decide whether `drm_kms` draws the pager band,
+    // `begin_page_drag` / `page_drag` / `end_page_drag` from the folder's
+    // horizontal touch handler, `clamp_page` right after `items_per_page` is
+    // assigned, and `page` is read by `drm_kms` to pick which items the grid
+    // shows.
+
+    /// `cols * rows`, floored at 1.
+    ///
+    /// Floored because the shell sets it after constructing the model and a
+    /// zero would make every division by it a NaN -- the same guard
+    /// `Layout::new_scaled` applies to `font_scale`.
+    #[inline]
+    pub fn items_per_page(&self) -> usize {
+        (self.items_per_page as usize).max(1)
+    }
+
+    /// How many pages the contents occupy. `FolderPagedView.getPageCount()`'s
+    /// content form, `ceil(n / (cols * rows))`.
+    ///
+    /// Empty is **one** page, not zero. The reference agrees:
+    /// `getPageCount() > 0 ? ... : 0` (`FolderPagedView.java:507`) is the
+    /// *desired width* branch, while `getDesiredHeight` returns 0 for zero
+    /// pages (`:511-514`) -- and a `FolderOpen` always exists while a folder
+    /// is being driven, so the shell needs "how many page positions are legal"
+    /// and that is at least 1.
+    #[inline]
+    pub fn page_count(&self) -> usize {
+        let n = self.item_count();
+        n.div_ceil(self.items_per_page()).max(1)
+    }
+
+    /// Whether the footer shows page dots.
+    ///
+    /// The reference's exact rule, `getPageCount() > 1`
+    /// (`FolderPagedView.java:496`, and `Folder.java:908` for the footer
+    /// swap). A single page gets a centred title and no dots: drawing one dot
+    /// for "page 1 of 1" is the single most common way a pager announces
+    /// that it exists when it does not need to.
+    #[inline]
+    pub fn shows_page_indicator(&self) -> bool {
+        self.page_count() > 1
+    }
+
+    /// Clamp the page state after the contents or the grid size changed.
+    ///
+    /// Separate from the setters because `items_per_page` is a `pub` field:
+    /// the shell sets it directly when the profile's folder grid is
+    /// reconfigured, and a folder that was on page 3 of a 3x3 grid is then on
+    /// page 27 of a 2x2 one unless something clamps it. One call, at the
+    /// configuration site, is cheaper than making the field private and
+    /// adding a setter that does half the job.
+    pub fn clamp_page(&mut self) {
+        let last = self.page_count().saturating_sub(1);
+        if self.page as usize > last {
+            self.page = last as u8;
+        }
+        self.page_offset_x = 0.0;
+    }
+
+    /// Start a horizontal page drag `x` px from the current page's left edge.
+    ///
+    /// The page does not move yet. The reference's pager holds the content
+    /// under the finger for the whole drag and only commits on release
+    /// (`snapToPage` after `setCurrentPage`), and splitting that into two
+    /// steps is what stops a single flick from advancing two pages -- which is
+    /// what advancing in *both* `begin` and `end` would do.
+    pub fn begin_page_drag(&mut self, x: f32) {
+        self.page_offset_x = if x.is_finite() { x } else { 0.0 };
+    }
+
+    /// A page drag in progress: the drag offset, px.
+    #[inline]
+    pub fn page_drag(&self) -> f32 {
+        self.page_offset_x
+    }
+
+    /// Commit a page drag: the page advances once if the offset passed half a
+    /// page width, and the offset is cleared.
+    ///
+    /// `page_w` is one page's width in px, which the caller gets from
+    /// `FolderLayout::grid`. Half is the reference's threshold
+    /// (`PagedView` snaps when the drag passes `mFlingThreshold`, i.e. half the
+    /// viewport), and evaluating it once on the *final* offset rather than on
+    /// the peak is what makes a flick that was briefly past the threshold
+    /// still land.
+    pub fn end_page_drag(&mut self, page_w: f32) {
+        let half = page_w.max(1.0) * 0.5;
+        // Dragging *left* reveals the next page and dragging *right* goes
+        // back, so the more negative offset advances and the more positive one
+        // rewinds. Getting this pair the wrong way round is the most likely
+        // mistake in a pager, and it feels right until the user tries it.
+        if self.page_offset_x <= -half {
+            self.page += 1;
+        } else if self.page_offset_x >= half {
+            self.page = self.page.saturating_sub(1);
+        }
+        self.page_offset_x = 0.0;
+        self.clamp_page();
     }
 }
 
@@ -1414,8 +1897,301 @@ mod tests {
         r.cards[i].dismiss_v = 0.0;
     }
 
+    /// Centre x of a rect, in the same px the rect is in.
+    fn center_x(r: Rect) -> f32 {
+        r.x + r.w * 0.5
+    }
+
+    /// Coordinate comparison at the scale the panel actually uses.
+    ///
+    /// `near` is a 1e-4 *tolerance*, which is right for a spring value and too
+    /// tight for an absolute pixel coordinate: an `f32` near 10^3 has a ULP of
+    /// about 6e-5, so two algebraically equal centre derivations
+    /// (`(h - card_h) * 0.5 + card_h * 0.5` and `h * 0.5`) can land two ULP
+    /// apart. 1e-3 px is ~16 ULP and four orders of magnitude below a pixel, so
+    /// it cannot mask a real layout change while tolerating the rounding.
+    fn near_px(a: f32, b: f32) -> bool {
+        (a - b).abs() <= 1e-3
+    }
+
     // ---------------------------------------------------------------------
 
+    #[test]
+    fn card_rect_centered_puts_the_selected_card_on_the_viewport_centre() {
+        let l = layout();
+        let (wf, hf) = PANEL;
+        let mut r = recents(3);
+
+        // Selected 0: card 0's *centre* is at wf * 0.5, not its left edge. The
+        // ad-hoc `first_x = wf * 0.5 - scroll * pitch - pitch * 0.5` form this
+        // replaces put the left edge there, so the whole card sat half a card
+        // to the right of centre.
+        assert_eq!(r.selected, 0);
+        let c0 = r.card_rect_centered(0, wf, hf).expect("live");
+        assert!(
+            near_px(center_x(c0), wf * 0.5),
+            "centre was {}",
+            center_x(c0)
+        );
+        assert!(near(c0.w, l.recents().card_w), "card width is layout's");
+
+        // Selected 1: card 1 takes the centre. *Immediately* after the page
+        // change, though, both cards are still where they were -- the reflow
+        // spring is holding them there, which is the slide rather than a snap.
+        // So the pitch is an assertion about the settled carousel, and the
+        // in-between is asserted separately below.
+        r.select(1);
+        assert_eq!(r.selected, 1);
+        assert_eq!(r.visible_card, 1, "focus and the cull hint move together");
+        run(&mut r, 1.0);
+
+        let c1 = r.card_rect_centered(1, wf, hf).expect("live");
+        assert!(
+            near_px(center_x(c1), wf * 0.5),
+            "centre was {}",
+            center_x(c1)
+        );
+        // Card 0 is exactly one pitch to its left. `pitch` is the
+        // centre-to-centre step, so this is the same pitch the reflow springs
+        // are armed with.
+        let c0 = r.card_rect_centered(0, wf, hf).expect("live");
+        assert!(
+            near_px(center_x(c0), wf * 0.5 - r.pitch),
+            "card 0 is at {} expected {}",
+            center_x(c0),
+            wf * 0.5 - r.pitch
+        );
+        // And card 2 is symmetric on the other side, so the pitch really is
+        // the step and not an accident of the subtraction.
+        let c2 = r.card_rect_centered(2, wf, hf).expect("live");
+        assert!(near_px(center_x(c2), wf * 0.5 + r.pitch));
+        // The settled neighbours are also exactly one pitch from each other,
+        // i.e. the gap between cards is `spacing`, not zero.
+        assert!(near_px(center_x(c2) - center_x(c1), r.pitch));
+
+        // A page change slides rather than snaps, so the invariant has to hold
+        // mid-animation too, or the selected card visibly jumps.
+        let mut r = recents(3);
+        r.select(1);
+        for _ in 0..8 {
+            r.step(FRAME_MS / 1000.0, FRAME_MS);
+            let sel = r
+                .card_rect_centered(usize::from(r.selected), wf, hf)
+                .expect("live");
+            assert!(
+                (center_x(sel) - wf * 0.5).abs() < r.pitch,
+                "selected card drifted off centre: {}",
+                center_x(sel)
+            );
+        }
+        // Settled, it is exactly centred again.
+        run(&mut r, 1.0);
+        let sel = r
+            .card_rect_centered(usize::from(r.selected), wf, hf)
+            .expect("live");
+        assert!(near_px(center_x(sel), wf * 0.5), "did not settle on centre");
+
+        // The scrub residue moves the whole strip, and it is reported in px.
+        // `card_rect_centered` already applies it, so it must NOT be applied a
+        // second time by the caller. The scrub is taken from a middle page so
+        // it is not run through the end-of-list overscroll curve, which would
+        // make the residue a damped fraction of the input.
+        let mut r = recents(3);
+        r.select(1);
+        r.scrub(r.pitch * 0.25);
+        assert_eq!(r.selected, 1, "quarter pitch does not page");
+        assert!(
+            near_px(r.carousel_scroll(), r.pitch * 0.25),
+            "scroll is px, got {}",
+            r.carousel_scroll()
+        );
+        assert!(
+            near(r.carousel_scroll(), r.drag_px),
+            "scroll is the residue"
+        );
+        // Every card shifts by the residue and by nothing else, so the strip
+        // tracks the finger as a rigid body. Compared against the same rect
+        // with the residue zeroed, which is the only difference between them.
+        let mut unscrubbed = r;
+        unscrubbed.drag_px = 0.0;
+        for i in 0..r.len as usize {
+            let off = center_x(r.card_rect_centered(i, wf, hf).expect("live"))
+                - center_x(unscrubbed.card_rect_centered(i, wf, hf).expect("live"));
+            assert!(near_px(off, r.carousel_scroll()), "card {i} residue: {off}");
+        }
+        // And it is reported raw, not pre-divided by the pitch. Dividing it
+        // again is the exact error the old `scroll * pitch` form made.
+        assert!(
+            !near_px(r.carousel_scroll(), r.pitch * 0.25 / r.pitch),
+            "the scroll offset must not be in card units"
+        );
+
+        // Out of range is a miss, not a panic -- a stale index from a stack
+        // that has since shrunk is normal.
+        let r = recents(3);
+        assert!(r.card_rect_centered(3, wf, hf).is_none(), "past the end");
+        assert!(
+            r.card_rect_centered(usize::MAX, wf, hf).is_none(),
+            "far past"
+        );
+        let empty = Recents::new(&l);
+        assert!(empty.card_rect_centered(0, wf, hf).is_none(), "no cards");
+        // At rest the residue is exactly zero, so a settled overview adds
+        // nothing, and an empty one has nothing to scroll.
+        let r = recents(0);
+        assert!(near(r.carousel_scroll(), 0.0), "nothing to scroll");
+    }
+
+    #[test]
+    fn the_focused_card_and_the_drawn_card_are_the_same_card() {
+        // `card_rect_centered` centres `selected` and the renderer draws
+        // `visible_card`. Those are two names for one thing, and if any
+        // mutation of the stack ever moves one without the other the selected
+        // card silently stops being the one in the middle.
+        let mut r = recents(MAX_TASKS as u32);
+        let check = |r: &Recents, what: &str| {
+            assert_eq!(
+                r.visible_card, r.selected,
+                "{what}: focus {} but cull hint {}",
+                r.selected, r.visible_card
+            );
+            assert!(r.selected < r.len.max(1), "{what}: focus past the end");
+        };
+        check(&r, "fresh");
+        for i in 0..r.len as usize {
+            r.select(i);
+            check(&r, "select");
+        }
+        // Past the end clamps rather than leaving the cull hint behind.
+        r.select(99);
+        check(&r, "over-select");
+        r.select(0);
+        // A scrub pages, and pages both.
+        r.scrub(r.pitch);
+        check(&r, "scrub forward");
+        r.scrub(-r.pitch);
+        check(&r, "scrub back");
+        // A removal follows the card the focus was on.
+        r.remove_by_pid(r.cards[1].pid);
+        check(&r, "remove below the focus");
+        r.select(0);
+        r.remove_by_pid(r.cards[0].pid);
+        check(&r, "remove the focused card");
+        // And so does an insertion.
+        r.push(TaskCard::new(99, 4242, 1));
+        check(&r, "push");
+        // An empty stack still has a live cull hint of zero and draws nothing.
+        let e = Recents::new(&layout());
+        check(&e, "empty");
+        assert!(e.cull_range().is_empty());
+    }
+
+    #[test]
+    fn card_rect_centered_agrees_with_card_rect_on_y() {
+        let l = layout();
+        let rl = l.recents();
+        // Every card, every selection, and the same y from both spellings. If
+        // these drift, the overview jumps vertically the frame the renderer
+        // switches helper, which is exactly the regression this pins.
+        let mut r = recents(3);
+        for sel in 0..3usize {
+            r.select(sel);
+            for i in 0..r.len as usize {
+                let a = r.card_rect(i, &rl).expect("live");
+                let b = r.card_rect_centered(i, l.w, l.h).expect("live");
+                assert!(near_px(a.y, b.y), "card {i} sel {sel}: {} vs {}", a.y, b.y);
+                assert!(near(a.h, b.h), "card {i} sel {sel}: height");
+                assert!(near(a.w, b.w), "card {i} sel {sel}: width");
+                assert!(near(a.radius, b.radius), "card {i} sel {sel}: radius");
+                // x agrees too: `card_rect` reads the card centre off the
+                // layout, which is the same viewport centre.
+                assert!(near_px(a.x, b.x), "card {i} sel {sel}: {} vs {}", a.x, b.x);
+            }
+            // Out of range matches too: both are `None`.
+            assert!(r.card_rect(3, &rl).is_none());
+            assert!(r.card_rect_centered(3, l.w, l.h).is_none());
+        }
+
+        // The vertical placement really is the layout's, and a dismiss moves
+        // it and nothing else.
+        let mut r = recents(2);
+        let base = r.card_rect_centered(0, l.w, l.h).expect("live");
+        assert!(
+            near_px(base.y, rl.card_center.1 - rl.card_h * 0.5),
+            "the card is centred on the layout's card centre"
+        );
+        // A drag moves it up, and only vertically. The rendered y is the
+        // dismiss *spring*, which tracks the finger 1:1 below the detach
+        // threshold and follows it on a `magnetic_detach` spring above, so the
+        // sub-threshold case is the exact one to pin here.
+        let small = r.detach / r.dismiss_length * 0.5;
+        drag(&mut r, 0, small);
+        let dragged = r.card_rect_centered(0, l.w, l.h).expect("live");
+        assert!(
+            near_px(dragged.y, base.y - small * r.dismiss_length),
+            "a sub-detach drag is 1:1"
+        );
+        assert!(near(dragged.w, base.w), "a drag does not resize the card");
+        assert!(
+            near_px(center_x(dragged), center_x(base)),
+            "nor move it across"
+        );
+        // Past the detach threshold the same rect is spring-driven, so it
+        // tracks the finger's *target* rather than the finger itself, and the
+        // two differ -- which is the magnetic give the reference is after.
+        let back = -r.dismiss_length * 0.5;
+        drag(&mut r, 0, back);
+        let sprung = r.card_rect_centered(0, l.w, l.h).expect("live");
+        assert!(
+            near(r.dismiss[0].target, r.cards[0].dismiss_y),
+            "aimed at finger"
+        );
+        // y is the spring *value*, not the target, which is why the card lags
+        // the finger once it detaches.
+        assert!(
+            near_px(sprung.y, l.h * 0.5 + r.dismiss[0].value - r.card_h * 0.5),
+            "y is the rendered spring value"
+        );
+        assert!(sprung.y > base.y, "and the card is above where it started");
+    }
+
+    #[test]
+    fn the_card_box_the_model_carries_is_the_layouts() {
+        // `card_rect_centered` is handed framebuffer dimensions, not a
+        // `RecentsLayout`, so the model carries its own copy of the card box.
+        // If that copy ever drifted from the layout the renderer would draw
+        // cards at the wrong size while every other layout-driven element
+        // stayed correct -- a bug with no other symptom.
+        let l = layout();
+        let rl = l.recents();
+        let r = recents(1);
+        assert!(
+            near(r.card_w, rl.card_w),
+            "card width: {} vs {}",
+            r.card_w,
+            rl.card_w
+        );
+        assert!(near(r.card_h, rl.card_h), "card height");
+        assert!(near(r.card_radius, rl.corner_r), "corner radius");
+        // And the pitch the carousel steps by is the width plus the gap, from
+        // the same layout, so a card is never overlapping its neighbour.
+        assert!(near(r.pitch, rl.card_w + rl.spacing), "pitch");
+        assert!(near(r.pitch, r.card_w + rl.spacing), "pitch uses the copy");
+        assert!(near(r.pitch, 797.142_9), "756 px card + 16 dp gap on 1080");
+
+        // The whole struct stays inline: no `Vec`, no `String`, no pointer to
+        // grow. `Recents` is `Copy`, so the renderer can read it without
+        // touching the heap, which is the property that made it worth keeping.
+        assert!(
+            core::mem::size_of::<Recents>() < 1024,
+            "Recents grew to {} bytes",
+            core::mem::size_of::<Recents>()
+        );
+        let copy = r; // `Copy`, not a clone: this compiles only if it is Copy.
+        assert_eq!(copy, r);
+    }
+
+    // ---------------------------------------------------------------------
 
     #[test]
     fn recents_dismiss_scale_ladder() {
@@ -1431,10 +2207,7 @@ mod tests {
         // plateau edges rather than asymptotically.
         assert!(near(dismiss_recents_scale(0.1), (1.0 + 0.9875) * 0.5));
         assert!(near(dismiss_recents_scale(0.5), 0.9875));
-        assert!(near(
-            dismiss_recents_scale(0.5375),
-            (0.9875 + 0.975) * 0.5
-        ));
+        assert!(near(dismiss_recents_scale(0.5375), (0.9875 + 0.975) * 0.5));
 
         // The plateaus are FLAT, which is the whole reason they exist: a small
         // overshoot past 0.2 must not read as movement.
@@ -1459,7 +2232,10 @@ mod tests {
         assert!(near(dismiss_recents_scale(0.0), DISMISS_SCALE_DEFAULT));
         let mut r = recents(2);
         drag(&mut r, 0, 0.1);
-        assert_eq!(r.on_card_release(0), DismissOutcome::Cancelled { card: 0, pid: 1001 });
+        assert_eq!(
+            r.on_card_release(0),
+            DismissOutcome::Cancelled { card: 0, pid: 1001 }
+        );
         assert!(near(r.scale.target, dismiss_recents_scale(0.0)));
 
         // Unusable input is not "certainly dismissing".
@@ -1487,7 +2263,10 @@ mod tests {
         assert_eq!(SpringConfig::task_dismiss().damping_ratio, 0.65);
         for (hops, zeta) in [0.65_f32, 0.80, 0.95, 1.0, 1.0].iter().enumerate() {
             assert!(
-                near(SpringConfig::task_dismiss_with_hops(hops as u8).damping_ratio, *zeta),
+                near(
+                    SpringConfig::task_dismiss_with_hops(hops as u8).damping_ratio,
+                    *zeta
+                ),
                 "hop {hops} zeta"
             );
             assert_eq!(
@@ -1507,7 +2286,10 @@ mod tests {
         // and the further cards must carry the softer profiles.
         let mut r = recents(3);
         drag(&mut r, 0, DISMISS_THRESHOLD_FRACTION + 0.01);
-        assert!(matches!(r.on_card_release(0), DismissOutcome::Committed { .. }));
+        assert!(matches!(
+            r.on_card_release(0),
+            DismissOutcome::Committed { .. }
+        ));
 
         for (i, zeta) in [0.65_f32, 0.80, 0.95].iter().enumerate() {
             assert!(near(r.dismiss[i].config.damping_ratio, *zeta), "card {i}");
@@ -1527,7 +2309,10 @@ mod tests {
         // to 1.0.
         let mut r = recents(2);
         drag(&mut r, 0, 0.1);
-        assert_eq!(r.on_card_release(0), DismissOutcome::Cancelled { card: 0, pid: 1001 });
+        assert_eq!(
+            r.on_card_release(0),
+            DismissOutcome::Cancelled { card: 0, pid: 1001 }
+        );
         assert!(near(r.dismiss[0].target, 0.0));
         assert!(near(r.dismiss[1].target, 0.0));
         assert!(near(r.scale.target, DISMISS_SCALE_DEFAULT));
@@ -1543,7 +2328,10 @@ mod tests {
         let held = r.card_rect(0, &layout().recents()).expect("live");
         assert!(near(held.x, before.x), "card 0 jumped instead of sliding");
         assert!(near(r.reflow[0].target, 0.0));
-        assert!(near(r.reflow[0].value, r.pitch), "one pitch of slide expected");
+        assert!(
+            near(r.reflow[0].value, r.pitch),
+            "one pitch of slide expected"
+        );
         // And it lands back in its slot.
         run(&mut r, 1.0);
         let after = r.card_rect(0, &layout().recents()).expect("live");
@@ -1571,7 +2359,9 @@ mod tests {
         // The evicted card comes back so the shell can free its surface.
         let mut r2 = recents(4);
         assert!(r2.push(TaskCard::new(9, 9999, 9)).is_none(), "not full yet");
-        let evicted = r2.push(TaskCard::new(4, 1004, 4)).expect("a full stack evicts");
+        let evicted = r2
+            .push(TaskCard::new(4, 1004, 4))
+            .expect("a full stack evicts");
         assert_eq!(evicted.pid, 1000, "the oldest is the one that goes");
         assert_eq!(r2.len as usize, MAX_TASKS);
 
@@ -1581,10 +2371,17 @@ mod tests {
         let mut r3 = recents(MAX_TASKS as u32);
         let stale = r3.push(TaskCard::new(99, 1001, 77)).expect("stale entry");
         assert_eq!(stale.pid, 1001);
-        assert_eq!(r3.len as usize, MAX_TASKS, "a promotion is not an insertion");
+        assert_eq!(
+            r3.len as usize, MAX_TASKS,
+            "a promotion is not an insertion"
+        );
         assert_eq!(r3.cards[0].pid, 1001, "most recent first");
         assert_eq!(r3.selected, 0, "the promoted card takes focus");
-        assert_eq!(r3.iter().filter(|c| c.pid == 1001).count(), 1, "no duplicate");
+        assert_eq!(
+            r3.iter().filter(|c| c.pid == 1001).count(),
+            1,
+            "no duplicate"
+        );
 
         // Removal frees exactly one slot and keeps the rest in order.
         let mut r4 = recents(5);
@@ -1595,7 +2392,10 @@ mod tests {
             r4.iter().map(|c| c.pid).collect::<Vec<_>>(),
             vec![1004, 1003, 1001, 1000]
         );
-        assert!(r4.remove_by_pid(4242).is_none(), "an absent pid is not an error");
+        assert!(
+            r4.remove_by_pid(4242).is_none(),
+            "an absent pid is not an error"
+        );
 
         // The selected index follows the *card* it pointed at, not the slot.
         // `recents(5)` is [1004, 1003, 1002, 1001, 1000], so index 3 is
@@ -1634,7 +2434,10 @@ mod tests {
         // the reflow springs and the recents scale.
         r.select(2);
         drag(&mut r, 2, DISMISS_THRESHOLD_FRACTION + 0.02);
-        assert!(matches!(r.on_card_release(2), DismissOutcome::Committed { .. }));
+        assert!(matches!(
+            r.on_card_release(2),
+            DismissOutcome::Committed { .. }
+        ));
         r.scrub(r.pitch);
         // Sanity: something is genuinely mid-flight right now, so this test is
         // not passing on a struct that never animated.
@@ -1648,8 +2451,14 @@ mod tests {
 
         // Every spring in the struct reports at rest, not merely "close".
         assert!(r.scale.is_at_rest(), "scale is {}", r.scale.value);
-        assert!(near(r.scale.value, r.scale.target), "scale not on its target");
-        assert!(near(r.scale.value, DISMISS_SCALE_DEFAULT), "scale must rest at 1.0");
+        assert!(
+            near(r.scale.value, r.scale.target),
+            "scale not on its target"
+        );
+        assert!(
+            near(r.scale.value, DISMISS_SCALE_DEFAULT),
+            "scale must rest at 1.0"
+        );
         for i in 0..MAX_TASKS {
             for (name, s) in [
                 ("dismiss", &r.dismiss[i]),
@@ -1666,7 +2475,10 @@ mod tests {
         let before = r.scale.value;
         run(&mut r, 1.0);
         assert!(near(r.scale.value, before), "a parked spring drifted");
-        assert!(r.park.iter().all(|d| d.is_infinite()), "a slot stayed armed");
+        assert!(
+            r.park.iter().all(|d| d.is_infinite()),
+            "a slot stayed armed"
+        );
 
         // A nonsensical frame time must not be able to disable parking: that
         // is the failure this mechanism exists to prevent.
@@ -1677,7 +2489,10 @@ mod tests {
             r2.step(FRAME_MS / 1000.0, f32::NAN);
         }
         for i in 0..MAX_TASKS {
-            assert!(r2.dismiss[i].is_at_rest(), "dismiss[{i}] with a bad frame_ms");
+            assert!(
+                r2.dismiss[i].is_at_rest(),
+                "dismiss[{i}] with a bad frame_ms"
+            );
             assert!(near(r2.dismiss[i].value, r2.dismiss[i].target));
         }
         assert!(near(r2.scale.value, DISMISS_SCALE_DEFAULT));
@@ -1691,7 +2506,10 @@ mod tests {
         for _ in 0..240 {
             r3.step(FRAME_MS / 1000.0, FRAME_MS);
         }
-        assert!(near(r3.dismiss[0].value, 0.0), "a poked spring must still park");
+        assert!(
+            near(r3.dismiss[0].value, 0.0),
+            "a poked spring must still park"
+        );
 
         // A live drag is exempt. Past the detach threshold the card follows the
         // finger on a `magnetic_detach` spring, so it *lags* the finger by
@@ -1700,7 +2518,10 @@ mod tests {
         // moving well past any settle duration, and stays inside the dismiss
         // clamp so the target genuinely advances every frame.
         let mut r4 = recents(2);
-        assert!(r4.detach < r4.dismiss_length, "the panel must have a drag band");
+        assert!(
+            r4.detach < r4.dismiss_length,
+            "the panel must have a drag band"
+        );
         r4.on_card_drag(0, -(r4.detach * 1.5));
         for i in 0..240 {
             // 3 px/frame at 120 Hz is 360 px/s, so the finger outruns the
@@ -1726,7 +2547,10 @@ mod tests {
         r4.cards[0].dismiss_v = 0.0;
         let _ = r4.on_card_release(0);
         run(&mut r4, 2.0);
-        assert!(r4.dismiss[0].is_at_rest(), "the release must re-arm parking");
+        assert!(
+            r4.dismiss[0].is_at_rest(),
+            "the release must re-arm parking"
+        );
     }
 
     #[test]
@@ -1774,7 +2598,11 @@ mod tests {
             r.on_card_release(0),
             DismissOutcome::Committed { card: 0, pid: 1001 }
         );
-        assert_eq!(r.cards[0].kill, KillState::Grace, "a commit starts the clock");
+        assert_eq!(
+            r.cards[0].kill,
+            KillState::Grace,
+            "a commit starts the clock"
+        );
 
         // Exactly at the threshold commits. The reference's own test is
         // `abs(displacement) > abs(0.5 * dismissLength)`, so the boundary is
@@ -1814,7 +2642,10 @@ mod tests {
         assert_eq!(r.cards[0].kill, KillState::Idle);
         // And an out-of-range index is ignored, not a panic.
         assert_eq!(r.on_card_release(7), DismissOutcome::Ignored);
-        assert_eq!(r.on_card_drag(7, -10.0), (), "out-of-range drag is a no-op");
+        assert!(
+            !r.on_card_drag(7, -10.0),
+            "an out-of-range drag is a no-op and fires no haptic edge"
+        );
     }
 
     #[test]
@@ -1823,7 +2654,10 @@ mod tests {
         let mut r = recents(3);
         assert_eq!(r.cards[0].pid, 1002);
         drag(&mut r, 0, DISMISS_THRESHOLD_FRACTION - 0.01);
-        assert_eq!(r.on_card_release(0), DismissOutcome::Cancelled { card: 0, pid: 1002 });
+        assert_eq!(
+            r.on_card_release(0),
+            DismissOutcome::Cancelled { card: 0, pid: 1002 }
+        );
         assert_eq!(r.cards[0].kill, KillState::Idle, "a cancel must not close");
         // The springs are aimed home, not left where the finger was.
         assert!(near(r.dismiss[0].target, 0.0));
@@ -1845,10 +2679,16 @@ mod tests {
         let mut r = recents(2);
         r.on_card_drag(0, -r.dismiss_length * 0.2);
         r.cards[0].dismiss_v = r.fast_fling * 0.5;
-        assert!(matches!(r.on_card_release(0), DismissOutcome::Cancelled { .. }));
+        assert!(matches!(
+            r.on_card_release(0),
+            DismissOutcome::Cancelled { .. }
+        ));
         assert!(near(r.scale.target, dismiss_recents_scale(0.0)));
         run(&mut r, 1.0);
-        assert!(near(r.scale.value, DISMISS_SCALE_DEFAULT), "release restores 1.0");
+        assert!(
+            near(r.scale.value, DISMISS_SCALE_DEFAULT),
+            "release restores 1.0"
+        );
 
         // The overview scale tracked the ladder during the drag, plateaus and
         // all. Each `drag` is a delta, so the return leg has to travel all the
@@ -1857,15 +2697,24 @@ mod tests {
         drag(&mut r, 0, 0.35);
         assert!(near(r.scale.value, DISMISS_SCALE_ON_CANCEL), "held plateau");
         drag(&mut r, 0, 0.6);
-        assert!(near(r.scale.value, DISMISS_SCALE_ON_SUCCESS), "past the threshold");
+        assert!(
+            near(r.scale.value, DISMISS_SCALE_ON_SUCCESS),
+            "past the threshold"
+        );
         // Back to 0.2 of upward travel: on the first ramp's plateau edge.
         drag(&mut r, 0, -0.75);
-        assert!(near(r.scale.value, DISMISS_SCALE_ON_CANCEL), "0.2 of travel");
+        assert!(
+            near(r.scale.value, DISMISS_SCALE_ON_CANCEL),
+            "0.2 of travel"
+        );
         // Past the origin and below it: not a dismiss at all, so the overview
         // does not shrink. This is the sign that matters and the reason
         // `dismiss_fraction` is signed.
         drag(&mut r, 0, -0.5);
-        assert!(r.cards[0].dismiss_y > 0.0, "the card is now below the origin");
+        assert!(
+            r.cards[0].dismiss_y > 0.0,
+            "the card is now below the origin"
+        );
         assert!(
             near(r.scale.value, DISMISS_SCALE_DEFAULT),
             "dragging below the origin must not shrink the overview"
@@ -1898,11 +2747,71 @@ mod tests {
         );
 
         let mut r = recents(2);
+        // The dismiss-threshold haptic fires on the *rising edge*, once per
+        // drag. Reading the `threshold_haptic_done` latch instead made
+        // `utlc::overview_touch_move` pulse on every `ACTION_MOVE`, so a
+        // 30-frame drag buzzed 30 times -- and the 30th frame of a long drag
+        // can sit far past the threshold, where the latch is still true.
+        {
+            let mut e = recents(2);
+            let step = e.dismiss_length / 30.0;
+            let mut pulses = 0usize;
+            for _ in 0..30 {
+                if e.on_card_drag(0, -step) {
+                    pulses += 1;
+                }
+            }
+            assert_eq!(
+                pulses, 1,
+                "a 30-frame dismiss drag must pulse exactly once, not once per frame"
+            );
+            // And the latch is still set, which is precisely why the shell must
+            // not read it: it stays true through the whole rest of the drag.
+            assert!(
+                e.threshold_haptic_done,
+                "the latch is a 'has fired' flag, not an edge"
+            );
+            // Releasing rearms the latch, so a *cancelled* drag pulses again.
+            //
+            // The release above committed (the travel was the full dismiss
+            // length), which kills the card -- a second drag on a dying card is
+            // a no-op by design, so the rearm has to be checked on a release
+            // that cancels.
+            let mut c = recents(2);
+            let short = c.dismiss_length / 60.0;
+            let mut below = 0usize;
+            for _ in 0..10 {
+                if c.on_card_drag(0, -short) {
+                    below += 1;
+                }
+            }
+            assert_eq!(below, 0, "a drag that never reaches the band stays quiet");
+            assert!(!c.threshold_haptic_done, "and leaves the latch clear");
+            assert!(
+                matches!(c.on_card_release(0), DismissOutcome::Cancelled { .. }),
+                "a release short of the threshold must cancel, not commit"
+            );
+            let mut after = 0usize;
+            for _ in 0..30 {
+                if c.on_card_drag(0, -short * 2.0) {
+                    after += 1;
+                }
+            }
+            assert_eq!(after, 1, "a rearmed drag pulses once, not once per frame");
+        }
+
         // Drag far past the origin: the travel stops at 25 dp.
         r.on_card_drag(0, 5000.0);
-        assert!(near(r.cards[0].dismiss_y, expect), "got {}", r.cards[0].dismiss_y);
+        assert!(
+            near(r.cards[0].dismiss_y, expect),
+            "got {}",
+            r.cards[0].dismiss_y
+        );
         r.on_card_drag(0, 5000.0);
-        assert!(near(r.cards[0].dismiss_y, expect), "a second drag must not creep");
+        assert!(
+            near(r.cards[0].dismiss_y, expect),
+            "a second drag must not creep"
+        );
 
         // Under the cap it tracks exactly.
         r.on_card_drag(0, -expect);
@@ -1912,13 +2821,19 @@ mod tests {
         // are not the same number.
         let mut r = recents(2);
         r.on_card_drag(0, -5000.0);
-        assert!(near(r.cards[0].dismiss_y, -r.dismiss_length), "upward clamp");
+        assert!(
+            near(r.cards[0].dismiss_y, -r.dismiss_length),
+            "upward clamp"
+        );
         assert!(r.dismiss_length > 2.0 * expect, "the bounds should differ");
 
         // The detach threshold is the other side of the 25 dp bound and is
         // also layout-derived.
         assert!(near(rl.detach_dp, 72.0 * l.profile().dp(1.0)), "72 dp");
-        assert!(r.detach > expect, "a card detaches before it undershoots 25 dp");
+        assert!(
+            r.detach > expect,
+            "a card detaches before it undershoots 25 dp"
+        );
 
         // Dragging a card that is already closing changes nothing, and it does
         // not steal the drag either.
@@ -1930,8 +2845,293 @@ mod tests {
         assert_eq!(r.dragging, NO_CARD);
         r.on_card_drag(0, 10.0);
         assert_eq!(r.cards[0].kill, KillState::Grace);
-        assert!(near(r.cards[0].dismiss_y, 0.0), "a dying card must not move");
+        assert!(
+            near(r.cards[0].dismiss_y, 0.0),
+            "a dying card must not move"
+        );
         assert_eq!(r.dragging, NO_CARD, "and must not take the drag");
+    }
+
+    // ---------------------------------------------------------------------
+    // Task-dismiss lifecycle
+    // ---------------------------------------------------------------------
+
+    /// Every pid a run collected as a [`KillAction::Force`], in order.
+    fn forced_pids(q: &KillQueue) -> Vec<i32> {
+        q.iter()
+            .filter_map(|a| match a {
+                KillAction::Force(p) => Some(*p),
+                KillAction::Close(_) => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn swiping_a_card_past_the_threshold_closes_it_and_reflows_the_stack() {
+        // `recents(3)` is [1002, 1001, 1000], most recent first, and the
+        // pushes left the reflow springs mid-slide. Settle them so this test
+        // measures the dismiss and not the push.
+        let mut r = recents(3);
+        run(&mut r, 1.0);
+        assert_eq!(r.len, 3);
+        assert_eq!(r.selected, 0, "the newest card takes focus");
+        assert_eq!(r.visible_card, 0);
+
+        // Drag card 0 up past the threshold, then release.
+        drag(&mut r, 0, DISMISS_THRESHOLD_FRACTION + 0.2);
+        assert!(
+            r.cards[0].dismiss_y.abs() / r.dismiss_length > DISMISS_THRESHOLD_FRACTION,
+            "the drag really did cross the threshold, or the rest proves nothing"
+        );
+        assert_eq!(
+            r.on_card_release(0),
+            DismissOutcome::Committed { card: 0, pid: 1002 }
+        );
+
+        // The threshold crossing is what armed the close: the card is in Grace
+        // with its clock started, not merely flagged.
+        assert_eq!(
+            r.cards[0].kill,
+            KillState::Grace,
+            "a commit starts the clock"
+        );
+        assert!(
+            near(r.cards[0].grace_started_ms, r.now_ms()),
+            "the clock starts now, got {} vs {}",
+            r.cards[0].grace_started_ms,
+            r.now_ms()
+        );
+        // And `arm_close` is idempotent from here: the card is already closing,
+        // so a second request is refused rather than re-arming the clock.
+        assert!(!r.arm_close(0), "a closing card must not re-arm");
+        assert!(
+            near(r.cards[0].grace_started_ms, r.now_ms()),
+            "and the clock did not move"
+        );
+
+        // The card animates out through the top, and the side effects run to
+        // completion, which is what the renderer fades on.
+        assert!(
+            near(r.dismiss[0].target, -r.dismiss_length),
+            "leaves upward"
+        );
+        assert!(near(r.effects[0].target, 1.0), "and finishes its effects");
+        let first = r.step(FRAME_MS / 1000.0, FRAME_MS);
+        assert_eq!(first.len, 0, "grace has not expired on the first frame");
+        assert!(r.dismiss[0].value < 0.0, "and it is already moving");
+        assert!(r.effects[0].value > 0.0, "effects are running");
+        assert_eq!(r.len, 3, "the card stays until the shell takes it");
+
+        // The grace clock runs in wall time, not frames, so the escalation
+        // lands on the frame the clock expires and not before.
+        assert_eq!(
+            run(&mut r, KILL_GRACE_MS / 1000.0 - 0.06).len,
+            0,
+            "too early"
+        );
+        let late = run(&mut r, 0.1);
+        assert_eq!(forced_pids(&late), vec![1002], "the swiped pid escalates");
+        assert_eq!(r.cards[0].kill, KillState::Forced);
+
+        // The shell then acknowledges and takes the card out, which is what
+        // closes the gap. `arm_reflow_remove` hands every survivor the offset
+        // that holds it where it is, so the neighbour slides one pitch inward
+        // instead of teleporting.
+        let gone = r.remove_by_pid(1002).expect("the swiped card is there");
+        assert_eq!(gone.pid, 1002);
+        assert_eq!(r.len, 2, "the stack shrank");
+        assert_eq!(
+            r.iter().map(|c| c.pid).collect::<Vec<_>>(),
+            vec![1001, 1000],
+            "and kept its order"
+        );
+        assert!(
+            near(r.reflow[0].value, r.pitch),
+            "neighbour is held one pitch out"
+        );
+        assert!(near(r.reflow[1].value, r.pitch), "so is the one behind it");
+        assert!(near(r.reflow[0].target, 0.0), "and both slide home");
+
+        // It really slides: the survivor is drawn holding its old position on
+        // the removal frame, then moves inward and lands in the selected slot.
+        let held = r.card_rect_centered(0, PANEL.0, PANEL.1).expect("live");
+        assert!(
+            near(center_x(held), PANEL.0 * 0.5 + r.pitch),
+            "held, not moved"
+        );
+        for _ in 0..6 {
+            r.step(FRAME_MS / 1000.0, FRAME_MS);
+            let mid = r.card_rect_centered(0, PANEL.0, PANEL.1).expect("live");
+            assert!(
+                center_x(mid) < center_x(held),
+                "the neighbour has to travel inward, not sit still"
+            );
+        }
+        run(&mut r, 1.0);
+        let rest = r.card_rect_centered(0, PANEL.0, PANEL.1).expect("live");
+        assert!(
+            near_px(center_x(rest), PANEL.0 * 0.5),
+            "and land on the centre"
+        );
+        // The vacated slot is at rest, so parking is not chasing a dead card.
+        let last = r.len as usize;
+        assert!(r.dismiss[last].is_at_rest() && r.reflow[last].is_at_rest());
+
+        // A removed card is not escalated again: the kill fired once, on the
+        // clock, and taking it out of the stack cannot queue a second kill.
+        assert_eq!(
+            run(&mut r, 1.0).len,
+            0,
+            "a removed card is not killed twice"
+        );
+    }
+
+    #[test]
+    fn a_drag_under_the_threshold_snaps_back_and_kills_nothing() {
+        // The negative case, which is the one that matters: a dismiss gesture
+        // that the user abandons must leave the stack exactly as it was.
+        let mut r = recents(3);
+        run(&mut r, 1.0);
+        let before = r.iter().map(|c| c.pid).collect::<Vec<_>>();
+
+        drag(&mut r, 0, DISMISS_THRESHOLD_FRACTION - 0.05);
+        assert_eq!(
+            r.on_card_release(0),
+            DismissOutcome::Cancelled { card: 0, pid: 1002 }
+        );
+
+        // No close was armed, and nothing is queued. `arm_close` is the public
+        // entry point `clear_all` and the shell use, and it arms any live
+        // dismissable card regardless of travel -- the *threshold* belongs to
+        // the release, which is what decided to cancel here.
+        assert_eq!(r.cards[0].kill, KillState::Idle, "a cancel must not close");
+        assert!(!r.arm_close(99), "an out-of-range index is refused");
+        // The springs are aimed home, not left where the finger was.
+        assert!(near(r.dismiss[0].target, 0.0), "the card springs home");
+        assert!(near(r.effects[0].target, 0.0), "with no side effects");
+        assert!(
+            near(r.scale.target, DISMISS_SCALE_DEFAULT),
+            "and the scale rests"
+        );
+
+        // Run it out well past the grace window: a snapped-back card has no
+        // clock, so nothing escalates.
+        assert_eq!(run(&mut r, 2.0).len, 0, "a cancelled drag must not kill");
+        assert_eq!(r.len, 3, "and must not remove anything");
+        assert_eq!(
+            r.iter().map(|c| c.pid).collect::<Vec<_>>(),
+            before,
+            "stack intact"
+        );
+        for c in r.iter() {
+            assert_eq!(c.kill, KillState::Idle, "pid {} is closing", c.pid);
+        }
+
+        // It really did land back in its slot, and its dismiss spring parked.
+        let back = r.card_rect_centered(0, PANEL.0, PANEL.1).expect("live");
+        assert!(
+            near_px(back.y, PANEL.1 * 0.5 - r.card_h * 0.5),
+            "back in the row"
+        );
+        assert!(r.dismiss[0].is_at_rest(), "dismiss parked");
+        assert!(near(r.dismiss[0].value, 0.0), "and landed on the origin");
+
+        // A flick *back* down is a cancel even from past the threshold, which
+        // is the other half of `onDragEnd` (`:307-338`).
+        let mut r = recents(2);
+        r.on_card_drag(0, -r.dismiss_length * 0.95);
+        r.cards[0].dismiss_v = r.fast_fling * 2.0;
+        assert!(matches!(
+            r.on_card_release(0),
+            DismissOutcome::Cancelled { .. }
+        ));
+        assert_eq!(r.cards[0].kill, KillState::Idle);
+        assert_eq!(run(&mut r, 2.0).len, 0, "a downward flick kills nothing");
+    }
+
+    #[test]
+    fn clear_all_closes_every_card_and_is_idempotent() {
+        let mut r = recents(3);
+        run(&mut r, 1.0);
+        let pids: Vec<i32> = r.iter().map(|c| c.pid).collect();
+
+        // Every dismissable card is asked to close, once.
+        let batch = r.clear_all();
+        assert_eq!(batch.len, 3, "one Close per card");
+        let mut closed: Vec<i32> = batch
+            .iter()
+            .map(|a| match a {
+                KillAction::Close(p) => *p,
+                KillAction::Force(_) => panic!("a fresh close is not an escalation"),
+            })
+            .collect();
+        closed.sort_unstable();
+        let mut want = pids.clone();
+        want.sort_unstable();
+        assert_eq!(closed, want, "every card, exactly once");
+        for c in r.iter() {
+            assert_eq!(c.kill, KillState::Grace, "pid {} is closing", c.pid);
+        }
+
+        // Calling it again mid-grace is a no-op: no card is asked twice and no
+        // clock is re-armed, which is what stops a repeatedly-invoked clear-all
+        // from keeping a stuck app alive forever.
+        let before: Vec<f32> = r.iter().map(|c| c.grace_started_ms).collect();
+        assert!(r.clear_all().is_empty(), "nothing left to close");
+        for (i, c) in r.iter().enumerate() {
+            assert!(
+                near(c.grace_started_ms, before[i]),
+                "pid {} clock moved",
+                c.pid
+            );
+        }
+
+        // And every pid is eventually force-killed, on the same clock a swipe
+        // uses. `clear_all` is a bulk request, not a different lifecycle.
+        assert_eq!(run(&mut r, KILL_GRACE_MS / 1000.0 - 0.05).len, 0, "not yet");
+        let mut forced = forced_pids(&run(&mut r, 0.1));
+        forced.sort_unstable();
+        assert_eq!(forced, want, "every card escalates to a kill");
+        for c in r.iter() {
+            assert_eq!(c.kill, KillState::Forced);
+        }
+        // Once each: a further grace period is silent.
+        assert_eq!(run(&mut r, 2.0).len, 0, "no card is killed twice");
+
+        // The shell then takes them out, one at a time as each close is
+        // acknowledged, and the stack drains to empty.
+        for pid in &pids {
+            assert!(r.remove_by_pid(*pid).is_some(), "pid {pid} is there");
+        }
+        assert_eq!(r.len, 0, "the stack is empty");
+        assert!(r.cull_range().is_empty(), "and nothing is drawn");
+        assert!(
+            r.card_rect_centered(0, PANEL.0, PANEL.1).is_none(),
+            "no card 0"
+        );
+        assert!(!r.arm_close(0), "and there is nothing left to arm");
+
+        // Clearing an empty stack is a no-op, not a panic, and stays that way.
+        let mut empty = Recents::new(&layout());
+        assert!(
+            empty.clear_all().is_empty(),
+            "an empty stack closes nothing"
+        );
+        assert!(empty.clear_all().is_empty(), "and again");
+        assert_eq!(empty.len, 0);
+        // Clearing a stack that has drained is the same call, so a shell that
+        // clears on every "clear all" gesture cannot fault.
+        assert!(r.clear_all().is_empty(), "a drained stack is still empty");
+        assert_eq!(r.len, 0);
+
+        // A pinned card is skipped and never killed, while its neighbours are
+        // not held up for it.
+        let mut r = recents(3);
+        r.cards[1].dismissable = false;
+        assert_eq!(r.clear_all().len, 2, "a pinned card is not asked to close");
+        let killed = forced_pids(&run(&mut r, 1.0));
+        assert_eq!(killed.len(), 2, "its neighbours are");
+        assert!(!killed.contains(&r.cards[1].pid), "the pinned one is not");
     }
 
     #[test]
@@ -2084,7 +3284,10 @@ mod tests {
             assert!(m.push(item));
         }
         assert!(m.push_shortcut(0), "room for one shortcut");
-        assert!(!m.push_shortcut(1), "the 8-slot buffer is the binding limit");
+        assert!(
+            !m.push_shortcut(1),
+            "the 8-slot buffer is the binding limit"
+        );
         assert_eq!(m.len, 8);
 
         // No variant can hold a `String` or a pointer, so the list is a
@@ -2108,7 +3311,10 @@ mod tests {
         // this module has to re-implement.
         assert!(near(damped_scroll(0.0, 100.0), 0.0));
         assert!(near(damped_scroll(100.0, 100.0), 0.07 * 100.0));
-        assert!(damped_scroll(1000.0, 100.0) < 0.1 * 100.0, "overdrag is resisted");
+        assert!(
+            damped_scroll(1000.0, 100.0) < 0.1 * 100.0,
+            "overdrag is resisted"
+        );
     }
 
     #[test]
@@ -2126,8 +3332,14 @@ mod tests {
 
         let mut f = FolderOpen::closed(3);
         assert_eq!(f.folder_idx, 3);
-        assert!(f.is_closed(), "a fresh folder is at rest, not animating out");
-        assert!(near(f.workspace_scale(), 1.0), "a closed workspace is unscaled");
+        assert!(
+            f.is_closed(),
+            "a fresh folder is at rest, not animating out"
+        );
+        assert!(
+            near(f.workspace_scale(), 1.0),
+            "a closed workspace is unscaled"
+        );
 
         f.open(4);
         assert_eq!(f.folder_idx, 4);
@@ -2139,19 +3351,31 @@ mod tests {
         // The title waits out its start delay before it moves at all; nothing
         // else does.
         f.step(0.010, FRAME_MS);
-        assert!(near(f.title_alpha.value, 0.0), "the title moved during its delay");
-        assert!(f.morph.value > 0.0, "the container must not wait on the title");
+        assert!(
+            near(f.title_alpha.value, 0.0),
+            "the title moved during its delay"
+        );
+        assert!(
+            f.morph.value > 0.0,
+            "the container must not wait on the title"
+        );
         f.step(0.010, FRAME_MS);
         assert!(near(f.title_delay_ms, 12.0), "the delay counts down in ms");
         f.step(0.012, FRAME_MS);
-        assert!(near(f.title_delay_ms, 0.0), "the delay is 32 ms of clock, no more");
+        assert!(
+            near(f.title_delay_ms, 0.0),
+            "the delay is 32 ms of clock, no more"
+        );
 
         // Open fully and check the endpoints the reference animates to.
         for _ in 0..240 {
             f.step(1.0 / 120.0, FRAME_MS);
         }
         assert!(near(f.morph.value, 1.0), "the morph did not park on 1.0");
-        assert!(near(f.scrim.value, FOLDER_SCRIM_ALPHA_DARK), "the scrim alpha");
+        assert!(
+            near(f.scrim.value, FOLDER_SCRIM_ALPHA_DARK),
+            "the scrim alpha"
+        );
         assert!(near(f.title_alpha.value, 1.0), "the footer alpha");
         // The workspace sits behind the open folder, driven by the scrim
         // spring, as in the reference's two runs of one spring.
@@ -2181,5 +3405,372 @@ mod tests {
         assert!(near(fl.scrim_alpha, FOLDER_SCRIM_ALPHA_DARK));
         assert!(near(fl.launcher_scale, FOLDER_LAUNCHER_SCALE));
         assert!(near(fl.title_delay_ms as f32, FOLDER_TITLE_DELAY_MS));
+    }
+
+    /// A folder holds a fixed-capacity inline list and no `String`, so the
+    /// whole of its state is `Copy` and the frame path cannot allocate. This
+    /// is the assertion that keeps a future `Vec` from being the easy fix for
+    /// something.
+    #[test]
+    fn a_folder_holds_its_contents_inline() {
+        // The inline id is a fixed byte array, not a pointer to one: a
+        // `String` would be 3 words and a `&str` 2, and either would drag a
+        // borrow or an allocator into the frame path.
+        assert_eq!(
+            core::mem::size_of::<FolderItem>(),
+            FOLDER_ID_BYTES + 1,
+            "a byte array and a length, nothing else"
+        );
+        let mut f = FolderOpen::closed(0);
+        // A `FolderOpen` is `Copy`, which is the property the shell relies on
+        // when it keeps one across the daemon loop.
+        let snapshot = f;
+        f.open(1);
+        assert_eq!(snapshot.folder_idx, 0, "the copy is independent");
+        assert_eq!(f.folder_idx, 1);
+
+        assert_eq!(f.item_count(), 0);
+        assert!(f.items().is_empty());
+        assert_eq!(f.item(0), None);
+        assert_eq!(FOLDER_ITEMS, 64);
+        assert_eq!(FOLDER_ID_BYTES, 32);
+    }
+
+    /// The inline id is byte-exact and refuses what it cannot hold. A
+    /// truncated id would be a *different app*, which is the failure this
+    /// bound exists to prevent.
+    #[test]
+    fn a_folder_item_id_round_trips_and_refuses_what_it_cannot_hold() {
+        for id in [
+            "a",
+            "com.android.providers.calendar",
+            "x/y",
+            &"z".repeat(31),
+        ] {
+            let item = FolderItem::new(id).unwrap_or_else(|| panic!("{id} must fit"));
+            assert_eq!(item.id(), id);
+        }
+        assert_eq!(FolderItem::new(""), None, "empty is not an app");
+        assert_eq!(
+            FolderItem::new(&"z".repeat(FOLDER_ID_BYTES)),
+            Some(FolderItem::new(&"z".repeat(FOLDER_ID_BYTES)).unwrap()),
+            "exactly the bound fits"
+        );
+        assert_eq!(
+            FolderItem::new(&"z".repeat(FOLDER_ID_BYTES + 1)),
+            None,
+            "one byte past the bound is refused, not clipped"
+        );
+        assert_eq!(FolderItem::new(&"z".repeat(1000)), None);
+        assert_eq!(FolderItem::EMPTY.id(), "");
+        // A multi-byte id is stored whole: no char is cut in half.
+        let multi = FolderItem::new("café 日本語").unwrap();
+        assert_eq!(multi.id(), "café 日本語");
+        assert!(multi.id().len() <= FOLDER_ID_BYTES);
+        // Debug is the readable form, so a failing assert names the app.
+        assert_eq!(format!("{multi:?}"), "FolderItem(\"café 日本語\")");
+    }
+
+    /// The contents replace rather than append, because that is what the
+    /// reference does: `FolderService.updateFolderWithItems` deletes every
+    /// row for the folder and re-inserts
+    /// (`data/folder/service/FolderService.kt:38-46`), and `FolderPagedView`'s
+    /// `bindItems` rebuilds its children (`FolderPagedView.java:460-492`).
+    /// A model that only appended could not express a reorder at all.
+    #[test]
+    fn folder_contents_replace_so_a_reorder_is_expressible() {
+        let mut f = FolderOpen::closed(0);
+        f.set_contents(&["a", "b", "c"]);
+        assert_eq!(f.item_count(), 3);
+        assert_eq!(
+            f.items().iter().map(|i| i.id()).collect::<Vec<_>>(),
+            vec!["a", "b", "c"]
+        );
+
+        // A reorder is a rewrite in the new order.
+        f.set_contents(&["c", "a", "b"]);
+        let order: Vec<&str> = f.items().iter().map(FolderItem::id).collect();
+        assert_eq!(order, vec!["c", "a", "b"]);
+
+        // And the old tail is dead, not merely unreachable: the count is what
+        // bounds `items()`, but a stale non-empty slot past it would show up
+        // the moment someone iterated the array directly.
+        f.set_contents(&["only"]);
+        assert_eq!(f.items().len(), 1);
+        assert_eq!(f.items()[0].id(), "only");
+        assert_eq!(f.item(1), None);
+
+        // Over capacity the excess is dropped and the rest survives in order.
+        let many: Vec<String> = (0..FOLDER_ITEMS + 5).map(|i| format!("a{i}")).collect();
+        let refs: Vec<&str> = many.iter().map(String::as_str).collect();
+        f.set_contents(&refs);
+        assert_eq!(f.item_count(), FOLDER_ITEMS, "the bound is the array's");
+        assert_eq!(f.items()[0].id(), "a0");
+        assert_eq!(
+            f.items()[FOLDER_ITEMS - 1].id(),
+            format!("a{}", FOLDER_ITEMS - 1)
+        );
+
+        // An id too long is skipped, not stored truncated.
+        let long = "q".repeat(FOLDER_ID_BYTES + 1);
+        f.set_contents(&["keep", &long, "also"]);
+        let kept: Vec<&str> = f.items().iter().map(FolderItem::id).collect();
+        assert_eq!(
+            kept,
+            vec!["keep", "also"],
+            "the un-representable id is dropped"
+        );
+    }
+
+    /// `add_item` appends, so a drop lands at the end of the visible grid
+    /// rather than at the touch point -- `rank = index`
+    /// (`data/folder/service/FolderService.kt:39-43`).
+    #[test]
+    fn adding_an_item_appends_and_reports_room() {
+        let mut f = FolderOpen::closed(0);
+        assert!(f.add_item("a"));
+        assert!(f.add_item("b"));
+        assert_eq!(
+            f.items().iter().map(FolderItem::id).collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+        assert!(!f.add_item(""), "an empty id is not an app");
+        assert!(!f.add_item(&"q".repeat(100)), "an id that cannot be held");
+
+        for i in 0..(FOLDER_ITEMS - 2) {
+            assert!(f.add_item(&format!("f{i}")), "slot {i}");
+        }
+        assert_eq!(f.item_count(), FOLDER_ITEMS);
+        assert!(!f.add_item("one too many"), "a full folder says so");
+        assert_eq!(f.item_count(), FOLDER_ITEMS, "and does not grow");
+    }
+
+    /// Removal shifts, because rank *is* the index: the pager computes the
+    /// page from `rank / maxItemsPerPage` (`FolderPagedView.java:327`), so a
+    /// hole would put the wrong items on the wrong page.
+    #[test]
+    fn removing_an_item_keeps_rank_dense() {
+        let mut f = FolderOpen::closed(0);
+        f.set_contents(&["a", "b", "c", "d"]);
+        assert!(f.remove_item(1));
+        let ids: Vec<&str> = f.items().iter().map(FolderItem::id).collect();
+        assert_eq!(ids, vec!["a", "c", "d"], "rank 1 now holds c, not a hole");
+        assert!(f.remove_item(0));
+        assert_eq!(f.items()[0].id(), "c");
+        assert_eq!(f.item_count(), 2, "c and d remain");
+        assert!(f.remove_item(1), "the last item");
+        assert!(f.remove_item(0), "and then the one before it");
+        assert_eq!(f.item_count(), 0);
+        assert!(f.items().is_empty());
+        assert!(!f.remove_item(0), "an empty folder has nothing to remove");
+        assert!(
+            !f.remove_item(99),
+            "an index past the end must not index the array"
+        );
+    }
+
+    /// The reference's rule is `getItemCount() <= 1` at three call sites
+    /// (`Folder.java:1129`, `:1331`, `:1757`) -- `<=`, not `==`, because a
+    /// folder reaches one item both by removal and by a completed drag. An
+    /// empty folder fires the rule but has no survivor to substitute, and
+    /// `LauncherDelegate.replaceFolderWithFinalItem` (`:160-162`) returns
+    /// without doing anything for one it cannot reduce.
+    #[test]
+    fn a_folder_of_one_item_collapses_into_that_item() {
+        let mut f = FolderOpen::closed(0);
+        assert_eq!(f.collapse(), FolderCollapse::Keep, "empty: no survivor");
+
+        f.set_contents(&["only.app"]);
+        assert_eq!(
+            f.collapse(),
+            FolderCollapse::IntoApp {
+                app_id: FolderItem::new("only.app").unwrap()
+            }
+        );
+
+        f.add_item("second");
+        assert_eq!(f.collapse(), FolderCollapse::Keep, "two is a folder");
+
+        // Either removal path that reaches one item reports the survivor, and
+        // it is the survivor rather than slot 0.
+        assert!(f.remove_item(0));
+        assert_eq!(f.item_count(), 1);
+        assert_eq!(
+            f.collapse(),
+            FolderCollapse::IntoApp {
+                app_id: FolderItem::new("second").unwrap()
+            },
+            "removing the first item leaves the second as the survivor"
+        );
+        // It is a value, not an action: the model did not delete itself.
+        assert_eq!(
+            f.item_count(),
+            1,
+            "applying the transition is the shell's job"
+        );
+        assert!(f.remove_item(0));
+        assert_eq!(
+            f.collapse(),
+            FolderCollapse::Keep,
+            "and an empty folder stays"
+        );
+    }
+
+    /// `itemsPerPage()` is `cols * rows` (`FolderGridOrganizer.java:92`) and
+    /// `getPageCount()` is `ceil(n / per_page)`, and the indicator is visible
+    /// only past one page (`FolderPagedView.java:496`).
+    #[test]
+    fn folder_paging_matches_the_reference_pager() {
+        let mut f = FolderOpen::closed(0);
+        f.items_per_page = 9;
+
+        assert_eq!(f.items_per_page(), 9);
+        assert_eq!(f.page_count(), 1, "an empty folder is one page");
+        assert!(!f.shows_page_indicator());
+
+        for n in 1..=9 {
+            // `vec!`, not `["a"; n]`: a repeat count must be a `const`, so a
+            // runtime length needs the allocation even in a test.
+            f.set_contents(&vec!["a"; n]);
+            assert_eq!(f.page_count(), 1, "{n} items is one page");
+            assert!(!f.shows_page_indicator(), "{n}: no dots for page 1 of 1");
+        }
+        for (n, pages) in [(10usize, 2usize), (18, 2), (19, 3), (64, 8)] {
+            f.set_contents(&vec!["a"; n]);
+            assert_eq!(f.page_count(), pages, "{n} items");
+            assert!(f.shows_page_indicator(), "{n} items needs dots");
+        }
+
+        // And it follows the grid rather than a fixed 9.
+        f.items_per_page = 25;
+        f.set_contents(&["a"; 19]);
+        assert_eq!(f.page_count(), 1, "19 items at 25 per page is one page");
+        assert!(!f.shows_page_indicator());
+        f.set_contents(&["a"; 26]);
+        assert_eq!(f.page_count(), 2);
+        assert!(f.shows_page_indicator());
+    }
+
+    /// Zero `items_per_page` must not produce an infinity, which is the same
+    /// guard `Layout::new_scaled` applies to `font_scale`.
+    #[test]
+    fn a_zero_page_size_degrades_to_one() {
+        let mut f = FolderOpen::closed(0);
+        f.set_contents(&["a", "b", "c"]);
+        f.items_per_page = 0;
+        assert_eq!(f.items_per_page(), 1, "never zero: it is a divisor");
+        assert_eq!(f.page_count(), 3);
+        // And the geometry layer agrees, or the shell would compute one page
+        // count and draw another.
+        let fl = FolderLayout::new(&layout());
+        assert_eq!(fl.items_per_page(), 9);
+        assert_eq!(fl.page_count(10), 2);
+    }
+
+    /// A drag commits once, on release, and clamps to the last page -- the
+    /// reference holds the content under the finger and snaps afterwards.
+    /// Committing in both `begin` and `end` would advance two pages per flick,
+    /// which is the bug this is here to prevent.
+    #[test]
+    fn a_page_drag_commits_once_and_clamps() {
+        let mut f = FolderOpen::closed(0);
+        f.items_per_page = 9;
+        // Ten items, so there are two pages to move between. An empty folder
+        // is one page and `clamp_page` would pin `page` at 0 -- which is
+        // correct, and would make every assertion below vacuous.
+        f.set_contents(&["a"; 10]);
+        let page_w = 800.0;
+
+        // Short drag: released where it started.
+        f.begin_page_drag(100.0);
+        assert!(near(f.page_drag(), 100.0), "the content follows the finger");
+        assert_eq!(f.page, 0, "the page does not move mid-drag");
+        f.end_page_drag(page_w);
+        assert_eq!(f.page, 0, "100 px is under half a page");
+        assert!(near(f.page_drag(), 0.0), "the offset clears on release");
+
+        // Long drag leftwards: next page. A leftward drag is a *negative* offset, and
+        // it advances -- dragging right rewinds.
+        f.begin_page_drag(-500.0);
+        f.end_page_drag(page_w);
+        assert_eq!(f.page, 1, "500 px is over half a page");
+
+        // Rightwards back to the first page.
+        f.begin_page_drag(500.0);
+        f.end_page_drag(page_w);
+        assert_eq!(f.page, 0);
+
+        // At the first page, dragging backwards stays put.
+        f.begin_page_drag(500.0);
+        f.end_page_drag(page_w);
+        assert_eq!(f.page, 0, "cannot page before the first page");
+
+        // At the last page, dragging forwards stays put.
+        f.set_contents(&["a"; 10]);
+        f.begin_page_drag(-500.0);
+        f.end_page_drag(page_w);
+        assert_eq!(f.page, 1);
+        f.begin_page_drag(-500.0);
+        f.end_page_drag(page_w);
+        assert_eq!(f.page, 1, "cannot page past the last page");
+
+        // A non-finite offset is refused rather than poisoning the page.
+        f.begin_page_drag(f32::NAN);
+        assert!(near(f.page_drag(), 0.0));
+    }
+
+    /// Losing the last page's worth of items must move the shell off a page
+    /// that no longer exists, or the grid shows nothing at all.
+    #[test]
+    fn removing_the_last_page_moves_the_current_page_back() {
+        let mut f = FolderOpen::closed(0);
+        f.items_per_page = 9;
+        f.set_contents(&["a"; 10]);
+        f.begin_page_drag(-500.0);
+        f.end_page_drag(800.0);
+        assert_eq!(f.page, 1, "on the second page");
+
+        f.remove_item(0);
+        assert_eq!(f.page_count(), 1);
+        assert_eq!(f.page, 0, "page 1 does not exist any more");
+        assert!(near(f.page_drag(), 0.0));
+
+        // Widening the grid does the same: 3x3 to 5x5 turns the last of three
+        // pages into the only page. Two leftward drags to reach page 2 of 3.
+        f.set_contents(&["a"; 19]);
+        for _ in 0..2 {
+            f.begin_page_drag(-500.0);
+            f.end_page_drag(800.0);
+        }
+        assert_eq!(f.page, 2, "19 items at 9 per page is three pages");
+        f.items_per_page = 25;
+        f.clamp_page();
+        assert_eq!(f.page, 0, "19 items at 25 per page is one page");
+    }
+
+    /// Opening resets the page but keeps the contents: the shell fills a
+    /// folder and *then* opens it, and the reference's pager starts at page 0
+    /// (`FolderPagedView.java:483-490`, `setCurrentPage(0)`).
+    #[test]
+    fn opening_resets_the_page_and_keeps_the_contents() {
+        let mut f = FolderOpen::closed(0);
+        f.items_per_page = 9;
+        f.set_contents(&["a"; 10]);
+        f.begin_page_drag(-500.0);
+        f.end_page_drag(800.0);
+        assert_eq!(f.page, 1);
+
+        f.open(3);
+        assert_eq!(f.page, 0, "a reopened folder starts at its first page");
+        assert!(near(f.page_drag(), 0.0));
+        assert_eq!(f.item_count(), 10, "the contents survive the open");
+        assert_eq!(f.folder_idx, 3);
+
+        // And so does a re-write of the contents, for the same reason.
+        f.set_contents(&["a"; 10]);
+        f.begin_page_drag(-500.0);
+        f.end_page_drag(800.0);
+        f.set_contents(&["a"; 10]);
+        assert_eq!(f.page, 0, "re-binding the pager starts it over");
     }
 }

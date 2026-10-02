@@ -329,8 +329,7 @@ impl GrallocManager {
         if let Some(content) = manifest_content {
             for hal in content.split("<hal").skip(1) {
                 let elem = hal.split("</hal>").next().unwrap_or(hal);
-                let is_aidl =
-                    elem.contains("format=\"aidl\"") || elem.contains("format='aidl'");
+                let is_aidl = elem.contains("format=\"aidl\"") || elem.contains("format='aidl'");
                 let name = elem
                     .split("<name>")
                     .nth(1)
@@ -681,8 +680,7 @@ impl GrallocManager {
                     size_bytes: y_size,
                 });
                 off += y_size;
-                let uv_size =
-                    (calc_stride_pixels as usize) * ((slice_height as usize) / 2);
+                let uv_size = (calc_stride_pixels as usize) * ((slice_height as usize) / 2);
                 planes.push(BufferPlane {
                     offset: off as u64,
                     stride_bytes: calc_stride_pixels,

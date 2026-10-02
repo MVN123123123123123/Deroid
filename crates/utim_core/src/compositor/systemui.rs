@@ -7,7 +7,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::time::Instant;
 
-use crate::compositor::spring::{SpringConfig, SpringOscillator};
+use crate::graphics::drm_kms::{SpringConfig, SpringSimulation};
 
 /// Cellular Radio Access Technology
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,10 +96,56 @@ pub struct QuickTile {
     pub subtitle: String,
 }
 
-/// org.freedesktop.Notifications Card
+/// One notification on its way into the shade.
+///
+/// A struct rather than seven positional arguments, which is what
+/// [`SystemUiShade::notify`] used to take. With positional args the compiler
+/// cannot catch `notify(a, 0, b, c, d, e, 2)` -- a swapped `summary` and `body`
+/// is the same type and the same shape, so it compiles and renders wrong. Seven
+/// arguments of which five are `String` is past the point where positional is
+/// readable by eye; this is the same change the renderer-side borrowed view
+/// needed anyway.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NotificationSpec {
+    /// The publisher's display name.
+    pub app_name: String,
+    /// The id this replaces, or 0 for a new notification. The freedesktop
+    /// `replaces_id`: a non-zero value that names a row already held replaces it,
+    /// which is what makes a progress bar that updates in place one row rather
+    /// than a hundred.
+    pub replaces_id: u32,
+    /// The publisher's icon hint. Carried for completeness; nothing renders it
+    /// yet, because the shade draws the app's real icon from the icon cache
+    /// rather than whatever path the publisher nominated.
+    pub app_icon: String,
+    /// Summary line.
+    pub summary: String,
+    /// Body text.
+    pub body: String,
+    /// Actions, as `(id, label)`. The id is what goes back to the server on a tap.
+    pub actions: Vec<(String, String)>,
+    /// Urgency, 0..=2. Clamped by [`SystemUiShade::notify`].
+    pub urgency: u8,
+}
+
+/// org.freedesktop.Notifications Card, as the shade holds it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NotificationCard {
     pub id: u32,
+    /// D-Bus urgency: 0 low, 1 normal, 2 critical.
+    ///
+    /// Carried on the card rather than in a parallel array beside the shade's
+    /// rows. The parallel version worked and was wrong in a way that only showed
+    /// up under load: it was indexed by *position in the ring*, so any insertion,
+    /// expiry or dismissal between the decode and the draw shifted every
+    /// critical flag after it onto the wrong row. A critical notification would
+    /// then be tinted on whatever row happened to take its place.
+    ///
+    /// The freedesktop spec's `urgency` hint is `org.freedesktop.Notifications`'s
+    /// only reason a row should be styled differently at all
+    /// (`NotificationView.java:212` paints the view's own critical tint), so this
+    /// is the field that makes the tint meaningful rather than positional.
+    pub urgency: u8,
     pub app_name: String,
     pub app_icon: String,
     pub summary: String,
@@ -111,10 +157,11 @@ pub struct NotificationCard {
 
 /// Quick Settings Panel & Notification Shade
 pub struct SystemUiShade {
-    pub display_width: f32,
-    pub display_height: f32,
     pub status_bar: StatusBarState,
-    pub pull_spring: SpringOscillator, // 0.0 = Hidden, 1.0 = Fully pulled down
+    /// 0.0 = Hidden, 1.0 = Fully pulled down. The canonical analytical
+    /// [`SpringSimulation`]: this crate has exactly one spring model, and the
+    /// shade uses it rather than a private integrator.
+    pub pull_spring: SpringSimulation,
     pub tiles: Vec<QuickTile>,
     pub brightness_percent: u8, // 0 to 100
     pub volume_percent: u8,     // 0 to 100
@@ -124,12 +171,18 @@ pub struct SystemUiShade {
     pub backlight_sysfs_path: String,
 }
 
+impl Default for SystemUiShade {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SystemUiShade {
     /// Hard cap: any client on org.freedesktop.Notifications could otherwise
     /// grow the list (and its O(n) scans) without limit.
     pub const MAX_NOTIFICATIONS: usize = 64;
 
-    pub fn new(display_width: f32, display_height: f32) -> Self {
+    pub fn new() -> Self {
         let tiles = vec![
             QuickTile {
                 kind: QuickTileKind::Wifi,
@@ -174,17 +227,8 @@ impl SystemUiShade {
         ];
 
         Self {
-            display_width,
-            display_height,
             status_bar: StatusBarState::default(),
-            pull_spring: SpringOscillator::new(
-                0.0,
-                SpringConfig {
-                    stiffness: 240.0,
-                    damping: 24.0,
-                    mass: 1.0,
-                },
-            ),
+            pull_spring: SpringSimulation::new(0.0, 0.0, SpringConfig::shade_pull()),
             tiles,
             brightness_percent: 75,
             volume_percent: 60,
@@ -196,7 +240,7 @@ impl SystemUiShade {
     }
 
     pub fn is_open(&self) -> bool {
-        self.pull_spring.target == 1.0 || self.pull_spring.current > 0.5
+        self.pull_spring.target == 1.0 || self.pull_spring.value > 0.5
     }
 
     pub fn open(&mut self) {
@@ -213,13 +257,6 @@ impl SystemUiShade {
         } else {
             self.open();
         }
-    }
-
-    pub fn set_pull_progress(&mut self, progress: f32) {
-        let clamped = progress.clamp(0.0, 1.0);
-        self.pull_spring.current = clamped;
-        self.pull_spring.target = clamped;
-        self.pull_spring.velocity = 0.0; // finger took over: drop stale velocity
     }
 
     pub fn toggle_tile(&mut self, kind: QuickTileKind) -> io::Result<bool> {
@@ -310,15 +347,16 @@ impl SystemUiShade {
         id
     }
 
-    pub fn notify(
-        &mut self,
-        app_name: String,
-        replaces_id: u32,
-        app_icon: String,
-        summary: String,
-        body: String,
-        actions: Vec<(String, String)>,
-    ) -> u32 {
+    pub fn notify(&mut self, spec: NotificationSpec) -> u32 {
+        let NotificationSpec {
+            app_name,
+            replaces_id,
+            app_icon,
+            summary,
+            body,
+            actions,
+            urgency,
+        } = spec;
         let id = if replaces_id != 0 && self.notifications.iter().any(|n| n.id == replaces_id) {
             replaces_id
         } else {
@@ -327,6 +365,10 @@ impl SystemUiShade {
 
         let card = NotificationCard {
             id,
+            // Clamped to the spec's three levels. A publisher sending 7 is not
+            // "very critical", it is sending a number it made up, and rendering
+            // that as louder than critical would make the level meaningless.
+            urgency: urgency.min(2),
             app_name,
             app_icon,
             summary,
@@ -347,16 +389,6 @@ impl SystemUiShade {
 
         self.status_bar.notification_count = self.notifications.len();
         id
-    }
-
-    pub fn close_notification(&mut self, id: u32) -> bool {
-        if let Some(pos) = self.notifications.iter().position(|n| n.id == id) {
-            self.notifications.remove(pos);
-            self.status_bar.notification_count = self.notifications.len();
-            true
-        } else {
-            false
-        }
     }
 
     pub fn on_notification_swipe(&mut self, id: u32, delta_x: f32) {
@@ -380,7 +412,10 @@ impl SystemUiShade {
     }
 
     pub fn update(&mut self, dt: f32) {
-        self.pull_spring.step(dt);
+        // `step_clamped`, not `step`: the shade advances from whatever clock
+        // the compositor is handed, and a non-finite delta must not be able to
+        // park NaN in `pull_spring.value`, which every shade read goes through.
+        self.pull_spring.step_clamped(dt);
     }
 }
 
@@ -398,7 +433,7 @@ mod tests {
 
     #[test]
     fn test_quick_settings_tile_toggles() {
-        let mut shade = SystemUiShade::new(1080.0, 2400.0);
+        let mut shade = SystemUiShade::new();
         // Point sysfs at temp files: toggles now report real I/O failures.
         let dir = std::env::temp_dir().join(format!("utim-sysui-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
@@ -435,7 +470,7 @@ mod tests {
 
     #[test]
     fn test_sysfs_failures_are_reported_not_masked() {
-        let mut shade = SystemUiShade::new(1080.0, 2400.0);
+        let mut shade = SystemUiShade::new();
         shade.torch_sysfs_path = "/tmp/definitely-absent-utim-torch".into();
         shade.backlight_sysfs_path = "/tmp/definitely-absent-utim-backlight".into();
         assert!(shade.toggle_tile(QuickTileKind::Torch).is_err());
@@ -446,16 +481,17 @@ mod tests {
 
     #[test]
     fn test_notification_cap_and_id_wrap() {
-        let mut shade = SystemUiShade::new(1080.0, 2400.0);
+        let mut shade = SystemUiShade::new();
         for i in 0..70 {
-            shade.notify(
-                format!("App{}", i),
-                0,
-                "icon".into(),
-                "S".into(),
-                "B".into(),
-                vec![],
-            );
+            shade.notify(NotificationSpec {
+                app_name: format!("App{}", i),
+                replaces_id: 0,
+                app_icon: "icon".into(),
+                summary: "S".into(),
+                body: "B".into(),
+                actions: vec![],
+                urgency: 1,
+            });
         }
         assert_eq!(shade.notifications.len(), SystemUiShade::MAX_NOTIFICATIONS);
         assert_eq!(
@@ -465,25 +501,42 @@ mod tests {
 
         // Id wrap: u32::MAX advances to 1, never 0 or panic.
         shade.next_notification_id = u32::MAX;
-        let id = shade.notify("W".into(), 0, "i".into(), "S".into(), "B".into(), vec![]);
+        let id = shade.notify(NotificationSpec {
+            app_name: "W".into(),
+            replaces_id: 0,
+            app_icon: "i".into(),
+            summary: "S".into(),
+            body: "B".into(),
+            actions: vec![],
+            urgency: 1,
+        });
         assert_eq!(id, u32::MAX);
         assert_eq!(shade.next_notification_id, 1);
-        let id2 = shade.notify("W".into(), 0, "i".into(), "S".into(), "B".into(), vec![]);
+        let id2 = shade.notify(NotificationSpec {
+            app_name: "W".into(),
+            replaces_id: 0,
+            app_icon: "i".into(),
+            summary: "S".into(),
+            body: "B".into(),
+            actions: vec![],
+            urgency: 1,
+        });
         assert_eq!(id2, 1);
     }
 
     #[test]
     fn test_notification_center_lifecycle_and_swipe_dismiss() {
-        let mut shade = SystemUiShade::new(1080.0, 2400.0);
+        let mut shade = SystemUiShade::new();
 
-        let id = shade.notify(
-            "Messaging".into(),
-            0,
-            "chatty".into(),
-            "New Message".into(),
-            "Hello from Linux Treble GSI!".into(),
-            vec![("reply".into(), "Reply".into())],
-        );
+        let id = shade.notify(NotificationSpec {
+            app_name: "Messaging".into(),
+            replaces_id: 0,
+            app_icon: "chatty".into(),
+            summary: "New Message".into(),
+            body: "Hello from Linux Treble GSI!".into(),
+            actions: vec![("reply".into(), "Reply".into())],
+            urgency: 1,
+        });
 
         assert_eq!(shade.notifications.len(), 1);
         assert_eq!(shade.status_bar.notification_count, 1);

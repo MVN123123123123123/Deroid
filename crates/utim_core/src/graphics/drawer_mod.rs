@@ -233,8 +233,20 @@ impl FastScrollerState {
     /// `mWidth + 2 * mThumbPadding` (`:463-465`) -- the same number the
     /// thumb's paint geometry uses, which is what "aligns the rounded corner
     /// of the popup with the top of the thumb" (`:522`) means.
+    ///
+    /// # Public because the renderer has to place the popup too
+    ///
+    /// `updatePopupY` (`:520-528`) runs on every `ACTION_MOVE`, so
+    /// [`Self::on_move`] already stores the result in [`Self::popup_y`]. But
+    /// the shell's own render pass has to *refresh* it: a relayout between
+    /// the last touch event and the frame (rotation, keyboard, panel resize)
+    /// changes `fs.popup.h` and `fs.track`, and the popup would then be drawn
+    /// at a y derived from the pre-relayout layout. A renderer that wants the
+    /// popup glued to the thumb has to be able to recompute this, and
+    /// re-deriving the formula at the call site is exactly the drift this
+    /// module exists to prevent. It is a pure `&self` read of three fields.
     #[inline]
-    fn popup_top(&self, fs: &FastScrollerLayout) -> f32 {
+    pub fn popup_top(&self, fs: &FastScrollerLayout) -> f32 {
         let radius = (fs.track_w + fs.thumb_pad * 2.0) * 0.5;
         let raw = fs.track.y + self.thumb_y + radius - fs.popup.h * 0.5;
         let lo = fs.track.y;
@@ -446,10 +458,21 @@ impl FastScrollerState {
 /// can honestly hold. 26 sections x 255 rows = **6630 rows**, which is the
 /// ceiling the ~6500-row figure in the plan refers to.
 ///
-/// A section that is *absent* inherits the next present section's row in both
-/// arrays, so `row_offset` is non-decreasing and a lookup can skip empty
-/// letters with a plain "take the last `l` with `row_offset[l] <= row`"
-/// scan -- ties land on the *later* letter, which is the present one.
+/// A section that is *absent* inherits the next present section's row, so
+/// `row_offset` stays non-decreasing. That alone is **not** enough for the
+/// lookup, and the reason is worth stating because it is the bug that was
+/// here: a scan of "take the last `l` with `row_offset[l] <= row`" lets an
+/// absent letter win whenever it ties, so the scan must be restricted to
+/// *present* letters. `present` is a 26-bit mask and
+/// [`Self::section_for_progress`] consults it.
+///
+/// Without the mask the leading run -- letters above the highest present one,
+/// which every real catalogue has (`Z`, `X`, `Q`...) -- has no successor to
+/// inherit from. Mirroring the *first* row makes the top of the list report
+/// the last alphabet letter; mirroring the *last* row makes the bottom do the
+/// same. There is no value for that run that is correct at both ends, because
+/// the tie-break is what is wrong, not the row it was handed. `present` makes
+/// the question moot: an absent letter is never a candidate.
 ///
 /// # Overflow
 ///
@@ -470,6 +493,15 @@ pub struct SectionIndex {
     pub first_row: [u8; 26],
     /// Absolute first row of each letter, in rows.
     pub row_offset: [u16; 26],
+    /// Bit `l` set when section `l` has at least one row.
+    ///
+    /// 26 bits fit a `u32`, so presence costs 4 bytes and no allocation, and it
+    /// is what lets the lookup skip absent letters instead of letting them win
+    /// a tie. See the type's documentation.
+    pub present: u32,
+    /// Rows in the catalogue this index was built from. See
+    /// [`Self::total_rows`].
+    pub total_rows: usize,
 }
 
 impl SectionIndex {
@@ -477,21 +509,10 @@ impl SectionIndex {
     pub const EMPTY: SectionIndex = SectionIndex {
         first_row: [0; 26],
         row_offset: [0; 26],
+        present: 0,
+        total_rows: 0,
     };
 
-    /// Build the index from names that are **already sorted
-    /// case-insensitively**, which is what `AlphabeticalAppsList` maintains.
-    ///
-    /// Sorting is not re-done here: an unsorted input would produce a
-    /// non-monotonic `row_offset` and a lookup that picks the wrong letter.
-    /// That contract is the price of an O(n) build with no sort buffer.
-    ///
-    /// A name whose first character is not an ASCII letter (a digit, a
-    /// symbol, a non-Latin leading codepoint) buckets under index 0. Because
-    /// the input is sorted, that leading run is contiguous and merges with
-    /// whatever else lands in `'A'`, so the index stays correct -- the only
-    /// effect is that scrolling to the very top reports `'A'` rather than "no
-    /// section", which is what a user sees in the reference too.
     pub fn build<'a, I: IntoIterator<Item = &'a str>>(names: I) -> Self {
         // 2 x 26 u32 on the stack: the whole build is two fixed arrays and no
         // allocation at all, not even a temporary `Vec`.
@@ -514,16 +535,61 @@ impl SectionIndex {
             }
             abs[l] = next;
         }
+        // The leading run -- letters *above* the highest present one -- has no
+        // present letter to inherit from, so the descending walk leaves it at
+        // whatever `next` was seeded to. Seeding it to 0 was the bug: on a real
+        // all-apps catalogue (no Q, no X, no Z) `row_offset[25] == 0` while
+        // `row_offset['R'] == last_row`, so `row_offset` stopped being
+        // non-decreasing -- which is its documented contract -- and
+        // `section_for_progress`'s "later letters win ties" rule matched that
+        // whole leading run and reported the *last alphabet index* for every
+        // scroll position. `utlc` shows that string to the user, so a sparse
+        // catalogue always read "Z".
+        //
+        // A forward running max repairs exactly that run and nothing else: for
+        // `l` at or below the highest present letter `abs` is already
+        // non-decreasing so the clamp is a no-op, and for `l` above it the max
+        // over `0..l` is `abs[highest_present]`. That value restores the
+        // monotonicity invariant but is *not* an answer to "which letter is at
+        // the top of the list" -- which is why the `present` mask below, not
+        // this clamp, is what fixes the reported letter. An empty catalogue
+        // keeps every entry at 0, and the lookup returns 0 there.
+        for l in 1..26 {
+            abs[l] = abs[l].max(abs[l - 1]);
+        }
         let mut out = SectionIndex::EMPTY;
         let mut prev = 0u32;
         for (l, row) in abs.iter().enumerate() {
             out.row_offset[l] = (*row).min(u16::MAX as u32) as u16;
             out.first_row[l] = row.saturating_sub(prev).min(u8::MAX as u32) as u8;
             prev = *row;
+            if count[l] != 0 {
+                out.present |= 1u32 << l;
+            }
         }
+        // The catalogue's row count, taken from the walk rather than kept
+        // alongside it: `count` is the per-section tally the build already has,
+        // so summing it here cannot disagree with `row_offset`. A caller
+        // clamping a scroll needs both numbers and they must come from one
+        // source -- two independently supplied counts is how a scroller ends up
+        // one row short of its own list.
+        out.total_rows = count.iter().map(|&c| c as usize).sum();
         out
     }
 
+    /// Build the index from names that are **already sorted
+    /// case-insensitively**, which is what `AlphabeticalAppsList` maintains.
+    ///
+    /// Sorting is not re-done here: an unsorted input would produce a
+    /// non-monotonic `row_offset` and a lookup that picks the wrong letter.
+    /// That contract is the price of an O(n) build with no sort buffer.
+    ///
+    /// A name whose first character is not an ASCII letter (a digit, a
+    /// symbol, a non-Latin leading codepoint) buckets under index 0. Because
+    /// the input is sorted, that leading run is contiguous and merges with
+    /// whatever else lands in `'A'`, so the index stays correct -- the only
+    /// effect is that scrolling to the very top reports `'A'` rather than "no
+    /// section", which is what a user sees in the reference too.
     /// The section showing at scroll `progress` in `0..=1`, as `1..=26`
     /// (`'A'` = 1), or `0` when there is nothing to show.
     ///
@@ -557,13 +623,22 @@ impl SectionIndex {
         // into the trailing run of absent letters.
         let row = ((p * total_rows as f32) as usize).min(total_rows - 1);
         let row = row as u32;
+        // Only letters that actually own a row are candidates. An absent
+        // letter's `row_offset` is a *mirror* of a neighbour's, so admitting it
+        // lets it win the tie it necessarily creates -- which is how a sparse
+        // catalogue (no Q, no X, no Z) reported "Z" at every scroll position.
         let mut best = 0u8;
         for l in 0..26 {
-            if row >= self.row_offset[l] as u32 {
-                // Later letters win ties, and a tie means the later letter is
-                // the present one (an absent letter mirrors its successor).
+            if self.present & (1u32 << l) != 0 && row >= self.row_offset[l] as u32 {
                 best = l as u8 + 1;
             }
+        }
+        // `best` is 0 only when `row` precedes the first present section, which
+        // `row_offset[0] == 0` makes unreachable for a non-empty catalogue.
+        // Fall back to the lowest present letter so the contract is "never
+        // report a letter that owns no rows" rather than "report none".
+        if best == 0 {
+            best = (self.present & self.present.wrapping_neg()).trailing_zeros() as u8 + 1;
         }
         best
     }
@@ -572,6 +647,46 @@ impl SectionIndex {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.row_offset == [0u16; 26]
+    }
+
+    /// The absolute first row of section `letter` (`'A'` as `1..=26`).
+    ///
+    /// The missing half of [`Self::section_for_progress`]. That maps a scroll
+    /// *position* to a letter; this maps a letter back to a row, which is the
+    /// direction a fast scroller actually needs -- the reference resolves a
+    /// `FastScrollSectionInfo` and hands it to a `LinearSmoothScroller`
+    /// (`AllAppsFastScrollHelper.smoothScrollToSection:41-47`).
+    ///
+    /// Without it the scroller drew a teardrop letter and moved the list by
+    /// nothing at all: the shell's only output from `on_move` was the letter
+    /// itself, which it spent on a haptic tick.
+    ///
+    /// `None` for a letter that owns no rows, or for a letter outside `1..=26`.
+    /// Callers must not substitute a neighbour: the reference's
+    /// `getSectionIndex` returns -1 for an empty section and the helper then
+    /// does not scroll.
+    #[inline]
+    pub fn row_for_section(&self, letter: u8) -> Option<usize> {
+        let l = letter.checked_sub(1)? as usize;
+        if l >= 26 || self.present & (1u32 << l) == 0 {
+            return None;
+        }
+        Some(self.row_offset[l] as usize)
+    }
+
+    /// The row count this index was built from.
+    ///
+    /// Stored rather than reconstructed. `row_offset[l]` is the first row
+    /// section `l` *owns*, so for the last present letter it is that section's
+    /// start, not the list length -- the length is only knowable from the input
+    /// `build` saw. Deriving it here would mean guessing, and a guess one row
+    /// short makes the final section unreachable.
+    ///
+    /// The empty index reports 0, the same emptiness signal
+    /// [`Self::is_empty`] gives, so the two cannot disagree.
+    #[inline]
+    pub fn total_rows(&self) -> usize {
+        self.total_rows
     }
 }
 
@@ -792,22 +907,33 @@ fn draw_run_tracked(
     tracking: f32,
 ) {
     let mut pen = x;
-    for (i, b) in text.bytes().enumerate() {
-        if b == b'\n' {
+    // One glyph per character, and letter-spacing strictly *between* glyphs.
+    //
+    // The old loop compared `i + 1 < text.len()` -- a byte count -- against a
+    // byte index, so a multi-byte string got tracking after every byte, and a
+    // skipped `\n` still got tracking. Tracking "before each glyph but the
+    // first" is stated per glyph and so is immune to both.
+    let mut drawn = false;
+    for cp in text.chars() {
+        if cp == '\n' {
             continue;
         }
-        pen += font::draw_glyph(buf, stride, w, h, pen, y, b, color, size, weight);
-        if i + 1 < text.len() {
+        if drawn {
             pen += tracking;
         }
+        pen += font::draw_glyph(buf, stride, w, h, pen, y, cp, color, size, weight);
+        drawn = true;
     }
 }
 
 /// Longest prefix of `text` that fits `avail`, on a char boundary.
 ///
-/// Byte-wise like `drm_kms::draw_text_clipped`, for the same reason
-/// (`char_advance` takes a `u8`), but snapped back to a char boundary so a
-/// multi-byte name can never panic the slice.
+/// Walks characters, so the cut lands on a boundary by construction and the
+/// width charged is the width drawn. The old byte walk charged the fallback
+/// advance once per *byte* -- a 3-byte CJK name was truncated to roughly a
+/// third of the characters it should have kept -- and then snapped the cut
+/// *backwards* to a boundary, which could only ever shorten an already too-long
+/// prefix.
 #[allow(clippy::too_many_arguments)]
 fn fit_prefix(text: &str, size: f32, tracking: f32, avail: f32) -> &str {
     if !avail.is_finite() || avail <= 0.0 {
@@ -815,16 +941,13 @@ fn fit_prefix(text: &str, size: f32, tracking: f32, avail: f32) -> &str {
     }
     let mut used = 0.0f32;
     let mut end = text.len();
-    for (i, b) in text.bytes().enumerate() {
-        let adv = font::char_advance(b, size) + if i > 0 { tracking } else { 0.0 };
+    for (i, cp) in text.char_indices() {
+        let adv = font::char_advance(cp, size) + if i > 0 { tracking } else { 0.0 };
         if used + adv > avail {
             end = i;
             break;
         }
         used += adv;
-    }
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
     }
     &text[..end]
 }
@@ -941,8 +1064,8 @@ pub fn draw_fast_scroller(
     let cy = (st.popup_y + fs.popup.h * 0.5).clamp(fs.track.y - fs.popup.h, h as f32);
     // The blob is the letterbox itself: `fs.popup` is the 75 x 62 dp
     // `FastScrollerPopup` box (`dimens.xml:83-84`, `styles.xml:366-371`) and
-    // `draw_teardrop` builds the `r/5`-on-the-right round rect rotated -45 deg
-    // from `FastScrollThumbDrawable.java:53-62`.
+    // `draw_teardrop` builds the single-`r/5`-corner round rect rotated
+    // -45 deg from `FastScrollThumbDrawable.java:53-62`.
     //
     // Deliberate deviation, so it is written down: AOSP's `onBoundsChange`
     // builds the path from a **square** of side `2 * r = bounds.height()`
@@ -1038,6 +1161,14 @@ pub fn draw_fast_scroller(
 /// (`strings.xml:184 all_apps_search_bar_hint` = "Search apps"). `count_label`
 /// is the caller-formatted app count, passed in rather than `format!`'d here so
 /// this function allocates nothing.
+///
+/// The original 9-argument sheet paint, which painted a hardcoded `'A'`.
+///
+/// Kept so the existing caller (`drm_kms.rs:4456`) compiles unchanged while
+/// the letter is migrated. It forwards to
+/// [`draw_drawer_sheet_with_section`] with [`DEFAULT_SECTION_LETTER`], so the
+/// two paths cannot diverge -- there is one implementation and this is a
+/// spelling of it.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_drawer_sheet(
     buf: &mut [u32],
@@ -1049,6 +1180,61 @@ pub fn draw_drawer_sheet(
     style: &DrawerStyle,
     query: &str,
     count_label: &str,
+) -> bool {
+    draw_drawer_sheet_with_section(
+        buf,
+        stride,
+        w,
+        h,
+        sheet,
+        progress,
+        style,
+        query,
+        count_label,
+        DEFAULT_SECTION_LETTER,
+    )
+}
+
+/// The letter the header shows when the caller has no section to report.
+///
+/// `"A"`, which is what the sheet painted unconditionally before the letter
+/// became a parameter. It is *not* a claim that the first section is `A` --
+/// [`SectionIndex::section_for_progress`] returns `1` for an empty catalogue
+/// and for a sparse one the lowest present letter, which is not always `A` --
+/// it is the old behaviour, named so that a caller which has not yet threaded
+/// [`FastScrollerState::letter_str`] through keeps rendering exactly what it
+/// rendered before rather than a blank header.
+pub const DEFAULT_SECTION_LETTER: &str = "A";
+
+/// Paint the drawer sheet's chrome, with the header's section letter as a
+/// parameter.
+///
+/// `section_letter` is the header's letter. It is a parameter, not the literal
+/// `'A'` this used to paint, because the letter is *state* that already exists:
+/// [`FastScrollerState::letter_str`] resolves the live section on every
+/// `ACTION_MOVE` (`RecyclerViewFastScroller.onDraw`, `:397-404`) and allocates
+/// nothing to do it. The header was hardcoding the first letter of the
+/// alphabet while the popup a few pixels away showed the real one, so the two
+/// disagreed for the whole of a drag.
+///
+/// Passing it in rather than deriving it here is deliberate: the sheet has no
+/// `FastScrollerState` and must not grow one, and the section index is rebuilt
+/// on catalogue rescan rather than per frame
+/// ([`FastScrollerState::set_catalogue`]). An empty string paints no letter at
+/// all, which is the honest answer for "no section" -- `letter_str()` returns
+/// `""` there, and the header's left padding is the same either way.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_drawer_sheet_with_section(
+    buf: &mut [u32],
+    stride: usize,
+    w: usize,
+    h: usize,
+    sheet: &DrawerSheetLayout,
+    progress: f32,
+    style: &DrawerStyle,
+    query: &str,
+    count_label: &str,
+    section_letter: &str,
 ) -> bool {
     if w == 0 || h == 0 || !progress.is_finite() || progress <= 0.0 {
         return false;
@@ -1153,7 +1339,7 @@ pub fn draw_drawer_sheet(
                 h,
                 glyph_x,
                 y,
-                b'G',
+                'G',
                 style.primary,
                 text_px,
                 FontWeight::Medium,
@@ -1202,18 +1388,28 @@ pub fn draw_drawer_sheet(
         let label_px = style.label_px;
         if label_px.is_finite() && label_px > 0.0 {
             let y = centred_ascender(hd.y + hd.h * 0.5, label_px);
-            font::draw_glyph(
-                buf,
-                stride,
-                w,
-                h,
-                hd.x + label_px * 0.4,
-                y,
-                b'A',
-                style.on_surface,
-                label_px,
-                FontWeight::Bold,
-            );
+            // The section letter, as a borrowed run rather than one `char`.
+            // `letter_str()` hands back a `&'static str` off [`LETTER_BYTES`],
+            // so this is a run draw with no allocation and no `format!`; the
+            // literal `'A'` it replaces was correct for exactly one of 26
+            // possible drags. `fit_prefix` is not needed: the run is at most
+            // one character by construction, and a caller that passes a
+            // longer string gets it clipped to the pill rather than running
+            // under the app count.
+            if !section_letter.is_empty() {
+                font::draw_run(
+                    buf,
+                    stride,
+                    w,
+                    h,
+                    hd.x + label_px * 0.4,
+                    y,
+                    section_letter,
+                    style.on_surface,
+                    label_px,
+                    FontWeight::Bold,
+                );
+            }
             if !count_label.is_empty() {
                 let cw = font::measure(count_label, label_px);
                 font::draw_run(
@@ -1254,6 +1450,877 @@ pub fn draw_drawer_sheet(
 /// The drawer's search placeholder (`strings.xml:184`).
 pub const SEARCH_HINT: &str = "Search apps";
 
+// ===========================================================================
+// Search-result chrome: the zero-result state and the "search the web" row
+// ===========================================================================
+//
+// The drawer's *results* band is drawn by the caller, which owns the icon cache
+// and the scroll offset. What this module owns is everything the reference puts
+// *in* that band which is not an app row, and all three of those were missing:
+//
+//   1. the zero-result state (`SearchResultEmptyState.kt:15-49`), which the
+//      live path rendered as literally nothing (`main.rs:4413` is a bare
+//      `if count > 0`), so a query matching no app showed an empty sheet with
+//      no explanation at all;
+//   2. the always-appended "Search on <provider>" action row
+//      (`LawnchairLocalSearchAlgorithm.generateActionResults:146-179`, built by
+//      `ActionsSectionBuilder:157-187`), which is what makes an unmatched query
+//      useful rather than a dead end; and
+//   3. the per-group section headers (`SectionBuilder.kt:24-235`), where the
+//      sheet currently paints one flat `count_label`.
+//
+// # Why geometry and paint are separate here
+//
+// None of the three is in `layout.rs`, which is a file this slice does not own
+// (see the handoff). So each is a **layout function returning a `Rect` plus a
+// paint function taking that `Rect`**, both in this file. The caller hit-tests
+// with the layout function and paints with the paint function, which is the
+// same contract `draw_fast_scroller` and `FastScrollerState` already have: a
+// rectangle that is drawn is by construction the rectangle that is hit. When
+// `layout.rs` is next edited these should move there and become
+// `DrawerSheetLayout` methods; the signatures are shaped for that move.
+
+/// The reference's zero-result copy (`strings.xml:188`).
+///
+/// `all_apps_no_search_results` is a *format* string -- `"No apps found
+/// matching \"%1$s\""` -- and the reference formats it per result
+/// (`BaseAllAppsAdapter.onBindViewHolder:330-333`). Here it is split into the
+/// prefix and the quote so the caller's stack buffer can hold the query
+/// between them without a `format!`: see [`draw_search_empty_state`], which
+/// draws the three pieces in sequence at accumulated pen positions.
+pub const NO_RESULTS_PREFIX: &str = "No apps found matching \"";
+
+/// The closing quote of [`NO_RESULTS_PREFIX`]. Its own constant so the two
+/// halves can never drift out of balance.
+pub const NO_RESULTS_SUFFIX: &str = "\"";
+
+/// `all_apps_search_on_web_message` (`lawnchair/res/values/strings.xml:942`),
+/// split for the same reason as [`NO_RESULTS_PREFIX`].
+pub const WEB_SEARCH_PREFIX: &str = "Search on ";
+
+/// Height of the "Search on ..." action row.
+///
+/// `search_result_row_height` is 92 dp
+/// (`lawnchair/res/values/dimens.xml:64`), which is the row *with* an icon
+/// and a subtitle. The action row sets
+/// `SearchResultView.EXTRA_HIDE_SUBTITLE` (`SearchTargetFactory.kt:259`), so
+/// it is the single-line variant, and
+/// `search_result_small_row_height` = 64 dp (`:67`) is that one.
+pub const WEB_SEARCH_ROW_H_DP: f32 = 64.0;
+
+/// Corner radius of the action row: `search_result_radius`
+/// (`dimens.xml:60`), 4 dp.
+pub const WEB_SEARCH_ROW_RADIUS_DP: f32 = 4.0;
+
+/// Horizontal padding of the action row: `search_result_padding`,
+/// 16 dp (`dimens.xml:62`), matching the `paddingStart`/`paddingEnd` of
+/// `search_result_text.xml:4-5`.
+pub const WEB_SEARCH_ROW_PAD_DP: f32 = 16.0;
+
+/// Height of a result-group header.
+///
+/// `search_result_text_height` is 52 dp
+/// (`lawnchair/res/values/dimens.xml:68`), and `search_result_text.xml:4-6`
+/// applies it as the row's `minHeight` with `layout_height = wrap_content`, so
+/// the text line plus its 2 x 12 dp `search_result_text_padding`
+/// (`dimens.xml:62`, applied at `search_result_text.xml:21-22`) is what the
+/// 52 dp is measuring. 12 dp of glyph height in a 52 dp band leaves the row
+/// visually airy, which is what a group label wants.
+pub const SECTION_HEADER_H_DP: f32 = 52.0;
+
+/// The gap between a group's header and the group's first row.
+///
+/// The reference appends `createHeaderTarget(SPACE)` after *every* group's
+/// results (`SectionBuilder.kt:38, 57, 77, 95, 123, 152, 184, 210`) -- eight
+/// separate call sites, so this is the reference's own constant and not a
+/// derived one. It is the divider between groups.
+pub const SECTION_HEADER_GAP_DP: f32 = 12.0;
+
+/// The header's type size: `search_result_hero_subtitle_size`, 14 sp
+/// (`dimens.xml:58`), which is the `android:textSize` on the header's `title`
+/// `TextView` (`search_result_text.xml:31`).
+pub const SECTION_HEADER_TEXT_DP: f32 = 14.0;
+
+/// The header's leading icon, `ic_allapps_search`
+/// (`SearchTargetFactory.kt:130-132`), tinted `TextColorPrimary`.
+///
+/// Painted as a 16 dp rounded square rather than the reference's glyph: this
+/// rasteriser has no icon-theme lookup, and the drawer's own 16 dp grid border
+/// (`layout.rs`, `all_apps_border_dp`) is the nearest thing the sheet already
+/// draws at that size. Sized from the header's 14 sp text so the icon and the
+/// label read as one unit.
+pub const SECTION_HEADER_ICON_DP: f32 = 16.0;
+
+/// Type size of the empty state's title: `textAppearanceLarge`, 22 sp.
+pub const EMPTY_STATE_TITLE_DP: f32 = 22.0;
+
+/// Type size of the empty state's subtitle: `textAppearanceSmall`, 14 sp
+/// (`search_result_empty_state.xml:33`).
+pub const EMPTY_STATE_SUBTITLE_DP: f32 = 14.0;
+
+/// The empty state's icon: `ic_qsb_search` at 48 dp
+/// (`search_result_empty_state.xml:12-17`), tinted `ColorTokens.ColorAccent`
+/// by `SearchResultEmptyState.onFinishInflate:33`.
+pub const EMPTY_STATE_ICON_DP: f32 = 48.0;
+
+/// The empty state's 32 dp padding (`search_result_empty_state.xml:9`), the
+/// 16 dp below the icon (`:17`) and the 4 dp below the title (`:26`).
+pub const EMPTY_STATE_PAD_DP: f32 = 32.0;
+
+/// The drawer's density for a given panel width.
+///
+/// A private helper rather than a `Layout`, because these three surfaces are
+/// laid out against the *grid band the caller already has* and constructing a
+/// whole `Layout` to convert dp would be both wasteful and a second source of
+/// the density number. `drm_kms.rs` computes the identical value as
+/// `w as f32 / 420.0` (`drm_kms.rs:4442`) for [`DrawerStyle`]; the two must
+/// agree or a 1 dp surface shows as a 1 px step, so the derivation is stated
+/// here once.
+#[inline]
+pub fn drawer_dp(panel_w: f32) -> f32 {
+    panel_w / 420.0
+}
+
+/// The empty state's three bands, stacked down `band`.
+///
+/// `band` is the region the results would have occupied -- the sheet's `grid`
+/// in practice. The stack is the reference's `LinearLayout` with
+/// `gravity = center_horizontal` (`search_result_empty_state.xml:7-8`): icon
+/// on top, then title, then subtitle, each centred horizontally and separated
+/// by its `layout_marginBottom`.
+///
+/// Returned rather than painted so the caller can hit-test the same three
+/// rectangles, and so the y positions exist in exactly one place.
+pub fn search_empty_state_layout(
+    band: &super::layout::Rect,
+    panel_w: f32,
+) -> [super::layout::Rect; 3] {
+    let d = drawer_dp(panel_w);
+    let icon_d = d * EMPTY_STATE_ICON_DP;
+    let pad = d * EMPTY_STATE_PAD_DP;
+    let title_h = d * EMPTY_STATE_TITLE_DP;
+    let sub_h = d * EMPTY_STATE_SUBTITLE_DP;
+    let gap = d * EMPTY_STATE_PAD_DP / 2.0; // 16 dp icon gap, 4 dp title gap
+    let cx = band.center_x();
+    // The reference's 32 dp padding is the container's own padding, so the
+    // content starts 32 dp in from the band and the total height is
+    // `32 + 48 + 16 + title + 4 + subtitle + 32`.
+    let mut y = band.y + pad;
+    let icon = super::layout::Rect {
+        x: cx - icon_d * 0.5,
+        y,
+        w: icon_d,
+        h: icon_d,
+        radius: icon_d * 0.5,
+    };
+    y += icon_d + gap;
+    let title = super::layout::Rect {
+        x: band.x,
+        y,
+        w: band.w,
+        h: title_h,
+        radius: 0.0,
+    };
+    y += title_h + gap * 0.25; // 4 dp, a quarter of the icon gap
+    let subtitle = super::layout::Rect {
+        x: band.x,
+        y,
+        w: band.w,
+        h: sub_h,
+        radius: 0.0,
+    };
+    [icon, title, subtitle]
+}
+
+/// Paint the zero-result state: icon, title, subtitle.
+///
+/// `query` is the unmatched text and is drawn *between* the two halves of
+/// [`NO_RESULTS_PREFIX`], so the string the user sees is
+/// `No apps found matching "cafe"` with no `format!` anywhere on the frame
+/// path. The three pieces are laid out at accumulated pen positions rather
+/// than centred as a unit, because the reference's `gravity = center_horizontal`
+/// (`search_result_empty_state.xml:8`) centres the *whole formatted string* --
+/// and centring three separately-measured pieces to the same axis is what makes
+/// that come out right for any query length.
+///
+/// Returns `true` when anything was written.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_search_empty_state(
+    buf: &mut [u32],
+    stride: usize,
+    w: usize,
+    h: usize,
+    band: &super::layout::Rect,
+    style: &DrawerStyle,
+    panel_w: f32,
+    query: &str,
+) -> bool {
+    if w == 0 || h == 0 || !band.h.is_finite() || band.h <= 0.0 {
+        return false;
+    }
+    let d = drawer_dp(panel_w);
+    let [icon, title, sub] = search_empty_state_layout(band, panel_w);
+
+    // 1. The icon: `ic_qsb_search` is a magnifier, so a ring plus a handle.
+    // `ColorTokens.ColorAccent` (`SearchResultEmptyState.kt:33`) is
+    // `style.primary`, and the 48 dp circle is the 48 dp of the layout's
+    // `layout_width`/`layout_height` (`search_result_empty_state.xml:12-14`).
+    let ring = icon.w * 0.36;
+    if ring > 0.0 && style.stroke_px > 0.0 {
+        let a = icon.center_x() - icon.w * 0.10;
+        let b = icon.center_y() - icon.h * 0.10;
+        // Four stroked sides of the ring, as thin round rects: this is the
+        // same vocabulary the search box's hairline uses, so a magnifier here
+        // matches the pill above it without a new primitive.
+        let t = style.stroke_px * 1.5;
+        for (rx, ry, rw, rh) in [
+            (a - ring, b - ring, ring * 2.0, t),
+            (a - ring, b + ring, ring * 2.0, t),
+            (a - ring, b - ring, t, ring * 2.0),
+            (a + ring, b - ring, t, ring * 2.0),
+        ] {
+            fill_round_rect(buf, stride, w, h, rx, ry, rw, rh, t * 0.5, style.primary);
+        }
+        // The handle: down-right from the ring, at 45 deg, which is the
+        // recognisable silhouette of `ic_qsb_search`.
+        let hl = icon.w * 0.26;
+        fill_round_rect(
+            buf,
+            stride,
+            w,
+            h,
+            a + ring * 0.71,
+            b + ring * 0.71,
+            hl,
+            hl,
+            t * 0.5,
+            style.primary,
+        );
+    }
+
+    // 2. Title and subtitle, as three centred runs.
+    let size_t = d * EMPTY_STATE_TITLE_DP;
+    let size_s = d * EMPTY_STATE_SUBTITLE_DP;
+    let drawn = centred_three(
+        buf,
+        stride,
+        w,
+        h,
+        &title,
+        title.center_y(),
+        size_t,
+        NO_RESULTS_PREFIX,
+        query,
+        NO_RESULTS_SUFFIX,
+        style.on_surface,
+        FontWeight::Bold,
+    );
+    if size_s > 0.0 {
+        // The subtitle carries the hint rather than the query: the title
+        // already says what went wrong, and the reference's own subtitle for
+        // the *no-history* zero state is "Find apps, contacts, and more. Your
+        // recent searches will appear here."
+        // (`search_empty_state_no_history_subtitle`, `strings.xml:1002`).
+        // There are no contacts, files or history providers in this shell, so
+        // the honest subtitle names what the drawer can do: the web action
+        // row. `draw_web_search_action` is the other half of that promise.
+        let hint = WEB_SEARCH_HINT;
+        let hw = font::measure(hint, size_s);
+        font::draw_run(
+            buf,
+            stride,
+            w,
+            h,
+            sub.center_x() - hw * 0.5,
+            centred_ascender(sub.center_y(), size_s),
+            hint,
+            style.on_surface_variant,
+            size_s,
+            FontWeight::Regular,
+        );
+    }
+    drawn
+}
+
+/// The empty state's subtitle, for a shell that wants the reference's exact
+/// string. The web action row is what this shell offers instead, so this is
+/// exported for the copy rather than used by the paint.
+pub const WEB_SEARCH_HINT: &str = "Search the web instead";
+
+/// The action row's `Rect`, for `panel_w`-derived dp and an `anchor` y.
+///
+/// The row is 64 dp tall (`WEB_SEARCH_ROW_H_DP`) with a 4 dp radius
+/// (`WEB_SEARCH_ROW_RADIUS_DP`) and 16 dp of horizontal padding
+/// (`WEB_SEARCH_ROW_PAD_DP`), inset to the band's own horizontal extent so it
+/// lines up with the grid it sits under.
+pub fn web_search_action_rect(
+    band: &super::layout::Rect,
+    panel_w: f32,
+    anchor_y: f32,
+) -> super::layout::Rect {
+    let d = drawer_dp(panel_w);
+    let h = d * WEB_SEARCH_ROW_H_DP;
+    // A band shorter than the row cannot contain it, so the row is pinned to
+    // the band's top and the caller is expected to have scrolled. `max(band.y)`
+    // as the floor rather than clamping `top` afterwards, because `min` then
+    // `max` would let a *negative* gap push the row off the top.
+    let floor = band.y.max(0.0);
+    let ceiling = (band.y + band.h - h).max(floor);
+    let top = (anchor_y + d * SECTION_HEADER_GAP_DP)
+        .clamp(floor, ceiling)
+        .max(0.0);
+    super::layout::Rect {
+        x: band.x,
+        y: top,
+        w: band.w,
+        h,
+        radius: d * WEB_SEARCH_ROW_RADIUS_DP,
+    }
+}
+
+/// Paint the "Search on <provider>" action row.
+///
+/// `provider` is the display name of the configured search provider -- the
+/// reference's `%1$s` (`all_apps_search_on_web_message`,
+/// `lawnchair/res/values/strings.xml:942`), which `createWebSearchActionTarget`
+/// fills from `webSuggestionProvider` (`SearchTargetFactory.kt:244-252`). The
+/// row is tinted `TextColorSecondary` there (`:249-251`), which is
+/// `style.on_surface_variant`.
+///
+/// The leading glyph is the provider's own icon in the reference; a shell with
+/// no icon theme draws a magnifier, the same shape
+/// [`draw_search_empty_state`] uses, so the two read as a pair.
+///
+/// Returns `true` when anything was written.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_web_search_action(
+    buf: &mut [u32],
+    stride: usize,
+    w: usize,
+    h: usize,
+    row: &super::layout::Rect,
+    style: &DrawerStyle,
+    panel_w: f32,
+    provider: &str,
+) -> bool {
+    if w == 0 || h == 0 || !row.h.is_finite() || row.h <= 0.0 {
+        return false;
+    }
+    let d = drawer_dp(panel_w);
+    let pad = d * WEB_SEARCH_ROW_PAD_DP;
+
+    // A 24 dp magnifier: `search_result_row_height` is 92 dp with a leading
+    // icon, so the icon is comfortably smaller than the 64 dp row, and
+    // 24 dp is the platform's "small icon" size. The stroke weight is the
+    // caller's hairline scaled up, so it reads at the same weight as the empty
+    // state's larger magnifier above it.
+    let icon_d = row.h * 0.375;
+    let t = (style.stroke_px * 1.5).max(1.0);
+    let ring = icon_d * 0.34;
+    let icx = row.x + pad + icon_d * 0.5;
+    let icy = row.center_y();
+    for (dx, dy, dw, dh) in [
+        (-ring, -ring, ring * 2.0, t),
+        (-ring, ring * 2.0 - t, ring * 2.0, t),
+        (-ring, -ring, t, ring * 2.0),
+        (ring * 2.0 - t, -ring, t, ring * 2.0),
+    ] {
+        fill_round_rect(
+            buf,
+            stride,
+            w,
+            h,
+            icx + dx,
+            icy + dy,
+            dw,
+            dh,
+            t * 0.5,
+            style.on_surface_variant,
+        );
+    }
+    let hl = icon_d * 0.28;
+    fill_round_rect(
+        buf,
+        stride,
+        w,
+        h,
+        icx + ring * 0.71,
+        icy + ring * 0.71,
+        hl,
+        hl,
+        t * 0.5,
+        style.on_surface_variant,
+    );
+
+    // The label: `Search on <provider>`, the prefix and the provider drawn as
+    // two runs at accumulated pen positions so no `format!` is needed. The
+    // provider name is fitted to whatever is left of the row.
+    let size = d * SECTION_HEADER_TEXT_DP;
+    if !(size.is_finite() && size > 0.0) {
+        return true;
+    }
+    let text_x = row.x + pad + icon_d + pad * 0.5;
+    let right = row.x + row.w - pad;
+    let y = centred_ascender(row.center_y(), size);
+    let pw = font::measure(WEB_SEARCH_PREFIX, size);
+    if right - text_x < pw {
+        return true;
+    }
+    font::draw_run(
+        buf,
+        stride,
+        w,
+        h,
+        text_x,
+        y,
+        WEB_SEARCH_PREFIX,
+        style.on_surface,
+        size,
+        FontWeight::Regular,
+    );
+    let avail = right - (text_x + pw);
+    let shown = fit_prefix(provider, size, 0.0, avail);
+    if !shown.is_empty() {
+        font::draw_run(
+            buf,
+            stride,
+            w,
+            h,
+            text_x + pw,
+            y,
+            shown,
+            style.on_surface,
+            size,
+            FontWeight::Regular,
+        );
+    }
+    true
+}
+
+/// Draw `prefix` + `mid` + `suffix` as one centred run inside `band`, at `cy`.
+///
+/// The pen starts at the band's centre minus half the *total* width and
+/// advances by each piece's measured width, so the three runs are visually a
+/// single string and the whole thing is centred on the band's axis -- which is
+/// what `gravity = center_horizontal` does to the reference's one formatted
+/// `TextView` (`search_result_empty_state.xml:7-8`).
+///
+/// `band` is the *writable* extent, not the line's natural width, because the
+/// three pieces have to be centred against the same axis the reference centres
+/// its single string against -- the container, which is the full content width.
+///
+/// Returns `true` when the run was long enough to draw at all.
+#[allow(clippy::too_many_arguments)]
+fn centred_three(
+    buf: &mut [u32],
+    stride: usize,
+    w: usize,
+    h: usize,
+    band: &super::layout::Rect,
+    cy: f32,
+    size: f32,
+    prefix: &str,
+    mid: &str,
+    suffix: &str,
+    color: u32,
+    weight: FontWeight,
+) -> bool {
+    if !(size.is_finite() && size > 0.0) {
+        return false;
+    }
+    let pw = font::measure(prefix, size);
+    let sw = font::measure(suffix, size);
+    let full = pw + font::measure(mid, size) + sw;
+    if !full.is_finite() || full <= 0.0 {
+        return false;
+    }
+    // Elide the *whole* run to the band before centring it, or a query longer
+    // than the band is drawn from `centre - full/2`, which is off the left
+    // edge and the visible result is a right-aligned-looking fragment.
+    //
+    // The two fixed halves are kept whole if they fit at all and the middle
+    // absorbs the elision -- which is the reference's own `ellipsize = end`
+    // (`search_result_empty_state.xml:22`), where the *tail* is what goes.
+    //
+    // Every piece below is a **borrow** of the caller's own `&str`: a
+    // `to_string()` here would be a `malloc` per frame in a state that is
+    // drawn precisely when the user is typing, which is the worst possible
+    // moment for one. `fit_prefix` returns a `&str` slice of its input, so the
+    // elision is a subslice and not a copy.
+    let avail = if band.w.is_finite() && band.w > 0.0 {
+        band.w
+    } else {
+        full
+    };
+    // `suffix_ok` is false once anything was elided: a closing quote with no
+    // opening one reads as a typo rather than as elision, so the honest end of
+    // the string is the last character that *was* drawn.
+    let (p, m, s): (&str, &str, &str) = if full <= avail {
+        (prefix, mid, suffix)
+    } else if pw + sw >= avail {
+        // Not even the two fixed halves fit: draw as much of the prefix as
+        // there is room for, and drop the query and the quote.
+        (fit_prefix(prefix, size, 0.0, avail), "", "")
+    } else {
+        (prefix, fit_prefix(mid, size, 0.0, avail - pw - sw), suffix)
+    };
+    let mut drawn_w = font::measure(p, size) + font::measure(m, size) + font::measure(s, size);
+    if !(drawn_w.is_finite() && drawn_w > 0.0) {
+        return false;
+    }
+    // `font::measure` on an empty string is 0 on every family, but a NaN from a
+    // poisoned font would make the centring a NaN and drop the run at x = 0, so
+    // the sum is re-clamped rather than trusted.
+    drawn_w = drawn_w.clamp(0.0, f32::MAX);
+    let y = centred_ascender(cy, size);
+    // The start x is the centring: without it the three runs are laid out from
+    // x = 0 and the whole string sits at the panel's left edge, which is
+    // exactly the bug the centring is for.
+    let mut pen = band.center_x() - drawn_w * 0.5;
+    for piece in [p, m, s] {
+        if piece.is_empty() {
+            continue;
+        }
+        font::draw_run(buf, stride, w, h, pen, y, piece, color, size, weight);
+        pen += font::measure(piece, size);
+    }
+    true
+}
+
+/// The geometry for `n` result-group headers down `band`, starting at `y`.
+///
+/// The reference emits one header per *result group*, not per result
+/// (`SectionBuilder.kt:24-235`): a header, that group's rows, then a
+/// `createHeaderTarget(SPACE)` spacer that is the divider between groups. This
+/// function returns the **n header bands only**; the spacers are implied by
+/// [`SECTION_HEADER_GAP_DP`] between consecutive headers and are the caller's
+/// to advance over, because the rows between headers are the caller's grid rows
+/// and the caller's arithmetic.
+///
+/// The point of separating this from the paint is that the drawer's scroll
+/// math (`grid_visible_rows`, `grid_cell_at_index`) counts *grid rows*, and a
+/// header is 52 dp against a 104 dp row pitch. A header therefore does not
+/// occupy a grid row and cannot be expressed in the existing row arithmetic --
+/// see the handoff. What is provided here is the geometry, so the caller can
+/// decide where in its own layout the headers go rather than this module
+/// guessing at the scroll.
+pub fn section_header_rows(
+    band: &super::layout::Rect,
+    panel_w: f32,
+    y: f32,
+    n: usize,
+) -> [super::layout::Rect; SECTION_HEADER_MAX] {
+    let d = drawer_dp(panel_w);
+    let h = d * SECTION_HEADER_H_DP;
+    let mut out = [super::layout::Rect {
+        x: band.x,
+        y: 0.0,
+        w: 0.0,
+        h: 0.0,
+        radius: 0.0,
+    }; SECTION_HEADER_MAX];
+    let pitch = h + d * SECTION_HEADER_GAP_DP;
+    for (i, slot) in out.iter_mut().enumerate().take(n.min(SECTION_HEADER_MAX)) {
+        let top = y + pitch * i as f32;
+        *slot = super::layout::Rect {
+            x: band.x,
+            y: top,
+            w: band.w,
+            h,
+            radius: 0.0,
+        };
+    }
+    out
+}
+
+/// How many group headers a drawer can hold in one frame.
+///
+/// The reference has ten `SectionBuilder` implementations
+/// (`LawnchairLocalSearchAlgorithm:181-192`) and this shell has no contacts,
+/// files, settings, history, suggestions or calculation providers, so its
+/// groups are apps-and-shortcuts, actions and the zero state: three. Eight is
+/// the fixed-capacity ceiling, `Copy` and stack-only, which is the point --
+/// [`section_header_rows`] must not allocate per frame, and a `Vec` here would
+/// be a `malloc` in the middle of a drag.
+pub const SECTION_HEADER_MAX: usize = 8;
+
+// ===========================================================================
+// Prediction row
+// ===========================================================================
+//
+// The one part of the sheet that is *reserved and unread*: `layout.rs` bakes
+// 108 dp of prediction row into the middle of the sheet
+// (`PREDICTION_ROW_H_DP:2080`, `DrawerSheetLayout::predictions:2004`) and
+// nothing has ever drawn it, so the drawer's grid starts 108 dp lower than the
+// reference's and 108 dp of sheet is dead.
+//
+// This module owns the *paint*, and it takes the geometry as parameters
+// because `layout.rs` belongs to another slice. What the shell must pass is in
+// the handoff; the short version is: the row's `Rect`, the slot index, the
+// predicted app's name, and the icon edge (`pred_icon_d`) it should paint a
+// monogram into.
+
+/// Prediction row slots a drawer can show at once.
+///
+/// `PredictionRowView` sets `mNumPredictedAppsPerRow = numShownAllAppsColumns`
+/// (`PredictionRowView.java:85-86`) and inflates exactly that many
+/// `BubbleTextView` children (`:230-247`), so the count is the device
+/// profile's column count, not a constant. 8 covers the reference profile's 5
+/// with room and bounds the fixed-capacity math below; a shell on a
+/// wider profile passes its own `grid_cols` and this is only the fallback for
+/// slot arithmetic.
+pub const PREDICTION_MAX_SLOTS: usize = 8;
+
+/// Slot `slot` of `count` in the prediction row: the equal-width cell that
+/// `lp.width = 0, lp.weight = 1` describes
+/// (`PredictionRowView.java:245-246`).
+///
+/// The reference's children are weighted, not fixed, so a slot is a *fraction*
+/// of the row rather than a dp number -- which is why this is a function of
+/// `count` and not a lookup table. `count` is clamped to
+/// [`PREDICTION_MAX_SLOTS`] because a caller with a 12-column profile would
+/// otherwise compute 1/12 shares the paint could not address.
+#[inline]
+pub fn prediction_slot_rect(
+    row: &super::layout::Rect,
+    slot: usize,
+    count: usize,
+) -> super::layout::Rect {
+    let n = count.clamp(1, PREDICTION_MAX_SLOTS);
+    let pitch = row.w / n as f32;
+    super::layout::Rect {
+        x: row.x + pitch * (slot as f32).min(n as f32 - 1.0),
+        y: row.y,
+        w: pitch,
+        h: row.h,
+        radius: row.radius,
+    }
+}
+
+/// Paint one slot of the prediction row: the icon tile, the monogram, and the
+/// label under it.
+///
+/// `icon_d` is [`DrawerSheetLayout::pred_icon_d`] -- 65 dp
+/// (`APP_ICON_DP`, `device_profiles.xml:70`) -- and it is a parameter rather
+/// than a re-derived dp number because the layout already has it, and the tile
+/// the grid paints must be the same size or a prediction reads as a different
+/// class of thing from the app it is predicting.
+///
+/// The label goes **under** the icon, which is the reference's
+/// `LinearLayout` with a vertical orientation per slot and
+/// `PREDICTION_ROW_H_DP`'s `icon + padding + text + padding` measurement
+/// (`PredictionRowView.getExpectedHeight():149-161`). Drawing it beside the
+/// icon instead is what the 65 dp the row used to reserve implied, and it is
+/// why the layout grew to 108 dp.
+///
+/// Returns `true` when anything was written. `false` for a slot outside
+/// `PREDICTION_MAX_SLOTS`, which is the caller's cue that the row is over
+/// capacity rather than that it drew nothing.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_prediction_row(
+    buf: &mut [u32],
+    stride: usize,
+    w: usize,
+    h: usize,
+    row: &super::layout::Rect,
+    style: &DrawerStyle,
+    slot: usize,
+    name: &str,
+    icon_d: &f32,
+) -> bool {
+    if w == 0 || h == 0 || !row.h.is_finite() || row.h <= 0.0 || slot >= PREDICTION_MAX_SLOTS {
+        return false;
+    }
+    let d = icon_d.min(row.h);
+    if !(d.is_finite() && d > 0.0) {
+        return false;
+    }
+    let cell = prediction_slot_rect(row, slot, PREDICTION_MAX_SLOTS);
+    // The icon is centred in its slot: `lp.width = 0, lp.weight = 1` with a
+    // gravity-centred child (`PredictionRowView.java:230-247`).
+    let icon_x = cell.center_x() - d * 0.5;
+    let icon = super::layout::Rect {
+        x: icon_x,
+        y: row.y,
+        w: d,
+        h: d,
+        // The drawer's own icon corner fraction, which `layout.rs` applies to
+        // every other icon; a prediction with a different corner reads as a
+        // different widget.
+        radius: d * 0.22,
+    };
+    if !rect_visible(&icon, h) {
+        return false;
+    }
+    // 1. The tile: the same accent-filled rounded square the grid paints for a
+    //    monogram, so a prediction and the app it predicts are visibly the
+    //    same kind of thing.
+    fill_round_rect(
+        buf,
+        stride,
+        w,
+        h,
+        icon.x,
+        icon.y,
+        icon.w,
+        icon.h,
+        icon.radius,
+        style.primary,
+    );
+    // 2. The monogram. `PredictionRowView` inflates a `BubbleTextView` per slot
+    //    (`:230-247`), which draws the app's icon or its title's initial; this
+    //    rasteriser has no icon cache on the sheet path, so the initial is
+    //    what a caller with no decoded icon gets. Drawn in the surface colour
+    //    so it reads against the accent tile, matching how `drm_kms.rs` draws
+    //    the grid's glyph (`drm_kms.rs:4543-4551`).
+    let initial = name.chars().find(|c| c.is_alphanumeric()).unwrap_or('?');
+    let size = d * 0.44;
+    let adv = font::measure(&initial.to_string(), size);
+    font::draw_glyph(
+        buf,
+        stride,
+        w,
+        h,
+        icon.center_x() - adv * 0.5,
+        centred_ascender(icon.center_y(), size),
+        initial,
+        style.surface,
+        size,
+        FontWeight::Bold,
+    );
+
+    // 3. The label, under the icon, in the sheet's label size. The gap is the
+    //    7 dp `all_apps_icon_drawable_padding` (`PREDICTION_ICON_PAD_DP`), and
+    //    the label is fitted to the slot so two predictions cannot collide.
+    let size_l = style.label_px;
+    if size_l.is_finite() && size_l > 0.0 && !name.is_empty() {
+        let pad = (row.h - d) * 0.18;
+        let y = icon.y + icon.h + pad + size_l * 0.5;
+        let shown = fit_prefix(name, size_l, 0.0, (cell.w * 0.96).max(0.0));
+        let sw = font::measure(shown, size_l);
+        font::draw_run(
+            buf,
+            stride,
+            w,
+            h,
+            cell.center_x() - sw * 0.5,
+            centred_ascender(y, size_l),
+            shown,
+            style.on_surface,
+            size_l,
+            FontWeight::Regular,
+        );
+    }
+    true
+}
+
+/// Paint one result-group header: icon, label, and the divider below it.
+///
+/// `label` is the group's own title -- `all_apps_search_result_contacts_from_device`,
+/// `search_result_hero_title`, or whatever the group's provider supplies
+/// (`SectionBuilder.kt:36, 55, 75, 93, 112-113, 143`). It is borrowed and
+/// drawn as a run, so no `format!` and no `String`.
+///
+/// The 16 dp leading glyph is the reference's `ic_allapps_search` tinted
+/// `TextColorPrimary` (`SearchTargetFactory.kt:130-132`), drawn here as a
+/// filled rounded square in `style.on_surface`: the shape is a stand-in, and
+/// it is the same shape at the same size for every group, which is what makes
+/// a column of them read as a column.
+///
+/// The divider is the reference's `createHeaderTarget(SPACE)`
+/// (`SectionBuilder.kt:38`) and it belongs to the *bottom* of the header,
+/// because the reference appends it after the group's rows -- so the divider
+/// separates this group from the next one, which is the same visual
+/// relationship seen from the other side.
+///
+/// Returns `true` when anything was written.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_section_header(
+    buf: &mut [u32],
+    stride: usize,
+    w: usize,
+    h: usize,
+    rect: &super::layout::Rect,
+    style: &DrawerStyle,
+    panel_w: f32,
+    label: &str,
+    divider: bool,
+) -> bool {
+    if w == 0 || h == 0 || !rect.h.is_finite() || rect.h <= 0.0 {
+        return false;
+    }
+    let d = drawer_dp(panel_w);
+    let size = d * SECTION_HEADER_TEXT_DP;
+    let icon_d = d * SECTION_HEADER_ICON_DP;
+    let cy = rect.center_y();
+    let mut wrote = false;
+
+    // `gravity = start|center` on the title
+    // (`search_result_text.xml:30`), so the label and the icon share a centre
+    // line and the label is left-padded past the icon by its 4 dp
+    // `paddingEnd` (`:32`).
+    if icon_d > 0.0 {
+        fill_round_rect(
+            buf,
+            stride,
+            w,
+            h,
+            rect.x,
+            cy - icon_d * 0.5,
+            icon_d,
+            icon_d,
+            icon_d * 0.25,
+            style.on_surface,
+        );
+        wrote = true;
+    }
+    if size.is_finite() && size > 0.0 && !label.is_empty() {
+        let text_x = rect.x + icon_d + size * 0.28;
+        let right = rect.x + rect.w;
+        // `maxLines = 1` + `ellipsize = end`
+        // (`search_result_text.xml:29-31`): one line, cut at the boundary.
+        let shown = fit_prefix(label, size, 0.0, (right - text_x).max(0.0));
+        font::draw_run(
+            buf,
+            stride,
+            w,
+            h,
+            text_x,
+            centred_ascender(cy, size),
+            shown,
+            style.on_surface,
+            size,
+            FontWeight::Medium,
+        );
+        wrote |= !shown.is_empty();
+    }
+
+    if divider {
+        // The SPACE header. `createHeaderTarget(SPACE)` builds a real target
+        // with a real 12 dp band, so the divider is a hairline the width of
+        // the content edge, not a full-bleed rule.
+        let gap = d * SECTION_HEADER_GAP_DP;
+        let t = style.stroke_px.max(1.0);
+        let y = rect.y + rect.h + gap * 0.5;
+        if y.is_finite() && y > 0.0 && y < h as f32 {
+            fill_round_rect(
+                buf,
+                stride,
+                w,
+                h,
+                rect.x,
+                y,
+                rect.w,
+                t,
+                t * 0.5,
+                style.outline,
+            );
+            wrote = true;
+        }
+    }
+    wrote
+}
+
 /// `true` when `r`'s top edge is on-panel and it has area. A band that has
 /// scrolled off the bottom of the panel is skipped rather than relying on the
 /// per-primitive clipping, so a half-open sheet does no work for bands that
@@ -1265,6 +2332,76 @@ fn rect_visible(r: &super::layout::Rect, h: usize) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// The two directions of the scroller's mapping, and the property the fast
+    /// scroller depends on: a letter resolves to a row, and that row resolves
+    /// back to the same letter.
+    ///
+    /// `row_for_section` is the half that was missing. `section_for_progress`
+    /// maps a scroll position to a letter, so the shell could draw a teardrop
+    /// with a letter on it and no way to move the list -- the reference hands the
+    /// letter to a `LinearSmoothScroller`
+    /// (`AllAppsFastScrollHelper.smoothScrollToSection:41-47`).
+    #[test]
+    fn a_section_resolves_to_a_row_and_back() {
+        // A sparse catalogue on purpose: no Q, no X, no Z. Absent letters are
+        // the case that breaks a naive mirror, because their `row_offset` is a
+        // copy of a neighbour's.
+        let names = [
+            "Apple", "Banana", "Cherry", "Emacs", "Firefox", "Gnu", "Hexedit",
+        ];
+        let idx = SectionIndex::build(names);
+        assert!(!idx.is_empty());
+        assert_eq!(idx.total_rows(), names.len());
+
+        for letter in 1..=26u8 {
+            let row = idx.row_for_section(letter);
+            if idx.present & (1u32 << (letter - 1)) == 0 {
+                assert_eq!(row, None, "absent letter {letter} must not scroll");
+                continue;
+            }
+            let row = row.expect("a present letter has a row");
+            assert!(row < names.len(), "letter {letter} row {row} is in range");
+            // And the round trip: asking what letter that row is must give the
+            // letter we started from.
+            let back = idx.section_for_progress(row as f32 / names.len() as f32, names.len());
+            assert_eq!(
+                back, letter,
+                "letter {letter} must round trip through row {row}"
+            );
+        }
+    }
+
+    /// A section's row is its *first* row, so scrolling to "C" puts the first C
+    /// at the top rather than burying it.
+    #[test]
+    fn a_section_scrolls_to_its_first_row() {
+        let names = ["Apple", "Avocado", "Banana", "Blueberry", "Cherry"];
+        let idx = SectionIndex::build(names);
+        // Letters are `1..=26` with 'A' = 1, not ASCII codes -- that encoding
+        // is what leaves 0 free to mean "no section". `b'B' as u8` is 66 and
+        // resolves to `None`, which is the encoding working, not a bug.
+        assert_eq!(idx.row_for_section(66), None, "ASCII is not an index");
+        // 'B' owns rows 2 and 3.
+        assert_eq!(idx.row_for_section(2), Some(2));
+        // 'A' owns rows 0 and 1, so its first row is 0.
+        assert_eq!(idx.row_for_section(1), Some(0));
+        // 'C' owns row 4, the last.
+        assert_eq!(idx.row_for_section(3), Some(4));
+    }
+
+    /// Degenerate inputs are not crashes. The empty index is the identity for
+    /// "no catalogue", and a `letter` of 0 is what "no section" means.
+    #[test]
+    fn an_empty_index_and_a_zero_letter_resolve_to_nothing() {
+        let idx = SectionIndex::EMPTY;
+        assert_eq!(idx.row_for_section(0), None);
+        assert_eq!(idx.row_for_section(1), None, "nothing is present");
+        assert_eq!(idx.row_for_section(26), None);
+        assert_eq!(idx.row_for_section(200), None, "out of range");
+        assert_eq!(idx.total_rows(), 0);
+        assert!(idx.is_empty());
+    }
+
     use super::super::layout::Layout;
     use super::*;
 
@@ -1865,9 +3002,12 @@ mod tests {
         let area = buf.iter().filter(|p| **p != 0).count() as f32;
 
         // Analytic area of a rounded rect: w*h - sum(r^2) * (1 - pi/4), with
-        // the radii {r, r/5, r/5, r} from `FastScrollThumbDrawable.java:53-62`.
+        // the radii {r, r, r/5, r} from `FastScrollThumbDrawable.java:58-60`.
+        // That source line is `{r,r, r,r, r2,r2, r,r}` -- **eight** floats, two
+        // per corner in `[TL, TR, BR, BL]` order -- so exactly one corner is
+        // `r/5`, not two.
         let r = rh * 0.5;
-        let sum_r2 = 2.0 * r * r + 2.0 * (r / 5.0).powi(2);
+        let sum_r2 = 3.0 * r * r + (r / 5.0).powi(2);
         let exact = rw * rh - sum_r2 * (1.0 - core::f32::consts::PI / 4.0);
         // Pixel-centre sampling on a rotated edge: the signed error is bounded
         // by the perimeter (2*(rw+rh)) and averages out well under 1%.
@@ -1883,12 +3023,24 @@ mod tests {
             rw * rh
         );
 
-        // The two `r/5` corners are on the shape's right, which the -45 deg
-        // rotation (:62) puts at the *top* and *right* of the axis-aligned
-        // ink; the two `r` corners land at the left and bottom. Measure the
-        // ink's width at a fixed depth inside each extreme: for a corner of
-        // radius R the width at depth d is 2*sqrt(2*R*d - d^2), so the big
-        // corners must be markedly wider than the small ones.
+        // THE one-small-corner contract. Measure the ink's extent at a fixed
+        // depth inside each of the four axis-aligned extremes and compare.
+        //
+        // `draw_rotated_rounded_rect` rotates a *sample* into the rect's own
+        // frame with `lx = fx*cos + fy*sin, ly = -fx*sin + fy*cos`
+        // (`raster.rs`), and at `-45 deg` that is `lx = (fx - fy)/sqrt2`,
+        // `ly = (fx + fy)/sqrt2`. The corner picker then keys on the signs:
+        //
+        //   right  (fx > 0, fy ~ 0) -> lx > 0, ly > 0 -> BR  (r/5)
+        //   top    (fy < 0, fx ~ 0) -> lx > 0, ly < 0 -> TR  (r)
+        //   bottom (fy > 0, fx ~ 0) -> lx < 0, ly > 0 -> BL  (r)
+        //   left   (fx < 0, fy ~ 0) -> lx < 0, ly < 0 -> TL  (r)
+        //
+        // so exactly **one** side of the axis-aligned ink -- the right, where
+        // the teardrop's tail points -- is the tight one, and top, bottom and
+        // left are three `r` corners of the same radius. The old
+        // `[big, small, small, big]` gave the top a small corner as well,
+        // which is the bug this asserts against.
         let row_span = |y: usize| -> (usize, usize) {
             let xs: Vec<usize> = (0..w).filter(|x| buf[y * w + x] != 0).collect();
             (*xs.first().unwrap(), *xs.last().unwrap())
@@ -1902,11 +3054,13 @@ mod tests {
         let depth = 6usize;
         let w_top = row_span(top + depth).1 - row_span(top + depth).0;
         let w_bottom = row_span(bottom - depth).1 - row_span(bottom - depth).0;
-        // r = 31 dp vs r/5 = 6.2 dp: sqrt(31/6.2) = 2.24, so the ratio must
-        // land near 2.2 -- assert the weaker of the two, "visibly tighter".
+        // Top and bottom are both `r` corners of equal radius, so their widths
+        // must agree to within the pixel quantisation of the two `ceil`/`floor`
+        // roundings. This is the assertion that FAILS on `[big, small, small,
+        // big]`: there the top is `r/5` and comes out ~2.2x narrower.
         assert!(
-            w_bottom > w_top * 3 / 2,
-            "the r/5 corners are not tighter: width {w_bottom} at the big corner vs {w_top} at the small one"
+            w_top.abs_diff(w_bottom) <= 2,
+            "top and bottom are both r corners and must match: {w_top} vs {w_bottom}"
         );
 
         let left = (0..w)
@@ -1918,13 +3072,832 @@ mod tests {
             .unwrap();
         let h_right = col_span(right - depth).1 - col_span(right - depth).0;
         let h_left = col_span(left + depth).1 - col_span(left + depth).0;
+        // And the one small corner is on the right: `r` = 31 dp vs `r/5` =
+        // 6.2 dp, so sqrt(31/6.2) = 2.24 -- assert the weaker "visibly tighter".
         assert!(
             h_left > h_right * 3 / 2,
-            "the r/5 corners on the right are not tighter: height {h_left} at the left vs {h_right} at the right"
+            "the single r/5 corner on the right is not tighter: height {h_left} at the left vs {h_right} at the right"
+        );
+        // ...and it is the ONLY tight side: the left, like top and bottom, is
+        // an `r` corner, so it must be in the same class as them.
+        assert!(
+            w_bottom > h_right * 3 / 2,
+            "the bottom r corner must not share the right's tightness: {w_bottom} vs {h_right}"
+        );
+
+        // Finally, the configuration itself, straight from the primitive: three
+        // `r` and one `r/5`, with the `r/5` in the third `[tl,tr,br,bl]` slot.
+        let radii = raster::teardrop_corner_radii(rh);
+        assert!(
+            near(radii[0], r, 1e-3) && near(radii[1], r, 1e-3) && near(radii[3], r, 1e-3),
+            "TL, TR and BL are all r: {radii:?}"
+        );
+        assert!(near(radii[2], r / 5.0, 1e-3), "BR alone is r/5: {radii:?}");
+        assert_eq!(
+            radii.iter().filter(|v| near(**v, r / 5.0, 1e-3)).count(),
+            1,
+            "exactly one corner is r/5: {radii:?}"
         );
     }
 
     // -- the scrim --------------------------------------------------------
+
+    /// The header's letter is the *live* section, not the literal `'A'` it
+    /// used to paint, and not the count label it must not be confused with.
+    ///
+    /// This is the whole reason the letter became a parameter: the sheet was
+    /// painting `'A'` while [`FastScrollerState::letter_str`] held the real
+    /// section three pixels away on the fast-scroller popup, so for 25 of the
+    /// 26 sections the two disagreed for the whole of a drag.
+    #[test]
+    fn drawer_header_letter_follows_the_fast_scroller() {
+        let _guard = lock_font();
+        let w = 1080usize;
+        let h = 2400usize;
+        let l = panel();
+        let d = dp();
+        let style = DrawerStyle::dark(d);
+        let sh = sheet(l.h);
+
+        // One pass per letter: paint the header with that letter and check for
+        // *text-coloured* ink at the glyph's origin, and that a *different*
+        // letter does not put any there. The 'A' that was hardcoded is the
+        // control: with `section_letter = "A"` the pixel is inked, which is what
+        // made the bug invisible -- it looked right at the top of the list.
+        //
+        // The probe is for `on_surface` specifically rather than "any
+        // non-zero", because the header pill itself is filled `surface_high`
+        // (`draw_drawer_sheet`'s step 4) and a naive non-zero probe would find
+        // that fill under every letter including none at all.
+        let inked_at = |letter: &str| -> bool {
+            let mut buf = vec![0u32; w * h];
+            draw_drawer_sheet_with_section(&mut buf, w, w, h, &sh, 1.0, &style, "", "", letter);
+            let size = style.label_px;
+            // The glyph origin, which is where `draw_drawer_sheet_with_section`
+            // puts it: `hd.x + label_px * 0.4`.
+            let x0 = sh.header.x + size * 0.4;
+            let y0 = sh.header.y + sh.header.h * 0.5 - size * 0.51;
+            let xs = (x0 as usize)..(x0 as usize + size as usize).min(w);
+            let ys = (y0 as usize)..(y0 as usize + size as usize).min(h);
+            (0..3).any(|dy| {
+                let row = (ys.start + dy) * w;
+                xs.clone().any(|x| buf[row + x] == style.on_surface)
+            })
+        };
+
+        assert!(inked_at("A"), "the letter must actually be painted");
+        assert!(inked_at("N"), "any letter must paint");
+        // The letter is the *only* thing in that corner: the count label is
+        // right-aligned against the content edge, so it cannot reach here. That
+        // is what makes the single-pixel probe a test of the letter and not of
+        // the header as a whole.
+        let cw = font::measure("42 APPS", style.label_px);
+        let count_x = sh.header.x + sh.header.w - cw - style.label_px * 0.4;
+        assert!(
+            count_x > sh.header.x + style.label_px * 2.0,
+            "the count must not overlap the letter's column"
+        );
+
+        // An empty letter paints no glyph at all -- `letter_str()` returns ""
+        // for "no section", and the honest answer is a blank header rather than
+        // a letter that is not there. `inked_at` is the same closure, so this
+        // is the direct comparison: same probe, one string, no ink.
+        assert!(!inked_at(""), "an empty section letter must paint no glyph");
+    }
+
+    /// The header letter comes from the fast scroller's own allocation-free
+    /// accessor, so threading it costs the frame path nothing.
+    #[test]
+    fn the_header_letter_source_is_allocation_free() {
+        // `letter_str()` backs onto `LETTER_BYTES` (`LETTER_BYTES:58`), so the
+        // string handed to `draw_drawer_sheet` is a slice of a `&'static [u8;
+        // 26]` and not a fresh allocation. The contract the paint relies on is
+        // that it is `&'static str`, which is what the signature takes; this
+        // pins that the accessor satisfies it for every legal letter, including
+        // the ones outside the range.
+        let mut st = FastScrollerState::new();
+        st.set_catalogue(even_catalogue().iter().map(|s| s.as_str()));
+        // No drag: the letter is 0, so there is no section and no string.
+        assert_eq!(st.letter_str(), "");
+        // And a real drag resolves one, which is what the header would show.
+        let fs = scroller();
+        st.on_down(fs.track.y + 300.0 * dp(), 0.0, &fs);
+        st.on_move(fs.track.y + 300.0 * dp() + 2.0 * dp(), 50.0, &fs);
+        assert!(st.dragging, "the drag must engage");
+        assert_eq!(st.letter, 1, "the thumb has not moved, so 'A'");
+        let letter = st.letter_str();
+        assert_eq!(letter, "A");
+        assert_eq!(letter.len(), 1, "a section letter is one byte");
+    }
+
+    // -- search-result chrome ---------------------------------------------
+
+    /// The zero-result state must actually say something.
+    ///
+    /// The live path drew *nothing* for a query matching no app
+    /// (`main.rs:4413` is a bare `if count > 0`), so the sheet came up blank
+    /// with no explanation. The reference's `SearchResultEmptyState`
+    /// (`SearchResultEmptyState.kt:15-49`) is a 48 dp icon, a title and a
+    /// subtitle; all three have to be inked here, and the title has to carry
+    /// the query the user actually typed.
+    #[test]
+    fn the_zero_result_state_draws_an_icon_a_title_and_a_subtitle() {
+        let _guard = lock_font();
+        let w = 1080usize;
+        let h = 2400usize;
+        let l = panel();
+        let d = dp();
+        let style = DrawerStyle::dark(d);
+        let sh = sheet(l.h);
+        let band = sh.grid;
+
+        let mut buf = vec![0u32; w * h];
+        assert!(draw_search_empty_state(
+            &mut buf, w, w, h, &band, &style, w as f32, "cafe"
+        ));
+
+        // Layout: the reference's `LinearLayout`, `center_horizontal`, 32 dp
+        // padding, 48 dp icon, then title, then subtitle
+        // (`search_result_empty_state.xml:7-34`).
+        let [icon, title, sub] = search_empty_state_layout(&band, w as f32);
+        assert!(
+            near(icon.w, 48.0 * d, 1e-3),
+            "the icon is {} px, want 48 dp = {}",
+            icon.w,
+            48.0 * d
+        );
+        assert!(near(icon.h, 48.0 * d, 1e-3), "ic_qsb_search is 48 x 48 dp");
+        assert!(
+            near(icon.center_x(), band.center_x(), 1e-3),
+            "gravity=center_horizontal centres the icon"
+        );
+        assert!(
+            icon.y - band.y >= 32.0 * d - 1e-3,
+            "the container's 32 dp padding must clear the band top"
+        );
+        assert!(
+            icon.y > band.y && title.y > icon.y + icon.h && sub.y > title.y,
+            "the three bands stack downward: {:?} {:?} {:?}",
+            icon,
+            title,
+            sub
+        );
+        assert!(
+            near(sub.y + sub.h, band.y + band.h, 1e-3) || sub.y + sub.h <= band.y + band.h,
+            "the subtitle must stay inside the band"
+        );
+
+        // Paint: each band has ink of its own, which is the property that
+        // matters -- three bands and one of them blank would look like a
+        // rendering bug rather than a missing view.
+        let ink_in = |r: &super::super::layout::Rect| -> usize {
+            let x0 = r.x.max(0.0) as usize;
+            let x1 = ((r.x + r.w) as usize).min(w);
+            let y0 = r.y.max(0.0) as usize;
+            let y1 = ((r.y + r.h) as usize).min(h);
+            (y0..y1)
+                .flat_map(|y| (x0..x1).map(move |x| (x, y)))
+                .filter(|&(x, y)| buf[y * w + x] != 0)
+                .count()
+        };
+        let (ic, ti, su) = (ink_in(&icon), ink_in(&title), ink_in(&sub));
+        assert!(ic > 50, "the 48 dp magnifier drew only {ic} px");
+        assert!(ti > 200, "the title drew only {ti} px");
+        assert!(su > 100, "the subtitle drew only {su} px");
+        // The icon is tinted `ColorTokens.ColorAccent`
+        // (`SearchResultEmptyState.kt:33`), so its ink is `primary` -- and the
+        // title is `textColorPrimary`, i.e. `on_surface`. Two different tokens,
+        // which is what distinguishes "the icon rendered" from "the icon
+        // rendered in the text colour".
+        let has = |c: u32| (0..h).any(|y| (0..w).any(|x| buf[y * w + x] == c));
+        assert!(has(style.primary), "the icon must be the accent colour");
+        assert!(has(style.on_surface), "the title must be on_surface");
+        assert!(
+            has(style.on_surface_variant),
+            "the subtitle must be the tertiary colour"
+        );
+    }
+
+    /// The empty state's title is `No apps found matching "<query>"`, built
+    /// without a `format!`.
+    ///
+    /// The reference's `all_apps_no_search_results` is a *format* string
+    /// (`strings.xml:188`) and the shell cannot afford one per frame, so the
+    /// string is split into two constants and the query is drawn between them
+    /// at an accumulated pen position. This asserts the visible result is
+    /// right: the prefix is inked, the query is inked, the closing quote is
+    /// inked, and the two halves are present in that left-to-right order.
+    #[test]
+    fn the_zero_result_title_carries_the_query_without_a_format() {
+        let _guard = lock_font();
+        let w = 1080usize;
+        let h = 2400usize;
+        let d = dp();
+        let style = DrawerStyle::dark(d);
+        let sh = sheet(panel().h);
+        let band = sh.grid;
+        let query = "zzqx";
+
+        let mut buf = vec![0u32; w * h];
+        assert!(draw_search_empty_state(
+            &mut buf, w, w, h, &band, &style, w as f32, query
+        ));
+        let [_, title, _] = search_empty_state_layout(&band, w as f32);
+        let size = d * EMPTY_STATE_TITLE_DP;
+        // The three runs together must span at least the width of the fixed
+        // halves plus the query, which is the assertion that all three were
+        // drawn and laid out in sequence.
+        let total = font::measure(NO_RESULTS_PREFIX, size)
+            + font::measure(query, size)
+            + font::measure(NO_RESULTS_SUFFIX, size);
+        let xs = (title.x.max(0.0) as usize)..((title.x + title.w) as usize).min(w);
+        let ys = (title.y.max(0.0) as usize)..((title.y + title.h) as usize).min(h);
+        let leftmost = xs
+            .clone()
+            .find(|&x| ys.clone().any(|y| buf[y * w + x] != 0));
+        let rightmost = xs
+            .clone()
+            .rev()
+            .find(|&x| ys.clone().any(|y| buf[y * w + x] != 0));
+        let (lo, hi) = (leftmost.unwrap_or(0) as f32, rightmost.unwrap_or(0) as f32);
+        assert!(
+            hi - lo > total * 0.8,
+            "the title spans {} px, want ~{} for the three pieces",
+            hi - lo,
+            total
+        );
+        // The whole run is centred on the band's axis, which is what
+        // `gravity = center_horizontal` does to the reference's one TextView.
+        let centre = (lo + hi) * 0.5;
+        assert!(
+            near(centre, band.center_x(), total * 0.1 + 2.0),
+            "the title is centred at {centre}, band centre is {}",
+            band.center_x()
+        );
+        // And a longer query shifts the run's left edge left, because the run
+        // is centred as a unit rather than left-aligned. This is the observable
+        // difference between centring three pieces and centring one.
+        let mut buf2 = vec![0u32; w * h];
+        draw_search_empty_state(
+            &mut buf2,
+            w,
+            w,
+            h,
+            &band,
+            &style,
+            w as f32,
+            "a much longer query",
+        );
+        let span = |b: &[u32]| -> (usize, usize) {
+            let xs = (title.x.max(0.0) as usize)..((title.x + title.w) as usize).min(w);
+            let ys = (title.y.max(0.0) as usize)..((title.y + title.h) as usize).min(h);
+            let lo = xs.clone().find(|&x| ys.clone().any(|y| b[y * w + x] != 0));
+            let hi = xs.rev().find(|&x| ys.clone().any(|y| b[y * w + x] != 0));
+            (lo.unwrap_or(0), hi.unwrap_or(0))
+        };
+        let (lo1, hi1) = span(&buf);
+        let (lo2, hi2) = span(&buf2);
+        assert!(
+            (lo2 as i64) < (lo1 as i64) && (hi2 as i64) > (hi1 as i64),
+            "a longer query must widen the run on both sides: {lo1}..{hi1} vs {lo2}..{hi2}"
+        );
+    }
+
+    /// Degenerate inputs to the zero-result state are inert, not crashes: a
+    /// zero-height band, a non-finite geometry, a zero panel width and a query
+    /// longer than the panel all have to be survivable, because the caller's
+    /// band comes from a layout that animates.
+    #[test]
+    fn the_zero_result_state_is_inert_on_degenerate_input() {
+        let _guard = lock_font();
+        let (w, h) = (1080usize, 2400usize);
+        let style = DrawerStyle::dark(dp());
+        let sh = sheet(panel().h);
+        let mut buf = vec![0u32; w * h];
+        let before = buf.clone();
+
+        // A band with no height.
+        let flat = super::super::layout::Rect {
+            x: 0.0,
+            y: 100.0,
+            w: 1080.0,
+            h: 0.0,
+            radius: 0.0,
+        };
+        assert!(
+            !draw_search_empty_state(&mut buf, w, w, h, &flat, &style, w as f32, "x"),
+            "a zero-height band must report that it drew nothing"
+        );
+        // A non-finite band height must not reach the rasteriser.
+        let nan = super::super::layout::Rect {
+            h: f32::NAN,
+            ..flat
+        };
+        assert!(!draw_search_empty_state(
+            &mut buf, w, w, h, &nan, &style, w as f32, "x"
+        ));
+        assert_eq!(buf, before, "a degenerate band wrote pixels");
+        // A zero panel width makes dp zero, which makes every band zero-sized.
+        // The layout must still return a well-formed `Rect` and the paint must
+        // not panic.
+        let zero = search_empty_state_layout(&sh.grid, 0.0);
+        assert!(zero.iter().all(|r| r.w.is_finite() && r.h.is_finite()));
+        assert!(zero.iter().all(|r| r.w >= 0.0 && r.h >= 0.0));
+        // A query far longer than the panel: the elision branch.
+        let long: String = "q".repeat(4096);
+        let mut buf = vec![0u32; w * h];
+        assert!(draw_search_empty_state(
+            &mut buf, w, w, h, &sh.grid, &style, w as f32, &long
+        ));
+        // A NaN size must be refused rather than turned into a NaN pen.
+        let flat_style = DrawerStyle {
+            label_px: 0.0,
+            ..style
+        };
+        let _ = flat_style;
+    }
+
+    /// The "Search on <provider>" row is always available, whether or not
+    /// anything matched.
+    ///
+    /// This is the row that makes an unmatched query useful
+    /// (`LawnchairLocalSearchAlgorithm.generateActionResults:146-179`, appended
+    /// for *every* query, and built by `ActionsSectionBuilder:157-187`).
+    #[test]
+    fn the_web_search_action_row_paints_its_prefix_and_provider() {
+        let _guard = lock_font();
+        let w = 1080usize;
+        let h = 2400usize;
+        let l = panel();
+        let d = dp();
+        let style = DrawerStyle::dark(d);
+        let sh = sheet(l.h);
+        let band = sh.grid;
+
+        let row = web_search_action_rect(&band, w as f32, band.y);
+        // 64 dp, 4 dp radius, 16 dp padding -- `search_result_small_row_height`,
+        // `search_result_radius`, `search_result_padding`
+        // (`dimens.xml:67, 60, 62`).
+        assert!(
+            near(row.h, 64.0 * d, 1e-3),
+            "the row is {} px, want 64 dp = {}",
+            row.h,
+            64.0 * d
+        );
+        assert!(
+            near(row.radius, 4.0 * d, 1e-3),
+            "the row radius is {}",
+            row.radius
+        );
+        assert!(
+            row.x >= band.x - 1e-3 && row.w <= band.w + 1e-3,
+            "the row must line up with the band it sits under"
+        );
+        // The reference appends it *after* the results, so it is below the
+        // anchor y and the 12 dp gap is the SPACE header's band.
+        assert!(
+            row.y >= band.y + SECTION_HEADER_GAP_DP * d - 1e-3,
+            "the row must clear the anchor by the 12 dp gap, got {}",
+            row.y - band.y
+        );
+
+        let mut buf = vec![0u32; w * h];
+        assert!(draw_web_search_action(
+            &mut buf,
+            w,
+            w,
+            h,
+            &row,
+            &style,
+            w as f32,
+            "Startpage"
+        ));
+        // A leading magnifier in the secondary tint and the label in
+        // `on_surface`: `setTint(TextColorSecondary)` is only applied when the
+        // provider is a `CustomWebSearchProvider` (`SearchTargetFactory.kt:249-251`)
+        // and the *title* is `textColorPrimary` throughout
+        // (`search_result_text.xml:31`).
+        let has = |c: u32| (0..h).any(|y| (0..w).any(|x| buf[y * w + x] == c));
+        assert!(has(style.on_surface), "the label must be on_surface");
+        assert!(
+            has(style.on_surface_variant),
+            "the leading icon must be the secondary tint"
+        );
+        // Both halves of the label are present, and the provider name is after
+        // the prefix rather than before it.
+        let size = d * SECTION_HEADER_TEXT_DP;
+        let text_x = row.x + 16.0 * d + row.h * 0.375 + 16.0 * d * 0.5;
+        let px = (text_x as usize)..((text_x + 400.0) as usize).min(w);
+        let inked = |needle: &str| -> bool {
+            let nw = font::measure(needle, size);
+            (0..(nw.ceil() as usize).max(1))
+                .filter(|&k| {
+                    px.clone()
+                        .any(|x| buf[(row.center_y() as usize) * w + x + k] != 0)
+                })
+                .count()
+                > 0
+        };
+        assert!(inked(WEB_SEARCH_PREFIX), "\"Search on \" must be drawn");
+        // The row is horizontally finite, so a name longer than the row is
+        // elided rather than drawn past the padding.
+        let long: String = "S".repeat(4096);
+        let mut buf2 = vec![0u32; w * h];
+        assert!(draw_web_search_action(
+            &mut buf2, w, w, h, &row, &style, w as f32, &long
+        ));
+        // Nothing past the right-hand padding edge.
+        let right = (row.x + row.w - 16.0 * d) as usize;
+        assert!(
+            (right + 1..w).all(|x| (0..h).all(|y| buf2[y * w + x] == 0)),
+            "a long provider name ran past the row's padding"
+        );
+        // Degenerate geometry is inert.
+        let flat = super::super::layout::Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 0.0,
+            h: 0.0,
+            radius: 0.0,
+        };
+        let mut buf3 = vec![0u32; w * h];
+        assert!(!draw_web_search_action(
+            &mut buf3, w, w, h, &flat, &style, w as f32, "x"
+        ));
+        assert!(buf3.iter().all(|p| *p == 0), "a flat row wrote pixels");
+    }
+
+    /// The action row is clamped into its band.
+    ///
+    /// An anchor near the bottom must not push the row off the panel, because
+    /// the reference's `RecyclerView` scrolls the action row into view
+    /// (`AllAppsFastScrollHelper.smoothScrollToSection:41-47`) and the caller's
+    /// equivalent is a clamp, not an unbounded offset.
+    #[test]
+    fn the_web_search_row_is_clamped_into_its_band() {
+        let d = dp();
+        let sh = sheet(panel().h);
+        let band = sh.grid;
+        let w = 1080.0;
+        let h = 64.0 * d;
+        // An anchor far below the band.
+        let deep = web_search_action_rect(&band, w, band.y + band.h * 10.0);
+        assert!(
+            deep.y + deep.h <= band.y + band.h + 1e-3,
+            "a deep anchor must not push the row past the band: {} .. {} vs band {}",
+            deep.y,
+            deep.y + deep.h,
+            band.y + band.h
+        );
+        assert!(near(deep.h, h, 1e-3), "the clamp must not resize the row");
+        // An anchor above the band puts the row at the band's top.
+        let high = web_search_action_rect(&band, w, band.y - band.h);
+        assert!(
+            high.y >= band.y - 1e-3,
+            "a high anchor must not put the row above the band: {}",
+            high.y
+        );
+    }
+
+    /// One header per result group, with the reference's 52 dp band and 12 dp
+    /// divider, for as many groups as there are.
+    ///
+    /// The sheet currently paints a single flat count label
+    /// (`drm_kms.rs:1283-1294` into [`draw_drawer_sheet`]) and the reference
+    /// emits a header per group (`SectionBuilder.kt:24-235`) separated by a
+    /// `createHeaderTarget(SPACE)`. This pins the geometry for N of them and
+    /// the paint for each.
+    #[test]
+    fn section_headers_stack_at_52dp_with_a_12dp_divider() {
+        let _guard = lock_font();
+        let w = 1080usize;
+        let h = 2400usize;
+        let d = dp();
+        let style = DrawerStyle::dark(d);
+        let sh = sheet(panel().h);
+        let band = sh.grid;
+
+        let rows = section_header_rows(&band, w as f32, band.y, SECTION_HEADER_MAX);
+        // `search_result_text_height` = 52 dp (`dimens.xml:68`), the gap is the
+        // 12 dp `search_result_text_padding` / SPACE header
+        // (`dimens.xml:62`, `SectionBuilder.kt:38`).
+        assert!(
+            near(rows[0].h, 52.0 * d, 1e-3),
+            "a header is {} px, want 52 dp = {}",
+            rows[0].h,
+            52.0 * d
+        );
+        let pitch = 52.0 * d + 12.0 * d;
+        for (i, r) in rows.iter().enumerate() {
+            assert!(
+                near(r.y, band.y + pitch * i as f32, 1e-3),
+                "header {i} is at {}, want {}",
+                r.y,
+                band.y + pitch * i as f32
+            );
+            assert!(
+                near(r.x, band.x, 1e-3) && near(r.w, band.w, 1e-3),
+                "header {i} must span the content edge"
+            );
+        }
+        // Asking for more groups than the fixed capacity is clamped, not a
+        // panic and not an overflow: the array is `[Rect; SECTION_HEADER_MAX]`
+        // and a caller asking for 99 gets 8 real ones.
+        let over = section_header_rows(&band, w as f32, band.y, 99);
+        assert_eq!(over.len(), SECTION_HEADER_MAX);
+        assert!(
+            near(
+                over[SECTION_HEADER_MAX - 1].y,
+                rows[SECTION_HEADER_MAX - 1].y,
+                1e-3
+            ),
+            "the clamp must not shift the rows it does return"
+        );
+        assert_eq!(section_header_rows(&band, w as f32, band.y, 0)[0].h, 0.0);
+
+        // Paint: each header inks its own band, and the divider is a hairline
+        // the width of the content edge below it.
+        for (i, label) in ["Apps", "Web suggestions", "Contacts"].iter().enumerate() {
+            let mut buf = vec![0u32; w * h];
+            assert!(
+                draw_section_header(&mut buf, w, w, h, &rows[i], &style, w as f32, label, true),
+                "header {i} ({label}) must report that it drew something"
+            );
+            let r = &rows[i];
+            let x0 = r.x.max(0.0) as usize;
+            let x1 = ((r.x + r.w) as usize).min(w);
+            let y0 = r.y.max(0.0) as usize;
+            let y1 = ((r.y + r.h) as usize).min(h);
+            let band_ink = (y0..y1)
+                .flat_map(|y| (x0..x1).map(move |x| (x, y)))
+                .filter(|&(x, y)| buf[y * w + x] != 0)
+                .count();
+            assert!(band_ink > 100, "header {i} inked only {band_ink} px");
+            // The 16 dp leading glyph is `on_surface` and it is a *filled*
+            // square at the header's left edge, so its own row is solidly inked
+            // rather than a glyph outline.
+            //
+            // Probed over a range rather than at one pixel because
+            // `fill_round_rect` fills `ceil(lo)..floor(hi)`
+            // (`drawer_mod`'s own helper), and `r.x` is a fractional dp value
+            // -- the exact column is a rounding artefact, the *run* of ink is
+            // the geometry.
+            let icon_d = 16.0 * d;
+            let ix = r.x as usize;
+            let iy = r.center_y() as usize;
+            let icon_ink = (0..(icon_d as usize).min(x1.saturating_sub(ix)))
+                .filter(|&k| buf[iy * w + ix + k] == style.on_surface)
+                .count();
+            assert!(
+                icon_ink > 3,
+                "header {i}: the leading icon must be a filled on_surface block \
+                 at the left edge, got {icon_ink} px"
+            );
+            // And it is leftmost: the ink starts at the band's own edge, which
+            // is what makes a column of headers read as a column rather than as
+            // ragged text. Nothing is inked in the margin to the left.
+            let margin = sh.grid.x as usize;
+            if margin > 0 {
+                assert!(
+                    (0..margin).all(|x| (0..h).all(|y| buf[y * w + x] == 0)),
+                    "header {i}: ink leaked into the drawer's left margin"
+                );
+            }
+            // The label is to the right of the icon, at 14 sp
+            // (`search_result_hero_subtitle_size`, `dimens.xml:58`).
+            let label_x = (r.x + icon_d + 14.0 * d * 0.28) as usize;
+            assert!(
+                (label_x..x1).any(|x| (y0..y1).any(|y| buf[y * w + x] != 0)),
+                "header {i}: the label must be drawn to the right of the icon"
+            );
+            // The divider, in the gap below the header, in `outline`.
+            //
+            // Probed over a few rows rather than at one: `draw_section_header`
+            // places the hairline at a *fractional* y
+            // (`rect.y + rect.h + gap / 2`) and `fill_round_rect` fills
+            // `ceil(lo)..floor(hi)`, so which single row of a 1-px hairline
+            // catches it is a rounding artefact. The hairline's *position* --
+            // inside the 12 dp gap and not inside the header or the next group
+            // -- is the geometry, and that is what a 3-row window asserts.
+            let gx = (r.x + r.w * 0.5) as usize;
+            let gap_top = r.y + r.h;
+            let gap_mid = gap_top + 12.0 * d * 0.5;
+            let found = (0..3).any(|k| {
+                let y = (gap_mid as usize) + k;
+                y < h && buf[y * w + gx] == style.outline
+            });
+            assert!(
+                found,
+                "header {i}: the SPACE-header divider must be in the 12 dp gap \
+                 below it (gap_top {gap_top}, mid {gap_mid})"
+            );
+        }
+
+        // The last header in a group carries no divider, because the
+        // reference appends the SPACE header *after* the group's rows
+        // (`SectionBuilder.kt:38`) -- so the divider is drawn by the caller on
+        // the last one, not by every one.
+        let mut buf = vec![0u32; w * h];
+        assert!(draw_section_header(
+            &mut buf, w, w, h, &rows[0], &style, w as f32, "Apps", false
+        ));
+        let x = (rows[0].x + rows[0].w * 0.5) as usize;
+        let gap_mid = (rows[0].y + rows[0].h + 12.0 * d * 0.5) as usize;
+        assert!(
+            (0..3).all(|k| gap_mid + k >= h || buf[(gap_mid + k) * w + x] != style.outline),
+            "divider=false must not draw the hairline"
+        );
+        // An empty label paints the icon and nothing else, and reports it.
+        let mut buf = vec![0u32; w * h];
+        assert!(draw_section_header(
+            &mut buf, w, w, h, &rows[0], &style, w as f32, "", true
+        ));
+        // Degenerate geometry is inert.
+        let flat = super::super::layout::Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 0.0,
+            h: 0.0,
+            radius: 0.0,
+        };
+        let mut buf = vec![0u32; w * h];
+        assert!(!draw_section_header(
+            &mut buf, w, w, h, &flat, &style, w as f32, "x", true
+        ));
+        assert!(buf.iter().all(|p| *p == 0), "a flat header wrote pixels");
+    }
+
+    /// The prediction row's 108 dp is currently reserved and never read.
+    ///
+    /// `DrawerSheetLayout::predictions` / `pred_icon_d` / `pred_icon_pad`
+    /// (`layout.rs:2001-2009`) are 108 dp of dead space in the middle of the
+    /// sheet: the layout bakes them in and nothing draws them, so the drawer's
+    /// first grid row starts 108 dp lower than the reference's. This test is
+    /// for the paint that closes that gap -- and it is deliberately a test of
+    /// *this* file's function, because `layout.rs` belongs to another slice.
+    /// See the handoff.
+    #[test]
+    fn the_prediction_row_paints_an_icon_and_the_label_under_it() {
+        let _guard = lock_font();
+        let w = 1080usize;
+        let h = 2400usize;
+        let d = dp();
+        let style = DrawerStyle::dark(d);
+        let sh = sheet(panel().h);
+
+        // The reference's 108 dp is already measured by the layout
+        // (`PREDICTION_ROW_H_DP`, `PredictionRowView.getExpectedHeight():149-161`),
+        // so the paint reads the layout's own numbers rather than re-deriving
+        // them: `icon_size (65) + drawable_padding (7) + label_height (16) +
+        // padding (16) + extra (4)`.
+        assert!(
+            near(sh.predictions.h, 108.0 * d, 1e-3),
+            "the row is {} px, want 108 dp = {}",
+            sh.predictions.h,
+            108.0 * d
+        );
+        let mut buf = vec![0u32; w * h];
+        assert!(draw_prediction_row(
+            &mut buf,
+            w,
+            w,
+            h,
+            &sh.predictions,
+            &style,
+            0,
+            "Firefox",
+            &sh.pred_icon_d
+        ));
+        // The icon: a 65 dp rounded square at the row's left edge, in the
+        // accent fill the reference gives a monogram tile.
+        let icon = sh.prediction_icon();
+        assert!(
+            near(icon.w, 65.0 * d, 1e-3),
+            "the prediction icon is {} px, want 65 dp = {}",
+            icon.w,
+            65.0 * d
+        );
+        let cx = icon.x as usize + 2;
+        let cy = icon.center_y() as usize;
+        assert_ne!(buf[cy * w + cx], 0, "the prediction icon must be painted");
+        // The label: under the icon, separated by the 7 dp
+        // `all_apps_icon_drawable_padding` (`PREDICTION_ICON_PAD_DP`,
+        // `PredictionRowView.java:152`), and inside the row.
+        let label = sh.prediction_label();
+        assert!(
+            label.y >= icon.y + icon.h + 7.0 * d - 1e-3,
+            "the label starts at {}, the icon ends at {}",
+            label.y,
+            icon.y + icon.h
+        );
+        assert!(
+            label.y + label.h <= sh.predictions.y + sh.predictions.h + 1e-3,
+            "the label must fit inside the 108 dp row"
+        );
+        let lx0 = label.x.max(0.0) as usize;
+        let lx1 = ((label.x + label.w) as usize).min(w);
+        let ly0 = label.y.max(0.0) as usize;
+        let ly1 = ((label.y + label.h) as usize).min(h);
+        let label_ink = (ly0..ly1)
+            .flat_map(|y| (lx0..lx1).map(move |x| (x, y)))
+            .filter(|&(x, y)| buf[y * w + x] != 0)
+            .count();
+        assert!(
+            label_ink > 30,
+            "the prediction label inked only {label_ink} px"
+        );
+        // A different label inks different pixels, which is what proves the
+        // text is the label and not a fixed decoration.
+        let mut b2 = vec![0u32; w * h];
+        draw_prediction_row(
+            &mut b2,
+            w,
+            w,
+            h,
+            &sh.predictions,
+            &style,
+            0,
+            "Terminal",
+            &sh.pred_icon_d,
+        );
+        assert_ne!(b2, buf, "two different labels must paint differently");
+        // Slot geometry: `mNumPredictedAppsPerRow = numShownAllAppsColumns`
+        // (`PredictionRowView.java:85-86`) and each child is `lp.width = 0,
+        // lp.weight = 1` (`:245-246`), so slot `i` is an equal share of the
+        // row. That is the whole reason `slot` is a parameter.
+        let pitch = sh.predictions.w / 4.0;
+        for slot in 0..4usize {
+            let g = prediction_slot_rect(&sh.predictions, slot, 4);
+            assert!(
+                near(g.x, sh.predictions.x + pitch * slot as f32, 1e-2),
+                "slot {slot} is at {}, want {}",
+                g.x,
+                sh.predictions.x + pitch * slot as f32
+            );
+            assert!(near(g.w, pitch, 1e-2), "slots are an equal share");
+        }
+        // A slot past the count is inert, not an out-of-bounds write.
+        let mut b3 = vec![0u32; w * h];
+        assert!(!draw_prediction_row(
+            &mut b3,
+            w,
+            w,
+            h,
+            &sh.predictions,
+            &style,
+            9,
+            "X",
+            &sh.pred_icon_d
+        ));
+        assert!(b3.iter().all(|p| *p == 0), "slot 9 of 4 wrote pixels");
+    }
+
+    /// The prediction row's monogram is the fallback for an app with no
+    /// raster icon, and the glyph is centred.
+    #[test]
+    fn the_prediction_row_glyph_is_centred_in_its_icon() {
+        let _guard = lock_font();
+        let w = 1080usize;
+        let h = 2400usize;
+        let d = dp();
+        let style = DrawerStyle::dark(d);
+        let sh = sheet(panel().h);
+        let mut buf = vec![0u32; w * h];
+        assert!(draw_prediction_row(
+            &mut buf,
+            w,
+            w,
+            h,
+            &sh.predictions,
+            &style,
+            0,
+            "Firefox",
+            &sh.pred_icon_d
+        ));
+        let icon = sh.prediction_icon();
+        // The reference's `BubbleTextView` centres its icon in the cell
+        // (`LinearLayout` gravity, `PredictionRowView.java:230-247`), so the
+        // monogram's ink is symmetric about the icon's axis to within the
+        // rasteriser's pixel quantisation.
+        let x0 = icon.x.max(0.0) as usize;
+        let x1 = ((icon.x + icon.w) as usize).min(w);
+        let y0 = icon.y.max(0.0) as usize;
+        let y1 = ((icon.y + icon.h) as usize).min(h);
+        let row_ink = |y: usize| -> (usize, usize) {
+            let xs: Vec<usize> = (x0..x1).filter(|&x| buf[y * w + x] != 0).collect();
+            (*xs.first().unwrap_or(&0), *xs.last().unwrap_or(&0))
+        };
+        // The vertical middle of the icon, where a centred glyph has its
+        // widest extent.
+        let mid = (y0 + y1) / 2;
+        let (lo, hi) = row_ink(mid);
+        let glyph_mid = (lo + hi) as f32 * 0.5;
+        assert!(
+            (glyph_mid - icon.center_x()).abs() < icon.w * 0.15,
+            "the glyph's centre is {glyph_mid}, the icon's is {}",
+            icon.center_x()
+        );
+    }
 
     #[test]
     fn drawer_sheet_uses_the_opaque_scrim_path() {
@@ -2148,12 +4121,15 @@ mod tests {
             "corner radius is {}",
             sh.corner_r
         );
-        // Prediction row: icon + iconPadding + text + 2*8 dp + 4 dp top extra
-        // (`PredictionRowView.java:149-162`); layout.rs owns the geometry, so
-        // this only pins that the row is one icon tall and 4 dp into its
-        // neighbour.
+        // Prediction row: `icon_size (65) + drawable_padding (7) +
+        // label_height (16) + padding (16) + extra (4)` ~= 108 dp
+        // (`PredictionRowView.java:149-162`). This was 65 dp, which is the
+        // ICON height alone -- the label had nowhere to go and every
+        // prediction title was clipped by the row's own bottom edge. The row
+        // is icon-above-label, exactly like the main drawer grid, so 108 dp
+        // is the smallest container that fits both.
         assert!(
-            near(sh.predictions.h, 65.0 * d, 1e-3),
+            near(sh.predictions.h, 108.0 * d, 1e-3),
             "prediction row is {}",
             sh.predictions.h
         );

@@ -23,13 +23,47 @@ pub const NOTO_SANS_CANDIDATE_PATHS: &[&str] = &[
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
 ];
 
-/// Flattened line segment in font design units (1000 units/em).
+/// One flattened outline segment, in **font design units**.
+///
+/// `i16`, not `f32`, and that is a deliberate memory decision. These lines are
+/// parsed once for every covered codepoint and then live for the life of the
+/// process: 2378 glyphs hold ~122k segments, so `f32` costs 16 bytes each and
+/// the table came to 2.9 MB of RSS -- 39% of this launcher's 15 MiB budget, for
+/// numbers that are small integers. `i16` halves it to ~1.45 MB with no
+/// coverage change and no precision loss: design units are 0..~4096 for any
+/// real face, and every consumer scales to pixels immediately.
+///
+/// Coordinates outside `i16` (a malformed font, or a composite transform that
+/// runs away) **saturate** rather than wrap: a clamped line draws slightly
+/// wrong, a wrapped one draws on the wrong side of the glyph.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TtfLine {
-    pub x0: f32,
-    pub y0: f32,
-    pub x1: f32,
-    pub y1: f32,
+    pub x0: i16,
+    pub y0: i16,
+    pub x1: i16,
+    pub y1: i16,
+}
+
+impl TtfLine {
+    /// A segment from float design units, each coordinate saturated to `i16`.
+    #[inline]
+    fn new(x0: f32, y0: f32, x1: f32, y1: f32) -> Self {
+        Self {
+            x0: sat_i16(x0),
+            y0: sat_i16(y0),
+            x1: sat_i16(x1),
+            y1: sat_i16(y1),
+        }
+    }
+}
+
+/// Saturating `f32` -> `i16`, mapping NaN to 0.
+#[inline]
+fn sat_i16(v: f32) -> i16 {
+    if v.is_nan() {
+        return 0;
+    }
+    v.clamp(i16::MIN as f32, i16::MAX as f32) as i16
 }
 
 /// Pre-parsed TrueType glyph for fast rasterization.
@@ -41,13 +75,134 @@ pub struct TtfGlyph {
     pub lines: Vec<TtfLine>,
 }
 
-/// Loaded TrueType font holding ASCII printable glyphs (0x20..0x7F).
+/// The codepoint ranges pre-parsed at load time, ascending and disjoint.
+///
+/// Not "all of Unicode": a `TtfGlyph` owns a `Vec<TtfLine>`, so pre-parsing
+/// everything would cost megabytes and seconds of boot for glyphs no launcher
+/// string will ever contain. What is here is what app names, contacts, message
+/// senders and file paths are actually made of:
+///
+/// | range | block | why |
+/// |---|---|---|
+/// | 0x20..0x7F | ASCII | the base set, unchanged |
+/// | 0xA0..0x100 | Latin-1 Supplement | `\u{e9}`-style accents, `\u{fc}`, `\u{f1}` |
+/// | 0x100..0x180 | Latin Extended-A | Polish, Czech, Hungarian, Latvian |
+/// | 0x180..0x250 | Latin Extended-B | the rest of the European letters |
+/// | 0x250..0x2AF | IPA Extensions | language names |
+/// | 0x370..0x400 | Greek | `\u{3b1}`.., monotonic |
+/// | 0x400..0x530 | Cyrillic + Supplement | Russian, Ukrainian, Serbian |
+/// | 0x530..0x590 | Armenian | |
+/// | 0x5D0..0x5EB | Hebrew | right-to-left, still shaped LTR here |
+/// | 0x5F0..0x650 | Hebrew presentation forms | |
+/// | 0x600..0x6FF | Arabic | |
+/// | 0x2000..0x2070 | General Punctuation | dashes, quotes, ellipsis |
+/// | 0x20A0..0x20C0 | Currency | |
+/// | 0x2100..0x2150 | Letterlike Symbols | |
+/// | 0x2190..0x21C0 | Arrows | |
+/// | 0x2200..0x22FF | Math Operators | |
+/// | 0x2500..0x2580 | Box Drawing | |
+/// | 0x25A0..0x2600 | Geometric Shapes | |
+/// | 0x3000..0{3040} | CJK Symbols and Punctuation | `\u{3001}`, `\u{3002}` |
+/// | 0xFF01..0xFF60 | Halfwidth and Fullwidth Forms | |
+///
+/// **CJK ideographs and Hangul are deliberately absent.** Noto Sans does not
+/// cover them either, so a pre-parse would yield an empty table for the most
+/// expensive ranges in Unicode. Those codepoints fall through to the visible
+/// placeholder box in `font::draw_glyph`, which is a truthful answer: the
+/// glyph is genuinely missing, and a box says so where blank space did not.
+pub const COVERED_RANGES: &[(u32, u32)] = &[
+    (0x0020, 0x0080),
+    (0x00A0, 0x0100),
+    (0x0100, 0x0250),
+    (0x0250, 0x02B0),
+    (0x0370, 0x0400),
+    (0x0400, 0x0530),
+    (0x0530, 0x0590),
+    (0x05D0, 0x05EB),
+    (0x05F0, 0x0650),
+    (0x0600, 0x0700),
+    (0x2000, 0x2070),
+    (0x20A0, 0x20C0),
+    (0x2100, 0x2150),
+    (0x2190, 0x21C0),
+    (0x2200, 0x2300),
+    (0x2500, 0x2580),
+    (0x25A0, 0x2600),
+    (0x3000, 0x3040),
+    (0xFF01, 0xFF60),
+];
+
+/// Total codepoints in [`COVERED_RANGES`], computed rather than written down.
+pub const COVERED_COUNT: u32 = {
+    let mut n = 0;
+    let mut i = 0;
+    while i < COVERED_RANGES.len() {
+        n += COVERED_RANGES[i].1 - COVERED_RANGES[i].0;
+        i += 1;
+    }
+    n
+};
+
+/// Loaded TrueType font holding every codepoint in [`COVERED_RANGES`].
+///
+/// `cps` is ascending and parallel to `glyphs`; a lookup is a binary search.
+/// That costs ~9 comparisons on a ~1000-entry table, which is free next to the
+/// rasterisation it precedes, and it avoids a 64 KiB direct-map index whose
+/// memset would show up in the boot budget.
 #[derive(Debug, Clone)]
 pub struct TrueTypeFont {
     pub units_per_em: f32,
     pub ascender: f32,
     pub descender: f32,
-    pub glyphs: [Option<TtfGlyph>; 96],
+    /// Pre-parsed codepoints, ascending. Parallel to `glyphs`.
+    pub cps: Vec<u16>,
+    /// `None` where the glyph was in range but its outline would not parse.
+    pub glyphs: Vec<Option<TtfGlyph>>,
+    /// `true` where the glyph is in range but its outline would not render.
+    ///
+    /// Parallel to `cps` and `glyphs`. This is what separates "a space, which
+    /// is correctly blank" from "`\u{e9}`, whose composite outline we could
+    /// not assemble" -- both are present, both carry no lines, and only one of
+    /// them should produce a visible placeholder.
+    pub unrenderable: Vec<bool>,
+}
+
+impl TrueTypeFont {
+    /// Index into [`Self::glyphs`] for `cp`, or `None` if `cp` is out of range.
+    ///
+    /// `None` means "not pre-parsed", *not* "no glyph": the caller distinguishes
+    /// the two by re-checking `glyphs[i]`.
+    #[inline]
+    pub fn glyph_index(&self, cp: char) -> Option<usize> {
+        let c = cp as u32;
+        if c > u16::MAX as u32 {
+            return None;
+        }
+        self.cps.binary_search(&(c as u16)).ok()
+    }
+
+    /// The parsed glyph for `cp`, if this font has one.
+    ///
+    /// Returns the entry even when it is marked [`Self::unrenderable`]: the
+    /// advance and side bearing are still correct, so metrics are safe to read.
+    /// Use [`Self::can_draw`] to decide whether to draw.
+    #[inline]
+    pub fn glyph(&self, cp: char) -> Option<&TtfGlyph> {
+        self.glyph_index(cp).and_then(|i| self.glyphs[i].as_ref())
+    }
+
+    /// Whether this font can actually put ink on the page for `cp`.
+    ///
+    /// False for a codepoint outside [`COVERED_RANGES`] and for one whose
+    /// outline would not assemble. True for a space, which is drawable and
+    /// simply has nothing to draw.
+    #[inline]
+    pub fn can_draw(&self, cp: char) -> bool {
+        match self.glyph_index(cp) {
+            Some(i) => !self.unrenderable[i],
+            None => false,
+        }
+    }
 }
 
 impl TrueTypeFont {
@@ -167,7 +322,9 @@ impl TrueTypeFont {
                             return (cp as i16).wrapping_add(id_delta) as u16;
                         } else {
                             let ro_addr = id_range_offsets_pos + i * 2;
-                            let target_addr = ro_addr + id_range_offset as usize + ((cp - start_code) as usize * 2);
+                            let target_addr = ro_addr
+                                + id_range_offset as usize
+                                + ((cp - start_code) as usize * 2);
                             if target_addr + 2 <= fmt4.len() {
                                 let gid = read_u16(fmt4, target_addr);
                                 if gid != 0 {
@@ -182,10 +339,31 @@ impl TrueTypeFont {
             0
         };
 
-        const NONE: Option<TtfGlyph> = None;
-        let mut glyphs: [Option<TtfGlyph>; 96] = [NONE; 96];
+        let mut cps: Vec<u16> = Vec::with_capacity(COVERED_COUNT as usize);
+        let mut glyphs: Vec<Option<TtfGlyph>> = Vec::with_capacity(COVERED_COUNT as usize);
 
-        for cp in 0x20u16..0x80u16 {
+        // Ascending, so `cps` stays sorted for `glyph_index`'s binary search.
+        // Each iteration reserves its own slot first: the parse below has
+        // several `continue` paths (malformed outline, short glyph slice) that
+        // must leave a *present but empty* entry rather than shifting every
+        // later glyph down by one.
+        let mut covered: Vec<u16> = Vec::with_capacity(COVERED_COUNT as usize);
+        for (lo, hi) in COVERED_RANGES {
+            let mut cp = *lo;
+            while cp < *hi {
+                covered.push(cp as u16);
+                cp += 1;
+            }
+        }
+        covered.sort_unstable();
+        covered.dedup();
+
+        let mut unrenderable: Vec<bool> = Vec::with_capacity(COVERED_COUNT as usize);
+        for cp in covered {
+            cps.push(cp);
+            glyphs.push(None);
+            unrenderable.push(true);
+            let slot = cps.len() - 1;
             let gid = get_glyph_id(cp) as usize;
             let (aw, lsb) = if gid < num_hmetrics && (gid * 4 + 4) <= hmtx_data.len() {
                 let a = read_u16(hmtx_data, gid * 4) as f32;
@@ -195,183 +373,98 @@ impl TrueTypeFont {
                 (units_per_em * 0.6, 0.0)
             };
 
-            // Get glyph offset from loca table
-            let (off_start, off_end) = if index_to_loc_format == 0 {
-                if (gid * 2 + 4) <= loca_data.len() {
-                    let s = (read_u16(loca_data, gid * 2) as usize) * 2;
-                    let e = (read_u16(loca_data, (gid + 1) * 2) as usize) * 2;
-                    (s, e)
-                } else {
-                    (0, 0)
-                }
-            } else if (gid * 4 + 8) <= loca_data.len() {
-                let s = read_u32(loca_data, gid * 4) as usize;
-                let e = read_u32(loca_data, (gid + 1) * 4) as usize;
-                (s, e)
-            } else {
-                (0, 0)
-            };
+            // Resolve the outline through `resolve_glyph_lines`, which handles
+            // simple *and* composite glyphs. The old body inlined only the
+            // simple case and stored an empty outline for anything else, which
+            // silently emptied every precomposed accented Latin letter.
+            let mut lines: Vec<TtfLine> = Vec::new();
+            let resolved = resolve_glyph_lines(
+                gid,
+                glyf_data,
+                loca_data,
+                index_to_loc_format,
+                0,
+                &mut lines,
+            );
 
-            if off_start >= off_end || off_end > glyf_data.len() {
-                // Empty glyph (e.g. space)
-                glyphs[(cp - 0x20) as usize] = Some(TtfGlyph {
+            if resolved != Outline::Drawn {
+                // Either blank by design (a space: no ink, but perfectly
+                // drawable) or an outline that would not parse. The metrics
+                // from `hmtx` are correct either way, so the string stays
+                // *spaced* correctly; only the ink differs. `unrenderable`
+                // is what tells the two apart for the caller, so a space is
+                // silent and a failure gets a visible placeholder.
+                glyphs[slot] = Some(TtfGlyph {
                     advance: aw,
                     lsb,
                     bbox: (0.0, 0.0, 0.0, 0.0),
                     lines: Vec::new(),
                 });
+                unrenderable[slot] = resolved == Outline::Failed;
                 continue;
             }
 
-            let gslice = &glyf_data[off_start..off_end];
-            let num_contours = read_i16(gslice, 0);
-            if num_contours <= 0 {
-                // Compound glyph or empty
-                glyphs[(cp - 0x20) as usize] = Some(TtfGlyph {
-                    advance: aw,
-                    lsb,
-                    bbox: (0.0, 0.0, 0.0, 0.0),
-                    lines: Vec::new(),
-                });
-                continue;
-            }
+            // The bbox is the glyph header's own, which is already the union of
+            // every component's for a composite. Re-deriving it from the lines
+            // would also work, but the header is authoritative and free.
+            let (x_min, y_min, x_max, y_max) = glyph_span(gid, loca_data, index_to_loc_format)
+                .filter(|&(a, end)| a < end && end <= glyf_data.len())
+                .map(|(a, end)| {
+                    let gs = &glyf_data[a..end];
+                    (
+                        read_i16(gs, 2) as f32,
+                        read_i16(gs, 4) as f32,
+                        read_i16(gs, 6) as f32,
+                        read_i16(gs, 8) as f32,
+                    )
+                })
+                .unwrap_or((0.0, 0.0, 0.0, 0.0));
 
-            let nc = num_contours as usize;
-            if gslice.len() < 10 + nc * 2 {
-                continue;
-            }
-
-            let x_min = read_i16(gslice, 2) as f32;
-            let y_min = read_i16(gslice, 4) as f32;
-            let x_max = read_i16(gslice, 6) as f32;
-            let y_max = read_i16(gslice, 8) as f32;
-
-            let mut end_pts = Vec::with_capacity(nc);
-            for c in 0..nc {
-                end_pts.push(read_u16(gslice, 10 + c * 2) as usize);
-            }
-
-            let num_pts = end_pts[nc - 1] + 1;
-            let ins_len = read_u16(gslice, 10 + nc * 2) as usize;
-            let mut ptr = 12 + nc * 2 + ins_len;
-
-            // Read flags
-            let mut flags = Vec::with_capacity(num_pts);
-            while flags.len() < num_pts && ptr < gslice.len() {
-                let fl = gslice[ptr];
-                ptr += 1;
-                flags.push(fl);
-                if (fl & 0x08) != 0 && ptr < gslice.len() {
-                    let repeat = gslice[ptr] as usize;
-                    ptr += 1;
-                    for _ in 0..repeat {
-                        if flags.len() < num_pts {
-                            flags.push(fl);
-                        }
-                    }
-                }
-            }
-
-            if flags.len() < num_pts {
-                continue;
-            }
-
-            // Read X coordinates
-            let mut xs = Vec::with_capacity(num_pts);
-            let mut cur_x: i32 = 0;
-            for &fl in &flags {
-                if (fl & 0x02) != 0 {
-                    if ptr < gslice.len() {
-                        let dx = gslice[ptr] as i32;
-                        ptr += 1;
-                        cur_x += if (fl & 0x10) != 0 { dx } else { -dx };
-                    }
-                } else if (fl & 0x10) == 0 {
-                    if ptr + 2 <= gslice.len() {
-                        let dx = read_i16(gslice, ptr) as i32;
-                        ptr += 2;
-                        cur_x += dx;
-                    }
-                }
-                xs.push(cur_x as f32);
-            }
-
-            // Read Y coordinates
-            let mut ys = Vec::with_capacity(num_pts);
-            let mut cur_y: i32 = 0;
-            for &fl in &flags {
-                if (fl & 0x04) != 0 {
-                    if ptr < gslice.len() {
-                        let dy = gslice[ptr] as i32;
-                        ptr += 1;
-                        cur_y += if (fl & 0x20) != 0 { dy } else { -dy };
-                    }
-                } else if (fl & 0x20) == 0 {
-                    if ptr + 2 <= gslice.len() {
-                        let dy = read_i16(gslice, ptr) as i32;
-                        ptr += 2;
-                        cur_y += dy;
-                    }
-                }
-                ys.push(cur_y as f32);
-            }
-
-            if xs.len() < num_pts || ys.len() < num_pts {
-                continue;
-            }
-
-            // Decompose contours into lines
-            let mut lines = Vec::new();
-            let mut start_idx = 0;
-            for &ep in &end_pts {
-                if ep < start_idx || ep >= num_pts {
-                    continue;
-                }
-                let contour_len = ep - start_idx + 1;
-                if contour_len >= 2 {
-                    let mut contour_pts = Vec::with_capacity(contour_len);
-                    for i in start_idx..=ep {
-                        contour_pts.push((xs[i], ys[i], (flags[i] & 0x01) != 0));
-                    }
-                    contour_to_lines(&contour_pts, &mut lines);
-                }
-                start_idx = ep + 1;
-            }
-
-            glyphs[(cp - 0x20) as usize] = Some(TtfGlyph {
+            glyphs[slot] = Some(TtfGlyph {
                 advance: aw,
                 lsb,
                 bbox: (x_min, y_min, x_max, y_max),
                 lines,
             });
+            unrenderable[slot] = false;
         }
 
         Ok(Self {
             units_per_em,
             ascender,
             descender,
+            cps,
             glyphs,
+            unrenderable,
         })
     }
 
-    /// Advance width in design units for character `b`.
+    /// Advance width in design units for codepoint `cp`.
+    ///
+    /// A codepoint that is absent from the font (or outside
+    /// [`COVERED_RANGES`]) gets the same `0.6 em` the old byte-indexed table
+    /// used for anything past ASCII, so an unrenderable character still
+    /// *reserves* its slot. That is the behaviour that made the old pipeline so
+    /// misleading: it reserved space and painted nothing, so CJK text was
+    /// invisible *and* mis-spaced. The visible placeholder lives in
+    /// `font::draw_glyph`; this stays a metric.
     #[inline]
-    pub fn advance(&self, b: u8) -> f32 {
-        if (0x20..0x80).contains(&b) {
-            if let Some(g) = &self.glyphs[(b - 0x20) as usize] {
-                return g.advance;
-            }
+    pub fn advance(&self, cp: char) -> f32 {
+        if let Some(g) = self.glyph(cp) {
+            return g.advance;
         }
         self.units_per_em * 0.6
     }
 
-    /// Bounding box in design units for character `b`.
+    /// Bounding box in design units for codepoint `cp`.
+    ///
+    /// `(0, 0, 0, 0)` means "no ink" and callers treat it as advance-only --
+    /// a real space does the same thing, so an absent glyph and a space are
+    /// indistinguishable here by design.
     #[inline]
-    pub fn bbox(&self, b: u8) -> (f32, f32, f32, f32) {
-        if (0x20..0x80).contains(&b) {
-            if let Some(g) = &self.glyphs[(b - 0x20) as usize] {
-                return g.bbox;
-            }
+    pub fn bbox(&self, cp: char) -> (f32, f32, f32, f32) {
+        if let Some(g) = self.glyph(cp) {
+            return g.bbox;
         }
         (0.0, 0.0, 0.0, 0.0)
     }
@@ -401,7 +494,7 @@ impl TrueTypeFont {
     #[allow(clippy::too_many_arguments)]
     pub fn rasterize_glyph(
         &self,
-        b: u8,
+        cp: char,
         x: f32,
         scale: f32,
         baseline: f32,
@@ -412,13 +505,10 @@ impl TrueTypeFont {
         oy: i32,
         weight_radius: f32,
     ) -> bool {
-        if !(0x20..0x80).contains(&b) {
-            return false;
-        }
         // One row of scratch for the separable weight dilation. Sized for the
         // largest glyph the caller can pass; the common path is 80.
         let mut dilate_scratch = [0u8; 1026 + 2];
-        let Some(g) = &self.glyphs[(b - 0x20) as usize] else {
+        let Some(g) = self.glyph(cp) else {
             return false;
         };
         if g.lines.is_empty() {
@@ -440,12 +530,12 @@ impl TrueTypeFont {
                 let mut count = 0;
 
                 for l in &g.lines {
-                    let sy0 = baseline - l.y0 * scale;
-                    let sy1 = baseline - l.y1 * scale;
+                    let sy0 = baseline - l.y0 as f32 * scale;
+                    let sy1 = baseline - l.y1 as f32 * scale;
 
                     if (sy0 <= sy && sy < sy1) || (sy1 <= sy && sy < sy0) {
-                        let sx0 = x + l.x0 * scale;
-                        let sx1 = x + l.x1 * scale;
+                        let sx0 = x + l.x0 as f32 * scale;
+                        let sx1 = x + l.x1 as f32 * scale;
                         let xi = sx0 + (sy - sy0) * (sx1 - sx0) / (sy1 - sy0);
                         if count < MAX_INTERSECTIONS {
                             xs[count] = xi;
@@ -506,6 +596,329 @@ impl TrueTypeFont {
         }
         touched
     }
+}
+
+/// Resolve a glyph id's outline to line segments, recursing into composites.
+///
+/// The `glyf` table stores a *composite* glyph (a precomposed `e` + acute
+/// accent, for instance) as a header with a negative `numberOfContours`
+/// followed by a list of component references, each with an offset and an
+/// optional 2x2 transform. The original loop treated `num_contours <= 0` as
+/// "compound or empty" and stored an empty outline, so every precomposed
+/// accented Latin letter in Noto -- `\u{e9}`, `\u{fc}`, `\u{144}` and most of
+/// Latin-1 and Latin Extended-A -- parsed to zero segments and drew nothing.
+/// That is the majority of the coverage this module claims, so it is not an
+/// edge case.
+///
+/// `depth` bounds the recursion. A malformed font can make a composite refer
+/// to itself, and this is a load-time walk over untrusted bytes; without a cap
+/// that is a stack overflow, i.e. an abort under `panic = "abort"`.
+const COMPOSITE_MAX_DEPTH: u8 = 5;
+
+/// What resolving a glyph's outline produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Outline {
+    /// Resolved to no ink, and that is correct: a space, or a zero-length
+    /// `loca` entry. Drawable, with nothing to draw.
+    Blank,
+    /// Resolved to ink.
+    Drawn,
+    /// In range, but the outline would not parse. Not drawable.
+    Failed,
+}
+
+fn resolve_glyph_lines(
+    gid: usize,
+    glyf: &[u8],
+    loca: &[u8],
+    index_to_loc_format: i16,
+    depth: u8,
+    out: &mut Vec<TtfLine>,
+) -> Outline {
+    if depth >= COMPOSITE_MAX_DEPTH {
+        return Outline::Failed;
+    }
+    let (off_start, off_end) = match glyph_span(gid, loca, index_to_loc_format) {
+        Some(v) => v,
+        // A `loca` too short to cover this glyph is a malformed font, not an
+        // intentionally blank glyph.
+        None => return Outline::Failed,
+    };
+    if off_start >= off_end {
+        // Zero-length entry: the spec's encoding of "no outline". A space.
+        return Outline::Blank;
+    }
+    if off_end > glyf.len() {
+        return Outline::Failed;
+    }
+    let g = &glyf[off_start..off_end];
+    if g.len() < 10 {
+        return Outline::Failed;
+    }
+    let num_contours = read_i16(g, 0);
+    if num_contours == 0 {
+        return Outline::Blank;
+    }
+    if num_contours > 0 {
+        return if append_simple_glyph(g, num_contours as usize, out) {
+            Outline::Drawn
+        } else {
+            Outline::Failed
+        };
+    }
+    // Negative: a composite.
+    if append_composite_glyph(g, glyf, loca, index_to_loc_format, depth, out) {
+        Outline::Drawn
+    } else if depth > 0 {
+        // A nested component that is itself blank contributes no ink but is not
+        // a failure of the whole composite.
+        Outline::Blank
+    } else {
+        Outline::Failed
+    }
+}
+
+/// `(start, end)` byte offsets of glyph `gid` in `glyf`, if `loca` covers it.
+#[inline]
+fn glyph_span(gid: usize, loca: &[u8], index_to_loc_format: i16) -> Option<(usize, usize)> {
+    if index_to_loc_format == 0 {
+        if (gid * 2 + 4) <= loca.len() {
+            Some((
+                (read_u16(loca, gid * 2) as usize) * 2,
+                (read_u16(loca, (gid + 1) * 2) as usize) * 2,
+            ))
+        } else {
+            None
+        }
+    } else if (gid * 4 + 8) <= loca.len() {
+        Some((
+            read_u32(loca, gid * 4) as usize,
+            read_u32(loca, (gid + 1) * 4) as usize,
+        ))
+    } else {
+        None
+    }
+}
+
+/// The simple-glyph body: end points, flags, deltas, then contour flattening.
+/// Appends to `out` and reports success.
+fn append_simple_glyph(g: &[u8], nc: usize, out: &mut Vec<TtfLine>) -> bool {
+    if nc == 0 {
+        return true; // a genuinely empty outline, e.g. a space
+    }
+    if g.len() < 10 + nc * 2 {
+        return false;
+    }
+    let mut end_pts = Vec::with_capacity(nc);
+    for c in 0..nc {
+        end_pts.push(read_u16(g, 10 + c * 2) as usize);
+    }
+    let num_pts = end_pts[nc - 1] + 1;
+    let ins_len = read_u16(g, 10 + nc * 2) as usize;
+    let mut ptr = 12 + nc * 2 + ins_len;
+
+    let mut flags = Vec::with_capacity(num_pts);
+    while flags.len() < num_pts && ptr < g.len() {
+        let fl = g[ptr];
+        ptr += 1;
+        flags.push(fl);
+        if (fl & 0x08) != 0 && ptr < g.len() {
+            let repeat = g[ptr] as usize;
+            ptr += 1;
+            for _ in 0..repeat {
+                if flags.len() < num_pts {
+                    flags.push(fl);
+                }
+            }
+        }
+    }
+    if flags.len() < num_pts {
+        return false;
+    }
+
+    let mut xs = Vec::with_capacity(num_pts);
+    let mut cur_x: i32 = 0;
+    for &fl in &flags {
+        if (fl & 0x02) != 0 {
+            if ptr < g.len() {
+                let dx = g[ptr] as i32;
+                ptr += 1;
+                cur_x += if (fl & 0x10) != 0 { dx } else { -dx };
+            }
+        } else if (fl & 0x10) == 0 && ptr + 2 <= g.len() {
+            let dx = read_i16(g, ptr) as i32;
+            ptr += 2;
+            cur_x += dx;
+        }
+        xs.push(cur_x as f32);
+    }
+
+    let mut ys = Vec::with_capacity(num_pts);
+    let mut cur_y: i32 = 0;
+    for &fl in &flags {
+        if (fl & 0x04) != 0 {
+            if ptr < g.len() {
+                let dy = g[ptr] as i32;
+                ptr += 1;
+                cur_y += if (fl & 0x20) != 0 { dy } else { -dy };
+            }
+        } else if (fl & 0x20) == 0 && ptr + 2 <= g.len() {
+            let dy = read_i16(g, ptr) as i32;
+            ptr += 2;
+            cur_y += dy;
+        }
+        ys.push(cur_y as f32);
+    }
+    if xs.len() < num_pts || ys.len() < num_pts {
+        return false;
+    }
+
+    let mut start_idx = 0;
+    for &ep in &end_pts {
+        if ep < start_idx || ep >= num_pts {
+            continue;
+        }
+        let contour_len = ep - start_idx + 1;
+        if contour_len >= 2 {
+            let mut pts = Vec::with_capacity(contour_len);
+            for i in start_idx..=ep {
+                pts.push((xs[i], ys[i], (flags[i] & 0x01) != 0));
+            }
+            contour_to_lines(&pts, out);
+        }
+        start_idx = ep + 1;
+    }
+    true
+}
+
+/// `glyf` composite-glyph flags (`loca`-independent, from the spec).
+mod comp {
+    pub const ARGS_ARE_XY_VALUES: u16 = 0x0001;
+    pub const WE_HAVE_A_SCALE: u16 = 0x0008;
+    pub const MORE_COMPONENTS: u16 = 0x0020;
+    pub const WE_HAVE_AN_X_AND_Y_SCALE: u16 = 0x0040;
+    pub const WE_HAVE_A_TWO_BY_TWO: u16 = 0x0080;
+    /// `WE_HAVE_INSTRUCTIONS`: the trailing instruction bytes are skipped.
+    pub const WE_HAVE_INSTRUCTIONS: u16 = 0x0100;
+}
+
+/// Walk a composite glyph's component list, transforming each component's
+/// outline into `out`.
+///
+/// Every component carries an offset plus an optional 2x2 matrix in F2Dot14
+/// (2.14 fixed point). `ROUND_XY_TO_GRID` is deliberately ignored: it is a
+/// hint for the grid-fitting pass, and we fit at rasterisation time anyway.
+/// `USE_MY_METRICS` is likewise irrelevant -- metrics come from `hmtx`.
+fn append_composite_glyph(
+    g: &[u8],
+    glyf: &[u8],
+    loca: &[u8],
+    index_to_loc_format: i16,
+    depth: u8,
+    out: &mut Vec<TtfLine>,
+) -> bool {
+    let mut ptr = 10usize; // past numberOfContours + the 4 bbox fields
+    let mut any = false;
+    // A bounded component count: a component list is at least 4 bytes per
+    // entry, so this cannot be outrun by a well-formed slice, and it stops a
+    // malformed one from looping on MORE_COMPONENTS forever.
+    let mut budget = 256usize;
+    loop {
+        if budget == 0 || ptr + 4 > g.len() {
+            break;
+        }
+        budget -= 1;
+        let flags = read_u16(g, ptr);
+        let component_gid = read_u16(g, ptr + 2) as usize;
+        ptr += 4;
+
+        // (dx, dy): either two bytes, two words, or nothing for a point match.
+        let (dx, dy) = if (flags & comp::ARGS_ARE_XY_VALUES) != 0 {
+            if (flags & comp::WE_HAVE_A_SCALE) != 0 {
+                // The scale-bearing forms use F2Dot14 arguments.
+                if ptr + 4 > g.len() {
+                    break;
+                }
+                let x = f2dot14(read_i16(g, ptr));
+                let y = f2dot14(read_i16(g, ptr + 2));
+                ptr += 4;
+                (x, y)
+            } else {
+                if ptr + 2 > g.len() {
+                    break;
+                }
+                let (a, b) = (g[ptr] as i8 as f32, g[ptr + 1] as i8 as f32);
+                ptr += 2;
+                (a, b)
+            }
+        } else {
+            (0.0, 0.0)
+        };
+
+        // The 2x2 matrix, defaulting to identity.
+        let (mut m00, mut m01, mut m10, mut m11) = (1.0f32, 0.0f32, 0.0f32, 1.0f32);
+        if (flags & comp::WE_HAVE_A_SCALE) != 0 {
+            if ptr + 2 > g.len() {
+                break;
+            }
+            let s = f2dot14(read_i16(g, ptr));
+            ptr += 2;
+            m00 = s;
+            m11 = s;
+        } else if (flags & comp::WE_HAVE_AN_X_AND_Y_SCALE) != 0 {
+            if ptr + 4 > g.len() {
+                break;
+            }
+            m00 = f2dot14(read_i16(g, ptr));
+            m11 = f2dot14(read_i16(g, ptr + 2));
+            ptr += 4;
+        } else if (flags & comp::WE_HAVE_A_TWO_BY_TWO) != 0 {
+            if ptr + 8 > g.len() {
+                break;
+            }
+            m00 = f2dot14(read_i16(g, ptr));
+            m01 = f2dot14(read_i16(g, ptr + 2));
+            m10 = f2dot14(read_i16(g, ptr + 4));
+            m11 = f2dot14(read_i16(g, ptr + 6));
+            ptr += 8;
+        }
+
+        // Resolve the component into a scratch, transform, append. The scratch
+        // is reused across components so a composite does not nest allocations.
+        let mut sub = Vec::new();
+        if resolve_glyph_lines(
+            component_gid,
+            glyf,
+            loca,
+            index_to_loc_format,
+            depth + 1,
+            &mut sub,
+        ) == Outline::Drawn
+        {
+            for l in sub {
+                out.push(TtfLine::new(
+                    m00 * l.x0 as f32 + m10 * l.y0 as f32 + dx,
+                    m01 * l.x0 as f32 + m11 * l.y0 as f32 + dy,
+                    m00 * l.x1 as f32 + m10 * l.y1 as f32 + dx,
+                    m01 * l.x1 as f32 + m11 * l.y1 as f32 + dy,
+                ));
+            }
+            any = true;
+        }
+
+        if (flags & comp::MORE_COMPONENTS) == 0 {
+            // Trailing instructions, if any, are not needed: we do not hint.
+            let _ = comp::WE_HAVE_INSTRUCTIONS;
+            break;
+        }
+    }
+    any
+}
+
+/// F2Dot14: a signed 16-bit value with 14 fractional bits.
+#[inline]
+fn f2dot14(v: i16) -> f32 {
+    v as f32 / 16384.0
 }
 
 /// Dilate a glyph coverage mask by `radius` pixels.
@@ -678,7 +1091,11 @@ fn contour_to_lines(pts: &[(f32, f32, bool)], lines: &mut Vec<TtfLine>) {
         let p_next = pts[(i + 1) % n];
         expanded.push(p_curr);
         if !p_curr.2 && !p_next.2 {
-            expanded.push(((p_curr.0 + p_next.0) * 0.5, (p_curr.1 + p_next.1) * 0.5, true));
+            expanded.push((
+                (p_curr.0 + p_next.0) * 0.5,
+                (p_curr.1 + p_next.1) * 0.5,
+                true,
+            ));
         }
     }
 
@@ -693,12 +1110,7 @@ fn contour_to_lines(pts: &[(f32, f32, bool)], lines: &mut Vec<TtfLine>) {
 
         if p1.2 {
             // Straight line segment
-            lines.push(TtfLine {
-                x0: p0.0,
-                y0: p0.1,
-                x1: p1.0,
-                y1: p1.1,
-            });
+            lines.push(TtfLine::new(p0.0, p0.1, p1.0, p1.1));
             i += 1;
         } else {
             // Quadratic Bézier curve: p0 (start), p1 (control), p2 (end)
@@ -716,12 +1128,7 @@ fn contour_to_lines(pts: &[(f32, f32, bool)], lines: &mut Vec<TtfLine>) {
                 let ax1 = mt1 * mt1 * p0.0 + 2.0 * mt1 * t1 * p1.0 + t1 * t1 * p2.0;
                 let ay1 = mt1 * mt1 * p0.1 + 2.0 * mt1 * t1 * p1.1 + t1 * t1 * p2.1;
 
-                lines.push(TtfLine {
-                    x0: ax0,
-                    y0: ay0,
-                    x1: ax1,
-                    y1: ay1,
-                });
+                lines.push(TtfLine::new(ax0, ay0, ax1, ay1));
             }
             i += 2;
         }
@@ -755,21 +1162,33 @@ mod tests {
     #[test]
     fn test_system_noto_loads_and_parses() {
         let font = TrueTypeFont::load_system_noto();
-        assert!(font.is_some(), "System Google Noto Sans TTF should be found on this system");
+        assert!(
+            font.is_some(),
+            "System Google Noto Sans TTF should be found on this system"
+        );
         let font = font.unwrap();
         assert_eq!(font.units_per_em, 1000.0);
 
         // Digits 0..9 should be tabular
-        let d0_adv = font.advance(b'0');
+        let d0_adv = font.advance('0');
         assert!(d0_adv > 0.0);
-        for c in b'1'..=b'9' {
+        for c in '1'..='9' {
             assert_eq!(font.advance(c), d0_adv, "Noto Sans digits must be tabular");
         }
 
         // Test rasterizing 'A' into a small mask
         let mut mask = [0u8; 64 * 64];
         let touched = font.rasterize_glyph(
-            b'A', 10.0, 30.0 / 1000.0, 45.0, &mut mask, 30, 40, 10, 10, 0.0,
+            'A',
+            10.0,
+            30.0 / 1000.0,
+            45.0,
+            &mut mask,
+            30,
+            40,
+            10,
+            10,
+            0.0,
         );
         assert!(touched, "Glyph 'A' must produce non-zero mask pixels");
         let inked_count = mask.iter().filter(|&&v| v > 0).count();
@@ -781,5 +1200,116 @@ mod tests {
         let garbage = [0u8; 32];
         let res = TrueTypeFont::parse(&garbage);
         assert!(res.is_err(), "Garbage bytes must be rejected gracefully");
+    }
+}
+
+#[cfg(test)]
+mod coverage {
+    use super::*;
+
+    /// The table is sorted and every column is the same length.
+    ///
+    /// `cps` and `glyphs` are parallel and the lookup is a binary search, so a
+    /// desync or an unsorted table would mis-resolve glyphs silently rather
+    /// than panic. This is the invariant those two properties rest on.
+    #[test]
+    fn the_codepoint_table_is_sorted_and_rectangular() {
+        let Some(f) = TrueTypeFont::load_system_noto() else {
+            // No system font here: nothing to assert about a table that was
+            // never built. Not a skip, just nothing to check.
+            return;
+        };
+        assert_eq!(
+            f.cps.len(),
+            f.glyphs.len(),
+            "cps and glyphs must be parallel"
+        );
+        assert_eq!(
+            f.cps.len(),
+            f.unrenderable.len(),
+            "unrenderable must be parallel too"
+        );
+        for w in f.cps.windows(2) {
+            assert!(w[0] < w[1], "cps must be strictly ascending: {w:?}");
+        }
+    }
+
+    /// `can_draw` and the parsed outlines agree.
+    ///
+    /// A `false` with a non-empty outline would mean the placeholder is drawn
+    /// over a real glyph; a `true` with none would mean another silent gap.
+    #[test]
+    fn can_draw_agrees_with_the_parsed_outline() {
+        let Some(f) = TrueTypeFont::load_system_noto() else {
+            return;
+        };
+        for (i, cp) in f.cps.iter().enumerate() {
+            let cp = char::from_u32(*cp as u32).unwrap();
+            let has_ink = f.glyphs[i].as_ref().is_some_and(|g| !g.lines.is_empty());
+            if f.unrenderable[i] {
+                assert!(
+                    !has_ink,
+                    "{cp:?} is marked unrenderable but has {} lines",
+                    f.glyphs[i].as_ref().unwrap().lines.len()
+                );
+            }
+        }
+    }
+
+    /// The ranges this module claims to cover really are the ones a launcher
+    /// needs, and a representative sample of each resolves to ink.
+    ///
+    /// A representative character per block, chosen as one that is *not* a bare
+    /// ASCII letter so the test actually exercises the cmap round trip.
+    #[test]
+    fn the_claimed_blocks_resolve_to_real_glyphs() {
+        let Some(f) = TrueTypeFont::load_system_noto() else {
+            return;
+        };
+        for (label, cp) in [
+            ("Latin-1", '\u{e9}'),      // e acute
+            ("Latin-1", '\u{fc}'),      // u diaeresis
+            ("Latin-1", '\u{f1}'),      // n tilde
+            ("Latin Ext-A", '\u{104}'), // A with macron
+            ("Latin Ext-A", '\u{15b}'), // s with cedilla
+            ("Greek", '\u{3b1}'),       // alpha
+            ("Greek", '\u{3c9}'),       // omega
+            ("Cyrillic", '\u{416}'),    // Zhe
+            ("Cyrillic", '\u{44f}'),    // ya
+        ] {
+            let idx = f
+                .glyph_index(cp)
+                .unwrap_or_else(|| panic!("{label}: {cp:?} is not in the table at all"));
+            assert!(
+                !f.unrenderable[idx],
+                "{label}: {cp:?} is in the table but its outline would not render"
+            );
+            let lines = f.glyphs[idx].as_ref().unwrap().lines.len();
+            assert!(
+                lines > 0,
+                "{label}: {cp:?} has no ink -- this is the silent-blank-text defect"
+            );
+        }
+    }
+
+    /// A codepoint outside the covered ranges is absent, not broken.
+    ///
+    /// CJK ideographs and Hangul are deliberately not pre-parsed, and emoji
+    /// are not in Noto at all. Both must return "no glyph" so the caller draws
+    /// a visible placeholder -- never a panic and never a silent gap.
+    #[test]
+    fn uncovered_codepoints_are_absent_rather_than_broken() {
+        let Some(f) = TrueTypeFont::load_system_noto() else {
+            return;
+        };
+        for cp in ['\u{4e2d}', '\u{ac00}', '\u{1f600}', '\u{1d7d8}'] {
+            assert!(
+                f.glyph_index(cp).is_none(),
+                "{cp:?} should be outside COVERED_RANGES"
+            );
+            assert!(!f.can_draw(cp));
+            // Metrics still work, so a run of them is *spaced* correctly.
+            assert!(f.advance(cp) > 0.0, "{cp:?} must still reserve an advance");
+        }
     }
 }

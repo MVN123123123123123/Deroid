@@ -7,6 +7,7 @@
 
 pub mod desktop;
 pub mod gestures;
+pub mod haptics;
 pub mod icons;
 pub mod ime;
 pub mod input;
@@ -16,7 +17,6 @@ pub mod protocols;
 pub mod recents;
 pub mod scene;
 pub mod server;
-pub mod spring;
 pub mod super_extreme;
 pub mod systemui;
 
@@ -27,6 +27,7 @@ pub use gestures::{
     GestureAction, GestureConfig, GestureEngine, MotionHistory, MotionPause, RawTouchEvent,
     TouchPhase, MOTION_SAMPLES,
 };
+pub use haptics::{HapticEffect, Haptics};
 pub use icons::{IconCache, ICON_MAX_EDGE};
 pub use ime::{ImeAction, KeyboardLayout, VirtualKeyboard};
 pub use input::{InputDispatchResult, InputDispatcher, LinuxInputEvent};
@@ -34,7 +35,7 @@ pub use lockscreen::{FingerprintHalBridge, FingerprintResult, LockScreen, LockSt
 pub use power_sync::{oom_roles, UtimPowerSync};
 pub use protocols::{
     drm_formats, toplevel_state, ProtocolGlobal, ProtocolRegistry, WaylandInterface, WlHeader,
-    WlMessage, WlMessageBuilder, WlrLayer,
+    WlMessage, WlrLayer,
 };
 pub use recents::{
     dismiss_recents_scale, DismissOutcome, FolderOpen, KillAction, KillQueue, KillState,
@@ -42,7 +43,6 @@ pub use recents::{
 };
 pub use scene::{plane_z_order, MobileScene, ShellMode};
 pub use server::{CompositorMetrics, WaylandServer};
-pub use spring::{SpringConfig, SpringOscillator};
 pub use super_extreme::{SuperExtremeScreen, SuperExtremeState, TtyKey, VolumeHud};
 pub use systemui::{
     CellularRat, NotificationCard, QuickTile, QuickTileKind, StatusBarState, SystemUiShade,

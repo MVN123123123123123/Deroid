@@ -194,13 +194,10 @@ impl GpuDetector {
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
-        let mhz = fs::read_to_string(
-            self.sysfs_root
-                .join("class/kgsl/kgsl-3d0/devfreq/cur_freq"),
-        )
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .map(|hz| (hz / 1_000_000) as u32);
+        let mhz = fs::read_to_string(self.sysfs_root.join("class/kgsl/kgsl-3d0/devfreq/cur_freq"))
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .map(|hz| (hz / 1_000_000) as u32);
         (model, mhz)
     }
 

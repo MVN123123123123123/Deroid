@@ -336,7 +336,10 @@ impl ReleaseFences {
     /// is new, so the caller can surface `TooManyLayers` instead of
     /// silently dropping the fence.
     pub fn insert(&mut self, key: u64, fence: Option<i32>) -> bool {
-        if let Some(entry) = self.entries[..self.count].iter_mut().find(|(k, _)| *k == key) {
+        if let Some(entry) = self.entries[..self.count]
+            .iter_mut()
+            .find(|(k, _)| *k == key)
+        {
             entry.1 = fence;
             return true;
         }
@@ -405,8 +408,7 @@ impl HwcComposer {
             for hal in content.split("<hal").skip(1) {
                 // Only consider the current <hal>...</hal> element.
                 let elem = hal.split("</hal>").next().unwrap_or(hal);
-                let is_aidl =
-                    elem.contains("format=\"aidl\"") || elem.contains("format='aidl'");
+                let is_aidl = elem.contains("format=\"aidl\"") || elem.contains("format='aidl'");
                 let name = elem
                     .split("<name>")
                     .nth(1)
@@ -630,8 +632,7 @@ impl HwcComposer {
         self.sorted_buf.clear();
         self.sorted_buf
             .extend(display_layers.iter().map(|(&id, l)| (id, l.z_order)));
-        self.sorted_buf
-            .sort_unstable_by_key(|&(id, z)| (z, id));
+        self.sorted_buf.sort_unstable_by_key(|&(id, z)| (z, id));
 
         // Check if any layer requested client or if total requested hardware layers exceeds max_planes
         let requested_client_count = display_layers
@@ -954,7 +955,8 @@ mod tests {
         // Supply ClientTarget (invalidates validation: a buffer swap needs
         // re-validation per the HWC contract).
         hwc.set_client_target(0, 999, None).unwrap();
-        hwc.validate_display(0).expect("Re-validate after client target");
+        hwc.validate_display(0)
+            .expect("Re-validate after client target");
         let (present_fence, release_fences) = hwc.present_display(0).expect("Present with target");
         assert!(present_fence.is_some());
         assert_eq!(release_fences.len(), 3);
@@ -1047,7 +1049,8 @@ mod tests {
         assert_eq!(changed, 2);
 
         hwc.set_client_target(0, 888, None).unwrap();
-        hwc.validate_display(0).expect("Re-validate after client target");
+        hwc.validate_display(0)
+            .expect("Re-validate after client target");
         let (present_fence, release_fences) = hwc.present_display(0).unwrap();
         assert!(present_fence.is_some());
         assert_eq!(release_fences.len(), 3);

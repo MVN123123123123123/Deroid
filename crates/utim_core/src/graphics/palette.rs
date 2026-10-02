@@ -152,7 +152,11 @@ fn in_gamut(r: f32, g: f32, b: f32) -> bool {
 #[inline]
 pub fn oklab_hue(a: f32, b: f32) -> f32 {
     let deg = b.atan2(a).to_degrees();
-    if deg < 0.0 { deg + 360.0 } else { deg }
+    if deg < 0.0 {
+        deg + 360.0
+    } else {
+        deg
+    }
 }
 
 /// The 12-shade tone ramp (`Shades.java:52-63`).
@@ -160,7 +164,9 @@ pub fn oklab_hue(a: f32, b: f32) -> f32 {
 /// Lightness `[99, 95, 90, 80, 70, 60, 49.6, 40, 30, 20, 10, 0]`.
 /// `MIDDLE_LSTAR` (49.6) is the lowest tone that still clears 4.5:1 against
 /// white, so a "dark" accent built on it is not a light one in disguise.
-pub const TONE_RAMP: [f32; 12] = [99.0, 95.0, 90.0, 80.0, 70.0, 60.0, 49.6, 40.0, 30.0, 20.0, 10.0, 0.0];
+pub const TONE_RAMP: [f32; 12] = [
+    99.0, 95.0, 90.0, 80.0, 70.0, 60.0, 49.6, 40.0, 30.0, 20.0, 10.0, 0.0,
+];
 /// The tone at which on-colour contrast against white is still >= 4.5:1.
 pub const MIDDLE_LSTAR: f32 = 49.6;
 /// Chroma ceiling at the very lightest tones (`Shades.java:52-63`).
@@ -203,7 +209,11 @@ pub fn gamut_chroma(l: f32, hue_deg: f32) -> f32 {
         return 0.0;
     }
     let rad = hue_deg.to_radians();
-    if in_gamut3(linear_rgb_from_oklab(l, CHROMA_CEILING * rad.cos(), CHROMA_CEILING * rad.sin())) {
+    if in_gamut3(linear_rgb_from_oklab(
+        l,
+        CHROMA_CEILING * rad.cos(),
+        CHROMA_CEILING * rad.sin(),
+    )) {
         return CHROMA_CEILING;
     }
     let (mut lo, mut hi) = (0.0f32, CHROMA_CEILING);
@@ -382,7 +392,10 @@ pub fn seed_from_color(seed_argb: u32) -> Seed {
     let (_l, a, bb) = oklab_from_linear_rgb(r, g, b);
     let chroma = (a * a + bb * bb).sqrt();
     if chroma < 1.0e-4 {
-        return Seed { hue: 0.0, chroma: 0.0 };
+        return Seed {
+            hue: 0.0,
+            chroma: 0.0,
+        };
     }
     Seed {
         hue: oklab_hue(a, bb),
@@ -500,11 +513,7 @@ impl MaterialYouPalette {
                 primary: t(dark_tone::PRIMARY, s.hue, accent),
                 on_primary: t(dark_tone::ON_PRIMARY, s.hue, accent),
                 primary_container: t(dark_tone::PRIMARY_CONTAINER, s.hue, accent),
-                on_primary_container: t(
-                    dark_tone::ON_PRIMARY_CONTAINER,
-                    s.hue,
-                    accent * 0.5,
-                ),
+                on_primary_container: t(dark_tone::ON_PRIMARY_CONTAINER, s.hue, accent * 0.5),
                 secondary: t(dark_tone::SECONDARY, s.hue, accent * 0.5),
                 tertiary: t(dark_tone::TERTIARY, tertiary_hue, accent),
                 on_surface: n(dark_tone::ON_SURFACE),
@@ -520,11 +529,7 @@ impl MaterialYouPalette {
                 primary: t(light_tone::PRIMARY, s.hue, accent),
                 on_primary: t(light_tone::ON_PRIMARY, s.hue, accent),
                 primary_container: t(light_tone::PRIMARY_CONTAINER, s.hue, accent),
-                on_primary_container: t(
-                    light_tone::ON_PRIMARY_CONTAINER,
-                    s.hue,
-                    accent * 0.5,
-                ),
+                on_primary_container: t(light_tone::ON_PRIMARY_CONTAINER, s.hue, accent * 0.5),
                 secondary: t(light_tone::SECONDARY, s.hue, accent * 0.5),
                 tertiary: t(light_tone::TERTIARY, tertiary_hue, accent),
                 on_surface: n(light_tone::ON_SURFACE),
@@ -572,10 +577,16 @@ mod tests {
         for i in [0u32, 1, 17, 64, 128, 200, 254, 255] {
             let r = srgb_to_linear(i as f32 / 255.0);
             let (l, a, b) = oklab_from_linear_rgb(r, r, r);
-            assert!((a).abs() < 1.0e-5 && (b).abs() < 1.0e-5, "grey {i} is not neutral");
+            assert!(
+                (a).abs() < 1.0e-5 && (b).abs() < 1.0e-5,
+                "grey {i} is not neutral"
+            );
             let (rr, gg, bb) = linear_rgb_from_oklab(l, a, b);
             assert!((rr - r).abs() < 1.0e-4, "grey {i} round trip");
-            assert!((gg - r).abs() < 1.0e-4 && (bb - r).abs() < 1.0e-4, "grey {i}");
+            assert!(
+                (gg - r).abs() < 1.0e-4 && (bb - r).abs() < 1.0e-4,
+                "grey {i}"
+            );
         }
     }
 
@@ -601,7 +612,13 @@ mod tests {
     fn hct_palette_matches_compose_scheme_tones() {
         // Plan §1.9, the role -> tone table, for several seeds. The tone is
         // the contract; hue and chroma are the design freedom.
-        for seed in [0xFF4285F4u32, 0xFFEA4335, 0xFFFBBC05, 0xFF34A853, 0xFF9E9E9E] {
+        for seed in [
+            0xFF4285F4u32,
+            0xFFEA4335,
+            0xFFFBBC05,
+            0xFF34A853,
+            0xFF9E9E9E,
+        ] {
             let dark = MaterialYouPalette::from_seed(seed);
             for (name, got, want) in [
                 ("surface", dark.surface, dark_tone::SURFACE),
@@ -634,7 +651,11 @@ mod tests {
                     dark_tone::ON_SURFACE_VARIANT,
                 ),
                 ("outline", dark.outline, dark_tone::OUTLINE),
-                ("outline_variant", dark.outline_variant, dark_tone::OUTLINE_VARIANT),
+                (
+                    "outline_variant",
+                    dark.outline_variant,
+                    dark_tone::OUTLINE_VARIANT,
+                ),
             ] {
                 assert!(
                     (lstar_of(got) - want).abs() < 0.5,
@@ -657,11 +678,7 @@ mod tests {
                 ),
                 ("primary", light.primary, light_tone::PRIMARY),
                 ("on_primary", light.on_primary, light_tone::ON_PRIMARY),
-                (
-                    "on_surface",
-                    light.on_surface,
-                    light_tone::ON_SURFACE,
-                ),
+                ("on_surface", light.on_surface, light_tone::ON_SURFACE),
                 (
                     "on_surface_variant",
                     light.on_surface_variant,
@@ -700,8 +717,15 @@ mod tests {
         // and therefore a real defect rather than quantisation.
         const FLOOR: f32 = 0.25;
         for seed in [
-            0xFF4285F4u32, 0xFFEA4335, 0xFFFBBC05, 0xFF34A853, 0xFF9E9E9E, 0xFF000000, 0xFFFFFFFF,
-            0xFF00FF00, 0xFFFF00FF,
+            0xFF4285F4u32,
+            0xFFEA4335,
+            0xFFFBBC05,
+            0xFF34A853,
+            0xFF9E9E9E,
+            0xFF000000,
+            0xFFFFFFFF,
+            0xFF00FF00,
+            0xFFFF00FF,
         ] {
             for hue in [0.0f32, 60.0, 137.0, 200.0, 271.0, 330.0] {
                 for &target in &TONE_RAMP {
@@ -758,7 +782,13 @@ mod tests {
 
     #[test]
     fn on_surface_onto_surface_clears_wcag_aa() {
-        for seed in [0xFF4285F4u32, 0xFFEA4335, 0xFFFBBC05, 0xFF9E9E9E, 0xFF000000] {
+        for seed in [
+            0xFF4285F4u32,
+            0xFFEA4335,
+            0xFFFBBC05,
+            0xFF9E9E9E,
+            0xFF000000,
+        ] {
             let dark = MaterialYouPalette::from_seed(seed);
             assert!(contrast_ratio(dark.on_surface, dark.surface) >= 4.5);
             let light = MaterialYouPalette::from_seed_light(seed);
@@ -800,11 +830,8 @@ mod tests {
             for lstar in [0.0f32, 20.0, 49.6, 60.0, 80.0, 95.0, 99.0, 100.0] {
                 let c = max_chroma(oklab_l_from_lstar(lstar), hue, 0.4);
                 let rad = hue.to_radians();
-                let (r, g, b) = linear_rgb_from_oklab(
-                    oklab_l_from_lstar(lstar),
-                    c * rad.cos(),
-                    c * rad.sin(),
-                );
+                let (r, g, b) =
+                    linear_rgb_from_oklab(oklab_l_from_lstar(lstar), c * rad.cos(), c * rad.sin());
                 let ok = (-1.0e-3..=1.0 + 1.0e-3).contains(&r)
                     && (-1.0e-3..=1.0 + 1.0e-3).contains(&g)
                     && (-1.0e-3..=1.0 + 1.0e-3).contains(&b);
@@ -838,7 +865,10 @@ mod tests {
             .abs()
             .max((ag as i32 - bg as i32).abs())
             .max((ab as i32 - bb as i32).abs());
-        assert!(delta <= 24, "L* 99 colours differ by {delta}, cap not applied");
+        assert!(
+            delta <= 24,
+            "L* 99 colours differ by {delta}, cap not applied"
+        );
     }
 
     #[test]

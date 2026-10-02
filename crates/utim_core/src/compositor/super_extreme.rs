@@ -53,7 +53,7 @@ impl VolumeHud {
     }
 
     pub fn is_visible(&self) -> bool {
-        self.visible_until.map_or(false, |until| Instant::now() < until)
+        self.visible_until.is_some_and(|until| Instant::now() < until)
     }
 
     /// Format 1-line ASCII volume bar for row 0.
@@ -196,7 +196,7 @@ impl SuperExtremeState {
     }
 
     pub fn on_power_button_release(&mut self) -> bool {
-        let held = self.power_press_start.take().map_or(false, |start| {
+        let held = self.power_press_start.take().is_some_and(|start| {
             Instant::now().duration_since(start) >= Duration::from_millis(1000)
         });
         if held {
