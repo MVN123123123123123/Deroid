@@ -331,9 +331,7 @@ impl CameraHal3Device {
         // u64 math: 100000x100000x2 = 2e10 (wraps u32 to 2820130816).
         let (w, h) = (self.stream_width as u64, self.stream_height as u64);
         let buffer_size = match self.stream_format {
-            CameraPixelFormat::Nv12 | CameraPixelFormat::Yuv420Planar => {
-                (w * h * 3 / 2) as usize
-            }
+            CameraPixelFormat::Nv12 | CameraPixelFormat::Yuv420Planar => (w * h * 3 / 2) as usize,
             CameraPixelFormat::Yuyv => (w * h * 2) as usize,
             CameraPixelFormat::JpegBlob => (w * h / 4) as usize,
             CameraPixelFormat::RawSensor => (w * h * 2) as usize,

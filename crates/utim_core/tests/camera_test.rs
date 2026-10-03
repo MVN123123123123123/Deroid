@@ -8,10 +8,10 @@
 //! - Frame capture feeding and compatibility with Linux desktop applications (Firefox WebRTC, Cheese)
 
 use utim_core::camera::{
-    AeMode, AfMode, AwbMode, CameraBringupStatus, CameraDeviceInfo, CameraFacing,
-    CameraHal3Device, CameraPixelFormat, CameraStreamType, FlashMode, V4l2Buffer,
-    V4l2LoopbackBridge, V4L2_CAP_READWRITE, V4L2_CAP_STREAMING, V4L2_CAP_VIDEO_CAPTURE,
-    V4L2_PIX_FMT_NV12, V4L2_PIX_FMT_YUYV,
+    AeMode, AfMode, AwbMode, CameraBringupStatus, CameraDeviceInfo, CameraFacing, CameraHal3Device,
+    CameraPixelFormat, CameraStreamType, FlashMode, V4l2Buffer, V4l2LoopbackBridge,
+    V4L2_CAP_READWRITE, V4L2_CAP_STREAMING, V4L2_CAP_VIDEO_CAPTURE, V4L2_PIX_FMT_NV12,
+    V4L2_PIX_FMT_YUYV,
 };
 
 fn create_mock_back_camera() -> CameraDeviceInfo {
@@ -216,12 +216,22 @@ fn test_milestone_5_1_camera_streaming_edge_cases() {
     let back_info = create_mock_back_camera();
     let mut camera = CameraHal3Device::new(back_info);
     camera
-        .configure_stream(CameraStreamType::Preview, 1920, 1080, CameraPixelFormat::Nv12)
+        .configure_stream(
+            CameraStreamType::Preview,
+            1920,
+            1080,
+            CameraPixelFormat::Nv12,
+        )
         .unwrap();
     camera.start_stream().unwrap();
 
     // 1. Reconfiguration while streaming must fail
-    let reconfig_err = camera.configure_stream(CameraStreamType::Preview, 1280, 720, CameraPixelFormat::Nv12);
+    let reconfig_err = camera.configure_stream(
+        CameraStreamType::Preview,
+        1280,
+        720,
+        CameraPixelFormat::Nv12,
+    );
     assert_eq!(
         reconfig_err,
         Err("Cannot reconfigure stream while streaming is active")
@@ -245,7 +255,10 @@ fn test_milestone_5_1_camera_streaming_edge_cases() {
 
     let frame2 = camera.produce_frame().unwrap();
     let b1 = v4l2.feed_hal_frame(&frame2).unwrap();
-    assert_eq!(b1, 1, "Must advance to buffer 1 rather than overwriting buffer 0");
+    assert_eq!(
+        b1, 1,
+        "Must advance to buffer 1 rather than overwriting buffer 0"
+    );
 
     let frame3 = camera.produce_frame().unwrap();
     let b2 = v4l2.feed_hal_frame(&frame3).unwrap();

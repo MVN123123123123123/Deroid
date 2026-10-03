@@ -139,8 +139,7 @@ impl HalManager {
             // H24: only synthesise a unit for a HAL that is actually present.
             // Falling back to a candidate known not to exist would ship a
             // dead ExecStart that dependents can order against.
-            let Some(chosen_bin) = candidate_bins.iter().find(|b| Path::new(b).exists())
-            else {
+            let Some(chosen_bin) = candidate_bins.iter().find(|b| Path::new(b).exists()) else {
                 continue;
             };
 
@@ -180,8 +179,7 @@ mod tests {
     fn test_vintf_detection() {
         // H32: pid-suffixed temp dir; the fixed "utim_test_hal" name raced
         // with concurrent cargo test invocations deleting it mid-test.
-        let temp_dir =
-            std::env::temp_dir().join(format!("utim_test_hal_{}", std::process::id()));
+        let temp_dir = std::env::temp_dir().join(format!("utim_test_hal_{}", std::process::id()));
         let _ = fs::remove_dir_all(&temp_dir);
         let vintf_dir = temp_dir.join("etc/vintf");
         fs::create_dir_all(&vintf_dir).unwrap();

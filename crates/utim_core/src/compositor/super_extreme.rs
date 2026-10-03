@@ -2,9 +2,9 @@
 //! Zero dynamic allocation on hot paths, event-driven, touch-screen compatible.
 //! Adheres strictly to GEMINI.md systems discipline.
 
+use crate::camera::ascii_video::AsciiCameraPreview;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
-use crate::camera::ascii_video::AsciiCameraPreview;
 
 /// Active Screen inside the Super Extreme TTY Shell
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,7 +53,8 @@ impl VolumeHud {
     }
 
     pub fn is_visible(&self) -> bool {
-        self.visible_until.is_some_and(|until| Instant::now() < until)
+        self.visible_until
+            .is_some_and(|until| Instant::now() < until)
     }
 
     /// Format 1-line ASCII volume bar for row 0.
@@ -61,7 +62,9 @@ impl VolumeHud {
         let pct = self.volume_percent as usize;
         let prefix = "VOL [";
         let suffix = format!("] {}%", pct);
-        let bar_width = width_chars.saturating_sub(prefix.len() + suffix.len()).max(4);
+        let bar_width = width_chars
+            .saturating_sub(prefix.len() + suffix.len())
+            .max(4);
         let filled = (pct * bar_width) / 100;
         let empty = bar_width.saturating_sub(filled);
 
@@ -147,14 +150,38 @@ impl SuperExtremeState {
             camera_preview: AsciiCameraPreview::new(),
             power_press_start: None,
             alarms: [
-                AlarmItem { time_str: "06:30", label: "Work Alarm", enabled: true },
-                AlarmItem { time_str: "07:15", label: "Exercise", enabled: false },
-                AlarmItem { time_str: "22:00", label: "Sleep", enabled: true },
+                AlarmItem {
+                    time_str: "06:30",
+                    label: "Work Alarm",
+                    enabled: true,
+                },
+                AlarmItem {
+                    time_str: "07:15",
+                    label: "Exercise",
+                    enabled: false,
+                },
+                AlarmItem {
+                    time_str: "22:00",
+                    label: "Sleep",
+                    enabled: true,
+                },
             ],
             sms_messages: [
-                SmsItem { sender: "ICE Emergency", snippet: "Status OK", time: "10:15" },
-                SmsItem { sender: "Doctor", snippet: "Appointment confirmed", time: "Yesterday" },
-                SmsItem { sender: "Operator", snippet: "Emergency broadcast test", time: "Sep 20" },
+                SmsItem {
+                    sender: "ICE Emergency",
+                    snippet: "Status OK",
+                    time: "10:15",
+                },
+                SmsItem {
+                    sender: "Doctor",
+                    snippet: "Appointment confirmed",
+                    time: "Yesterday",
+                },
+                SmsItem {
+                    sender: "Operator",
+                    snippet: "Emergency broadcast test",
+                    time: "Sep 20",
+                },
             ],
             request_exit_to_normal: false,
             request_reboot: false,
@@ -247,7 +274,12 @@ impl SuperExtremeState {
     }
 
     /// Password screen: enter character via on-screen TTY keyboard or physical key
-    pub fn enter_password_char(&mut self, c: char, expected_pin_hash: Option<u64>, pin_salt: u64) -> bool {
+    pub fn enter_password_char(
+        &mut self,
+        c: char,
+        expected_pin_hash: Option<u64>,
+        pin_salt: u64,
+    ) -> bool {
         if self.active_screen != SuperExtremeScreen::Password {
             return false;
         }
@@ -282,7 +314,8 @@ impl SuperExtremeState {
             }
         } else {
             // No PIN enrolled: any non-empty input or enter unlocks
-            if !self.password_input.is_empty() || self.active_screen == SuperExtremeScreen::Password {
+            if !self.password_input.is_empty() || self.active_screen == SuperExtremeScreen::Password
+            {
                 self.active_screen = SuperExtremeScreen::Home;
                 self.password_input.clear();
                 return true;
@@ -295,7 +328,10 @@ impl SuperExtremeState {
     pub fn snap_photo(&mut self) -> Option<PathBuf> {
         if self.active_screen == SuperExtremeScreen::CameraPreview {
             if let Ok(path) = self.camera_preview.snap_photo() {
-                self.last_action_message = Some(format!("Snapped photo: {:?}", path.file_name().unwrap_or_default()));
+                self.last_action_message = Some(format!(
+                    "Snapped photo: {:?}",
+                    path.file_name().unwrap_or_default()
+                ));
                 return Some(path);
             }
         }
@@ -398,7 +434,8 @@ impl SuperExtremeState {
                             self.emergency_input.pop();
                         }
                         TtyKey::Enter => {
-                            self.last_action_message = Some(format!("Emergency call placed: {}", self.emergency_input));
+                            self.last_action_message =
+                                Some(format!("Emergency call placed: {}", self.emergency_input));
                         }
                         TtyKey::Cancel => self.handle_back(),
                     }
@@ -453,7 +490,8 @@ impl SuperExtremeState {
                             self.phone_input.pop();
                         }
                         TtyKey::Enter => {
-                            self.last_action_message = Some(format!("Calling {}", self.phone_input));
+                            self.last_action_message =
+                                Some(format!("Calling {}", self.phone_input));
                         }
                         TtyKey::Cancel => self.handle_back(),
                     }

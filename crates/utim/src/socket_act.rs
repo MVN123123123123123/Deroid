@@ -33,11 +33,7 @@ impl SocketActivationManager {
     pub fn bind_socket(&mut self, unit_name: &str, socket_sec: &SocketSection) -> io::Result<()> {
         // Re-binding an already-bound socket unit (daemon-reload) reuses the
         // existing FDs instead of leaking a second listener pair.
-        if self
-            .active_sockets
-            .iter()
-            .any(|s| s.name == unit_name)
-        {
+        if self.active_sockets.iter().any(|s| s.name == unit_name) {
             return Ok(());
         }
 

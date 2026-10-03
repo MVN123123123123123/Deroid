@@ -118,10 +118,30 @@ pub struct Snapshot<'a> {
     pub folder_drag_out: bool,
     pub folder_menu_progress: f32,
     pub folder_menu_anchor: (f32, f32),
+    /// Folder rename. Mirrors `DrmInteractiveState::{folder_rename_buffer,
+    /// folder_rename_editing}`; fixed-capacity `Copy`, so no allocation on the
+    /// frame path.
+    pub folder_rename_buffer: crate::graphics::drm_kms::FolderRenameBuffer,
+    pub folder_rename_editing: bool,
     /// Power governor. [`PowerSaverMode::SuperExtreme`] short-circuits
     /// `paint_frame` into the TTY recovery shell, which is a whole second
     /// renderer.
     pub power_saver_mode: PowerSaverMode,
+    /// The app whose info panel is open. Mirrors
+    /// `DrmInteractiveState::app_info`; `None` -- the default -- is the home
+    /// screen.
+    pub app_info: Option<crate::graphics::drm_kms::AppInfoSpec<'a>>,
+    /// Which page of the on-screen keyboard is up. Mirrors
+    /// `DrmInteractiveState::keyboard_layout`.
+    pub keyboard_layout: crate::compositor::ime::KeyboardLayout,
+    /// Workspace drag. Mirrors `DrmInteractiveState::{drag_slot, drag_pos,
+    /// drag_lift, drag_drop_slot, drag_merge_slot}` -- see the folder gesture
+    /// fields above for why each one needs a mirror here.
+    pub drag_slot: Option<u8>,
+    pub drag_pos: (f32, f32),
+    pub drag_lift: f32,
+    pub drag_drop_slot: Option<u8>,
+    pub drag_merge_slot: Option<u8>,
 }
 
 impl Default for Snapshot<'_> {
@@ -206,6 +226,15 @@ impl Default for Snapshot<'_> {
             folder_drag_out: false,
             folder_menu_progress: 0.0,
             folder_menu_anchor: (0.0, 0.0),
+            folder_rename_buffer: crate::graphics::drm_kms::FolderRenameBuffer::EMPTY,
+            folder_rename_editing: false,
+            app_info: None,
+            keyboard_layout: crate::compositor::ime::KeyboardLayout::Qwerty,
+            drag_slot: None,
+            drag_pos: (0.0, 0.0),
+            drag_lift: 0.0,
+            drag_drop_slot: None,
+            drag_merge_slot: None,
         }
     }
 }
@@ -278,6 +307,15 @@ impl<'a> Clone for Snapshot<'a> {
             folder_drag_out: self.folder_drag_out,
             folder_menu_progress: self.folder_menu_progress,
             folder_menu_anchor: self.folder_menu_anchor,
+            folder_rename_buffer: self.folder_rename_buffer,
+            folder_rename_editing: self.folder_rename_editing,
+            app_info: self.app_info,
+            keyboard_layout: self.keyboard_layout,
+            drag_slot: self.drag_slot,
+            drag_pos: self.drag_pos,
+            drag_lift: self.drag_lift,
+            drag_drop_slot: self.drag_drop_slot,
+            drag_merge_slot: self.drag_merge_slot,
         }
     }
 }
@@ -373,6 +411,15 @@ impl<'a> Snapshot<'a> {
             folder_drag_out: self.folder_drag_out,
             folder_menu_progress: self.folder_menu_progress,
             folder_menu_anchor: self.folder_menu_anchor,
+            folder_rename_buffer: self.folder_rename_buffer,
+            folder_rename_editing: self.folder_rename_editing,
+            app_info: self.app_info,
+            keyboard_layout: self.keyboard_layout,
+            drag_slot: self.drag_slot,
+            drag_pos: self.drag_pos,
+            drag_lift: self.drag_lift,
+            drag_drop_slot: self.drag_drop_slot,
+            drag_merge_slot: self.drag_merge_slot,
             ..Default::default()
         }
     }
@@ -1012,11 +1059,38 @@ mod tests {
         let mut launch_snap = snap.clone();
         launch_snap.launch_progress = 0.42;
         launch_snap.launch_origin = Some((540.0, 980.0));
+        // The three surfaces this change added, each at a mid-drag / mid-panel
+        // value so the draw path is actually entered. `keyboard_layout` is
+        // `Symbols` rather than the default because the symbols page is the one
+        // that reaches `keyboard_rows` and not the digit aliases.
+        let mut symbols_snap = keyboard_snap.clone();
+        symbols_snap.keyboard_layout = crate::compositor::ime::KeyboardLayout::Symbols;
+        let mut app_info_snap = snap.clone();
+        app_info_snap.app_info = Some(crate::graphics::drm_kms::AppInfoSpec {
+            id: "org.mozilla.firefox",
+            name: "Firefox",
+            exec: "/usr/lib/firefox/firefox",
+            target: "gnome-software",
+            icon: Some(&icon),
+            color: 0xFF2563EB,
+            glyph: "F",
+            target_kind: crate::graphics::layout::AppInfoTarget::Details,
+            installing: false,
+        });
+        let mut drag_snap = snap.clone();
+        drag_snap.drag_slot = Some(0);
+        drag_snap.drag_pos = (540.0, 1400.0);
+        drag_snap.drag_lift = 1.0;
+        drag_snap.drag_drop_slot = Some(3);
+        drag_snap.drag_merge_slot = Some(4);
         for (label, s) in [
             ("keyboard", keyboard_snap),
+            ("keyboard/symbols", symbols_snap),
             ("shade", shade_snap),
             ("drawer", drawer_snap),
             ("launch", launch_snap),
+            ("app-info", app_info_snap),
+            ("workspace-drag", drag_snap),
         ] {
             c.draw(&s); // warm per-state caches outside the bracket
             let before = allocations();
@@ -4230,6 +4304,1179 @@ mod tests {
                  scrimmed surface {want:#010x} -- the blur is leaking into the \
                  sheet, or the sheet is translucent over the wallpaper"
             );
+        }
+    }
+
+    /// The keyboard sheet's box, as `(x, y, w, h)` pixels.
+    ///
+    /// Derived from the same `Keyboard` the renderer builds, so a probe cannot
+    /// drift onto the wrong box. Every page-diff test below *depends* on this box
+    /// being where the sheet is actually painted -- probing the home screen
+    /// instead would compare two identical home screens and agree for the wrong
+    /// reason -- so the tests assert something is inside it first.
+    fn sheet_geometry() -> PxRect {
+        let kb = crate::graphics::layout::Keyboard::new_for(
+            1080.0,
+            2400.0,
+            crate::compositor::ime::KeyboardLayout::Qwerty,
+        );
+        let f = kb.frame;
+        (f.x as usize, f.y as usize, f.w as usize, f.h as usize)
+    }
+
+    /// The ink a drawn label must carry, `max(MIN_INK_PIXELS, 1% of the region)`.
+    fn min_ink(r: PxRect) -> usize {
+        MIN_INK_PIXELS.max(r.2 * r.3 / 100)
+    }
+
+    // =======================================================================
+    // IME layouts: the pixels
+    // =======================================================================
+
+    /// A frame with one of the three keyboard pages up.
+    fn ime_snap<'a>(
+        icon: &'a RgbaImage,
+        layout: crate::compositor::ime::KeyboardLayout,
+    ) -> Snapshot<'a> {
+        Snapshot {
+            keyboard: true,
+            keyboard_layout: layout,
+            grid: apps(icon, &["Messages"], 0xFF2563EB),
+            ..Default::default()
+        }
+    }
+
+    /// The three keyboard pages draw three different sheets.
+    ///
+    /// **The whole assertion.** `VirtualKeyboard::handle_key_tap` has had working
+    /// `?123` / `ABC` / `123` arms since the IME was written, and the renderer
+    /// built `Keyboard::new(w, h)` -- one fixed QWERTY -- for every frame. A user
+    /// could tap `?123`, `handle_key_tap` would set `layout = Symbols`, and not
+    /// one pixel would change. That is the project's named worst outcome reached
+    /// from the opposite direction to the one usually reported: not a correct
+    /// implementation nobody called, but a *called* implementation that changed
+    /// nothing.
+    ///
+    /// [`region_diff`], not [`count_ink`]: `count_ink` measures contrast against a
+    /// neighbour sample, so two sheets differing only in their key caps -- drawn
+    /// on a background of the same colour -- score identically. That is the exact
+    /// shape of the bug being pinned.
+    ///
+    /// Every *pair* is asserted, and separately over the character rows rather
+    /// than the whole sheet, so a renderer that painted the toggle label and
+    /// nothing else cannot pass.
+    #[test]
+    fn the_three_keyboard_pages_draw_three_different_sheets() {
+        let _guard = crate::graphics::font::font_test_lock();
+        use crate::compositor::ime::KeyboardLayout as L;
+        let icon = stub_icon([80, 140, 220]);
+        let sheet = sheet_geometry();
+        assert!(
+            sheet.2 > 400 && sheet.3 > 200,
+            "the keyboard sheet box is {sheet:?}, which is not a keyboard"
+        );
+
+        let mut frames = Vec::new();
+        for layout in [L::Qwerty, L::Symbols, L::Numeric] {
+            let mut c = Canvas::new(1080, 2400);
+            c.draw(&ime_snap(&icon, layout));
+            frames.push((layout, c));
+        }
+
+        // The sheet really is on screen: two pages that differ *must* differ, so
+        // a pair with a zero diff is a failure rather than a pass. That is the
+        // property being asserted, so there is no separate "is it there" check
+        // to get wrong -- but the box is asserted non-degenerate above so the
+        // probe cannot be a no-op that trivially agrees.
+        let rows = (sheet.0, sheet.1 + sheet.3 / 3, sheet.2, sheet.3 / 3);
+        for i in 0..frames.len() {
+            for j in (i + 1)..frames.len() {
+                let (la, a) = &frames[i];
+                let (lb, b) = &frames[j];
+                assert_ne!(
+                    region_diff(&a.buf, &b.buf, 1080, sheet),
+                    0,
+                    "{la:?} and {lb:?} painted an identical keyboard sheet -- the \
+                     layout field reaches the state and not the renderer"
+                );
+                assert_ne!(
+                    region_diff(&a.buf, &b.buf, 1080, rows),
+                    0,
+                    "{la:?} and {lb:?} agree across the top third of the sheet; \
+                     only the bottom row changed, so the page's own characters \
+                     are still fixed"
+                );
+            }
+        }
+    }
+
+    /// The layout toggle is drawn, and its label follows the page.
+    ///
+    /// Separate from the test above, which would still pass if the bottom row were
+    /// painted from one hard-coded string. What has to be true here is that the
+    /// label on the toggle key names the page it leads to -- so the string the
+    /// renderer paints and the string `handle_key_tap` dispatches are the same
+    /// value, which is why both go through
+    /// [`crate::graphics::layout::keyboard_toggle_label`].
+    ///
+    /// Probed against the toggle key's own rect, from the same `Keyboard` the
+    /// renderer built.
+    #[test]
+    fn the_layout_toggle_key_is_drawn_and_relabels_itself_per_page() {
+        let _guard = crate::graphics::font::font_test_lock();
+        use crate::compositor::ime::KeyboardLayout as L;
+        use crate::graphics::layout::Keyboard;
+        let icon = stub_icon([80, 140, 220]);
+        let toggle = px(Keyboard::new_for(1080.0, 2400.0, L::Qwerty).row4_layout);
+        assert!(
+            toggle.2 > 40 && toggle.3 > 20,
+            "the toggle key box is {toggle:?}, too small to carry a label"
+        );
+        let want = min_ink(toggle);
+
+        let mut frames = Vec::new();
+        for layout in [L::Qwerty, L::Symbols, L::Numeric] {
+            let mut c = Canvas::new(1080, 2400);
+            c.draw(&ime_snap(&icon, layout));
+            frames.push((layout, c));
+        }
+
+        // Every page labels its toggle, and the label is legible ink rather than
+        // an empty key cap.
+        for (layout, c) in &frames {
+            let (ink, _) = count_ink(&c.buf, 1080, toggle);
+            assert!(
+                ink >= want,
+                "{layout:?}: the toggle key carries {ink} ink px of a required \
+                 {want} -- the key is drawn empty"
+            );
+        }
+        // The label changes between the two pages that have different labels.
+        let (alpha, ca) = &frames[0];
+        let (symbols, cs) = &frames[1];
+        assert_eq!(
+            Keyboard::new_for(1080.0, 2400.0, *alpha).toggle_label(),
+            "?123",
+        );
+        assert_eq!(
+            Keyboard::new_for(1080.0, 2400.0, *symbols).toggle_label(),
+            "ABC",
+        );
+        assert_ne!(
+            region_diff(&ca.buf, &cs.buf, 1080, toggle),
+            0,
+            "the toggle key painted the same pixels on the alpha and symbols \
+             pages; its label is not following the page"
+        );
+    }
+
+    /// `keyboard_layout` is mirrored from `Snapshot` into the renderer state.
+    ///
+    /// `state_with` ends in `..Default::default()`, so a mirror dropped *there*
+    /// is invisible: the field compiles, is hashed, and is unreachable from this
+    /// harness. Rendered with a non-default value and required to change the
+    /// sheet, which is what catches exactly that.
+    #[test]
+    fn the_keyboard_layout_field_reaches_the_frame() {
+        let _guard = crate::graphics::font::font_test_lock();
+        use crate::compositor::ime::KeyboardLayout as L;
+        let icon = stub_icon([80, 140, 220]);
+        let sheet = sheet_geometry();
+        let base = ime_snap(&icon, L::Qwerty);
+
+        let mut quiet = Canvas::new(1080, 2400);
+        quiet.draw(&base);
+
+        for layout in [L::Symbols, L::Numeric] {
+            let snap = Snapshot {
+                keyboard_layout: layout,
+                ..base.clone()
+            };
+            assert_eq!(
+                snap.clone().keyboard_layout,
+                layout,
+                "Snapshot::Clone lost it"
+            );
+            let mut c = Canvas::new(1080, 2400);
+            c.draw(&snap);
+            assert_ne!(
+                region_diff(&quiet.buf, &c.buf, 1080, sheet),
+                0,
+                "{layout:?} changed nothing on the keyboard sheet"
+            );
+        }
+        // The two defaults must agree, or a default frame is not a resting frame.
+        assert_eq!(
+            Snapshot::default().keyboard_layout,
+            crate::graphics::drm_kms::DrmInteractiveState::default().keyboard_layout,
+            "Snapshot::default and DrmInteractiveState::default disagree on the \
+             resting keyboard page"
+        );
+    }
+
+    // =======================================================================
+    // App info: the pixels
+    // =======================================================================
+
+    fn app_info_snap<'a>(icon: &'a RgbaImage, name: &'a str) -> Snapshot<'a> {
+        Snapshot {
+            grid: apps(icon, &[name], 0xFF2563EB),
+            app_info: Some(crate::graphics::drm_kms::AppInfoSpec {
+                id: name,
+                name,
+                exec: "/usr/bin/firefox",
+                target: "gnome-software",
+                icon: Some(icon),
+                color: 0xFF2563EB,
+                glyph: "F",
+                target_kind: crate::graphics::layout::AppInfoTarget::Details,
+                installing: false,
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// The app-info panel is a surface, and every line of it is drawn from the
+    /// spec.
+    ///
+    /// What was broken: `PopupItem::AppInfo` is a variant, `draw_popup` gives it
+    /// the accent colour as the affirmative row, and no field anywhere held the
+    /// app being looked at -- so the row was painted and the tap went nowhere.
+    ///
+    /// Each of the five rows is probed by changing *that one field* of the spec
+    /// and requiring a change inside *that row's rect*. Probing one region per
+    /// field is what stops "something changed" from passing a panel that painted
+    /// only the name.
+    #[test]
+    fn the_app_info_panel_paints_every_line_of_its_spec() {
+        let _guard = crate::graphics::font::font_test_lock();
+        let icon = stub_icon([40, 120, 240]);
+        let a = crate::graphics::layout::AppInfoLayout::new(1080.0, 2400.0);
+        let base = app_info_snap(&icon, "Firefox");
+        let spec = base.app_info.expect("the fixture has a panel");
+
+        let mut base_frame = Canvas::new(1080, 2400);
+        base_frame.draw(&base);
+
+        // Opaque: a band below the controls where only the workspace would show
+        // through. Sampled away from every control so a panel that painted its
+        // own content and left the home screen visible cannot pass.
+        let band = (
+            0usize,
+            (a.icon.y + a.icon.h + a.hint.y - a.icon.y - a.icon.h) as usize,
+            1080usize,
+            300usize,
+        );
+        let mut home = Canvas::new(1080, 2400);
+        home.draw(&Snapshot {
+            grid: apps(&icon, &["Firefox"], 0xFF2563EB),
+            ..Default::default()
+        });
+        assert_ne!(
+            region_diff(&home.buf, &base_frame.buf, 1080, band),
+            0,
+            "the app-info panel left the workspace visible below its controls"
+        );
+
+        // Each field, changed alone, must change its own row.
+        let rows: [(&str, crate::graphics::layout::Rect); 5] = [
+            ("name", a.name),
+            ("id", a.id_line),
+            ("exec", a.exec_line),
+            ("target", a.target_line),
+            ("hint", a.hint),
+        ];
+        use crate::graphics::drm_kms::AppInfoSpec;
+        let variants: Vec<(AppInfoSpec, crate::graphics::layout::Rect)> = vec![
+            (
+                AppInfoSpec {
+                    name: "Firefox ESR",
+                    ..spec
+                },
+                a.name,
+            ),
+            (
+                AppInfoSpec {
+                    id: "org.mozilla.firefox",
+                    ..spec
+                },
+                a.id_line,
+            ),
+            (
+                AppInfoSpec {
+                    exec: "/usr/lib/firefox/firefox",
+                    ..spec
+                },
+                a.exec_line,
+            ),
+            (
+                AppInfoSpec {
+                    target: "discover-flatpak",
+                    ..spec
+                },
+                a.target_line,
+            ),
+            (
+                AppInfoSpec {
+                    installing: true,
+                    ..spec
+                },
+                a.hint,
+            ),
+        ];
+        assert_eq!(
+            variants.len(),
+            rows.len(),
+            "one variant per drawn line; adding a line to AppInfoLayout needs a \
+             sixth variant or this test stops covering the panel"
+        );
+        for ((name, _rect), (mutated, drawn_at)) in rows.iter().zip(variants.iter()) {
+            let mut c = Canvas::new(1080, 2400);
+            c.draw(&Snapshot {
+                app_info: Some(*mutated),
+                ..base.clone()
+            });
+            assert_ne!(
+                region_diff(&base_frame.buf, &c.buf, 1080, px(*drawn_at)),
+                0,
+                "the {name} line painted the same pixels for both values; row \
+                 {name:?} of AppInfoLayout is not drawn from the spec"
+            );
+        }
+    }
+
+    /// The handoff button is enabled only when there is something to launch.
+    ///
+    /// This is the panel's reason for existing on a Linux device. The reference
+    /// resolves its app-info target only at the tap and toasts afterwards if
+    /// nothing handled it (`PackageManagerHelper.java:160-187`); UTLC has to say
+    /// so *before* it, because the target is a program on this machine and a user
+    /// cannot tell from a menu row whether tapping it will do anything.
+    #[test]
+    fn the_app_info_handoff_button_is_disabled_with_nothing_to_launch() {
+        let _guard = crate::graphics::font::font_test_lock();
+        let icon = stub_icon([40, 120, 240]);
+        let a = crate::graphics::layout::AppInfoLayout::new(1080.0, 2400.0);
+        let base = app_info_snap(&icon, "Firefox");
+        let btn = px(a.open_button);
+
+        let mut enabled = Canvas::new(1080, 2400);
+        enabled.draw(&base);
+        let (ink, _) = count_ink(&enabled.buf, 1080, btn);
+        assert!(
+            ink >= min_ink(btn),
+            "the handoff button carries {ink} ink px; it has no legible label"
+        );
+
+        let mut spec = base.app_info.expect("the fixture has a panel");
+        spec.target = "";
+        let blind = Snapshot {
+            app_info: Some(spec),
+            ..base.clone()
+        };
+        let mut disabled = Canvas::new(1080, 2400);
+        disabled.draw(&blind);
+
+        assert!(
+            !blind.app_info.expect("still a panel").can_open(),
+            "an empty target reports itself launchable"
+        );
+        assert_ne!(
+            region_diff(&enabled.buf, &disabled.buf, 1080, btn),
+            0,
+            "an unresolvable target draws exactly the enabled handoff button -- \
+             the panel promises an action it cannot take"
+        );
+    }
+
+    /// `AppInfoSpec::EMPTY` and `AppInfoSpec::default()` are the same spec.
+    ///
+    /// `EMPTY` is the `..` in `AppInfoSpec { id, name, ..AppInfoSpec::EMPTY }` --
+    /// the form a shell uses when it knows what an app is but has no decoded icon
+    /// yet -- and `default()` is the form `..Default::default()` takes. Two tables
+    /// of "nothing" is one more thing to keep in step, so they are compared here.
+    #[test]
+    fn the_app_info_spec_defaults_are_one_value() {
+        let icon = stub_icon([9, 9, 9]);
+        assert_eq!(
+            crate::graphics::drm_kms::AppInfoSpec::EMPTY,
+            crate::graphics::drm_kms::AppInfoSpec::default(),
+        );
+        // ...and a spec built from only the identity is the empty one plus the
+        // identity, which is exactly what the panel needs to be legible.
+        let named = crate::graphics::drm_kms::AppInfoSpec {
+            id: "org.mozilla.firefox",
+            name: "Firefox",
+            exec: "/usr/bin/firefox",
+            target: "gnome-software",
+            ..crate::graphics::drm_kms::AppInfoSpec::EMPTY
+        };
+        assert!(named.can_open());
+        assert!(named.icon.is_none(), "EMPTY supplied an icon");
+        let mut c = Canvas::new(1080, 2400);
+        c.draw(&Snapshot {
+            app_info: Some(named),
+            ..Default::default()
+        });
+        let a = crate::graphics::layout::AppInfoLayout::new(1080.0, 2400.0);
+        let (ink, _) = count_ink(&c.buf, 1080, px(a.name));
+        assert!(
+            ink >= min_ink(px(a.name)),
+            "an icon-less spec painted no legible name"
+        );
+        let _ = icon;
+    }
+
+    /// The panel is off until a shell opens it.
+    ///
+    /// Smaller than the test above on purpose. That one proves the panel
+    /// *paints*; this proves the *default* does not, which is the only thing
+    /// keeping it from being an always-on overlay. An `app_info` field defaulting
+    /// to `Some` would make the launcher unusable and every other render test in
+    /// this file would still pass.
+    #[test]
+    fn the_app_info_panel_is_off_until_a_shell_opens_it() {
+        let _guard = crate::graphics::font::font_test_lock();
+        let icon = stub_icon([40, 120, 240]);
+        assert!(
+            Snapshot::default().app_info.is_none(),
+            "Snapshot::default has an app-info panel open"
+        );
+        assert!(
+            crate::graphics::drm_kms::DrmInteractiveState::default()
+                .app_info
+                .is_none(),
+            "DrmInteractiveState::default has an app-info panel open"
+        );
+        // It is a *surface*, not a few lines of type over the home screen.
+        let mut plain = Canvas::new(1080, 2400);
+        plain.draw(&Snapshot {
+            grid: apps(&icon, &["Firefox"], 0xFF2563EB),
+            ..Default::default()
+        });
+        let mut panel = Canvas::new(1080, 2400);
+        panel.draw(&app_info_snap(&icon, "Firefox"));
+        let changed = region_diff(&plain.buf, &panel.buf, 1080, (0, 0, 1080, 2400));
+        assert!(
+            changed > 500_000,
+            "opening the app-info panel changed only {changed} of {} px; it is \
+             not a surface",
+            1080 * 2400
+        );
+    }
+
+    // =======================================================================
+    // Workspace drag: the pixels
+    // =======================================================================
+
+    /// A home screen with a real grid, so a drag has something to lift.
+    fn drag_snap<'a>(icon: &'a RgbaImage) -> Snapshot<'a> {
+        Snapshot {
+            grid: apps(
+                icon,
+                &["Alpha", "Bravo", "Charlie", "Delta", "Echo"],
+                0xFF2563EB,
+            ),
+            ..Default::default()
+        }
+    }
+
+    /// The same grid with **no decoded bitmaps**, so a tile is a flat colour.
+    ///
+    /// Needed by the position test: with a bitmap icon the centre pixel of a
+    /// tile is the icon's own colour, so "the tile is at this position" cannot be
+    /// read as "this pixel is the tile's fill". A glyph-only fixture is what makes
+    /// the framebuffer answer the question.
+    fn drag_snap_glyphs() -> Snapshot<'static> {
+        Snapshot {
+            grid: vec![
+                AppGridItem {
+                    id: "Alpha",
+                    name: "Alpha",
+                    color: 0xFF2563EB,
+                    glyph: "A",
+                    icon: None,
+                    folder_n: 0,
+                    folder_id: 0,
+                },
+                AppGridItem {
+                    id: "Bravo",
+                    name: "Bravo",
+                    color: 0xFF2563F5,
+                    glyph: "B",
+                    icon: None,
+                    folder_n: 0,
+                    folder_id: 0,
+                },
+                AppGridItem {
+                    id: "Charlie",
+                    name: "Charlie",
+                    color: 0xFF256FFF,
+                    glyph: "C",
+                    icon: None,
+                    folder_n: 0,
+                    folder_id: 0,
+                },
+                AppGridItem {
+                    id: "Delta",
+                    name: "Delta",
+                    color: 0xFF257509,
+                    glyph: "D",
+                    icon: None,
+                    folder_n: 0,
+                    folder_id: 0,
+                },
+                AppGridItem {
+                    id: "Echo",
+                    name: "Echo",
+                    color: 0xFF257B13,
+                    glyph: "E",
+                    icon: None,
+                    folder_n: 0,
+                    folder_id: 0,
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    /// Whether `rect`'s centre scanline contains `colour` anywhere.
+    ///
+    /// A scanline rather than a single pixel because a glyph is drawn on the tile
+    /// and its stroke may sit exactly on the centre; asking "does this row of the
+    /// frame contain the tile's fill" is the question that actually means "is the
+    /// tile here", and it is still a *position* question -- the same colour at the
+    /// same coordinates of a different rect means the tile is elsewhere.
+    fn scanline_has(c: &Canvas, rect: &crate::graphics::layout::Rect, colour: u32) -> bool {
+        let y = (rect.center_y().max(0.0) as usize).min(2399);
+        let x0 = (rect.x.max(0.0) as usize).min(1079);
+        let x1 = ((rect.x + rect.w).max(0.0) as usize).min(1080);
+        (x0..x1.max(x0 + 1)).any(|x| c.buf[y * 1080 + x] == colour)
+    }
+
+    /// The five workspace-drag fields are mirrored and each reaches the frame.
+    ///
+    /// Scoped for the reason
+    /// [`the_six_folder_gesture_fields_reach_the_frame`] gives: a whole-struct
+    /// mirror guard needs a complete `DrmInteractiveState` literal and would stop
+    /// compiling for anybody else's field. The set here is known and small, so
+    /// each field is set in isolation against a quiet baseline and required to
+    /// change the pixels in its own rect.
+    #[test]
+    fn the_five_workspace_drag_fields_reach_the_frame() {
+        let _guard = crate::graphics::font::font_test_lock();
+        let icon = stub_icon_sized([200, 60, 60], 121);
+        let base = drag_snap(&icon);
+        let l = Layout::plain(1080.0, 2400.0);
+
+        let mut quiet = Canvas::new(1080, 2400);
+        quiet.draw(&base);
+
+        const LIFTED: u8 = 0;
+        const TARGET: u8 = 3;
+        let home = l.grid_icon(LIFTED as usize);
+        let target = l.grid_icon(TARGET as usize);
+        assert!(
+            (home.center_x() - target.center_x()).abs() > 40.0,
+            "the fixture's lifted and target cells are on top of each other"
+        );
+        // Out in the open, clear of both cells and of the dock.
+        let at = (540.0f32, 1400.0f32);
+        let lifted_full = l.drag_lifted_rect(LIFTED as usize, at, 1.0);
+        let lifted_flat = l.drag_lifted_rect(LIFTED as usize, at, 0.0);
+        assert!(
+            lifted_full.w > lifted_flat.w + 1.0,
+            "the lift does not change the tile, so the lift field cannot be \
+             observed in the frame"
+        );
+
+        let variants: Vec<(&str, Snapshot, Vec<PxRect>)> = vec![
+            (
+                "drag_slot",
+                Snapshot {
+                    drag_slot: Some(LIFTED),
+                    drag_pos: at,
+                    drag_lift: 1.0,
+                    ..base.clone()
+                },
+                // The resting cell is vacated and the tile appears at the finger.
+                vec![px(home), px(lifted_full)],
+            ),
+            (
+                "drag_pos",
+                Snapshot {
+                    drag_slot: Some(LIFTED),
+                    drag_pos: (at.0 + 60.0, at.1),
+                    drag_lift: 1.0,
+                    ..base.clone()
+                },
+                // A band the first tile vacated and the second one now covers.
+                vec![
+                    px(lifted_full),
+                    px(l.drag_lifted_rect(LIFTED as usize, (at.0 + 60.0, at.1), 1.0)),
+                ],
+            ),
+            (
+                "drag_lift",
+                Snapshot {
+                    drag_slot: Some(LIFTED),
+                    drag_pos: at,
+                    drag_lift: 0.0,
+                    ..base.clone()
+                },
+                // At lift 0 the tile is smaller, so the ring the bigger tile
+                // covered is now background.
+                vec![px(lifted_full)],
+            ),
+            (
+                "drag_drop_slot",
+                Snapshot {
+                    drag_slot: Some(LIFTED),
+                    drag_pos: at,
+                    drag_lift: 1.0,
+                    drag_drop_slot: Some(TARGET),
+                    ..base.clone()
+                },
+                vec![px(target)],
+            ),
+            (
+                "drag_merge_slot",
+                Snapshot {
+                    drag_slot: Some(LIFTED),
+                    drag_pos: at,
+                    drag_lift: 1.0,
+                    drag_merge_slot: Some(TARGET),
+                    ..base.clone()
+                },
+                vec![px(target)],
+            ),
+        ];
+        assert_eq!(
+            variants.len(),
+            5,
+            "one variant per drag field added to DrmInteractiveState; a sixth \
+             field needs a sixth variant or this test stops covering the block"
+        );
+
+        for (name, snap, regions) in variants {
+            let mut c = Canvas::new(1080, 2400);
+            c.draw(&snap);
+            let changed: usize = regions
+                .iter()
+                .map(|r| region_diff(&quiet.buf, &c.buf, 1080, *r))
+                .sum();
+            assert!(
+                changed > 200,
+                "{name} changed {changed} px of {regions:?} -- the field is on \
+                 Snapshot but is not reaching the renderer"
+            );
+        }
+    }
+
+    /// The merge plate and the drop gap are different affordances, and the merge
+    /// wins when both are set.
+    ///
+    /// The reference is explicit that they are different modes: arming a merge
+    /// calls `mDragTargetLayout.clearDragOutlines()` and switches to
+    /// `DRAG_MODE_CREATE_FOLDER` (`Workspace.java:2955-2958`), so a cell being
+    /// merged into shows a `PreviewBackground` and *no* drop outline. A renderer
+    /// that drew both would show a gap cut through the plate, which is the visual
+    /// tell that two derivations are fighting.
+    ///
+    /// Compared per-mode against the quiet baseline *and* against each other, so
+    /// a plate and a gap that were accidentally the same colour would still be
+    /// caught by the third assertion.
+    #[test]
+    fn the_merge_plate_and_the_drop_gap_are_different_and_never_both() {
+        let _guard = crate::graphics::font::font_test_lock();
+        let icon = stub_icon_sized([200, 60, 60], 121);
+        let base = drag_snap(&icon);
+        let target = Layout::plain(1080.0, 2400.0).grid_icon(3);
+
+        let dragging = |merge: Option<u8>, drop: Option<u8>| Snapshot {
+            drag_slot: Some(0),
+            drag_pos: (540.0, 1400.0),
+            drag_lift: 1.0,
+            drag_drop_slot: drop,
+            drag_merge_slot: merge,
+            ..base.clone()
+        };
+        let render = |s: &Snapshot| {
+            let mut c = Canvas::new(1080, 2400);
+            c.draw(s);
+            c
+        };
+        let quiet = render(&base);
+        let gap_only = render(&dragging(None, Some(3)));
+        let plate = render(&dragging(Some(3), None));
+        let both = render(&dragging(Some(3), Some(3)));
+
+        let r = px(target);
+        assert!(
+            region_diff(&quiet.buf, &gap_only.buf, 1080, r) > 200,
+            "the drop gap painted nothing over the target cell"
+        );
+        assert!(
+            region_diff(&quiet.buf, &plate.buf, 1080, r) > 200,
+            "the merge plate painted nothing over the target cell"
+        );
+        assert!(
+            region_diff(&gap_only.buf, &plate.buf, 1080, r) > 200,
+            "the drop gap and the merge plate painted identical pixels; there is \
+             one affordance, and it is ambiguous"
+        );
+        // Both set at once: the result is byte-identical to the merge alone.
+        assert_eq!(
+            region_diff(&plate.buf, &both.buf, 1080, r),
+            0,
+            "a merge and a gap on the same cell drew something extra; the \
+             reference clears the outlines when a merge arms"
+        );
+    }
+
+    /// A lifted cell carries a key shadow, and it is *below* the tile.
+    ///
+    /// **Added because neutering this draw did not turn anything red.** The first
+    /// version of the drag guard probed the lifted rect, which the opaque tile
+    /// covers completely -- so the shadow, drawn *under* the tile and offset by
+    /// `.5dp` (`styles.xml:425-426`), was invisible to it. That is the same trap the
+    /// icon-shadow guard in this file documents: "a shadow is painted under the fill,
+    /// so the only pixels it can change are the ones the tile does not cover", and
+    /// sampling the tile alone misses it.
+    ///
+    /// Probed in a band immediately *below* the tile and clear of its rounded
+    /// corners, with the band above it as the negative control: a shadow drawn
+    /// centred on the tile, or drawn above it, would score worse on the upper band
+    /// than the lower one.
+    #[test]
+    fn the_lifted_cell_carries_a_key_shadow_below_it() {
+        let _guard = crate::graphics::font::font_test_lock();
+        let base = drag_snap_glyphs();
+        let l = Layout::plain(1080.0, 2400.0);
+        let at = (300.0f32, 1300.0f32);
+        let lifted = l.drag_lifted_rect(0, at, 1.0);
+        let off = l.drag_shadow_offset();
+        assert!(
+            off >= 1.0,
+            "the shadow offset rounds away to nothing: {off}"
+        );
+
+        let mut quiet = Canvas::new(1080, 2400);
+        quiet.draw(&base);
+        let mut dragging = Canvas::new(1080, 2400);
+        dragging.draw(&Snapshot {
+            drag_slot: Some(0),
+            drag_pos: at,
+            drag_lift: 1.0,
+            ..base.clone()
+        });
+
+        // Clear of the rounded corners on both sides.
+        let bx = (lifted.x + lifted.w * 0.32) as usize;
+        let bw = (lifted.w * 0.36) as usize;
+        let thick = ((off * 3.0) as usize).max(3);
+        let below = (bx, (lifted.y + lifted.h) as usize, bw, thick);
+        let above = (bx, (lifted.y - thick as f32).max(0.0) as usize, bw, thick);
+        assert_ne!(
+            region_diff(&quiet.buf, &dragging.buf, 1080, below),
+            0,
+            "the lifted cell painted no key shadow below it; a lifted cell with no \
+ shadow does not read as lifted"
+        );
+        assert!(
+            region_diff(&quiet.buf, &dragging.buf, 1080, above)
+                < region_diff(&quiet.buf, &dragging.buf, 1080, below),
+            "the key shadow is not below the tile; `keyShadowOffsetY` is +.5dp \
+ (styles.xml:425-426), so a shadow drawn above is the wrong one"
+        );
+    }
+
+    /// The lifted tile is painted at the position the shell reported.
+    ///
+    /// A *position* test, not a "the pixels changed" test: the reach is already
+    /// covered by [`the_five_workspace_drag_fields_reach_the_frame`], and this
+    /// asks the sharper question -- does the rendered tile land on
+    /// [`crate::graphics::layout::Layout::drag_lifted_rect`]'s centre.
+    ///
+    /// Two probes at the same slot and lift with different `drag_pos`. A renderer
+    /// that ignored `drag_pos` would paint the same tile twice and a "did it
+    /// change" assertion would pass; reading the colour out of the framebuffer
+    /// does not.
+    #[test]
+    fn the_lifted_cell_is_painted_at_the_drag_position() {
+        let _guard = crate::graphics::font::font_test_lock();
+        // Glyph-only tiles: a decoded bitmap would put the *icon's* colour at the
+        // tile's centre and this test would be measuring the icon, not the tile.
+        let base = drag_snap_glyphs();
+        let l = Layout::plain(1080.0, 2400.0);
+        let colour = base.grid[0].color;
+
+        let a = (300.0f32, 1400.0f32);
+        let b = (760.0f32, 1600.0f32);
+        let shot = |at: (f32, f32)| {
+            let mut c = Canvas::new(1080, 2400);
+            c.draw(&Snapshot {
+                drag_slot: Some(0),
+                drag_pos: at,
+                drag_lift: 1.0,
+                ..base.clone()
+            });
+            c
+        };
+        let ca = shot(a);
+        let cb = shot(b);
+        let ra = l.drag_lifted_rect(0, a, 1.0);
+        let rb = l.drag_lifted_rect(0, b, 1.0);
+        for rect in [ra, rb] {
+            assert!(
+                rect.center_x() > 0.0
+                    && rect.center_x() < 1080.0
+                    && rect.center_y() > 0.0
+                    && rect.center_y() < 2400.0,
+                "the lifted centre ({},{}) is off the panel",
+                rect.center_x(),
+                rect.center_y()
+            );
+        }
+
+        // The tile is at A in frame A, at B in frame B, and at neither otherwise.
+        // All four halves: without the negative arms a renderer that drew the
+        // tile in *both* places would satisfy the two positive ones.
+        assert!(scanline_has(&ca, &ra, colour), "the tile is not at drag A");
+        assert!(
+            !scanline_has(&cb, &ra, colour),
+            "the tile is still at drag A after the drag moved to B"
+        );
+        assert!(scanline_has(&cb, &rb, colour), "the tile is not at drag B");
+        assert!(
+            !scanline_has(&ca, &rb, colour),
+            "the tile is at drag B even though the drag is at A"
+        );
+        // And the pixels really moved.
+        assert_ne!(
+            region_diff(&ca.buf, &cb.buf, 1080, px(ra)),
+            0,
+            "moving the drag did not move the lifted tile"
+        );
+        assert_ne!(
+            region_diff(&ca.buf, &cb.buf, 1080, px(rb)),
+            0,
+            "moving the drag did not move the lifted tile"
+        );
+    }
+
+    /// Every new `Snapshot` field has the agreed default and survives a clone.
+    ///
+    /// The mirror invariant asserted directly for the seven fields this change
+    /// added, because there is no whole-struct guard (see
+    /// [`the_six_folder_gesture_fields_reach_the_frame`] for why a complete
+    /// literal is not viable while another agent is adding fields). A value is
+    /// set on every field and read back after a clone, so a field added without a
+    /// `Clone` arm shows up as a diff rather than as a silently dropped value.
+    #[test]
+    fn every_new_snapshot_field_has_a_default_and_survives_a_clone() {
+        let icon = stub_icon([1, 2, 3]);
+        let d = Snapshot::default();
+        assert!(
+            d.app_info.is_none(),
+            "the default frame has an app-info panel"
+        );
+        assert_eq!(
+            d.keyboard_layout,
+            crate::compositor::ime::KeyboardLayout::Qwerty
+        );
+        assert!(d.drag_slot.is_none());
+        assert_eq!(d.drag_pos, (0.0, 0.0));
+        assert_eq!(d.drag_lift, 0.0);
+        assert!(d.drag_drop_slot.is_none());
+        assert!(d.drag_merge_slot.is_none());
+        assert_eq!(
+            d.folder_rename_buffer,
+            crate::graphics::drm_kms::FolderRenameBuffer::EMPTY
+        );
+        assert!(!d.folder_rename_editing);
+
+        let full = Snapshot {
+            app_info: Some(crate::graphics::drm_kms::AppInfoSpec {
+                id: "id",
+                name: "name",
+                exec: "exec",
+                target: "target",
+                icon: Some(&icon),
+                color: 1,
+                glyph: "G",
+                target_kind: crate::graphics::layout::AppInfoTarget::Store,
+                installing: true,
+            }),
+            keyboard_layout: crate::compositor::ime::KeyboardLayout::Numeric,
+            drag_slot: Some(2),
+            drag_pos: (11.0, 22.0),
+            drag_lift: 0.5,
+            drag_drop_slot: Some(3),
+            drag_merge_slot: Some(4),
+            folder_rename_buffer: crate::graphics::drm_kms::FolderRenameBuffer::truncated("Games"),
+            folder_rename_editing: true,
+            grid: apps(&icon, &["x"], 0),
+            ..Default::default()
+        };
+        let c = full.clone();
+        assert_eq!(c.app_info, full.app_info);
+        assert_eq!(c.keyboard_layout, full.keyboard_layout);
+        assert_eq!(c.drag_slot, full.drag_slot);
+        assert_eq!(c.drag_pos, full.drag_pos);
+        assert_eq!(c.drag_lift, full.drag_lift);
+        assert_eq!(c.drag_drop_slot, full.drag_drop_slot);
+        assert_eq!(c.drag_merge_slot, full.drag_merge_slot);
+        assert_eq!(c.folder_rename_buffer, full.folder_rename_buffer);
+        assert_eq!(c.folder_rename_editing, full.folder_rename_editing);
+    }
+
+    /// The rename field replaces the static title when editing, with a caret.
+    ///
+    /// `region_diff` for "did it change", `count_ink` only for "is there
+    /// contrast": the field rect must differ from the static frame, the caret
+    /// rect must carry ink, and an empty buffer must differ from a pre-filled
+    /// one (placeholder vs text). Published geometry comes from
+    /// `folder_grid_geometry`'s origin, not from `FolderLayout` directly --
+    /// those are layout coordinates while the sheet is vertically centred --
+    /// while `FolderLayout::menu` stays panel-space.
+    #[test]
+    fn folder_rename_field_replaces_the_title_and_shows_a_caret() {
+        let _guard = crate::graphics::font::font_test_lock();
+        let icon = stub_icon_sized([40, 120, 240], 121);
+        let base = open_folder(&icon, &["Alpha", "Bravo", "Charlie", "Delta"]);
+        let mut quiet = Canvas::new(1080, 2400);
+        quiet.draw(&base);
+        let editing = Snapshot {
+            folder_rename_editing: true,
+            folder_rename_buffer: crate::graphics::drm_kms::FolderRenameBuffer::truncated("New"),
+            ..base.clone()
+        };
+        let mut live = Canvas::new(1080, 2400);
+        live.draw(&editing);
+        let geom = crate::graphics::drm_kms::folder_rename_geometry();
+        assert!(
+            geom.live && geom.editing,
+            "the rename field was not published"
+        );
+        assert!(!geom.field.is_empty(), "the published field is empty");
+        // Panel coordinates are layout plus the grid's own offset, while the
+        // menu stays panel-space: the same `origin - cell` delta
+        // `folder_layout_offset` (`main.rs:645`) derives.
+        let fl = Layout::plain(1080.0, 2400.0).folder();
+        let grid = crate::graphics::drm_kms::folder_grid_geometry();
+        assert!(grid.live, "the folder grid was not published");
+        let layout_field = fl.rename_field();
+        let (ox, oy) = (grid.origin.0 - fl.cell.x, grid.origin.1 - fl.cell.y);
+        assert!(
+            (geom.field.x - (layout_field.x + ox)).abs() < 1.5
+                && (geom.field.y - (layout_field.y + oy)).abs() < 1.5,
+            "published {:?} is not layout {:?} + offset ({ox},{oy})",
+            geom.field,
+            layout_field
+        );
+        let field = px(geom.field);
+        let changed = region_diff(&quiet.buf, &live.buf, 1080, field);
+        assert!(
+            changed > 500,
+            "editing changed only {changed} px of {field:?} -- the field is not drawn"
+        );
+        // Caret carries contrast against its neighbourhood. `px` insets by a
+        // pixel on every side, which would leave a 2 px caret zero-width, so
+        // the probe is the caret's own box widened by one.
+        let caret_box: PxRect = (
+            geom.caret.x as usize,
+            geom.caret.y as usize,
+            (geom.caret.w as usize).max(1) + 2,
+            geom.caret.h as usize,
+        );
+        let (ink, _) = count_ink(&live.buf, 1080, caret_box);
+        assert!(
+            ink > 0,
+            "the caret at {:?} carries no ink -- it is not drawn",
+            geom.caret
+        );
+        // Empty draws the placeholder, which differs from pre-filled text.
+        let mut blank = Canvas::new(1080, 2400);
+        blank.draw(&Snapshot {
+            folder_rename_editing: true,
+            folder_rename_buffer: crate::graphics::drm_kms::FolderRenameBuffer::EMPTY,
+            ..base.clone()
+        });
+        assert_ne!(
+            region_diff(&live.buf, &blank.buf, 1080, field),
+            0,
+            "empty and pre-filled buffers paint identically; the placeholder rule is dead"
+        );
+        // Not editing draws no field.
+        let dead = crate::graphics::drm_kms::folder_rename_geometry();
+        let mut shut = Canvas::new(1080, 2400);
+        shut.draw(&base);
+        let _ = dead;
+        assert_eq!(
+            region_diff(&quiet.buf, &shut.buf, 1080, field),
+            0,
+            "a non-editing folder paints where the field would be"
+        );
+    }
+
+    /// A folder drag-out shows a workspace slot distinct from the Remove bar.
+    ///
+    /// Both are drawn when `folder_drag_out` is true, but they are different
+    /// affordances: the bar is a top-band primary fill
+    /// (`DeleteDropTarget.java:115`), the slot is a grid-cell tertiary outline
+    /// from `folder_drag_to_workspace_target`. `region_diff` for change: the
+    /// bar changes in both drag-out frames, the cell only when the finger is
+    /// over the grid.
+    #[test]
+    fn folder_drag_out_shows_a_workspace_slot_distinct_from_remove() {
+        let _guard = crate::graphics::font::font_test_lock();
+        let icon = stub_icon_sized([40, 120, 240], 121);
+        let base = open_folder(&icon, &["Alpha", "Bravo", "Charlie", "Delta"]);
+        let mut quiet = Canvas::new(1080, 2400);
+        quiet.draw(&base);
+        let l = Layout::plain(1080.0, 2400.0);
+        let dtb = crate::graphics::layout::drop_target_bar(&l);
+        let bar: PxRect = (
+            dtb.bar.x as usize,
+            0,
+            dtb.bar.w as usize,
+            dtb.bar.h as usize,
+        );
+        // Over workspace cell 3: helper must agree it is a target.
+        let target = l.grid_icon(3).center();
+        assert!(crate::graphics::layout::folder_drag_to_workspace_target(&l, target).is_some());
+        let mut over_grid = Canvas::new(1080, 2400);
+        over_grid.draw(&Snapshot {
+            folder_drag_slot: Some(0),
+            folder_drag_pos: target,
+            folder_drag_out: true,
+            ..base.clone()
+        });
+        // Over the dock (outside the grid band): helper is None, so no slot.
+        let scrim_pos = (540.0f32, 2300.0f32);
+        assert_eq!(
+            crate::graphics::layout::folder_drag_to_workspace_target(&l, scrim_pos),
+            None
+        );
+        let mut over_scrim = Canvas::new(1080, 2400);
+        over_scrim.draw(&Snapshot {
+            folder_drag_slot: Some(0),
+            folder_drag_pos: scrim_pos,
+            folder_drag_out: true,
+            ..base.clone()
+        });
+        let cell = px(l.drag_gap_rect(3));
+        // The bar is present in both drag-out frames.
+        assert!(
+            region_diff(&quiet.buf, &over_grid.buf, 1080, bar) > 5_000,
+            "the Remove bar did not appear over the grid"
+        );
+        assert!(
+            region_diff(&quiet.buf, &over_scrim.buf, 1080, bar) > 5_000,
+            "the Remove bar did not appear over the scrim"
+        );
+        // The workspace slot only over the grid, in the tertiary role (distinct
+        // from the Remove bar's primary fill). Counted by exact colour, not by
+        // `region_diff`: the lifted folder cell also changes the cell rect, so
+        // a change assertion would pass with no outline at all.
+        let tertiary = (0xFF << 24) | (MaterialYouPalette::default_dark().tertiary & 0x00FF_FFFF);
+        let count_tertiary = |b: &[u32]| -> usize {
+            let (x0, y0, rw, rh) = cell;
+            let mut n = 0;
+            for y in y0..(y0 + rh) {
+                for x in x0..(x0 + rw) {
+                    if b[y * 1080 + x] == tertiary {
+                        n += 1;
+                    }
+                }
+            }
+            n
+        };
+        assert!(
+            count_tertiary(&over_grid.buf) > 20,
+            "no tertiary workspace slot where the folder drag is over the grid"
+        );
+        assert_eq!(
+            count_tertiary(&over_scrim.buf),
+            0,
+            "a tertiary workspace slot where the drag is outside the grid"
+        );
+        assert_eq!(
+            count_tertiary(&quiet.buf),
+            0,
+            "the quiet frame already has the slot colour"
+        );
+    }
+
+    /// Orphan drop affordances with no lifted cell draw nothing.
+    ///
+    /// `draw_workspace_drag` returns first on `drag_slot == None`, so a gap or
+    /// plate without a lift -- which the reference never has without a drag view
+    /// (`DragLayer.java:190`) -- cannot appear. `region_diff` for change: all
+    /// three rects must match the quiet frame.
+    #[test]
+    fn workspace_drag_with_no_lift_draws_nothing() {
+        let _guard = crate::graphics::font::font_test_lock();
+        let icon = stub_icon_sized([200, 60, 60], 121);
+        let base = drag_snap(&icon);
+        let mut quiet = Canvas::new(1080, 2400);
+        quiet.draw(&base);
+        let mut orphan = Canvas::new(1080, 2400);
+        orphan.draw(&Snapshot {
+            drag_slot: None,
+            drag_pos: (540.0, 1400.0),
+            drag_lift: 1.0,
+            drag_drop_slot: Some(3),
+            drag_merge_slot: Some(3),
+            ..base.clone()
+        });
+        let l = Layout::plain(1080.0, 2400.0);
+        for (label, r) in [
+            ("gap", px(l.drag_gap_rect(3))),
+            ("plate", px(l.drag_merge_rect(3))),
+            ("lift", px(l.drag_lifted_rect(0, (540.0, 1400.0), 1.0))),
+        ] {
+            assert_eq!(
+                region_diff(&quiet.buf, &orphan.buf, 1080, r),
+                0,
+                "{label} drew with drag_slot == None"
+            );
+        }
+    }
+
+    /// Rename editing and the folder-to-workspace slot do not allocate.
+    ///
+    /// Fixed-capacity `Copy` buffers only: the frame path must not see the
+    /// allocator. Warms per-state caches outside the bracket, then asserts
+    /// three composed frames allocate nothing.
+    #[test]
+    fn rename_and_folder_workspace_target_do_not_allocate() {
+        use alloc_probe::allocations;
+        let _guard = crate::graphics::font::font_test_lock();
+        let icon = stub_icon_sized([80, 160, 240], 121);
+        let base = open_folder(&icon, &["Alpha", "Bravo"]);
+        let editing = Snapshot {
+            folder_rename_editing: true,
+            folder_rename_buffer: crate::graphics::drm_kms::FolderRenameBuffer::truncated("New"),
+            ..base.clone()
+        };
+        let l = Layout::plain(1080.0, 2400.0);
+        let target = l.grid_icon(2).center();
+        let drag_out = Snapshot {
+            folder_drag_slot: Some(0),
+            folder_drag_pos: target,
+            folder_drag_out: true,
+            ..base.clone()
+        };
+        let mut c = Canvas::new(1080, 2400);
+        for s in [&editing, &drag_out] {
+            c.draw(s);
+            let before = allocations();
+            for _ in 0..3 {
+                c.draw(s);
+            }
+            assert_eq!(before, allocations());
         }
     }
 }

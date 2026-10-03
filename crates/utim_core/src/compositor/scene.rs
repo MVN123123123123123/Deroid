@@ -109,7 +109,10 @@ impl MobileScene {
         // Allocate HWC hardware composition layers; log and degrade if the
         // composer rejects us rather than silently dropping planes.
         if let Err(e) = scene.try_init_hwc_layers() {
-            eprintln!("[-] HWC layer init failed, degrading to client composition: {}", e);
+            eprintln!(
+                "[-] HWC layer init failed, degrading to client composition: {}",
+                e
+            );
         }
         scene
     }

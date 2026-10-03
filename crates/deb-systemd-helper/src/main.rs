@@ -348,9 +348,7 @@ fn unmask_unit(root: &str, unit: &str) -> Result<(), String> {
             Ok(())
         }
         Ok(_) => Err(format!("{unit} is not masked")),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Err(format!("{unit} is not masked"))
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(format!("{unit} is not masked")),
         Err(e) => Err(format!("cannot inspect {}: {e}", link_target.display())),
     }
 }
@@ -492,8 +490,7 @@ mod tests {
     #[test]
     fn test_unmask_unmasked_is_an_error() {
         // S12: unmasking a never-masked unit must not silently succeed.
-        let temp =
-            std::env::temp_dir().join(format!("test_dsh_unmask_{}", std::process::id()));
+        let temp = std::env::temp_dir().join(format!("test_dsh_unmask_{}", std::process::id()));
         let _ = fs::remove_dir_all(&temp);
         fs::create_dir_all(&temp).unwrap();
         let root_str = temp.to_str().unwrap();

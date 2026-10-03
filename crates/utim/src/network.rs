@@ -48,7 +48,8 @@ pub fn setup_network_subsystem() -> io::Result<()> {
         if let Ok(entries) = fs::read_dir("/sys/class/net") {
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().to_string();
-                if !name.starts_with("eth") && !name.starts_with("en") && !name.starts_with("wlan") {
+                if !name.starts_with("eth") && !name.starts_with("en") && !name.starts_with("wlan")
+                {
                     continue;
                 }
                 println!("[UTIM] Configuring primary network interface: {}", name);
@@ -62,22 +63,23 @@ pub fn setup_network_subsystem() -> io::Result<()> {
                 libc::ioctl(sock, libc::SIOCSIFADDR, &ifr);
 
                 // Set Netmask 255.255.255.0
-                let sin = &mut *(&mut ifr.ifr_ifru.ifru_netmask as *mut _ as *mut libc::sockaddr_in);
+                let sin =
+                    &mut *(&mut ifr.ifr_ifru.ifru_netmask as *mut _ as *mut libc::sockaddr_in);
                 sin.sin_family = libc::AF_INET as libc::sa_family_t;
                 sin.sin_addr.s_addr = u32::from_ne_bytes([255, 255, 255, 0]);
                 libc::ioctl(sock, libc::SIOCSIFNETMASK, &ifr);
 
                 // Set Broadcast 10.0.2.255
-                let sin = &mut *(&mut ifr.ifr_ifru.ifru_broadaddr as *mut _ as *mut libc::sockaddr_in);
+                let sin =
+                    &mut *(&mut ifr.ifr_ifru.ifru_broadaddr as *mut _ as *mut libc::sockaddr_in);
                 sin.sin_family = libc::AF_INET as libc::sa_family_t;
                 sin.sin_addr.s_addr = u32::from_ne_bytes([10, 0, 2, 255]);
                 libc::ioctl(sock, libc::SIOCSIFBRDADDR, &ifr);
 
                 // Set Flags UP | RUNNING | BROADCAST | MULTICAST
-                ifr.ifr_ifru.ifru_flags = (libc::IFF_UP
-                    | libc::IFF_RUNNING
-                    | libc::IFF_BROADCAST
-                    | libc::IFF_MULTICAST) as libc::c_short;
+                ifr.ifr_ifru.ifru_flags =
+                    (libc::IFF_UP | libc::IFF_RUNNING | libc::IFF_BROADCAST | libc::IFF_MULTICAST)
+                        as libc::c_short;
                 libc::ioctl(sock, libc::SIOCSIFFLAGS, &ifr);
 
                 // Add default gateway 10.0.2.2

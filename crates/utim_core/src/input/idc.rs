@@ -203,9 +203,7 @@ impl InputDeviceConfig {
             TouchPressureCalibration::Physical | TouchPressureCalibration::Amplitude => {
                 (raw_pressure as f32 * self.pressure_scale).clamp(0.0, 1.0)
             }
-            TouchPressureCalibration::Default => {
-                (raw_pressure as f32 / 4096.0).clamp(0.0, 1.0)
-            }
+            TouchPressureCalibration::Default => (raw_pressure as f32 / 4096.0).clamp(0.0, 1.0),
         }
     }
 

@@ -46,11 +46,7 @@ impl TelephonyWakeManager {
     }
 
     /// Triggered by kernel modem IRQ or RIL unsol packet during sleep
-    pub fn on_modem_irq_event(
-        &mut self,
-        reason: WakeReason,
-        mpg: &mut MobilePowerGovernor,
-    ) {
+    pub fn on_modem_irq_event(&mut self, reason: WakeReason, mpg: &mut MobilePowerGovernor) {
         self.wake_events_count += 1;
         self.last_wake_reason = Some(reason);
 
@@ -58,18 +54,15 @@ impl TelephonyWakeManager {
         if mpg.acquire_wake_lock(TELEPHONY_WAKE_LOCK).is_ok() {
             self.wake_lock_active = true;
             self.alert_tick = self.alert_tick.wrapping_add(1);
-            self.alert_deadline_ticks = self
-                .alert_tick
-                .wrapping_add(Self::ALERT_TIMEOUT_TICKS);
+            self.alert_deadline_ticks = self.alert_tick.wrapping_add(Self::ALERT_TIMEOUT_TICKS);
         }
     }
 
     /// Release wake lock after call answered, rejected, or notification timeout
     pub fn release_alert_lock(&mut self, mpg: &mut MobilePowerGovernor) {
-        if self.wake_lock_active
-            && mpg.release_wake_lock(TELEPHONY_WAKE_LOCK).is_ok() {
-                self.wake_lock_active = false;
-            }
+        if self.wake_lock_active && mpg.release_wake_lock(TELEPHONY_WAKE_LOCK).is_ok() {
+            self.wake_lock_active = false;
+        }
     }
 
     /// Expire an unanswered alert (call poll_timeout(now_tick) from the loop).

@@ -1237,6 +1237,507 @@ impl GestureEngine {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Double-tap detection
+// ---------------------------------------------------------------------------
+//
+// # Why this exists
+//
+// `InputDispatcher::finish_touch` (`input.rs:237-266`) returns
+// `InputDispatchResult::Tap { x, y }` and
+// `InputDispatchResult::LongPress { x, y }` with **no timestamp**, so the
+// shell has never had a clock for a tap, let alone a history of them.
+// `GestureEngine::process_touch` consumes `RawTouchEvent`, which does carry
+// `timestamp: Instant` (`gestures.rs:169-176`) but is only fed drags and
+// flings: `finish_touch` routes a movement of 25 px or more to `Touch`, and
+// everything short of 400 ms to `Tap` (`input.rs:243-254`). So a double-tap
+// is not merely unimplemented -- the data to detect one is discarded at the
+// point it is produced.
+//
+// # What the reference does with one
+//
+// `WorkspaceTouchListener.onDoubleTap` (`WorkspaceTouchListener.java:261-267`)
+// sets a flag, claims the following `UP`/`CANCEL` so the tap underneath does
+// not also open an app (`:108-113`), and hands off to
+// `GestureController.onDoubleTap()` (`GestureController.kt:48-50`), which runs
+// whichever `GestureHandlerConfig` the user picked. The **default is Sleep**:
+// `PreferenceManager2.kt:813-816` declares
+// `doubleTapGestureHandler` with `defaultValue = GestureHandlerConfig.Sleep`
+// (`GestureHandlerConfig.kt:76-78`).
+//
+// # Why the timestamp is a parameter
+//
+// Nothing here reads a clock. The same lesson as `ScreenTimeout::poll_budget`
+// in `crates/utlc/src/main.rs`: when a timeout reads the clock itself, two
+// reads inside one event cannot be guaranteed to agree, and the disagreement
+// shows up as a gesture that fires a frame late. Feeding the timestamp in --
+// the shell's evdev `EV_TIME` stamp, which `input.rs:199-217`
+// (`event_timestamp`) already has -- makes every decision here a function of
+// the event stream alone, which is also what makes it testable without a
+// sleep.
+
+/// `ViewConfiguration.getDoubleTapTimeout()`: the platform's maximum gap
+/// between the two `DOWN`s of a double-tap.
+///
+/// `PipTouchState.java:40` reads it from the platform and
+/// `PipTouchState.java:132-133` tests
+/// `(mDownTouchTime - mLastDownTouchTime) < DOUBLE_TAP_TIMEOUT`, i.e. the gap
+/// is measured **down to down**, not up to up. UTLC's 300 ms is that platform
+/// default, which the reference tree does not override anywhere.
+pub const DOUBLE_TAP_TIMEOUT_MS: u64 = 300;
+
+/// `ViewConfiguration.getDoubleTapMinTime()`: the platform's *lower* bound on
+/// the same gap, in ms.
+///
+/// A second `DOWN` faster than this is not read as a second tap at all. The
+/// reference tree uses it when synthesising a double-tap for a UI test
+/// (`SplitScreenUtils.kt:369-371`) but does not set it, so the same 40 ms
+/// platform default applies.
+pub const DOUBLE_TAP_MIN_TIME_MS: u64 = 40;
+
+/// The reference's own movement tolerance for a pending touch: **twice** the
+/// panel slop, in dp.
+///
+/// `WorkspaceTouchListener.java:92-94`,
+/// `mTouchSlop = 2 * ViewConfiguration.get(launcher).getScaledTouchSlop()`,
+/// with the comment "Use twice the touch slop as we are looking for long press
+/// which is more likely to cause movement", and applied as a radius at
+/// `WorkspaceTouchListener.java:175-177`
+/// (`PointF.length(...) > mTouchSlop` cancels). The workspace's own
+/// double-tap tolerance comes from `GestureDetector`
+/// (`WorkspaceTouchListener.java:95`), whose `getDoubleTapSlop()` is framework
+/// code and is **not vendored into this tree** -- so 2x slop is the closest
+/// movement radius the reference actually states, and it is the same radius
+/// that decides "was this a tap at all" in `input.rs:243`.
+pub const DOUBLE_TAP_SLOP_DP: f32 = 2.0 * DP_TOUCH_SLOP;
+
+/// Thresholds for double-tap recognition. All three are read on the touch
+/// path, so the struct is `Copy` and a caller builds it once.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DoubleTapConfig {
+    /// Movement tolerance in px: the two taps must land within this radius of
+    /// each other. See [`DOUBLE_TAP_SLOP_DP`].
+    pub slop: f32,
+    /// Maximum `DOWN`-to-`DOWN` gap, in ms. See [`DOUBLE_TAP_TIMEOUT_MS`].
+    pub window_ms: u64,
+    /// Minimum `DOWN`-to-`DOWN` gap, in ms. See [`DOUBLE_TAP_MIN_TIME_MS`].
+    pub min_window_ms: u64,
+}
+
+impl DoubleTapConfig {
+    /// The platform defaults, on a density-1.0 panel.
+    pub const DEFAULT: Self = Self {
+        slop: DOUBLE_TAP_SLOP_DP,
+        window_ms: DOUBLE_TAP_TIMEOUT_MS,
+        min_window_ms: DOUBLE_TAP_MIN_TIME_MS,
+    };
+
+    /// Thresholds for a panel of `density` px/dp.
+    ///
+    /// The slop is the only field that scales: the two windows are wall-clock
+    /// and a denser panel does not make people tap faster. A non-finite or
+    /// non-positive density collapses to 1.0 for the reason spelled out on
+    /// [`GestureConfig::for_density`] -- a zero slop pairs only two identical
+    /// points, and a NaN one never pairs at all.
+    pub fn for_density(density: f32) -> Self {
+        let d = if density.is_finite() && density > 0.0 {
+            density
+        } else {
+            1.0
+        };
+        Self {
+            slop: DOUBLE_TAP_SLOP_DP * d,
+            ..Self::DEFAULT
+        }
+    }
+}
+
+impl Default for DoubleTapConfig {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// One completed tap: when the finger went down, when it came up, and where.
+///
+/// Both timestamps are needed, not just the up: the pairing window is
+/// `DOWN`-to-`DOWN` (`PipTouchState.java:132-133`) while the time the first
+/// tap is still *waiting* runs from its `UP`
+/// (`PipTouchState.java:356-358`). Collapsing them into one number is what
+/// makes a naive implementation pair a first tap that had already expired.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Tap {
+    /// `DOWN` on the shell's monotonic millisecond clock.
+    pub down_ms: u64,
+    /// `UP` on the same clock. Never before [`Tap::down_ms`] as far as this
+    /// type is concerned; [`Tap::new`] clamps it.
+    pub up_ms: u64,
+    /// Release x, in panel px.
+    pub x: f32,
+    /// Release y, in panel px.
+    pub y: f32,
+}
+
+impl Tap {
+    /// A tap that went down at `down_ms` and came up at `up_ms`.
+    ///
+    /// An `up_ms` before `down_ms` is clamped rather than trusted: a wrapped
+    /// or out-of-order evdev stamp must not become a negative duration that
+    /// silently widens every window.
+    #[inline]
+    pub const fn new(down_ms: u64, up_ms: u64, x: f32, y: f32) -> Self {
+        Self {
+            down_ms,
+            up_ms: if up_ms < down_ms { down_ms } else { up_ms },
+            x,
+            y,
+        }
+    }
+
+    /// How long the finger was down, in ms.
+    #[inline]
+    pub const fn duration_ms(&self) -> u64 {
+        self.up_ms - self.down_ms
+    }
+
+    /// Centre-to-centre distance to `other`, in px.
+    #[inline]
+    pub fn distance_to(&self, other: Tap) -> f32 {
+        let (dx, dy) = (other.x - self.x, other.y - self.y);
+        (dx * dx + dy * dy).sqrt()
+    }
+
+    /// `DOWN`-to-`DOWN` gap to `other`, in ms; `0` if the clock went backwards.
+    #[inline]
+    pub const fn gap_to(&self, other: Tap) -> u64 {
+        other.down_ms.saturating_sub(self.down_ms)
+    }
+}
+
+/// What one touch sequence turned out to be, at the moment it ended.
+///
+/// This enum is the whole reason the pair-breaking rule is structural. A
+/// caller cannot report a drag as anything *other* than [`TouchEnd::Other`],
+/// and reporting anything as [`TouchEnd::Other`] unconditionally discards the
+/// pending first half. Splitting "tap" and "not a tap" into a sum type means
+/// there is no third path on which a drag silently leaves a stale first tap
+/// armed -- which is exactly the bug
+/// `PipTouchState.java:132` guards against with `!mPreviouslyDragging`
+/// (set at `:219`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TouchEnd {
+    /// A tap: short, and within the dispatcher's own movement box
+    /// (`input.rs:243-254`).
+    Tap {
+        /// `DOWN` on the shell's monotonic millisecond clock.
+        down_ms: u64,
+        /// `UP` on the same clock.
+        up_ms: u64,
+        /// Release x, in panel px.
+        x: f32,
+        /// Release y, in panel px.
+        y: f32,
+    },
+    /// Anything else: a drag, a fling, a long press, a cancel. Breaks the pair.
+    Other,
+}
+
+impl TouchEnd {
+    /// The [`Tap`] this sequence produced, if it was a tap.
+    #[inline]
+    pub const fn as_tap(self) -> Option<Tap> {
+        match self {
+            TouchEnd::Tap {
+                down_ms,
+                up_ms,
+                x,
+                y,
+            } => Some(Tap::new(down_ms, up_ms, x, y)),
+            TouchEnd::Other => None,
+        }
+    }
+}
+
+/// What [`TapHistory::on_touch_end`] decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TapOutcome {
+    /// A tap with nothing to pair with. It is now pending as the first half of
+    /// a possible double-tap, and it will be dropped after
+    /// [`DoubleTapConfig::window_ms`] minus its own duration.
+    FirstTap,
+    /// Two taps that met the slop and the window. The pending first half is
+    /// consumed, so a third tap starts a fresh pair rather than a triple.
+    DoubleTap,
+    /// A tap that arrived while a first half was pending but did not pair --
+    /// too far away, outside the window, or faster than the minimum. The old
+    /// first half is discarded and **this** tap becomes the new pending one,
+    /// so a run of misses can never chain two unrelated taps together.
+    Unpaired,
+    /// The sequence was not a tap, so any pending first half was discarded.
+    Interrupted,
+}
+
+/// A pure predicate: do these two taps form a double-tap?
+///
+/// Three conditions, all necessary:
+///
+/// * the `DOWN`-to-`DOWN` gap is at least [`DoubleTapConfig::min_window_ms`]
+///   and strictly below [`DoubleTapConfig::window_ms`] -- the two halves of
+///   `PipTouchState.java:132-133`, which has the upper bound only because the
+///   platform's own detector applies the lower one;
+/// * the releases are within [`DoubleTapConfig::slop`] of each other, the
+///   radius of [`DOUBLE_TAP_SLOP_DP`];
+/// * the second `DOWN` is not before the first. This is stated separately
+///   rather than left to the gap comparison because a backwards gap reads as
+///   zero, which passes a `min_window_ms` of zero -- so with the minimum
+///   opened up, only this check refuses a wrapped clock.
+///
+/// Free function on purpose: it holds no state, so it can be pinned against
+/// hand-computed cases without driving a state machine.
+pub fn forms_double_tap(first: Tap, second: Tap, config: DoubleTapConfig) -> bool {
+    if second.down_ms < first.down_ms {
+        return false;
+    }
+    let gap = first.gap_to(second);
+    if gap < config.min_window_ms || gap >= config.window_ms {
+        return false;
+    }
+    // `slop` is a distance, so compare squared: one `sqrt` per tap saved. A
+    // non-positive *or* non-finite slop pairs nothing, so a misconfigured
+    // tolerance can never widen the rule into "always".
+    let (dx, dy) = (second.x - first.x, second.y - first.y);
+    let slop = config.slop;
+    if slop <= 0.0 || !slop.is_finite() {
+        return false;
+    }
+    dx * dx + dy * dy <= slop * slop
+}
+
+/// The last tap, and whether it is still waiting for a partner.
+///
+/// 24 bytes, `Copy`, no allocation, no clock. The one piece of mutable state
+/// on the tap path is a single optional [`Tap`].
+///
+/// Construct with [`TapHistory::new`]; a plain `Default` is
+/// [`DoubleTapConfig::DEFAULT`] and a density-scaled panel wants
+/// [`TapHistory::with_config`] fed [`DoubleTapConfig::for_density`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TapHistory {
+    /// The first half of a possible pair, or `None`.
+    pending: Option<Tap>,
+    config: DoubleTapConfig,
+}
+
+impl TapHistory {
+    /// An empty history with the given thresholds.
+    #[inline]
+    pub const fn new(config: DoubleTapConfig) -> Self {
+        Self {
+            pending: None,
+            config,
+        }
+    }
+
+    /// The thresholds in force.
+    #[inline]
+    pub const fn config(&self) -> DoubleTapConfig {
+        self.config
+    }
+
+    /// The pending first half, if one is armed. Does **not** check expiry --
+    /// use [`TapHistory::pending_within`] for that, or
+    /// [`TapHistory::on_touch_end`], which expires before it pairs.
+    #[inline]
+    pub const fn pending(&self) -> Option<Tap> {
+        self.pending
+    }
+
+    /// Forget any pending first half. A full reset.
+    #[inline]
+    pub fn reset(&mut self) {
+        self.pending = None;
+    }
+
+    /// Milliseconds the pending first half is still good for, from `now_ms`.
+    ///
+    /// This is the timeout the shell needs so a first tap does not linger
+    /// forever: it is the window minus the first tap's own duration minus
+    /// however long it has already been waiting, floored at zero. The
+    /// reference computes the same quantity as
+    /// `PipTouchState.getDoubleTapTimeoutCallbackDelay` (`:355-360`),
+    /// `Math.max(0, DOUBLE_TAP_TIMEOUT - (mUpTouchTime - mDownTouchTime))`,
+    /// which is where the "minus the tap's own duration" comes from. Returns
+    /// `0` when nothing is pending or the budget is spent, so a shell can
+    /// poll it without a branch of its own.
+    pub fn remaining_ms(&self, now_ms: u64) -> u64 {
+        let Some(first) = self.pending else {
+            return 0;
+        };
+        // All three `saturating_sub`s floor at zero, and a `u64` cannot go
+        // negative, so a `now_ms` behind the tap's own `UP` -- or a tap longer
+        // than the whole window -- reads as "spent" rather than wrapping to an
+        // enormous budget.
+        self.config
+            .window_ms
+            .saturating_sub(first.duration_ms())
+            .saturating_sub(now_ms.saturating_sub(first.up_ms))
+    }
+
+    /// Whether a first half is pending and still inside its budget at
+    /// `now_ms`.
+    #[inline]
+    pub fn is_armed(&self, now_ms: u64) -> bool {
+        self.pending.is_some() && self.remaining_ms(now_ms) > 0
+    }
+
+    /// The pending first half, but only if `now_ms` is still inside its
+    /// budget. This is the reading a shell wants for a "waiting for the
+    /// second tap" affordance.
+    pub fn pending_within(&self, now_ms: u64) -> Option<Tap> {
+        self.is_armed(now_ms).then_some(self.pending)?
+    }
+
+    /// The one entry point: report how a touch sequence ended.
+    ///
+    /// This is the function the shell calls from wherever it currently turns
+    /// an [`InputDispatchResult`] into a row, and it is deliberately the only
+    /// way to change the state -- there is no `push_tap` that a drag could
+    /// skip past, so the pair-breaking rule cannot be forgotten.
+    pub fn on_touch_end(&mut self, end: TouchEnd) -> TapOutcome {
+        let Some(tap) = end.as_tap() else {
+            // `WorkspaceTouchListener.java:102-104` clears the flag on every
+            // `DOWN`; `PipTouchState.java:132` refuses to pair when the
+            // previous sequence dragged (`:219`).
+            self.pending = None;
+            return TapOutcome::Interrupted;
+        };
+        // An expired first half is not a first half. Expiring here rather
+        // than trusting the caller is what makes `remaining_ms` advisory
+        // rather than load-bearing.
+        let paired = self
+            .pending
+            .filter(|first| self.remaining_ms(first.up_ms) > 0)
+            .is_some_and(|first| forms_double_tap(first, tap, self.config));
+        if paired {
+            self.pending = None;
+            TapOutcome::DoubleTap
+        } else if self.pending.is_some() {
+            // Keep only the newer tap: a chain of misses must not be able to
+            // pair tap 1 with tap 3.
+            self.pending = Some(tap);
+            TapOutcome::Unpaired
+        } else {
+            self.pending = Some(tap);
+            TapOutcome::FirstTap
+        }
+    }
+
+    /// Convenience for a shell that has a timestamp in hand and wants the
+    /// boolean directly. Same semantics as [`TapHistory::on_touch_end`].
+    #[inline]
+    pub fn tap(&mut self, tap: Tap) -> bool {
+        self.on_touch_end(TouchEnd::Tap {
+            down_ms: tap.down_ms,
+            up_ms: tap.up_ms,
+            x: tap.x,
+            y: tap.y,
+        }) == TapOutcome::DoubleTap
+    }
+}
+
+impl Default for TapHistory {
+    fn default() -> Self {
+        Self::new(DoubleTapConfig::DEFAULT)
+    }
+}
+
+/// What a double-tap runs.
+///
+/// The ten `GestureHandlerConfig.Simple` variants, which are the ten fixed
+/// entries a settings dropdown can hold
+/// (`GestureHandlerConfig.kt:74-130`). `GestureHandlerConfig.OpenApp`
+/// (`GestureHandlerConfig.kt:133-184`) is deliberately absent: it is a
+/// `data class` carrying an `OpenAppTarget`, so it is "open the app the user
+/// picked" rather than a fixed menu entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u8)]
+pub enum DoubleTapAction {
+    /// `GestureHandlerConfig.NoOp` (`GestureHandlerConfig.kt:72-74`).
+    NoOp = 0,
+    /// `GestureHandlerConfig.Sleep` (`:76-78`). **The reference default**:
+    /// `PreferenceManager2.kt:813-816`.
+    Sleep = 1,
+    /// `GestureHandlerConfig.Recents` (`:80-84`).
+    Recents = 2,
+    /// `GestureHandlerConfig.OpenNotifications` (`:86-91`).
+    OpenNotifications = 3,
+    /// `GestureHandlerConfig.OpenQuickSettings` (`:93-98`).
+    OpenQuickSettings = 4,
+    /// `GestureHandlerConfig.OpenAppDrawer` (`:100-107`).
+    OpenAppDrawer = 5,
+    /// `GestureHandlerConfig.OpenAppSearch` (`:109-116`).
+    OpenAppSearch = 6,
+    /// `GestureHandlerConfig.OpenSearch` (`:118-123`).
+    OpenSearch = 7,
+    /// `GestureHandlerConfig.OpenAssistant` (`:125-130`).
+    OpenAssistant = 8,
+}
+
+/// `PreferenceManager2.kt:815`: `defaultValue = GestureHandlerConfig.Sleep`.
+pub const DOUBLE_TAP_DEFAULT: DoubleTapAction = DoubleTapAction::Sleep;
+
+impl DoubleTapAction {
+    /// Every action, in `GestureHandlerConfig.kt`'s declaration order.
+    pub const ALL: [DoubleTapAction; 9] = [
+        DoubleTapAction::NoOp,
+        DoubleTapAction::Sleep,
+        DoubleTapAction::Recents,
+        DoubleTapAction::OpenNotifications,
+        DoubleTapAction::OpenQuickSettings,
+        DoubleTapAction::OpenAppDrawer,
+        DoubleTapAction::OpenAppSearch,
+        DoubleTapAction::OpenSearch,
+        DoubleTapAction::OpenAssistant,
+    ];
+
+    /// The persisted key, verbatim from the reference's `@SerialName`.
+    pub const fn id(self) -> &'static str {
+        match self {
+            DoubleTapAction::NoOp => "noOp",
+            DoubleTapAction::Sleep => "sleep",
+            DoubleTapAction::Recents => "recents",
+            DoubleTapAction::OpenNotifications => "openNotificationdata",
+            DoubleTapAction::OpenQuickSettings => "openQuickSettings",
+            DoubleTapAction::OpenAppDrawer => "openAppDrawer",
+            DoubleTapAction::OpenAppSearch => "openAppSearch",
+            DoubleTapAction::OpenSearch => "openSearch",
+            DoubleTapAction::OpenAssistant => "openAssistant",
+        }
+    }
+
+    /// The settings-row label, from the `@StringRes` each variant names
+    /// (`GestureHandlerConfig.kt:74-130`). ASCII only: this tree has no font
+    /// package, so a non-ASCII label renders as tofu.
+    pub const fn label(self) -> &'static str {
+        match self {
+            DoubleTapAction::NoOp => "No action",
+            DoubleTapAction::Sleep => "Sleep",
+            DoubleTapAction::Recents => "Recents",
+            DoubleTapAction::OpenNotifications => "Open notifications",
+            DoubleTapAction::OpenQuickSettings => "Open quick settings",
+            DoubleTapAction::OpenAppDrawer => "Open app drawer",
+            DoubleTapAction::OpenAppSearch => "Open app search",
+            DoubleTapAction::OpenSearch => "Open search",
+            DoubleTapAction::OpenAssistant => "Open assistant",
+        }
+    }
+
+    /// The action whose [`DoubleTapAction::id`] is `s`, if any.
+    pub fn from_id(s: &str) -> Option<DoubleTapAction> {
+        DoubleTapAction::ALL.into_iter().find(|a| a.id() == s)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2845,5 +3346,508 @@ mod tests {
         let d = GestureConfig::for_density(DENSITY_1080P);
         assert!(d.is_scrub_dominant(d.scrub_threshold_x, 0.0));
         assert!(!d.is_scrub_dominant(d.scrub_threshold_x * 0.99, 0.0));
+    }
+
+    // -- double-tap detection ---------------------------------------------
+    //
+    // Section note: every case below is a hand-computed (gap, distance) pair,
+    // not a value read back out of the implementation. The thresholds are the
+    // platform's, stated at the top of the section, so the bounds are
+    // arithmetic on those constants rather than on anything the code produced.
+
+    /// A tap that went down and up inside `dur_ms`, released at `(x, y)`.
+    fn tap(down_ms: u64, dur_ms: u64, x: f32, y: f32) -> Tap {
+        Tap::new(down_ms, down_ms + dur_ms, x, y)
+    }
+
+    /// The four numbers the recognition rule is stated in: the window's lower
+    /// and upper bound, and the slop.
+    #[test]
+    fn double_tap_thresholds_are_the_platform_defaults() {
+        let c = DoubleTapConfig::DEFAULT;
+        assert_eq!(c.window_ms, 300, "ViewConfiguration.getDoubleTapTimeout");
+        assert_eq!(c.min_window_ms, 40, "ViewConfiguration.getDoubleTapMinTime");
+        // `WorkspaceTouchListener.java:94`: twice the panel slop, 8 dp each.
+        assert_eq!(c.slop, 16.0);
+        assert_eq!(c.slop, 2.0 * DP_TOUCH_SLOP);
+        // Density is the only thing that scales, and it scales the slop alone:
+        // a denser panel does not make people tap faster.
+        let d = DoubleTapConfig::for_density(DENSITY_1080P);
+        assert!((d.slop - 16.0 * DENSITY_1080P).abs() < 1.0e-4);
+        assert_eq!(d.window_ms, c.window_ms);
+        assert_eq!(d.min_window_ms, c.min_window_ms);
+        // A degenerate density collapses to 1.0 rather than to a zero slop,
+        // which would pair only two identical points.
+        for bad in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            let b = DoubleTapConfig::for_density(bad);
+            assert_eq!(b.slop, c.slop, "density {bad}");
+            assert_eq!(b.window_ms, c.window_ms);
+        }
+    }
+
+    /// The happy path, at both ends of the window. The gap is measured
+    /// `DOWN`-to-`DOWN` (`PipTouchState.java:132-133`), so the *up* of the
+    /// second tap is `dur` ms after its own `DOWN` and plays no part.
+    #[test]
+    fn two_taps_inside_the_window_and_the_slop_are_a_double_tap() {
+        let c = DoubleTapConfig::DEFAULT;
+        // 40 ms apart: the shortest pairing the platform will accept.
+        assert!(forms_double_tap(
+            tap(1000, 20, 500.0, 900.0),
+            tap(1040, 20, 500.0, 900.0),
+            c
+        ));
+        // 299 ms apart: the longest, since the bound is strict (`:133`).
+        assert!(forms_double_tap(
+            tap(1000, 20, 500.0, 900.0),
+            tap(1299, 20, 500.0, 900.0),
+            c
+        ));
+        // Diagonally at exactly the slop radius: (12, 12) is 16.97, so use
+        // (0, 16) which is exactly 16.
+        assert!(forms_double_tap(
+            tap(1000, 20, 500.0, 900.0),
+            tap(1100, 20, 500.0, 916.0),
+            c
+        ));
+    }
+
+    /// Each of the three conditions, knocked out one at a time. These are the
+    /// perturbations of the happy path, so a rule that is accidentally
+    /// missing fails here rather than passing the happy path.
+    #[test]
+    fn each_condition_knocked_out_alone_breaks_the_pair() {
+        let c = DoubleTapConfig::DEFAULT;
+        let a = tap(1000, 20, 500.0, 900.0);
+        // Too soon: 39 ms, one below the minimum.
+        assert!(!forms_double_tap(a, tap(1039, 20, 500.0, 900.0), c));
+        // Too late: exactly the window, which is excluded (`:133` is `<`).
+        assert!(!forms_double_tap(a, tap(1300, 20, 500.0, 900.0), c));
+        assert!(!forms_double_tap(a, tap(1400, 20, 500.0, 900.0), c));
+        // Too far: 17 px down, one past the 16 px slop.
+        assert!(!forms_double_tap(a, tap(1100, 20, 500.0, 917.0), c));
+        // Too far on x only, to catch a check that only looks at y.
+        assert!(!forms_double_tap(a, tap(1100, 20, 517.0, 900.0), c));
+        // A zero slop pairs nothing at all, rather than everything.
+        let zero = DoubleTapConfig { slop: 0.0, ..c };
+        assert!(!forms_double_tap(a, tap(1100, 20, 500.0, 900.0), zero));
+        assert!(forms_double_tap(
+            a,
+            tap(1100, 20, 500.0, 900.0),
+            DoubleTapConfig { slop: 1.0e-6, ..c }
+        ));
+    }
+
+    /// A wrapped or out-of-order stamp must not pair. A negative gap that
+    /// wrapped to a huge positive one would otherwise look like a slow first
+    /// tap and *fail* the window -- so the dangerous direction is the one that
+    /// wraps small, which is what `Tap::gap_to` returning 0 rules out via the
+    /// minimum. Checked at both 0 and a non-zero minimum.
+    #[test]
+    fn a_backwards_clock_never_pairs() {
+        let c = DoubleTapConfig::DEFAULT;
+        let a = tap(1000, 20, 500.0, 900.0);
+        let b = tap(1100, 20, 500.0, 900.0);
+        // In order, 100 ms apart at the same point: pairs.
+        assert!(forms_double_tap(a, b, c));
+        // Reversed, the gap is negative. `Tap::gap_to` clamps it to 0, which
+        // the 40 ms minimum already refuses -- so the guard that matters is
+        // the ordering one, not the clamp.
+        assert_eq!(b.gap_to(a), 0, "a backwards gap reads as zero");
+        assert!(!forms_double_tap(b, a, c));
+        // With the minimum opened up there is nothing left to refuse it but
+        // the ordering check itself.
+        let no_min = DoubleTapConfig {
+            min_window_ms: 0,
+            ..c
+        };
+        assert!(!forms_double_tap(b, a, no_min));
+        assert!(forms_double_tap(a, b, no_min), "in order it still pairs");
+    }
+
+    /// The first tap's own duration eats into its budget. This is the whole
+    /// reason `Tap` carries both timestamps: a 250 ms press leaves only 50 ms
+    /// for a partner, and an implementation that measured up-to-up would give
+    /// it 300. Mirrors `PipTouchState.getDoubleTapTimeoutCallbackDelay`
+    /// (`:355-360`), `DOUBLE_TAP_TIMEOUT - (mUpTouchTime - mDownTouchTime)`.
+    #[test]
+    fn a_long_first_tap_leaves_a_shorter_budget() {
+        let c = DoubleTapConfig::DEFAULT;
+        let mut h = TapHistory::new(c);
+        // A 250 ms press.
+        h.on_touch_end(TouchEnd::Tap {
+            down_ms: 1000,
+            up_ms: 1250,
+            x: 500.0,
+            y: 900.0,
+        });
+        assert_eq!(h.remaining_ms(1250), 50, "300 - 250");
+        // A partner 60 ms after the up is 310 ms after the down: outside.
+        assert_eq!(
+            h.on_touch_end(TouchEnd::Tap {
+                down_ms: 1310,
+                up_ms: 1330,
+                x: 500.0,
+                y: 900.0,
+            }),
+            TapOutcome::Unpaired
+        );
+        // 49 ms after the up is 299 ms after the down: inside, with 1 ms to
+        // spare. The bound is on the `DOWN` gap, so the second tap's own
+        // duration is irrelevant.
+        let mut h = TapHistory::new(c);
+        h.on_touch_end(TouchEnd::Tap {
+            down_ms: 1000,
+            up_ms: 1250,
+            x: 500.0,
+            y: 900.0,
+        });
+        assert_eq!(h.remaining_ms(1299), 1, "299 ms of the 300 ms window used");
+        assert!(h.is_armed(1299));
+        assert_eq!(h.pending_within(1299), Some(tap(1000, 250, 500.0, 900.0)));
+        assert_eq!(h.remaining_ms(1300), 0, "the window bound is strict");
+        assert!(!h.is_armed(1300));
+        assert_eq!(h.pending_within(1300), None);
+        assert_eq!(
+            h.on_touch_end(TouchEnd::Tap {
+                down_ms: 1299,
+                up_ms: 1500,
+                x: 500.0,
+                y: 900.0,
+            }),
+            TapOutcome::DoubleTap,
+            "a second tap that itself lasts 201 ms still pairs"
+        );
+    }
+
+    /// The timeout: the first tap does not linger forever. `remaining_ms`
+    /// counts down from the window and floors at zero, and the shell's
+    /// `is_armed` / `pending_within` go false exactly when it reaches zero.
+    #[test]
+    fn the_first_tap_does_not_linger_past_its_budget() {
+        let c = DoubleTapConfig::DEFAULT;
+        let mut h = TapHistory::new(c);
+        assert_eq!(h.remaining_ms(0), 0, "nothing pending");
+        assert!(!h.is_armed(0));
+        assert_eq!(h.pending(), None);
+        assert_eq!(
+            h.on_touch_end(TouchEnd::Tap {
+                down_ms: 1000,
+                up_ms: 1010,
+                x: 500.0,
+                y: 900.0,
+            }),
+            TapOutcome::FirstTap
+        );
+        assert_eq!(h.remaining_ms(1010), 290, "300 - a 10 ms press");
+        assert!(h.is_armed(1010));
+        // The `DOWN` gap from 1000 is what the window is measured on, so the
+        // budget runs out at 1300 -- not at 1310 (up-to-up) and not at 1200
+        // (window minus nothing).
+        assert!(h.is_armed(1299), "one ms of the 300 ms window left");
+        assert_eq!(h.remaining_ms(1299), 1);
+        assert!(!h.is_armed(1300), "the bound is strict (`:133` is `<`)");
+        assert_eq!(h.remaining_ms(1300), 0, "floored, not negative");
+        assert_eq!(h.pending_within(1300), None);
+        // The stored tap is still there -- `pending` is the raw reading, and
+        // `pending_within` is the one that expires. Mixing them up is a bug
+        // this pins.
+        assert_eq!(h.pending(), Some(tap(1000, 10, 500.0, 900.0)));
+        // And a backwards clock cannot inflate the budget.
+        assert_eq!(h.remaining_ms(0), 290, "saturating, not wrapping");
+    }
+
+    /// A double-tap consumes the pending first half, so a third tap starts a
+    /// fresh pair instead of firing again -- the reference's
+    /// `mDoubleTapPending` claim of the following `UP`/`CANCEL`
+    /// (`WorkspaceTouchListener.java:108-113`) exists for the same reason:
+    /// one user intent, one action.
+    #[test]
+    fn a_double_tap_consumes_the_pair_and_the_third_tap_starts_over() {
+        let mut h = TapHistory::new(DoubleTapConfig::DEFAULT);
+        fn t(h: &mut TapHistory, ms: u64) -> TapOutcome {
+            h.on_touch_end(TouchEnd::Tap {
+                down_ms: ms,
+                up_ms: ms + 10,
+                x: 500.0,
+                y: 900.0,
+            })
+        }
+        assert_eq!(t(&mut h, 1000), TapOutcome::FirstTap);
+        assert_eq!(t(&mut h, 1100), TapOutcome::DoubleTap);
+        assert_eq!(h.pending(), None, "the pair was consumed");
+        assert_eq!(
+            t(&mut h, 1200),
+            TapOutcome::FirstTap,
+            "not a second double-tap"
+        );
+        assert_eq!(t(&mut h, 1300), TapOutcome::DoubleTap);
+    }
+
+    /// **The rule the brief is really about: a drag in between breaks the
+    /// pair.** `PipTouchState.java:132` refuses to pair when the previous
+    /// sequence dragged (`!mPreviouslyDragging`, set at `:219`), and
+    /// `WorkspaceTouchListener.java:102-104` clears the pending flag on every
+    /// `DOWN`. Feeding a long press between the two taps is the same event from
+    /// the detector's point of view: a non-tap.
+    #[test]
+    fn a_drag_in_between_breaks_the_pair() {
+        // A drag is `TouchEnd::Other`: past the dispatcher's own 25 px box, so
+        // `finish_touch` never even calls it a tap (`input.rs:243-256`).
+        let mut h = TapHistory::new(DoubleTapConfig::DEFAULT);
+        let t = |h: &mut TapHistory, ms: u64| {
+            h.on_touch_end(TouchEnd::Tap {
+                down_ms: ms,
+                up_ms: ms + 10,
+                x: 500.0,
+                y: 900.0,
+            })
+        };
+        assert_eq!(t(&mut h, 1000), TapOutcome::FirstTap);
+        assert_eq!(h.on_touch_end(TouchEnd::Other), TapOutcome::Interrupted);
+        assert_eq!(h.pending(), None, "the drag left a tap armed");
+        // Two taps 100 ms apart, 50 ms after the drag, which is inside every
+        // threshold -- so the only thing that can refuse this pair is the
+        // drag.
+        assert_eq!(t(&mut h, 1050), TapOutcome::FirstTap);
+        assert_eq!(
+            t(&mut h, 1100),
+            TapOutcome::DoubleTap,
+            "only after re-arming"
+        );
+    }
+
+    /// A run of misses must not chain two unrelated taps together. Tap 1, a
+    /// miss, then tap 3 near tap *1*: the answer has to be no, because tap 2
+    /// is the pending half after the miss. Without this, a slow double-tap
+    /// followed by a fast one fires.
+    #[test]
+    fn a_run_of_misses_never_chains_tap_one_onto_tap_three() {
+        let mut h = TapHistory::new(DoubleTapConfig::DEFAULT);
+        let t = |h: &mut TapHistory, ms: u64, x: f32| {
+            h.on_touch_end(TouchEnd::Tap {
+                down_ms: ms,
+                up_ms: ms + 10,
+                x,
+                y: 900.0,
+            })
+        };
+        assert_eq!(t(&mut h, 1000, 500.0), TapOutcome::FirstTap);
+        // Tap 2 is 500 ms later -- a miss, and it re-arms as the new first half.
+        assert_eq!(t(&mut h, 1500, 500.0), TapOutcome::Unpaired);
+        assert_eq!(h.pending().map(|p| p.down_ms), Some(1500));
+        // Tap 3 is 100 ms after tap 2 but 200 ms after tap 1: it pairs with
+        // tap 2, not with tap 1, and tap 1 is gone for good.
+        assert_eq!(t(&mut h, 1600, 500.0), TapOutcome::DoubleTap);
+        // The chain does not restart into a phantom.
+        assert_eq!(h.pending(), None);
+        assert_eq!(t(&mut h, 1700, 500.0), TapOutcome::FirstTap);
+    }
+
+    /// An expired first half is not a first half. This is the difference
+    /// between `remaining_ms` being advisory and load-bearing: a caller that
+    /// polls it and a caller that ignores it must get the same answer.
+    #[test]
+    fn an_expired_first_half_does_not_pair_even_without_a_poll() {
+        let mut h = TapHistory::new(DoubleTapConfig::DEFAULT);
+        h.on_touch_end(TouchEnd::Tap {
+            down_ms: 1000,
+            up_ms: 1010,
+            x: 500.0,
+            y: 900.0,
+        });
+        // Never polled. The tap arrives 5000 ms later.
+        assert_eq!(
+            h.on_touch_end(TouchEnd::Tap {
+                down_ms: 5000,
+                up_ms: 5010,
+                x: 500.0,
+                y: 900.0,
+            }),
+            TapOutcome::Unpaired,
+            "an expired first half still reports Unpaired, not DoubleTap"
+        );
+        // And the newcomer is the new first half, so the very next tap pairs.
+        assert_eq!(
+            h.on_touch_end(TouchEnd::Tap {
+                down_ms: 5100,
+                up_ms: 5110,
+                x: 500.0,
+                y: 900.0,
+            }),
+            TapOutcome::DoubleTap
+        );
+    }
+
+    /// The whole thing is a single optional tap. No `Vec`, no `String`, no
+    /// clock, and `Send` so the compositor can own it across threads.
+    #[test]
+    fn the_tap_history_is_one_optional_tap_and_no_clock() {
+        assert!(!core::mem::needs_drop::<TapHistory>());
+        // `Option<Tap>` is 32 (a 24-byte `Tap` plus a discriminant; none of
+        // its four scalar fields has a niche) and `DoubleTapConfig` is 24
+        // (f32, 4 bytes of padding, two u64). Fixed, so it can live in the
+        // compositor's own state.
+        assert_eq!(core::mem::size_of::<TapHistory>(), 56);
+        fn assert_send<T: Send>() {}
+        assert_send::<TapHistory>();
+        assert_send::<DoubleTapConfig>();
+        // And it is deterministic: the same event stream gives the same
+        // answers on every run, because nothing in it reads time.
+        let run = || {
+            let mut h = TapHistory::new(DoubleTapConfig::DEFAULT);
+            let mut out = [false; 4];
+            for (i, ms) in [1000u64, 1100, 5000, 5100].into_iter().enumerate() {
+                out[i] = h.tap(tap(ms, 10, 500.0, 900.0));
+            }
+            out
+        };
+        assert_eq!(run(), run());
+        assert_eq!(run(), [false, true, false, true]);
+    }
+
+    /// A cancelled sequence is a non-tap, so it breaks the pair.
+    /// `WorkspaceTouchListener.java:109` treats `CANCEL` exactly like `UP`
+    /// for this purpose.
+    ///
+    /// The dispatcher reports a long press as its own variant
+    /// (`input.rs:245-248`), so the mapping from `InputDispatchResult` to
+    /// [`TouchEnd`] is pinned here rather than left as a suggestion: it is
+    /// exhaustively matched, so a future variant cannot silently become a tap.
+    #[test]
+    fn cancel_and_long_press_break_the_pair() {
+        use crate::compositor::input::InputDispatchResult;
+
+        /// The mapping the shell has to write. Exhaustive on purpose.
+        fn end_of(r: &InputDispatchResult, down_ms: u64, up_ms: u64) -> TouchEnd {
+            match *r {
+                InputDispatchResult::Tap { x, y } => TouchEnd::Tap {
+                    down_ms,
+                    up_ms,
+                    x,
+                    y,
+                },
+                // A drag, a long press, a cancel, an injected key: all break
+                // the pair. `InputDispatchResult::Touch(RawTouchEvent)` is a
+                // completed gesture here by construction, because
+                // `finish_touch` only routes movement past the 25 px box
+                // there (`input.rs:243-256`).
+                _ => TouchEnd::Other,
+            }
+        }
+
+        let tap_result = InputDispatchResult::Tap { x: 500.0, y: 900.0 };
+        let long_press = InputDispatchResult::LongPress { x: 500.0, y: 900.0 };
+        let drag = InputDispatchResult::Touch(RawTouchEvent {
+            touch_id: 1,
+            phase: TouchPhase::Up,
+            x: 500.0,
+            y: 900.0,
+            timestamp: std::time::Instant::now(),
+        });
+        let none = InputDispatchResult::None;
+
+        // Only `Tap` maps to a tap; the three others are all `Other`.
+        assert_eq!(
+            end_of(&tap_result, 1000, 1010),
+            TouchEnd::Tap {
+                down_ms: 1000,
+                up_ms: 1010,
+                x: 500.0,
+                y: 900.0
+            }
+        );
+        for r in [&long_press, &drag, &none] {
+            assert_eq!(end_of(r, 1000, 1010), TouchEnd::Other, "{r:?}");
+        }
+
+        // And the consequence: a tap, a long press, a tap -- no double-tap,
+        // where the reference clears the flag on every `DOWN`
+        // (`WorkspaceTouchListener.java:102-104`).
+        let mut h = TapHistory::new(DoubleTapConfig::DEFAULT);
+        assert_eq!(
+            h.on_touch_end(end_of(&tap_result, 1000, 1010)),
+            TapOutcome::FirstTap
+        );
+        assert_eq!(
+            h.on_touch_end(end_of(&long_press, 1020, 1400)),
+            TapOutcome::Interrupted
+        );
+        assert_eq!(h.pending(), None);
+        assert_eq!(
+            h.on_touch_end(end_of(&tap_result, 1100, 1110)),
+            TapOutcome::FirstTap,
+            "the tap after the long press starts a new pair"
+        );
+    }
+
+    /// `Tap::new` clamps an out-of-order stamp rather than producing a negative
+    /// duration, and `forms_double_tap` is a pure function of its arguments.
+    #[test]
+    fn a_tap_clamps_an_out_of_order_stamp() {
+        let t = Tap::new(1000, 900, 1.0, 2.0);
+        assert_eq!(t.up_ms, 1000);
+        assert_eq!(t.duration_ms(), 0);
+        assert_eq!(t.distance_to(Tap::new(0, 0, 4.0, 6.0)), 5.0);
+        // `as_tap` is the only conversion from `TouchEnd`, and it is exact.
+        assert_eq!(
+            TouchEnd::Other.as_tap(),
+            None,
+            "a non-tap has no Tap, by construction"
+        );
+        assert_eq!(
+            TouchEnd::Tap {
+                down_ms: 5,
+                up_ms: 3,
+                x: 7.0,
+                y: 8.0
+            }
+            .as_tap(),
+            Some(Tap::new(5, 3, 7.0, 8.0))
+        );
+    }
+
+    /// The default action is **Sleep**: `PreferenceManager2.kt:813-816`
+    /// declares `doubleTapGestureHandler` with
+    /// `defaultValue = GestureHandlerConfig.Sleep`. If this ever reads
+    /// `NoOp`, the launcher quietly stops sleeping on a double-tap and nobody
+    /// notices because the rest of the gesture layer still works.
+    #[test]
+    fn the_default_double_tap_action_is_sleep() {
+        assert_eq!(DOUBLE_TAP_DEFAULT, DoubleTapAction::Sleep);
+        // The `@SerialName`s as **literals**. An earlier version of this
+        // iterated the table asserting `from_id(a.id()) == Some(a)`, which
+        // round-trips through the very table under test: a mis-spelt
+        // `id()` passed. The perturbation sweep caught it -- changing
+        // `OpenQuickSettings`'s key to `open_quick_settings` left the suite
+        // green. So the keys are spelled out here instead.
+        let want = [
+            (DoubleTapAction::NoOp, "noOp"),
+            (DoubleTapAction::Sleep, "sleep"),
+            (DoubleTapAction::Recents, "recents"),
+            (DoubleTapAction::OpenNotifications, "openNotificationdata"),
+            (DoubleTapAction::OpenQuickSettings, "openQuickSettings"),
+            (DoubleTapAction::OpenAppDrawer, "openAppDrawer"),
+            (DoubleTapAction::OpenAppSearch, "openAppSearch"),
+            (DoubleTapAction::OpenSearch, "openSearch"),
+            (DoubleTapAction::OpenAssistant, "openAssistant"),
+        ];
+        for (a, id) in want {
+            assert_eq!(a.id(), id, "{a:?} key");
+            assert_eq!(DoubleTapAction::from_id(id), Some(a), "{id}");
+            assert!(a.label().is_ascii(), "{} label is not ASCII", a.id());
+        }
+        // `OpenApp` is the one `GestureHandlerConfig` variant that is absent,
+        // because it is a `data class` carrying an `OpenAppTarget`
+        // (`GestureHandlerConfig.kt:133-184`) and cannot be a fixed entry.
+        assert_eq!(DoubleTapAction::ALL.len(), 9);
+        assert_eq!(DoubleTapAction::from_id("openApp"), None);
+        // The two handlers that are also externally invokable upstream
+        // (`GestureHandlerConfig.kt:106`, `:115`) are present, so a shell can
+        // wire them without a second enum.
+        assert_eq!(
+            DoubleTapAction::from_id("openAppDrawer"),
+            Some(DoubleTapAction::OpenAppDrawer)
+        );
     }
 }

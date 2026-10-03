@@ -275,7 +275,8 @@ impl UnitDag {
         // If cycle exists and some nodes remain with in-degree > 0, append them anyway
         // (sorted for determinism). Uses a HashSet for O(1) membership.
         let sorted_set: HashSet<&String> = sorted.iter().collect();
-        let mut leftover: Vec<&String> = needed.iter().filter(|u| !sorted_set.contains(*u)).collect();
+        let mut leftover: Vec<&String> =
+            needed.iter().filter(|u| !sorted_set.contains(*u)).collect();
         leftover.sort();
         for u in leftover {
             sorted.push(u.clone());
@@ -315,9 +316,7 @@ impl UnitDag {
                         // from pending: it can never change again, so it must
                         // not block dependents (else one failed condition
                         // wedges the whole boot).
-                        if dep_node.state == UnitState::Inactive
-                            && !pending_set.contains(after)
-                        {
+                        if dep_node.state == UnitState::Inactive && !pending_set.contains(after) {
                             return true;
                         }
                         false

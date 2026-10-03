@@ -11,7 +11,9 @@ pub mod sms;
 pub mod voice;
 pub mod wake;
 
-pub use data::{ApnAuthType, ApnProfile, DataCallSession, DataCallState, MobileDataManager, PdpProtocol};
+pub use data::{
+    ApnAuthType, ApnProfile, DataCallSession, DataCallState, MobileDataManager, PdpProtocol,
+};
 pub use modem::{
     ModemManagerBridge, ModemState, RadioAccessTechnology, SimCardState, SimSlot,
     TELEPHONY_CGROUP_PATH, TELEPHONY_OOM_SCORE_ADJ,

@@ -264,7 +264,8 @@ mod tests {
         sync.set_power_saver_mode(PowerSaverMode::Normal).unwrap();
         assert_eq!(sync.power_saver_mode, PowerSaverMode::Normal);
 
-        sync.set_power_saver_mode(PowerSaverMode::SuperExtreme).unwrap();
+        sync.set_power_saver_mode(PowerSaverMode::SuperExtreme)
+            .unwrap();
         assert_eq!(sync.power_saver_mode, PowerSaverMode::SuperExtreme);
 
         sync.set_power_saver_mode(PowerSaverMode::Off).unwrap();

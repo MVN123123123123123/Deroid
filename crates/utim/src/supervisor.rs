@@ -374,10 +374,7 @@ impl Supervisor {
                     // C5/B13: a socket that fails to bind must report Failed,
                     // never Active.
                     if let Err(e) = self.sockets.bind_socket(unit_name, sock) {
-                        self.log_msg(&format!(
-                            "Socket unit {} failed to bind: {}",
-                            unit_name, e
-                        ));
+                        self.log_msg(&format!("Socket unit {} failed to bind: {}", unit_name, e));
                         self.dag.set_state(unit_name, UnitState::Failed);
                         self.pending_units.remove(unit_name);
                         return Ok(());
@@ -440,10 +437,7 @@ impl Supervisor {
         // pre-execve (or on execve failure); parent distinguishes "failed to
         // start" from "started then exited". Forking/Notify/Oneshot keep the
         // legacy fire-and-observe semantics.
-        let report_failures = matches!(
-            svc.service_type,
-            ServiceType::Simple | ServiceType::Exec
-        );
+        let report_failures = matches!(svc.service_type, ServiceType::Simple | ServiceType::Exec);
         let mut exec_pipe = [-1; 2];
         if report_failures {
             unsafe {
@@ -577,7 +571,8 @@ impl Supervisor {
                         break;
                     }
                 }
-                if !priv_fail && !gids.is_empty()
+                if !priv_fail
+                    && !gids.is_empty()
                     && unsafe { libc::setgroups(gids.len(), gids.as_ptr()) } != 0
                 {
                     priv_fail = true;
@@ -743,10 +738,7 @@ impl Supervisor {
                         exec_succeeded = true;
                     } else if n < 0 {
                         let e = io::Error::last_os_error();
-                        self.log_msg(&format!(
-                            "Unit {} exec pipe read error: {}",
-                            unit_name, e
-                        ));
+                        self.log_msg(&format!("Unit {} exec pipe read error: {}", unit_name, e));
                         exec_succeeded = false;
                     } else {
                         exec_succeeded = false;
@@ -978,11 +970,7 @@ impl Supervisor {
                                 ));
                                 self.dag.set_state(&unit_name, UnitState::Failed);
                             } else {
-                                if !self
-                                    .pending_restarts
-                                    .iter()
-                                    .any(|(n, _)| n == &unit_name)
-                                {
+                                if !self.pending_restarts.iter().any(|(n, _)| n == &unit_name) {
                                     self.pending_restarts
                                         .push((unit_name.clone(), Instant::now()));
                                 }
@@ -1111,11 +1099,7 @@ impl Supervisor {
                                 "Scheduling restart for {} in {:?}",
                                 unit_name, delay
                             ));
-                            if !self
-                                .pending_restarts
-                                .iter()
-                                .any(|(n, _)| n == &unit_name)
-                            {
+                            if !self.pending_restarts.iter().any(|(n, _)| n == &unit_name) {
                                 self.pending_restarts
                                     .push((unit_name.clone(), Instant::now() + delay));
                             }
@@ -1219,7 +1203,8 @@ impl Supervisor {
         for (name, since) in &self.stopping_since {
             if let Some(node) = self.dag.get(name) {
                 if node.state == UnitState::Deactivating
-                    && now.checked_duration_since(*since).unwrap_or(Duration::ZERO) >= self.stop_timeout
+                    && now.checked_duration_since(*since).unwrap_or(Duration::ZERO)
+                        >= self.stop_timeout
                 {
                     escalate.push((name.clone(), node.pid));
                 }
@@ -1262,7 +1247,9 @@ impl Supervisor {
                 if node.state == UnitState::Active {
                     if let Some(ref svc) = node.unit.service {
                         if svc.watchdog_sec > Duration::ZERO
-                            && now.checked_duration_since(*last_ping).is_some_and(|d| d > svc.watchdog_sec)
+                            && now
+                                .checked_duration_since(*last_ping)
+                                .is_some_and(|d| d > svc.watchdog_sec)
                         {
                             expired.push((name.clone(), node.pid));
                         }
@@ -1440,7 +1427,8 @@ fn close_fds_except(keep: &[i32]) {
     }
 }
 
-fn resolve_binary(binary: &str) -> Option<String> {    if binary.starts_with('/') {
+fn resolve_binary(binary: &str) -> Option<String> {
+    if binary.starts_with('/') {
         return Some(binary.to_string());
     }
     let default_path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
@@ -1643,7 +1631,9 @@ ExecStart=/bin/true
         let node = supervisor.dag.get_mut("notify-app.service").unwrap();
         node.state = UnitState::Activating;
         node.pid = Some(9999);
-        supervisor.pid_to_unit.insert(9999, "notify-app.service".to_string());
+        supervisor
+            .pid_to_unit
+            .insert(9999, "notify-app.service".to_string());
 
         // Case 1: Notify message with matching sender_pid
         let msg = NotifyMessage {
@@ -1856,7 +1846,8 @@ ExecStart=/bin/true
         );
         supervisor.dag.insert(unit_abnormal);
 
-        let content_abort = "[Unit]\nDescription=Abort\n[Service]\nRestart=on-abort\nExecStart=/bin/sleep 10\n";
+        let content_abort =
+            "[Unit]\nDescription=Abort\n[Service]\nRestart=on-abort\nExecStart=/bin/sleep 10\n";
         let unit_abort = utim_core::unit::parse_unit(
             "abort.service",
             Path::new("/test/abort.service"),
@@ -1865,9 +1856,13 @@ ExecStart=/bin/true
         supervisor.dag.insert(unit_abort);
 
         // 1. Clean exit (code 0) -> no restart for either
-        supervisor.dag.set_state("abnormal.service", UnitState::Active);
+        supervisor
+            .dag
+            .set_state("abnormal.service", UnitState::Active);
         supervisor.dag.set_pid("abnormal.service", Some(1001));
-        supervisor.pid_to_unit.insert(1001, "abnormal.service".to_string());
+        supervisor
+            .pid_to_unit
+            .insert(1001, "abnormal.service".to_string());
         supervisor.handle_process_exits(&[ProcessExitInfo {
             pid: 1001,
             status: 0,
@@ -1875,13 +1870,20 @@ ExecStart=/bin/true
             exit_code: 0,
             signal: None,
         }]);
-        assert_eq!(supervisor.dag.get("abnormal.service").unwrap().state, UnitState::Inactive);
+        assert_eq!(
+            supervisor.dag.get("abnormal.service").unwrap().state,
+            UnitState::Inactive
+        );
         assert!(supervisor.pending_restarts.is_empty());
 
         // 2. Non-zero exit (exit 1) -> no restart for on-abnormal or on-abort
-        supervisor.dag.set_state("abnormal.service", UnitState::Active);
+        supervisor
+            .dag
+            .set_state("abnormal.service", UnitState::Active);
         supervisor.dag.set_pid("abnormal.service", Some(1002));
-        supervisor.pid_to_unit.insert(1002, "abnormal.service".to_string());
+        supervisor
+            .pid_to_unit
+            .insert(1002, "abnormal.service".to_string());
         supervisor.handle_process_exits(&[ProcessExitInfo {
             pid: 1002,
             status: 256,
@@ -1889,13 +1891,20 @@ ExecStart=/bin/true
             exit_code: 1,
             signal: None,
         }]);
-        assert_eq!(supervisor.dag.get("abnormal.service").unwrap().state, UnitState::Failed);
+        assert_eq!(
+            supervisor.dag.get("abnormal.service").unwrap().state,
+            UnitState::Failed
+        );
         assert!(supervisor.pending_restarts.is_empty());
 
         // 3. Clean signal (SIGTERM) -> no restart
-        supervisor.dag.set_state("abnormal.service", UnitState::Active);
+        supervisor
+            .dag
+            .set_state("abnormal.service", UnitState::Active);
         supervisor.dag.set_pid("abnormal.service", Some(1003));
-        supervisor.pid_to_unit.insert(1003, "abnormal.service".to_string());
+        supervisor
+            .pid_to_unit
+            .insert(1003, "abnormal.service".to_string());
         supervisor.handle_process_exits(&[ProcessExitInfo {
             pid: 1003,
             status: libc::SIGTERM,
@@ -1903,13 +1912,20 @@ ExecStart=/bin/true
             exit_code: -1,
             signal: Some(libc::SIGTERM),
         }]);
-        assert_eq!(supervisor.dag.get("abnormal.service").unwrap().state, UnitState::Failed);
+        assert_eq!(
+            supervisor.dag.get("abnormal.service").unwrap().state,
+            UnitState::Failed
+        );
         assert!(supervisor.pending_restarts.is_empty());
 
         // 4. Abnormal signal (SIGABRT) -> restart scheduled for on-abnormal
-        supervisor.dag.set_state("abnormal.service", UnitState::Active);
+        supervisor
+            .dag
+            .set_state("abnormal.service", UnitState::Active);
         supervisor.dag.set_pid("abnormal.service", Some(1004));
-        supervisor.pid_to_unit.insert(1004, "abnormal.service".to_string());
+        supervisor
+            .pid_to_unit
+            .insert(1004, "abnormal.service".to_string());
         supervisor.handle_process_exits(&[ProcessExitInfo {
             pid: 1004,
             status: libc::SIGABRT,
@@ -1917,14 +1933,19 @@ ExecStart=/bin/true
             exit_code: -1,
             signal: Some(libc::SIGABRT),
         }]);
-        assert_eq!(supervisor.dag.get("abnormal.service").unwrap().state, UnitState::Activating);
+        assert_eq!(
+            supervisor.dag.get("abnormal.service").unwrap().state,
+            UnitState::Activating
+        );
         assert_eq!(supervisor.pending_restarts.len(), 1);
         supervisor.pending_restarts.clear();
 
         // 5. Abnormal signal (SIGSEGV) -> restart scheduled for on-abort
         supervisor.dag.set_state("abort.service", UnitState::Active);
         supervisor.dag.set_pid("abort.service", Some(1005));
-        supervisor.pid_to_unit.insert(1005, "abort.service".to_string());
+        supervisor
+            .pid_to_unit
+            .insert(1005, "abort.service".to_string());
         supervisor.handle_process_exits(&[ProcessExitInfo {
             pid: 1005,
             status: libc::SIGSEGV,
@@ -1932,15 +1953,24 @@ ExecStart=/bin/true
             exit_code: -1,
             signal: Some(libc::SIGSEGV),
         }]);
-        assert_eq!(supervisor.dag.get("abort.service").unwrap().state, UnitState::Activating);
+        assert_eq!(
+            supervisor.dag.get("abort.service").unwrap().state,
+            UnitState::Activating
+        );
         assert_eq!(supervisor.pending_restarts.len(), 1);
         supervisor.pending_restarts.clear();
 
         // 6. Watchdog timeout abort -> restart scheduled for on-abnormal
-        supervisor.dag.set_state("abnormal.service", UnitState::Active);
+        supervisor
+            .dag
+            .set_state("abnormal.service", UnitState::Active);
         supervisor.dag.set_pid("abnormal.service", Some(1006));
-        supervisor.pid_to_unit.insert(1006, "abnormal.service".to_string());
-        supervisor.watchdog_aborted.insert("abnormal.service".to_string());
+        supervisor
+            .pid_to_unit
+            .insert(1006, "abnormal.service".to_string());
+        supervisor
+            .watchdog_aborted
+            .insert("abnormal.service".to_string());
         supervisor.handle_process_exits(&[ProcessExitInfo {
             pid: 1006,
             status: libc::SIGKILL,
@@ -1948,7 +1978,10 @@ ExecStart=/bin/true
             exit_code: -1,
             signal: Some(libc::SIGKILL),
         }]);
-        assert_eq!(supervisor.dag.get("abnormal.service").unwrap().state, UnitState::Activating);
+        assert_eq!(
+            supervisor.dag.get("abnormal.service").unwrap().state,
+            UnitState::Activating
+        );
         assert_eq!(supervisor.pending_restarts.len(), 1);
     }
 }

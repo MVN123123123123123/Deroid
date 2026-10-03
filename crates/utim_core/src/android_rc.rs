@@ -134,12 +134,11 @@ pub fn parse_android_rc_with_imports(content: &str) -> RcParse {
                 let command = parts[2..].iter().map(|s| s.to_string()).collect();
                 current_service = Some(AndroidService::new(name, command));
             } else {
-                eprintln!(
-                    "android_rc: ignoring command-less service line: {trimmed:?}"
-                );
+                eprintln!("android_rc: ignoring command-less service line: {trimmed:?}");
             }
         } else if let Some(ref mut svc) = current_service {
-            match parts[0] {                "class" => {
+            match parts[0] {
+                "class" => {
                     svc.class = parts[1..].iter().map(|s| s.to_string()).collect();
                 }
                 "user" => {
@@ -180,8 +179,7 @@ pub fn parse_android_rc_with_imports(content: &str) -> RcParse {
                     svc.extra.push(parts.join(" "));
                 }
                 "socket" | "writepid" | "file" | "task" | "priority" | "nice"
-                | "oom_score_adjust" | "rlimit" | "seclabel" | "write" | "mkdir"
-                | "exec" => {
+                | "oom_score_adjust" | "rlimit" | "seclabel" | "write" | "mkdir" | "exec" => {
                     svc.extra.push(parts.join(" "));
                 }
                 other => {

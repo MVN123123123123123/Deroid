@@ -72,7 +72,10 @@ impl MobilePowerGovernor {
                 // B7: no file => no lock; do not record a phantom lock.
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
-                    format!("{} does not exist (no wake_lock interface?)", wake_lock_path.display()),
+                    format!(
+                        "{} does not exist (no wake_lock interface?)",
+                        wake_lock_path.display()
+                    ),
                 ));
             }
         }
@@ -144,7 +147,11 @@ impl MobilePowerGovernor {
         fs::write(&freeze_file, val).map_err(|e| {
             io::Error::new(
                 io::ErrorKind::NotFound,
-                format!("{} missing (cgroup2 not mounted?): {}", freeze_file.display(), e),
+                format!(
+                    "{} missing (cgroup2 not mounted?): {}",
+                    freeze_file.display(),
+                    e
+                ),
             )
         })
     }
@@ -195,7 +202,8 @@ impl MobilePowerGovernor {
             for entry in entries.flatten() {
                 let name = entry.file_name();
                 let name_str = name.to_string_lossy();
-                if name_str.starts_with("cpu") && name_str[3..].chars().all(|c| c.is_ascii_digit()) {
+                if name_str.starts_with("cpu") && name_str[3..].chars().all(|c| c.is_ascii_digit())
+                {
                     let gov_path = entry.path().join("cpufreq/scaling_governor");
                     if gov_path.exists() {
                         match fs::write(&gov_path, format!("{}\n", governor)) {
@@ -222,7 +230,8 @@ impl MobilePowerGovernor {
             for entry in entries.flatten() {
                 let name = entry.file_name();
                 let name_str = name.to_string_lossy();
-                if name_str.starts_with("cpu") && name_str[3..].chars().all(|c| c.is_ascii_digit()) {
+                if name_str.starts_with("cpu") && name_str[3..].chars().all(|c| c.is_ascii_digit())
+                {
                     let freq_path = entry.path().join("cpufreq/scaling_max_freq");
                     if freq_path.exists() {
                         match fs::write(&freq_path, format!("{}\n", max_khz)) {

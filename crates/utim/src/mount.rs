@@ -98,7 +98,10 @@ pub fn mount_early_filesystems() -> io::Result<()> {
     );
     let _ = fs::create_dir_all("/sys/fs/cgroup/user.slice");
     let _ = fs::create_dir_all("/sys/fs/cgroup/system.slice");
-    let _ = fs::write("/sys/fs/cgroup/cgroup.subtree_control", b"+cpu +memory +io +pids\n");
+    let _ = fs::write(
+        "/sys/fs/cgroup/cgroup.subtree_control",
+        b"+cpu +memory +io +pids\n",
+    );
 
     // 8. Populate static /dev character nodes and standard symlinks
     populate_static_dev_nodes();

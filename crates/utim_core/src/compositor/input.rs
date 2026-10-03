@@ -2,8 +2,8 @@
 //! Conforms strictly to GEMINI.md systems discipline: no heap allocations on the hot path,
 //! pure standard library POSIX evdev parsing, sub-millisecond dispatch latency.
 
-use std::time::Instant;
 use crate::compositor::gestures::{RawTouchEvent, TouchPhase};
+use std::time::Instant;
 
 // --- Linux Input ABI Constants (linux/input.h / linux/input-event-codes.h) ---
 pub const EV_SYN: u16 = 0x00;
@@ -13,10 +13,10 @@ pub const EV_ABS: u16 = 0x03;
 
 pub const SYN_REPORT: u16 = 0x00;
 
-pub const BTN_LEFT: u16 = 0x110;   // 272
-pub const BTN_RIGHT: u16 = 0x111;  // 273
+pub const BTN_LEFT: u16 = 0x110; // 272
+pub const BTN_RIGHT: u16 = 0x111; // 273
 pub const BTN_MIDDLE: u16 = 0x112; // 274
-pub const BTN_TOUCH: u16 = 0x14a;  // 330
+pub const BTN_TOUCH: u16 = 0x14a; // 330
 
 pub const REL_X: u16 = 0x00;
 pub const REL_Y: u16 = 0x01;
@@ -101,8 +101,7 @@ pub struct LinuxInputEvent {
 // The decoder below strides batches by this layout; a silent size change
 // desynchronises every event after the first.
 const _: () = assert!(
-    std::mem::size_of::<LinuxInputEvent>() == 24
-        && std::mem::align_of::<LinuxInputEvent>() == 8,
+    std::mem::size_of::<LinuxInputEvent>() == 24 && std::mem::align_of::<LinuxInputEvent>() == 8,
     "LinuxInputEvent must match the kernel's struct input_event (64-bit)"
 );
 #[cfg(target_pointer_width = "32")]
@@ -126,10 +125,25 @@ impl LinuxInputEvent {
 pub enum InputDispatchResult {
     None,
     Touch(RawTouchEvent),
-    Tap { x: f32, y: f32 },
-    LongPress { x: f32, y: f32 },
-    PointerMove { x: f32, y: f32 },
-    KeyPress { code: u16, ch: Option<char>, pressed: bool, repeat: bool, ctrl: bool },
+    Tap {
+        x: f32,
+        y: f32,
+    },
+    LongPress {
+        x: f32,
+        y: f32,
+    },
+    PointerMove {
+        x: f32,
+        y: f32,
+    },
+    KeyPress {
+        code: u16,
+        ch: Option<char>,
+        pressed: bool,
+        repeat: bool,
+        ctrl: bool,
+    },
 }
 
 /// Clamp a coordinate into a display extent that may be degenerate (0x0

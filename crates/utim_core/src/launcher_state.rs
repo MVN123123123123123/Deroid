@@ -503,6 +503,52 @@ impl FolderRecord {
     }
 }
 
+/// What a folder-to-workspace drop did.
+///
+/// Both variants mutate exactly one folder plus at most one page, and both
+/// leave every other record byte-identical.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MoveToWorkspaceOutcome {
+    /// The member now occupies `page[slot]` (`slot` is the final index).
+    Placed {
+        app_id: String,
+        page: usize,
+        slot: usize,
+    },
+    /// The destination cell already held a folder and the member was appended
+    /// to it. No page was touched.
+    MergedIntoFolder { app_id: String, into_folder: u32 },
+}
+
+/// Why a folder-to-workspace drop was refused.
+///
+/// Every variant leaves the state byte-identical: validation runs before any
+/// mutation, so `Err` means nothing was touched (build-then-swap, the same
+/// guarantee [`FolderRecord::reorder`] keeps).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MoveToWorkspaceReject {
+    /// No folder with this id.
+    UnknownFolder,
+    /// `member_index` out of range, or the member id is empty.
+    BadMemberIndex,
+    /// `dest_page` is beyond the workspace.
+    BadDestPage,
+    /// Appending would exceed [`PAGE_CAPACITY`].
+    PageFull,
+    /// The destination folder already holds [`MAX_FOLDER_ITEMS`].
+    DestFolderFull,
+    /// The destination cell is the source folder itself.
+    DestIsSameFolder,
+    /// The destination holds an app: the reference creates a folder from the
+    /// two (`Workspace.createUserFolderIfNecessary`, `Workspace.java:2150-2202`);
+    /// this layer signals instead of overwriting so the shell can call
+    /// `folder_create` with both ids.
+    WouldCreateFolder {
+        dest_app: String,
+        moving_app: String,
+    },
+}
+
 /// The persisted launcher state.
 ///
 /// Every field has a default that reproduces the behaviour UTLC had before this
@@ -616,9 +662,11 @@ pub struct LauncherState {
     pub show_search_bar: bool,
 
     /// Rotate the panel with the accelerometer. The reference's `allowRotation`
-    /// (`res/xml/launcher_preferences.xml:44`). UTLC has a complete
-    /// orientation model (`sensors/sensor_proxy.rs:33-96`) and no path to
-    /// reach it.
+    /// (`res/xml/launcher_preferences.xml:44`). Persisted here, fed to
+    /// `RotationPolicy::set_auto_rotate` (re-synced after every settings tap)
+    /// and polled from `SensorProxy` at ~2 Hz; `Rotate` decisions go through
+    /// `rotation::decide_modeset` to the KMS device's `set_orientation`, so the
+    /// settings row is a live `Toggle`.
     pub auto_rotate: bool,
 
     /// Seconds of no input before the display blanks. Zero disables the
@@ -963,6 +1011,12 @@ impl LauncherState {
 
     /// Rename a folder. `false` if the folder is unknown.
     ///
+    /// The title is clipped to [`MAX_FOLDER_TITLE_BYTES`] on a char boundary
+    /// rather than rejected, matching `folder_create` and `sanitise`: a
+    /// truncated label is a cosmetic loss where a refused rename is a gesture
+    /// that silently did nothing. Committed through the footer editor's
+    /// back-key path (`Folder.java:569`, `mInfo.setTitle`).
+    ///
     /// An empty title is legal and is not the same as clearing it: the
     /// reference shows `R.string.folder_hint_text` as the hint for an empty
     /// name (`Folder.java:706-712`), so the empty title is the untitled state
@@ -974,6 +1028,180 @@ impl LauncherState {
         let clipped = clip_title(title);
         f.title = clipped;
         true
+    }
+
+    /// Resolve one folder member for an `AppInfo` handoff.
+    ///
+    /// Pure accessor: borrows, never allocates, safe on the frame path. The
+    /// shell holds `(folder_id, index)` from hit-testing the open folder and
+    /// needs the app id to build the info payload; the reference hands the
+    /// same item back to the caller's completion path (`Folder.java:1740-1741`,
+    /// `removeFolderContent` hands its `ItemInfo[]` to `rearrangeChildren`,
+    /// and the drop target decides where it lands; `DeleteDropTarget.java:115`
+    /// resolves the label the same way). Returns `None` for an unknown
+    /// folder, an out-of-range index, or an empty member id (a gap, not an
+    /// app, and only a hand-built record can hold one since `sanitise` and
+    /// `insert_item` both refuse to create it).
+    ///
+    /// The folder id echoes back so the caller can assert the handoff still
+    /// targets the folder it hit-tested (`FolderEntry.id`,
+    /// `data/folder/FolderEntity.kt:41-43`).
+    #[inline]
+    pub fn folder_member_info(&self, folder_id: u32, index: usize) -> Option<(u32, &str)> {
+        let f = self.folders.iter().find(|f| f.id == folder_id)?;
+        let app = f.items.get(index)?;
+        if app.is_empty() {
+            return None;
+        }
+        Some((f.id, app.as_str()))
+    }
+
+    /// Move one folder member onto the workspace.
+    ///
+    /// The missing folder-to-workspace handoff: `folder_remove_item` hands the
+    /// app nowhere (`Folder.java:1739-1763`, `removeFolderContent` leaves the
+    /// destination to the caller's completion path), and a drag out of a
+    /// folder needs exactly one store call that both leaves the folder and
+    /// lands on the workspace. The drag-enter/exit alarms that bracket the
+    /// gesture live in the view (`Folder.java:1179-1184`, `onDragEnter`;
+    /// `Folder.java:1293-1300`, `onDragExit`); this is their store
+    /// counterpart, called once the drop cell is known.
+    ///
+    /// `dest_slot` is a cell index within `dest_page`: `dest_slot < len` names
+    /// the cell there, `dest_slot >= len` means "append" (clamped, as the
+    /// reference clamps a folder rank with `Utilities.boundToRange`,
+    /// `Folder.java:1715`). A `dest_slot` past the end never creates holes.
+    ///
+    /// Destination handling mirrors the reference's workspace drop:
+    /// * empty (append, or an empty-string gap): place the member there;
+    /// * holds an app: return [`MoveToWorkspaceReject::WouldCreateFolder`]
+    ///   rather than overwriting. The reference creates a folder from the two
+    ///   (`Workspace.java:2150-2202`, `createUserFolderIfNecessary`), so the
+    ///   shell calls `folder_create` with both ids instead;
+    /// * holds a folder: append the member to it (`Workspace.java:2207-2229`,
+    ///   `addToExistingFolderIfNecessary`; the folder tap state it lands in is
+    ///   `DragLayer.java:190`). A stale token (no such folder, only a
+    ///   hand-built state can hold one since `folder_delete` leaves the cell
+    ///   to the shell) is repaired by overwriting it;
+    /// * holds the source folder itself: rejected as
+    ///   [`MoveToWorkspaceReject::DestIsSameFolder`].
+    ///
+    /// Leaving the last member behind leaves an empty folder behind: the
+    /// reference collapses a one-item folder (`Folder.java:1753-1758`,
+    /// `replaceFolderWithFinalItem`), but that is a second mutation the caller
+    /// did not ask for, so the shell decides via `folder_delete`.
+    ///
+    /// Build-then-swap: every rejection validates before touching anything, so
+    /// `Err` leaves `self` byte-identical. `Ok` mutates exactly one folder
+    /// plus at most one page and respects [`MAX_FOLDER_ITEMS`] and
+    /// [`PAGE_CAPACITY`]. Allocates at most two id clones; mutation is off the
+    /// frame path, while [`Self::folder_member_info`] stays the frame-path
+    /// resolver.
+    pub fn move_item_to_workspace(
+        &mut self,
+        folder_id: u32,
+        member_index: usize,
+        dest_page: usize,
+        dest_slot: usize,
+    ) -> Result<MoveToWorkspaceOutcome, MoveToWorkspaceReject> {
+        let src_pos = self
+            .folders
+            .iter()
+            .position(|f| f.id == folder_id)
+            .ok_or(MoveToWorkspaceReject::UnknownFolder)?;
+        let moving_app = self.folders[src_pos]
+            .items
+            .get(member_index)
+            .cloned()
+            .ok_or(MoveToWorkspaceReject::BadMemberIndex)?;
+        if moving_app.is_empty() {
+            return Err(MoveToWorkspaceReject::BadMemberIndex);
+        }
+        if dest_page >= self.home_pages.len() {
+            return Err(MoveToWorkspaceReject::BadDestPage);
+        }
+        enum Plan {
+            Append,
+            ReplaceGap,
+            Merge { dest_pos: usize, needs_push: bool },
+        }
+        let plan = if dest_slot >= self.home_pages[dest_page].len() {
+            if self.home_pages[dest_page].len() >= PAGE_CAPACITY {
+                return Err(MoveToWorkspaceReject::PageFull);
+            }
+            Plan::Append
+        } else {
+            let token = self.home_pages[dest_page][dest_slot].clone();
+            if token.is_empty() {
+                Plan::ReplaceGap
+            } else {
+                match Cell::from_token(&token) {
+                    Cell::App(dest_app) => {
+                        return Err(MoveToWorkspaceReject::WouldCreateFolder {
+                            dest_app,
+                            moving_app,
+                        });
+                    }
+                    Cell::Folder(dest_id) => {
+                        if dest_id == folder_id {
+                            return Err(MoveToWorkspaceReject::DestIsSameFolder);
+                        }
+                        match self.folders.iter().position(|f| f.id == dest_id) {
+                            None => Plan::ReplaceGap,
+                            Some(dest_pos) => {
+                                let already = self.folders[dest_pos]
+                                    .items
+                                    .iter()
+                                    .any(|i| i == &moving_app);
+                                if !already
+                                    && self.folders[dest_pos].items.len() >= MAX_FOLDER_ITEMS
+                                {
+                                    return Err(MoveToWorkspaceReject::DestFolderFull);
+                                }
+                                Plan::Merge {
+                                    dest_pos,
+                                    needs_push: !already,
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        let removed = self.folders[src_pos].items.remove(member_index);
+        debug_assert_eq!(removed, moving_app);
+        match plan {
+            Plan::Append => {
+                self.home_pages[dest_page].push(moving_app.clone());
+                let slot = self.home_pages[dest_page].len() - 1;
+                Ok(MoveToWorkspaceOutcome::Placed {
+                    app_id: moving_app,
+                    page: dest_page,
+                    slot,
+                })
+            }
+            Plan::ReplaceGap => {
+                self.home_pages[dest_page][dest_slot] = moving_app.clone();
+                Ok(MoveToWorkspaceOutcome::Placed {
+                    app_id: moving_app,
+                    page: dest_page,
+                    slot: dest_slot,
+                })
+            }
+            Plan::Merge {
+                dest_pos,
+                needs_push,
+            } => {
+                if needs_push {
+                    self.folders[dest_pos].items.push(moving_app.clone());
+                }
+                let into_folder = self.folders[dest_pos].id;
+                Ok(MoveToWorkspaceOutcome::MergedIntoFolder {
+                    app_id: moving_app,
+                    into_folder,
+                })
+            }
+        }
     }
 
     /// The next id to hand out: the lowest non-zero integer not already in
@@ -2534,5 +2762,322 @@ mod tests {
         assert!(LauncherState::default().pages_as_cells()[0]
             .iter()
             .all(|c| matches!(c, Cell::App(_))));
+    }
+
+    /// The member resolver borrows without allocating, for the `AppInfo`
+    /// handoff (`Folder.java:1740-1741`, `DeleteDropTarget.java:115`).
+    #[test]
+    fn folder_member_info_resolves_members_without_allocating() {
+        let mut s = LauncherState::default();
+        let id = s
+            .folder_create("Tools", &["a".into(), "b".into()], false)
+            .unwrap();
+        assert_eq!(s.folder_member_info(id, 0), Some((id, "a")));
+        assert_eq!(s.folder_member_info(id, 1), Some((id, "b")));
+        assert_eq!(s.folder_member_info(id, 2), None, "past the end");
+        assert_eq!(
+            s.folder_member_info(id, usize::MAX),
+            None,
+            "usize::MAX is past the end"
+        );
+        assert_eq!(s.folder_member_info(99, 0), None, "unknown folder");
+        assert_eq!(s.folder_member_info(0, 0), None, "id 0 is never a folder");
+        // An empty member is a gap, not an app, and must not hand off.
+        s.folders
+            .iter_mut()
+            .find(|f| f.id == id)
+            .unwrap()
+            .items
+            .push(String::new());
+        let last = s.folder(id).unwrap().items.len() - 1;
+        assert_eq!(s.folder_member_info(id, last), None);
+    }
+
+    /// Rename clips rather than refuses, and empty means "show the hint"
+    /// (`Folder.java:569` commits on back key, `Folder.java:706-712` shows
+    /// `folder_hint_text` for the empty title).
+    #[test]
+    fn folder_set_title_clips_and_empty_means_hint() {
+        let mut s = LauncherState::default();
+        let id = s.folder_create("Tools", &[], false).unwrap();
+        let long = "é".repeat(MAX_FOLDER_TITLE_BYTES + 40);
+        assert!(s.folder_set_title(id, &long));
+        let title = s.folder(id).unwrap().title.clone();
+        assert!(
+            title.len() <= MAX_FOLDER_TITLE_BYTES,
+            "clipped to {title:?}"
+        );
+        assert!(title.starts_with("é"), "kept the head, cut the tail");
+        // Char boundary: `é` is 2 bytes, so the length stays even.
+        assert_eq!(title.len() % 2, 0);
+        assert!(!s.folder_set_title(99, "x"), "unknown folder");
+        assert!(s.folder_set_title(id, ""));
+        assert_eq!(
+            s.folder(id).unwrap().title,
+            "",
+            "empty is the untitled state; the renderer supplies the hint"
+        );
+    }
+
+    /// Drag-out onto an empty cell places the member there and removes it
+    /// from the folder (`Folder.java:1739-1763` leaves the destination to the
+    /// caller; the enter/exit alarms are `Folder.java:1179-1184,1293-1300`).
+    #[test]
+    fn move_item_to_workspace_places_on_empty_cell() {
+        let mut s = LauncherState {
+            home_pages: vec![vec!["x".into()]],
+            ..Default::default()
+        };
+        let fid = s
+            .folder_create("F", &["m1".into(), "m2".into()], false)
+            .unwrap();
+        // Append: dest_slot past the end clamps to the end.
+        let out = s
+            .move_item_to_workspace(fid, 0, 0, 99)
+            .expect("empty tail accepts");
+        assert_eq!(
+            out,
+            MoveToWorkspaceOutcome::Placed {
+                app_id: "m1".into(),
+                page: 0,
+                slot: 1,
+            }
+        );
+        assert_eq!(s.home_pages[0], vec!["x", "m1"]);
+        assert_eq!(s.folder(fid).unwrap().items, vec!["m2"]);
+        assert!(!s.is_dirty(), "the store never touches dirty itself");
+        // Gap fill: an empty-string cell is replaced, not shifted.
+        s.home_pages[0].push(String::new());
+        let out = s.move_item_to_workspace(fid, 0, 0, 2).expect("gap accepts");
+        assert_eq!(
+            out,
+            MoveToWorkspaceOutcome::Placed {
+                app_id: "m2".into(),
+                page: 0,
+                slot: 2,
+            }
+        );
+        assert_eq!(s.home_pages[0], vec!["x", "m1", "m2"]);
+        assert!(s.folder(fid).unwrap().items.is_empty());
+        // The empty folder is left behind for the shell to delete.
+        assert!(s.folder(fid).is_some());
+    }
+
+    /// Drop onto a folder icon merges into it (`Workspace.java:2207-2229`,
+    /// `addToExistingFolderIfNecessary`; the tap state is
+    /// `DragLayer.java:190`).
+    #[test]
+    fn move_item_to_workspace_merges_into_existing_folder() {
+        let mut s = LauncherState {
+            home_pages: vec![Vec::new()],
+            ..Default::default()
+        };
+        let src = s.folder_create("S", &["m1".into()], false).unwrap();
+        let dst = s.folder_create("D", &["d1".into()], false).unwrap();
+        s.home_pages[0] = vec![format!("{FOLDER_CELL_PREFIX}{dst}")];
+        let out = s
+            .move_item_to_workspace(src, 0, 0, 0)
+            .expect("folder dest merges");
+        assert_eq!(
+            out,
+            MoveToWorkspaceOutcome::MergedIntoFolder {
+                app_id: "m1".into(),
+                into_folder: dst,
+            }
+        );
+        assert!(s.folder(src).unwrap().items.is_empty());
+        assert_eq!(s.folder(dst).unwrap().items, vec!["d1", "m1"]);
+        assert_eq!(
+            s.home_pages[0],
+            vec![format!("{FOLDER_CELL_PREFIX}{dst}")],
+            "no page was touched"
+        );
+    }
+
+    /// Drop onto an app signals folder creation instead of overwriting
+    /// (`Workspace.java:2150-2202`, `createUserFolderIfNecessary`), leaving
+    /// the state byte-identical for the shell to call `folder_create`.
+    #[test]
+    fn move_item_to_workspace_signals_folder_creation_instead_of_overwriting() {
+        let mut s = LauncherState {
+            home_pages: vec![vec!["desk".into()]],
+            ..Default::default()
+        };
+        let fid = s.folder_create("F", &["m1".into()], false).unwrap();
+        let before = s.clone();
+        let err = s
+            .move_item_to_workspace(fid, 0, 0, 0)
+            .expect_err("occupied by an app");
+        assert_eq!(
+            err,
+            MoveToWorkspaceReject::WouldCreateFolder {
+                dest_app: "desk".into(),
+                moving_app: "m1".into(),
+            }
+        );
+        assert_eq!(s, before, "the signal changed nothing");
+        assert_eq!(s.to_text(), before.to_text());
+    }
+
+    /// Every rejection leaves the state byte-identical (build-then-swap, as
+    /// `reorder` does; the rank guard is `FolderDao.kt:66-75`).
+    #[test]
+    fn move_item_to_workspace_rejections_leave_state_byte_identical() {
+        let mut s = LauncherState {
+            home_pages: vec![vec!["desk".into()]],
+            ..Default::default()
+        };
+        let src = s
+            .folder_create("S", &["m1".into(), "m2".into()], false)
+            .unwrap();
+        let dst = s.folder_create("D", &["d1".into()], false).unwrap();
+        // Fill the destination folder to its cap.
+        {
+            let f = s.folders.iter_mut().find(|f| f.id == dst).unwrap();
+            f.items.clear();
+            for i in 0..MAX_FOLDER_ITEMS {
+                f.items.push(format!("f{i}"));
+            }
+        }
+        // A full page for the PageFull case.
+        s.home_pages.push(
+            (0..PAGE_CAPACITY)
+                .map(|i| format!("p{i}"))
+                .collect::<Vec<String>>(),
+        );
+        let full_page = 1;
+        let cases: Vec<(u32, usize, usize, usize)> = vec![
+            (999, 0, 0, 99),
+            (src, 99, 0, 99),
+            (src, 0, 99, 0),
+            (src, 0, full_page, 99),
+            (src, 0, 0, 0),
+        ];
+        for (fid, member, page, slot) in cases {
+            let before = s.clone();
+            let before_text = s.to_text();
+            let _ = s.move_item_to_workspace(fid, member, page, slot);
+            assert_eq!(s, before, "rejection must not touch state");
+            assert_eq!(s.to_text(), before_text);
+        }
+        // Destination is the source folder itself.
+        s.home_pages[0] = vec![format!("{FOLDER_CELL_PREFIX}{src}")];
+        let before = s.clone();
+        assert_eq!(
+            s.move_item_to_workspace(src, 0, 0, 0),
+            Err(MoveToWorkspaceReject::DestIsSameFolder)
+        );
+        assert_eq!(s, before);
+        // Destination folder is full.
+        s.home_pages[0] = vec![format!("{FOLDER_CELL_PREFIX}{dst}")];
+        let before = s.clone();
+        assert_eq!(
+            s.move_item_to_workspace(src, 0, 0, 0),
+            Err(MoveToWorkspaceReject::DestFolderFull)
+        );
+        assert_eq!(s, before);
+    }
+
+    /// The three `move_item_to_workspace` edges the byte-identity sweep above
+    /// does not cover: an empty member id (only a hand-built record can hold
+    /// one, since `sanitise` and `insert_item` both refuse to create it), a
+    /// stale folder token (repaired by overwrite, not refused), and a merge
+    /// into a full folder that already holds the app (nothing to push, so no
+    /// refusal -- the `!already` guard before the `DestFolderFull` check).
+    #[test]
+    fn move_item_to_workspace_edges_repair_or_refuse_without_touching_state() {
+        // An empty member is a gap, not an app: refused, byte-identical.
+        let mut s = LauncherState {
+            home_pages: vec![vec!["desk".into()]],
+            ..Default::default()
+        };
+        let src = s.folder_create("S", &["m1".into()], false).unwrap();
+        s.folders
+            .iter_mut()
+            .find(|f| f.id == src)
+            .unwrap()
+            .items
+            .push(String::new());
+        let last = s.folder(src).unwrap().items.len() - 1;
+        let before = s.clone();
+        assert_eq!(
+            s.move_item_to_workspace(src, last, 0, 99),
+            Err(MoveToWorkspaceReject::BadMemberIndex)
+        );
+        assert_eq!(s, before);
+        assert_eq!(s.to_text(), before.to_text());
+
+        // A stale token names no folder, so there is nothing to merge into and
+        // the member overwrites the cell -- the repair the doc comment promises.
+        let mut s = LauncherState {
+            home_pages: vec![vec![format!("{FOLDER_CELL_PREFIX}99")]],
+            ..Default::default()
+        };
+        let src = s.folder_create("S", &["m1".into()], false).unwrap();
+        let out = s
+            .move_item_to_workspace(src, 0, 0, 0)
+            .expect("a stale token is repaired, not refused");
+        assert_eq!(
+            out,
+            MoveToWorkspaceOutcome::Placed {
+                app_id: "m1".into(),
+                page: 0,
+                slot: 0,
+            }
+        );
+        assert_eq!(s.home_pages[0], vec!["m1".to_string()]);
+        assert!(s.folder(src).unwrap().items.is_empty());
+
+        // The destination is at `MAX_FOLDER_ITEMS` but already holds the app:
+        // no push is needed, so the merge succeeds and the destination is
+        // untouched while the source still loses the member.
+        let mut s = LauncherState {
+            home_pages: vec![Vec::new()],
+            ..Default::default()
+        };
+        let src = s.folder_create("S", &["m1".into()], false).unwrap();
+        let dst = s.folder_create("D", &[], false).unwrap();
+        {
+            let f = s.folders.iter_mut().find(|f| f.id == dst).unwrap();
+            f.items.push("m1".into());
+            for i in 0..MAX_FOLDER_ITEMS - 1 {
+                f.items.push(format!("f{i}"));
+            }
+        }
+        assert_eq!(s.folder(dst).unwrap().items.len(), MAX_FOLDER_ITEMS);
+        s.home_pages[0] = vec![format!("{FOLDER_CELL_PREFIX}{dst}")];
+        let out = s
+            .move_item_to_workspace(src, 0, 0, 0)
+            .expect("already there needs no room");
+        assert_eq!(
+            out,
+            MoveToWorkspaceOutcome::MergedIntoFolder {
+                app_id: "m1".into(),
+                into_folder: dst,
+            }
+        );
+        assert_eq!(
+            s.folder(dst).unwrap().items.len(),
+            MAX_FOLDER_ITEMS,
+            "nothing was pushed"
+        );
+        assert!(s.folder(src).unwrap().items.is_empty());
+    }
+
+    /// A refused rename changes nothing: not the title, not the order, not a
+    /// byte of the file. The happy-path clip is covered by
+    /// `folder_set_title_clips_and_empty_means_hint`; this is the refusal half.
+    #[test]
+    fn folder_set_title_refusal_is_byte_identical() {
+        let mut s = LauncherState::default();
+        let id = s.folder_create("Tools", &["a".into()], false).unwrap();
+        let before = s.clone();
+        let before_text = s.to_text();
+        assert!(!s.folder_set_title(99, "x"), "unknown folder");
+        assert!(!s.folder_set_title(0, "x"), "id 0 is never a folder");
+        assert_eq!(s, before);
+        assert_eq!(s.to_text(), before_text);
+        // The folder that does exist is untouched by its neighbour's refusal.
+        assert_eq!(s.folder(id).unwrap().title, "Tools");
     }
 }

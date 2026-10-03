@@ -199,7 +199,11 @@ impl AsciiCameraPreview {
 
         // Write ASCII art capture
         writeln!(f, "=== FRONT CAMERA ASCII SNAPSHOT ===")?;
-        writeln!(f, "Timestamp: {} | Resolution: {}x{}", timestamp, ASCII_COLS, ASCII_ROWS)?;
+        writeln!(
+            f,
+            "Timestamp: {} | Resolution: {}x{}",
+            timestamp, ASCII_COLS, ASCII_ROWS
+        )?;
         writeln!(f, "------------------------------------------------")?;
         for r in 0..self.current_frame.rows {
             let row = self.current_frame.row(r);
@@ -236,7 +240,10 @@ mod tests {
         let frame = convert_nv12_to_ascii(&nv12, w, h);
         assert_eq!(frame.cols, ASCII_COLS);
         assert_eq!(frame.grid[0][0], b' ');
-        assert!(frame.grid[ASCII_ROWS - 1][ASCII_COLS - 1] == b'%' || frame.grid[ASCII_ROWS - 1][ASCII_COLS - 1] == b'@');
+        assert!(
+            frame.grid[ASCII_ROWS - 1][ASCII_COLS - 1] == b'%'
+                || frame.grid[ASCII_ROWS - 1][ASCII_COLS - 1] == b'@'
+        );
 
         let white_nv12 = vec![255u8; w * h];
         let white_frame = convert_nv12_to_ascii(&white_nv12, w, h);

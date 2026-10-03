@@ -819,8 +819,7 @@ pub fn apply_dropin(unit: &mut SystemdUnit, dropin_content: &str) {
 
     // Merge Install section (additive)
     unit.install.wanted_by.extend(dropin_unit.install.wanted_by);
-    unit
-        .install
+    unit.install
         .required_by
         .extend(dropin_unit.install.required_by);
     unit.install.also.extend(dropin_unit.install.also);

@@ -2729,6 +2729,23 @@ pub const FOLDER_DRAG_SHADOW_DP: f32 = 0.5;
 /// why this is a value the draw path consults rather than a blanket fill.
 pub const FOLDER_DRAG_SHADOW_ALPHA: u8 = 0x89;
 
+/// Max bytes in the folder rename buffer.
+///
+/// 64, because a folder title is a single line in the footer (`FolderLayout::footer`,
+/// 56 dp) and the reference commits it through `FolderInfo.setTitle`
+/// (`Folder.java:569`, `:1851`): a title longer than the footer can show is
+/// truncated by the draw path, not stored. Fixed capacity and `Copy` so the
+/// frame path never allocates.
+pub const FOLDER_RENAME_MAX: usize = 64;
+
+/// Placeholder drawn when the rename buffer is empty.
+///
+/// The reference's name field shows the current title as its hint rather than
+/// as its content (`Folder.java:569`); an empty buffer therefore draws this
+/// hint and never the stale `folder_title`, so "the user cleared the field"
+/// cannot read as "the rename did not happen".
+pub const FOLDER_RENAME_PLACEHOLDER: &str = "Rename folder";
+
 /// Dilation of the preview radius by item count
 /// (`ClippedFolderIconLayoutRule.radiusDilationForItems`, `:210-218`): 0.15 for
 /// three items, 0.12 for four, 0 for one or two.
@@ -2775,6 +2792,524 @@ pub fn folder_preview_radius(available: f32, n: usize, shapes: bool) -> f32 {
         // (MAX_RADIUS_DILATION) * (n - MIN) / (MAX - MIN), `:14,187-188`.
         m * (1.0 + 0.25 * (n as f32 - 2.0) / 2.0)
     }
+}
+
+// ===========================================================================
+// Workspace drag
+// ===========================================================================
+//
+// The geometry half of a home-screen icon drag. UTLC has no drag layer at all,
+// so this is deliberately *only* geometry: every function here is a pure
+// function of `(Layout, slot, position)`, and the shell owns the touch dispatch,
+// the reorder commit and the page animation.
+//
+// What is borrowed is `Workspace.onDragOver` and its two helpers
+// (`Workspace.java:2689-2787`), plus the pager's own release logic in
+// `PagedView` -- because the page-turn decision is not a property of the
+// workspace grid at all, it is `PagedView`'s, and re-deriving it here is what
+// would make a drag turn pages differently from a swipe.
+
+/// Width of the band at each side of the pager that arms a page turn, dp.
+///
+/// The reference's `CellLayout` border space is the natural scale here: a drag
+/// is turned into a page turn because the *icon* has crossed into the
+/// neighbouring page's bounds, and `Workspace.checkDragObjectIsOverNeighbourPages`
+/// tests exactly that with `verifyInsidePage` on `nextPage - 1` and
+/// `nextPage + 1` (`Workspace.java:2877-2909`). A single page width is the
+/// closest analogue of "the neighbouring page's bounds" for a pager with no
+/// laid-out neighbours, and 48 dp is the launcher's own minimum touch target
+/// ([`TOUCH_TARGET_FRACTION`]'s token), so the band is at least one comfortable
+/// thumb width on every density.
+pub const DRAG_PAGE_EDGE_DP: f32 = 48.0;
+
+/// How long a drag must sit in the edge band before it turns the page, ms.
+///
+/// `ENTER_SPRING_LOAD_HOVER_TIME` (`SpringLoadedDragController.kt:62`). The
+/// reference arms an [`Alarm`] on every `onDragOver` whose target page changed
+/// and `snapToPage`s when it fires (`:33-44, 47-57`), which is a *hover* rule
+/// and not a proximity rule: dragging briskly across an edge does not turn the
+/// page, and holding still at one does.
+pub const DRAG_PAGE_HOVER_MS: u32 = 500;
+
+/// How long a drag may sit on nothing at all before the drag is cancelled, ms.
+///
+/// `ENTER_SPRING_LOAD_CANCEL_HOVER_TIME` (`SpringLoadedDragController.kt:64`),
+/// the same alarm's `null` arm. Exposed because the shell needs the same value
+/// to decide when a drag that never entered a band should be called off.
+pub const DRAG_CANCEL_HOVER_MS: u32 = 950;
+
+/// Horizontal velocity that counts as a fling, dp/s.
+///
+/// `fling_threshold_velocity` (`res/values/dimens.xml:105`), read by
+/// `PagedView.shouldFlingForVelocity` (`:1619-1621`).
+pub const PAGE_FLING_VELOCITY_DP: f32 = 500.0;
+
+/// The easier threshold once the drag has passed the page slop, dp/s.
+///
+/// `easy_fling_threshold_velocity` (`res/values/dimens.xml:106`), selected by
+/// `mAllowEasyFling` (`PagedView.java:1620`), which is set once the accumulated
+/// motion exceeds the paging touch slop (`:1349`).
+pub const PAGE_EASY_FLING_VELOCITY_DP: f32 = 400.0;
+
+/// Fraction of a page a drag must travel for the *move alone* to commit a turn.
+///
+/// `SIGNIFICANT_MOVE_THRESHOLD` (`PagedView.java:88`), applied by
+/// `isSignificantMove` (`:1306-1308`) against the page's measured width.
+pub const PAGE_SIGNIFICANT_MOVE: f32 = 0.4;
+
+/// Fraction of a page past which a fling back the other way returns to the
+/// starting page rather than skipping one further.
+///
+/// `RETURN_TO_ORIGINAL_PAGE_THRESHOLD` (`PagedView.java:86`), applied at
+/// `:1477-1480`.
+pub const PAGE_RETURN_TO_ORIGINAL: f32 = 0.33;
+
+/// The fraction of an icon that is treated as its visible area.
+///
+/// The reference's `IconNormalizer.ICON_VISIBLE_AREA_FACTOR`, used by
+/// `CellLayout.getFolderCreationRadius` as
+/// `ICON_VISIBLE_AREA_FACTOR * grid.iconSizePx / 2` for the folder-creation
+/// radius (`CellLayout.java:966-971`) and by `DeviceProfile.folderIconSizePx`
+/// (`:1393`).
+///
+/// **Provenance caveat, stated rather than hidden:** `IconNormalizer` is not in
+/// this tree -- `src/com/android/launcher3/icons/` holds `IconCache`,
+/// `LauncherIcons`, `CacheableShortcutInfo` and `LauncherIconProvider` and no
+/// normalizer -- so the *value* cannot be cited from the reference the way the
+/// *use* of it can. `0.8` is upstream AOSP's. Every other constant in this
+/// section is a transcription; this one is not, and it is named so a reader who
+/// disagrees can change it in one place.
+pub const ICON_VISIBLE_AREA_FACTOR: f32 = 0.8;
+
+/// Everything a lifted workspace cell is drawn as, in one value.
+///
+/// The mirror of [`FolderLayout::preview_in`]'s role for the folder drag: the
+/// draw path and the shell's dispatch both read these rects, so the thing that
+/// follows the finger and the thing that is measured for a drop are the same
+/// rect. All four are zero-sized when the corresponding field is `None`, which
+/// is what makes "no drop indicator" a geometry and not a special case in the
+/// draw loop.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WorkspaceDragGeometry {
+    /// The lifted cell, drawn at the finger and scaled by the lift.
+    pub lifted: Rect,
+    /// The lifted cell's key shadow, offset down and across from the lift.
+    pub shadow: Rect,
+    /// The drop indicator: the gap the grid has opened at.
+    pub gap: Rect,
+    /// The folder-creation backdrop over the occupied cell under the drag.
+    pub merge: Rect,
+}
+
+/// Which page a lifted cell is turning the pager towards, and whether it should.
+///
+/// Produced by [`Layout::drag_page_crossing`] every frame of a drag. `Copy`,
+/// three scalars wide, no allocation -- it is read on the frame path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageCrossing {
+    /// The page a release would settle on. Equal to the starting page when
+    /// [`Self::cross`] is false.
+    pub target: usize,
+    /// Whether a turn is armed.
+    pub cross: bool,
+    /// Why, or [`PageCrossReason::None`].
+    pub reason: PageCrossReason,
+}
+
+/// What armed a page turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageCrossReason {
+    /// Nothing did: the drag is not near an edge, is moving the other way, or
+    /// the pager has no page in that direction.
+    None,
+    /// The drag has been inside the edge band long enough.
+    /// `SpringLoadedDragController`'s hover alarm
+    /// (`SpringLoadedDragController.kt:47-57`).
+    Hover,
+    /// The fling velocity alone exceeded the threshold, wherever the finger is.
+    /// `PagedView`'s `isFling` branch (`:1499-1501`).
+    Fling,
+}
+
+/// One frame's worth of input to [`Layout::drag_page_crossing`.
+///
+/// Grouped into a struct rather than passed as six arguments because five of
+/// the six are per-frame drag state and the pager geometry is *not*: the caller
+/// fills one of these per drag, and a new field cannot be silently defaulted
+/// into position 6 of a call.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DragPageQuery {
+    /// The page the drag started on, clamped against [`Self::total_pages`].
+    pub page: usize,
+    /// Pages on the pager. `0` and `1` both mean "no turn is possible".
+    pub total_pages: usize,
+    /// The extreme x of the drag, panel coordinates.
+    ///
+    /// **Extreme**, not the finger: the reference decides from
+    /// `min(d.x, centerX)` or `max(d.x, centerX)` depending on which way the
+    /// icon is heading (`Workspace.java:2893-2895`), because the icon's leading
+    /// edge is what enters the neighbouring page's bounds. The caller picks the
+    /// min or the max with the same rule.
+    pub x: f32,
+    /// Where the touch went down, for the significant-move test.
+    pub down_x: f32,
+    /// Horizontal velocity in px/s. **Negative drags content left**, which in
+    /// LTR is towards the *next* page -- `isVelocityLeft` in the reference
+    /// (`PagedView.java:1461`).
+    pub velocity: f32,
+    /// How long the drag has been continuously inside the edge band.
+    pub hovered_ms: u32,
+}
+
+impl DragPageQuery {
+    /// The query a drag that is not in flight answers with: no turn.
+    pub const NONE: Self = Self {
+        page: 0,
+        total_pages: 1,
+        x: 0.0,
+        down_x: 0.0,
+        velocity: 0.0,
+        hovered_ms: 0,
+    };
+}
+
+impl Layout {
+    /// The scale a lifted workspace cell is drawn at, from its resting edge.
+    ///
+    /// The same computation as [`FolderLayout::drag_lift`], and deliberately
+    /// *not* a second implementation of it: both delegate to
+    /// [`drag_lift_scale_for`], because a workspace cell and a folder cell are
+    /// the same 6 dp lift in the reference (`DragView.java:174`,
+    /// `res/values/dimens.xml:353`) and two copies of `(1 + dp / edge)` are two
+    /// places for the next retune to land in only one of.
+    #[inline]
+    pub fn drag_lift_scale(&self, edge: f32) -> f32 {
+        drag_lift_scale_for(edge, &self.profile())
+    }
+
+    /// The key-shadow offset for a lifted workspace cell, in px.
+    ///
+    /// [`FolderLayout::drag_shadow_offset`]'s value and its citation
+    /// (`.5dp`, `styles.xml:425-426`), for the same "one value, two surfaces"
+    /// reason as [`Self::drag_lift_scale`].
+    #[inline]
+    pub fn drag_shadow_offset(&self) -> f32 {
+        self.profile().dp(FOLDER_DRAG_SHADOW_DP).max(1.0)
+    }
+
+    /// The cell rect a lifted workspace cell is drawn into.
+    ///
+    /// Centred on `at` -- which the shell supplies as the drag view's *visual
+    /// centre*, because the reference resolves both the drop cell and the
+    /// page-turn edge from `d.getVisualCenter` and not from the touch
+    /// (`Workspace.java:2709, 2893-2895`) -- and scaled from the resting edge by
+    /// [`Self::drag_lift_scale`], interpolated by `lift`.
+    ///
+    /// `lift` is a progress, not a flag: the reference's lift is an
+    /// animation off the long-press, and drawing it as a step means the icon
+    /// jumps. At `lift == 0.0` this is exactly `grid_icon(slot)` centred on the
+    /// finger, so a drag that has not started lifting is still the cell the
+    /// shell hit-tested.
+    #[inline]
+    pub fn drag_lifted_rect(&self, slot: usize, at: (f32, f32), lift: f32) -> Rect {
+        let resting = self.grid_icon(slot);
+        let lift = if lift.is_finite() {
+            lift.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let scale = 1.0 + (self.drag_lift_scale(resting.w) - 1.0) * lift;
+        let edge = resting.w * scale;
+        Rect {
+            x: at.0 - edge * 0.5,
+            y: at.1 - edge * 0.5,
+            w: edge,
+            h: edge,
+            radius: resting.radius * scale,
+        }
+    }
+
+    /// The key shadow of a lifted cell: the lifted rect, offset down and across.
+    ///
+    /// `styles.xml:425-426` gives both axes `.5dp`, and the offset is part of
+    /// the icon rather than of the cell it started in, which is why it is a
+    /// function of the *lifted* rect and not of `slot`.
+    #[inline]
+    pub fn drag_shadow_rect(&self, lifted: Rect) -> Rect {
+        let off = self.drag_shadow_offset();
+        Rect {
+            x: lifted.x + off,
+            y: lifted.y + off,
+            w: lifted.w,
+            h: lifted.h,
+            radius: lifted.radius,
+        }
+    }
+
+    /// The drop indicator for `slot`: the cell the grid's gap has opened at.
+    ///
+    /// The reference swaps in a transparent `CellLayoutLayoutParams` at
+    /// `(cellX, cellY)` and animates a `mDragOutline` in behind it
+    /// (`CellLayout.visualizeDropLocation:1196-1224`), so the indicator *is*
+    /// the target cell's bounds. Outdented by half the slack between cells,
+    /// because `getReorderRadius` outdents by half the border space
+    /// (`CellLayout.java:980-981`) and the indicator is drawn from the same
+    /// geometry.
+    #[inline]
+    pub fn drag_gap_rect(&self, slot: usize) -> Rect {
+        let icon = self.grid_icon(slot);
+        let (sx, sy) = self.drag_outdent();
+        Rect {
+            x: icon.x - sx,
+            y: icon.y - sy,
+            w: icon.w + sx * 2.0,
+            h: icon.h + sy * 2.0,
+            radius: icon.radius + sx.max(sy),
+        }
+    }
+
+    /// The folder-creation backdrop over the occupied cell at `slot`.
+    ///
+    /// The reference's `mFolderCreateBg` is a `PreviewBackground` sized to the
+    /// hovered icon and set `isClipping = false` so the full backdrop shows
+    /// *behind* it (`Workspace.java:2942-2956`). "Two icons onto each other"
+    /// is this: a rounded plate that appears under the icon under the drag.
+    #[inline]
+    pub fn drag_merge_rect(&self, slot: usize) -> Rect {
+        self.drag_gap_rect(slot)
+    }
+
+    /// The radius within which a lifted cell arms a *reorder* of `slot`.
+    ///
+    /// `CellLayout.getReorderRadius` (`:976-998`). For a 1x1 cell that can hold
+    /// a folder -- which is every workspace cell -- the reference takes the
+    /// smaller of the four half-distances from the centre to the outdented cell
+    /// bounds (`:983-991`), *not* the diagonal, precisely so a reorder does not
+    /// start before the icon is over the target. That branch is reproduced
+    /// verbatim; the general span case (`:993-997`) has no workspace analogue,
+    /// because a workspace cell is always 1x1.
+    #[inline]
+    pub fn drag_reorder_radius(&self, slot: usize) -> f32 {
+        let r = self.drag_gap_rect(slot);
+        let (cx, cy) = r.center();
+        (cx - r.x)
+            .min(cy - r.y)
+            .min(r.x + r.w - cx)
+            .min(r.y + r.h - cy)
+            .max(0.0)
+    }
+
+    /// The radius within which a lifted cell arms a *folder merge* with `slot`.
+    ///
+    /// `CellLayout.getFolderCreationRadius` (`:966-971`): halfway between the
+    /// reorder radius and the icon's own visible radius. Halfway is the point --
+    /// the merge wins the inner half of the reorder zone and loses the outer
+    /// half, so an icon that is merely near a neighbour reorders and an icon
+    /// that is *on* it merges.
+    #[inline]
+    pub fn drag_merge_radius(&self, slot: usize) -> f32 {
+        let visible = ICON_VISIBLE_AREA_FACTOR * self.grid_icon(slot).w * 0.5;
+        (self.drag_reorder_radius(slot) + visible) * 0.5
+    }
+
+    /// Workspace slot a folder drag would land on, or `None`.
+    ///
+    /// Cross-surface target for a cell dragged out of a folder: the workspace
+    /// cell under `pos` (panel coordinates), resolved with the same arithmetic
+    /// as [`Self::home_grid_hit`] but without a scroll offset -- the folder
+    /// sheet covers the workspace, so the grid underneath is at rest. `None`
+    /// outside the grid band, for a degenerate grid (`max_rows == 0`,
+    /// `grid_cols == 0`, non-positive pitch), or for non-finite input.
+    ///
+    /// Exclusive on the far edges, because `Rect::contains` is inclusive on
+    /// both edges (`layout.rs:154`) and an inclusive test here would let a
+    /// drop on the grid's bottom edge also hit the page indicator.
+    ///
+    /// Distinct from the Remove bar (`drop_target_bar`): that is the top 56 dp
+    /// band (`DeleteDropTarget.java:115`), this is a grid cell. The renderer
+    /// draws both when a folder drag is out, in different colours, so the two
+    /// affordances cannot be confused.
+    ///
+    /// The reference separates "in the folder" from "outside it" by inflating
+    /// the hit rect (`Folder.java:1179-1184`) and by an exit alarm
+    /// (`Folder.java:1293-1300`); the shell applies that first and calls this
+    /// only once `is_drag_out` is true.
+    #[inline]
+    pub fn folder_drag_slot(&self, pos: (f32, f32)) -> Option<usize> {
+        folder_drag_to_workspace_target(self, pos)
+    }
+
+    /// Which page a lifted cell is turning towards, and whether it should.
+    ///
+    /// The reference resolves this in two places and this is the union of them:
+    ///
+    /// * **Hover.** `SpringLoadedDragController` arms an alarm when the drag
+    ///   enters a page (`:33-44`) and `snapToPage`s when it fires (`:47-57`).
+    ///   That is a *dwell* rule: crossing an edge quickly does not turn the
+    ///   page, and resting in one does. Hence [`DragPageQuery::hovered_ms`]
+    ///   rather than a bare proximity test.
+    /// * **Fling.** `PagedView`'s release path takes the fling branch whenever
+    ///   `|velocity|` exceeds the threshold, wherever the finger is
+    ///   (`:1461, 1499-1501`), and `Workspace` re-runs `forceTouchMove` after a
+    ///   page transition so the new page is checked too
+    ///   (`Workspace.java:1439-1445`).
+    ///
+    /// A **significant move** also turns the page on its own: the reference's
+    /// `isSignificantMove` is `|delta| > 0.4 * pageWidth`
+    /// (`PagedView.java:88, 1306-1308`) and the release takes that branch when
+    /// the move and the fling do not disagree (`:1490, 1499`).
+    ///
+    /// LTR only, and stated rather than hidden: the brief's dispatch contract is
+    /// direction-free, and every other hit test in this module is LTR for the
+    /// same reason. An RTL shell negates `x`, `down_x` and `velocity` before
+    /// calling.
+    pub fn drag_page_crossing(&self, q: &DragPageQuery) -> PageCrossing {
+        let pages = q.total_pages.max(1);
+        // The starting page is clamped before anything else, so *every* return
+        // path reports a page that exists. An unclamped `q.page` -- which a shell
+        // can produce by passing a drag's page before its pager has been sized --
+        // would otherwise be echoed straight back as `target`, and a shell that
+        // assigns `home_page = crossing.target` on release would jump to a page
+        // that is not there.
+        let page = q.page.min(pages - 1) as i32;
+        let stay = PageCrossing {
+            target: page as usize,
+            cross: false,
+            reason: PageCrossReason::None,
+        };
+        if pages < 2 {
+            return stay;
+        }
+        // A negative velocity drags the content left, which advances the page.
+        //
+        // Non-finite is "not moving", explicitly. `f32::INFINITY` compares
+        // `Greater` against zero, so without this guard an infinity read as
+        // "rightwards" *and* as a fling (`inf.abs() > threshold` is true) and
+        // turned the pager back a page -- which is the failure
+        // `a_still_drag_turns_no_page` found by including infinity in its list.
+        // The reference's `shouldFlingForVelocity` is a strict `>` on a finite
+        // `Math.abs` (`PagedView.java:1620`), so a NaN there is false too.
+        let step: i32 = if !q.velocity.is_finite() {
+            return stay;
+        } else if q.velocity < 0.0 {
+            1
+        } else if q.velocity > 0.0 {
+            -1
+        } else {
+            return stay;
+        };
+        let candidate = page + step;
+        if candidate < 0 || candidate >= pages as i32 {
+            return stay;
+        }
+        let p = self.profile();
+        let edge = p.dp(DRAG_PAGE_EDGE_DP);
+        // The band the drag has to be inside is the one it is heading *towards*.
+        let band = if step > 0 {
+            (edge, self.w)
+        } else {
+            (0.0, edge)
+        };
+        // `edge` is the band's *width*, and the comparison against it is
+        // exclusive: a drag sitting exactly on the boundary of the neighbouring
+        // page is not yet over it. `Rect::contains` being inclusive on both edges
+        // is a documented hazard in this project, and an inclusive test here is
+        // the same bug with a different rect.
+        let in_band = edge > 0.0 && q.x >= band.0 && q.x < band.1;
+        let fling = q.velocity.abs() > p.dp(PAGE_EASY_FLING_VELOCITY_DP);
+        let significant = (q.x - q.down_x).abs() > self.w * PAGE_SIGNIFICANT_MOVE;
+        let crossed = match (fling, in_band) {
+            (true, _) => Some(PageCrossReason::Fling),
+            (false, true) if q.hovered_ms >= DRAG_PAGE_HOVER_MS => Some(PageCrossReason::Hover),
+            (false, true) if significant => Some(PageCrossReason::Hover),
+            _ => None,
+        };
+        match crossed {
+            Some(reason) => PageCrossing {
+                target: candidate as usize,
+                cross: true,
+                reason,
+            },
+            None => stay,
+        }
+    }
+
+    /// Half the slack between two workspace cells, per axis.
+    ///
+    /// The analogue of `CellLayout`'s `-mBorderSpace.x / 2` outdent
+    /// (`CellLayout.java:980-981`). `Layout` has no border-space field -- its
+    /// cell *is* the pitch -- so the slack is what is left of the pitch once the
+    /// icon has been centred in it, which is the same quantity by construction.
+    #[inline]
+    fn drag_outdent(&self) -> (f32, f32) {
+        (
+            (self.col_pitch - self.icon_size).max(0.0) * 0.5,
+            (self.row_pitch - self.icon_size).max(0.0) * 0.5,
+        )
+    }
+}
+
+/// The lift computation shared by [`Layout::drag_lift_scale`] and
+/// [`FolderLayout::drag_lift`], so the workspace and folder surfaces cannot
+/// drift apart.
+///
+/// `(width + 6 dp) / width` (`DragView.java:174`, `res/values/dimens.xml:353`),
+/// clamped at 1.5 so a degenerate `edge` cannot produce an infinite scale.
+#[inline]
+pub fn drag_lift_scale_for(edge: f32, p: &DeviceProfile) -> f32 {
+    if edge <= 0.0 || !edge.is_finite() {
+        return 1.0;
+    }
+    let lift = p.dp(FOLDER_DRAG_LIFT_DP);
+    (1.0 + lift / edge).min(1.5)
+}
+
+/// Workspace slot a folder drag would land on, or `None`.
+///
+/// Free-function form of [`Layout::folder_drag_slot`] so the shell and the
+/// renderer share one derivation. Pure geometry of `(layout, pos)`: no
+/// allocation, `Copy` in and out. Guards every row-count division -- `max_rows
+/// == 0`, `grid_cols == 0`, non-positive pitch -- by returning `None` rather
+/// than dividing.
+///
+/// See [`Layout::folder_drag_slot`] for the reference citations and the
+/// Remove-bar distinction.
+#[inline]
+pub fn folder_drag_to_workspace_target(l: &Layout, pos: (f32, f32)) -> Option<usize> {
+    let (x, y) = pos;
+    if !x.is_finite() || !y.is_finite() {
+        return None;
+    }
+    if l.max_rows == 0 || l.grid_cols == 0 {
+        return None;
+    }
+    if l.col_pitch <= 0.0 || l.row_pitch <= 0.0 {
+        return None;
+    }
+    if !l.col_pitch.is_finite() || !l.row_pitch.is_finite() {
+        return None;
+    }
+    // Exclusive band test: `y < grid_bottom`, not `<=`, for the
+    // `Rect::contains` reason documented on `rename_hit`.
+    if y < l.grid_top || y >= l.grid_bottom {
+        return None;
+    }
+    if x < 0.0 || x >= l.w {
+        return None;
+    }
+    let col = (x / l.col_pitch).floor() as usize;
+    if col >= l.grid_cols {
+        return None;
+    }
+    let row_f = (y - l.grid_top) / l.row_pitch;
+    if !row_f.is_finite() || row_f < 0.0 {
+        return None;
+    }
+    let row = row_f as usize;
+    if row >= l.max_rows {
+        return None;
+    }
+    Some(row * l.grid_cols + col)
 }
 
 /// An open folder: its grid, its chrome and its preview metrics.
@@ -3191,11 +3726,7 @@ impl FolderLayout {
     /// by a real panel.
     #[inline]
     pub fn drag_lift(&self, edge: f32, l: &Layout) -> f32 {
-        if edge <= 0.0 {
-            return 1.0;
-        }
-        let lift = l.profile().dp(FOLDER_DRAG_LIFT_DP);
-        (1.0 + lift / edge).min(1.5)
+        drag_lift_scale_for(edge, &l.profile())
     }
 
     /// The key-shadow offset for a lifted cell, in px.
@@ -3494,6 +4025,83 @@ impl FolderLayout {
             item_h: pl.item_h,
             inner_r: pl.inner_r,
         }
+    }
+
+    /// The rename text field, in layout coordinates.
+    ///
+    /// The footer inset by a quarter of its height on every side, so the field
+    /// sits where the static title sits (`draw_folder` centres the title in the
+    /// footer) and the shell hit-tests exactly what is drawn. Layout
+    /// coordinates: the draw path offsets by `folder_grid_geometry`'s origin
+    /// minus `cell` (see `folder_layout_offset` in `main.rs:645`), while
+    /// [`Self::menu`] is already panel-space and must not shift.
+    ///
+    /// The reference commits a rename from this band (`Folder.java:569`,
+    /// `:1851`, announced via `DragLayer.java:190`).
+    #[inline]
+    pub fn rename_field(&self) -> Rect {
+        let f = self.footer();
+        let inset_x = self.footer_h * 0.25;
+        let inset_y = self.footer_h * 0.25;
+        Rect {
+            x: f.x + inset_x,
+            y: f.y + inset_y,
+            w: (f.w - inset_x * 2.0).max(0.0),
+            h: (f.h - inset_y * 2.0).max(0.0),
+            radius: (f.h - inset_y * 2.0).max(0.0) * 0.25,
+        }
+    }
+
+    /// The caret for `text_w` px of text inside `field`.
+    ///
+    /// A 2 px vertical bar at `field.x + pad + text_w`, clamped inside the
+    /// field so a full buffer cannot push it off the sheet. `text_w` is the
+    /// measured advance (the renderer measures with `font::measure`), so the
+    /// layout never measures text itself. Pure geometry, no allocation.
+    #[inline]
+    pub fn rename_caret(&self, field: Rect, text_w: f32) -> Rect {
+        if field.w <= 0.0 || field.h <= 0.0 {
+            return Rect {
+                x: field.x,
+                y: field.y,
+                w: 0.0,
+                h: 0.0,
+                radius: 0.0,
+            };
+        }
+        let pad = field.h * 0.2;
+        let tw = if text_w.is_finite() {
+            text_w.max(0.0).min((field.w - pad * 2.0).max(0.0))
+        } else {
+            0.0
+        };
+        let caret_w = 2.0_f32.min(field.w);
+        let caret_h = (field.h * 0.6).max(1.0).min(field.h);
+        Rect {
+            x: field.x + pad + tw,
+            y: field.y + (field.h - caret_h) * 0.5,
+            w: caret_w,
+            h: caret_h,
+            radius: 0.0,
+        }
+    }
+
+    /// Whether `(x, y)` hits the rename field, in layout coordinates.
+    ///
+    /// Exclusive on the far edges (`x < x+w`, `y < y+h`): `Rect::contains` is
+    /// inclusive on both edges (`layout.rs:154`), so a touch exactly on the
+    /// field's right edge would otherwise also hit whatever is laid out next
+    /// to it. Zero-size fields hit nothing.
+    #[inline]
+    pub fn rename_hit(&self, x: f32, y: f32) -> bool {
+        let f = self.rename_field();
+        if f.is_empty() {
+            return false;
+        }
+        if !x.is_finite() || !y.is_finite() {
+            return false;
+        }
+        x >= f.x && x < f.x + f.w && y >= f.y && y < f.y + f.h
     }
 }
 
@@ -4306,6 +4914,19 @@ pub enum Key {
     Hide,
     Space,
     Enter,
+    /// The layout toggle, bottom-left of the space bar.
+    ///
+    /// Added with the three-page keyboard. Before it existed the `?123` / `ABC` /
+    /// `123` arms of [`crate::compositor::ime::VirtualKeyboard::handle_key_tap`]
+    /// were unreachable, because there was no key that could produce them: the
+    /// bottom row was `Hide | space | Enter` and the whole sheet was one fixed
+    /// QWERTY. Dispatching this variant is what makes
+    /// [`crate::compositor::ime::KeyboardLayout`] observable.
+    ///
+    /// The caller resolves it with
+    /// [`crate::compositor::ime::KeyboardLayout::toggled`], never by matching the
+    /// drawn label -- see [`keyboard_toggle_label`].
+    Layout,
 }
 
 /// Which app surface is on screen, for the panel-level geometry.
@@ -4376,9 +4997,108 @@ pub const KB_ROW1: usize = 10;
 pub const KB_ROW2: usize = 9;
 pub const KB_ROW3_MID: usize = 7;
 
+/// The digit row, shared by all three pages.
+///
+/// Row 1 is identical on the alpha, symbols and numeric pages -- which is exactly
+/// how a Gboard-shaped keyboard is arranged, and why "the layouts look different"
+/// is a claim about rows 2 and 3 and not about the whole sheet.
+pub const KB_DIGITS: [char; KB_ROW1] = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '0'];
+
+/// Alpha page, row 2: the first nine letters.
+pub const KB_ALPHA_ROW2: [char; KB_ROW2] = ['q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o'];
+
+/// Alpha page, row 3 between shift and backspace: the remaining seven letters.
+pub const KB_ALPHA_ROW3: [char; KB_ROW3_MID] = ['z', 'x', 'c', 'v', 'b', 'n', 'm'];
+
+/// Symbols page, row 2.
+pub const KB_SYMBOL_ROW2: [char; KB_ROW2] = ['^', '%', '$', '#', '&', '*', '!', '?', ':'];
+
+/// Symbols page, row 3 between shift and backspace.
+pub const KB_SYMBOL_ROW3: [char; KB_ROW3_MID] = ['<', '>', '@', '"', '\'', ';', ','];
+
+/// Numeric page, row 2: the punctuation a telephone-style field needs.
+pub const KB_NUMERIC_ROW2: [char; KB_ROW2] = ['-', '/', ':', ';', '(', ')', '@', '&', '"'];
+
+/// Numeric page, row 3 between shift and backspace.
+pub const KB_NUMERIC_ROW3: [char; KB_ROW3_MID] = ['.', ',', '?', '!', '\'', '*', '#'];
+
+/// The three character rows of a keyboard page.
+///
+/// Returned as three *slices* rather than a per-page struct so a page cannot be
+/// handed to the renderer with a row of the wrong length: every table below is
+/// typed `[char; KB_ROWn]`, so the slice lengths are the row counts by
+/// construction and the draw loop's `0..KB_ROWn` cannot read past one.
+///
+/// ASCII-only (`0x20..=0x7E`) throughout, and that is load-bearing rather than
+/// cosmetic: `font.rs` covers only `0x20..0x7F` and asserts that every other
+/// code point draws *no ink*, so a real `€` or `§` on a key cap would be a blank
+/// square. The same restriction is why [`crate::compositor::ime`] notes the
+/// absent degree sign on the weather line.
+#[inline]
+pub fn keyboard_rows(layout: crate::compositor::ime::KeyboardLayout) -> KeyboardRows {
+    use crate::compositor::ime::KeyboardLayout as L;
+    match layout {
+        L::Qwerty => KeyboardRows {
+            row2: &KB_ALPHA_ROW2,
+            row3: &KB_ALPHA_ROW3,
+        },
+        L::Symbols => KeyboardRows {
+            row2: &KB_SYMBOL_ROW2,
+            row3: &KB_SYMBOL_ROW3,
+        },
+        L::Numeric => KeyboardRows {
+            row2: &KB_NUMERIC_ROW2,
+            row3: &KB_NUMERIC_ROW3,
+        },
+    }
+}
+
+/// Row 2 and row 3 of one keyboard page. Row 1 is always [`KB_DIGITS`].
+///
+/// The three are read by the renderer *and* by [`Keyboard::hit`], so a key that
+/// is drawn is the key that is pressed -- the property the whole of this module's
+/// geometry exists to keep.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct KeyboardRows {
+    pub row2: &'static [char],
+    pub row3: &'static [char],
+}
+
+/// The label drawn on the layout-toggle key for a page, and the string
+/// [`crate::compositor::ime::VirtualKeyboard::handle_key_tap`] dispatches for it.
+///
+/// One function for both halves of that sentence, because two tables is how a
+/// drawn `?123` ends up being handled as something else. The renderer paints
+/// `keyboard_toggle_label(state.keyboard_layout)` and the shell feeds a tap back
+/// as the identical `&'static str`, so there is no second spelling to drift.
+///
+/// The reference has no keyboard to cite here and therefore neither does this: a
+/// launcher does not own an IME. `ExtendedEditText.showSoftInputInternal`
+/// hands the field to the platform `InputMethodManager`
+/// (`ExtendedEditText.java:128-136`) and `ActivityContext.isHardwareKeyboard`
+/// branches on `Configuration.KEYBOARD_QWERTY` rather than on any key set
+/// (`ActivityContext.java:391-395`), and the manifest keeps `keyboardHidden` in
+/// `configChanges` (`AndroidManifest.xml:60`) because the launcher never hosts
+/// one. The `?123` / `ABC` / `123` labels are Gboard's, not the reference's, so
+/// they are documented as such here and in `ime.rs`.
+#[inline]
+pub fn keyboard_toggle_label(layout: crate::compositor::ime::KeyboardLayout) -> &'static str {
+    use crate::compositor::ime::KeyboardLayout as L;
+    match layout {
+        L::Qwerty => "?123",
+        L::Symbols => "ABC",
+        L::Numeric => "ABC",
+    }
+}
+
 /// Full virtual keyboard geometry.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Keyboard {
+    /// Which page this is. Carried on the geometry rather than passed to each
+    /// reader because [`Self::hit`] resolves `row2` / `row3` to *characters*
+    /// through [`keyboard_rows`], and a `Keyboard` that did not know its page
+    /// could not tell `w` from `#`.
+    pub layout: crate::compositor::ime::KeyboardLayout,
     pub frame: Rect,
     /// Frame rows: number, top, height.
     pub rows: [f32; 4],
@@ -4388,13 +5108,37 @@ pub struct Keyboard {
     pub row3_mid: [Rect; KB_ROW3_MID],
     pub row3_backspace: Rect,
     pub row4_hide: Rect,
+    /// The layout toggle, between `row4_hide` and `row4_space`.
+    ///
+    /// Labelled by [`keyboard_toggle_label`]; [`Self::hit`] returns
+    /// [`Key::Layout`] for it.
+    pub row4_layout: Rect,
     pub row4_space: Rect,
     pub row4_enter: Rect,
 }
 
 impl Keyboard {
     /// Build the keyboard for a panel, sized as a fraction of the display.
+    ///
+    /// The alpha page, kept as the one-argument form so every existing call site
+    /// -- and every existing test fixture -- means the same thing it meant before
+    /// the symbols and numeric pages existed. It is *not* a default in the sense
+    /// of "nobody chose it": [`Self::new_for`] is what the renderer calls, with
+    /// the layout the shell actually holds.
+    #[inline]
     pub fn new(w: f32, h: f32) -> Self {
+        Self::new_for(w, h, crate::compositor::ime::KeyboardLayout::Qwerty)
+    }
+
+    /// [`Self::new`] for a specific page.
+    ///
+    /// The frame, the rows and every rect are **identical** across the three
+    /// pages -- only the characters behind them change. That is deliberate: the
+    /// bottom row's key *widths* do not move when a page changes, so a shell
+    /// that cached a `Keyboard` from one frame keeps hitting the right keys on
+    /// the next, and `hit` cannot return a different key for the same touch
+    /// because the geometry moved.
+    pub fn new_for(w: f32, h: f32, layout: crate::compositor::ime::KeyboardLayout) -> Self {
         let pad = w * 0.012;
         // The frame must actually contain four rows of keys, so derive the
         // key height from the available height rather than the other way
@@ -4439,11 +5183,22 @@ impl Keyboard {
         for (i, slot) in row3_mid.iter_mut().enumerate() {
             *slot = mk(inner_x + shift_w + mid_w * i as f32, mid_w, 2);
         }
-        let hide_w = inner_w * 0.18;
+        // Bottom row: hide | layout toggle | space | enter.
+        //
+        // `hide_w` dropped from 0.18 to 0.16 to make room for the toggle key
+        // without taking the width out of the space bar, which is the one key
+        // whose size a thumb actually notices. The toggle is the widest of the
+        // two small keys because "?123" is four glyphs where "Hide" is four
+        // lowercase letters at the same scale -- both fit comfortably at
+        // `em_px_at(1, ..)`, and the fraction is checked by
+        // `the_toggle_key_is_wide_enough_for_its_label`.
+        let hide_w = inner_w * 0.16;
+        let layout_w = inner_w * 0.19;
         let enter_w = inner_w * 0.24;
-        let space_w = inner_w - hide_w - enter_w;
+        let space_w = inner_w - hide_w - layout_w - enter_w;
 
         Self {
+            layout,
             frame,
             rows,
             row1,
@@ -4452,9 +5207,23 @@ impl Keyboard {
             row3_mid,
             row3_backspace: mk(inner_x + inner_w - shift_w, shift_w, 2),
             row4_hide: mk(inner_x, hide_w, 3),
-            row4_space: mk(inner_x + hide_w, space_w, 3),
+            row4_layout: mk(inner_x + hide_w, layout_w, 3),
+            row4_space: mk(inner_x + hide_w + layout_w, space_w, 3),
             row4_enter: mk(inner_x + inner_w - enter_w, enter_w, 3),
         }
+    }
+
+    /// The characters of row 2 and row 3 for this keyboard's page.
+    #[inline]
+    pub fn rows_for_layout(&self) -> KeyboardRows {
+        keyboard_rows(self.layout)
+    }
+
+    /// The label to paint on [`Self::row4_layout`], and the string a tap on it
+    /// dispatches. One value for both, so they cannot disagree.
+    #[inline]
+    pub fn toggle_label(&self) -> &'static str {
+        keyboard_toggle_label(self.layout)
     }
 
     /// Key at index `i` of row 1.
@@ -4496,10 +5265,16 @@ impl Keyboard {
     }
 
     /// Key under `(x, y)`, if the touch landed on the keyboard.
+    ///
+    /// Reads this keyboard's own page tables through [`Self::rows_for_layout`],
+    /// so `w` on the alpha page and `#` on the symbols page are the same rect
+    /// with different labels rather than two rects that could be placed
+    /// differently.
     pub fn hit(&self, x: f32, y: f32) -> Option<Key> {
         if !self.frame.contains(x, y) {
             return None;
         }
+        let keys = self.rows_for_layout();
         if self.row3_shift.contains(x, y) {
             return Some(Key::Shift);
         }
@@ -4510,11 +5285,17 @@ impl Keyboard {
         // would walk the row twice per touch.
         for (i, r) in self.row3_mid.iter().enumerate() {
             if r.contains(x, y) {
-                return Some(Key::Char(ROW3[i]));
+                return Some(Key::Char(keys.row3[i]));
             }
         }
         if self.row4_hide.contains(x, y) {
             return Some(Key::Hide);
+        }
+        // Siblings with space and enter, and scanned with them: any order is
+        // correct because the three rects are disjoint, and putting the toggle
+        // in the same scan is what keeps it from being forgotten.
+        if self.row4_layout.contains(x, y) {
+            return Some(Key::Layout);
         }
         if self.row4_enter.contains(x, y) {
             return Some(Key::Enter);
@@ -4523,7 +5304,7 @@ impl Keyboard {
             return Some(Key::Space);
         }
         let row1_pitch = self.row1_pitch();
-        for (i, key) in ROW1.iter().enumerate() {
+        for (i, key) in KB_DIGITS.iter().enumerate() {
             let r = Rect {
                 x: self.row1.x + row1_pitch * i as f32,
                 y: self.row1.y,
@@ -4536,7 +5317,7 @@ impl Keyboard {
             }
         }
         let row2_pitch = self.row2_pitch();
-        for (i, key) in ROW2.iter().enumerate() {
+        for (i, key) in keys.row2.iter().enumerate() {
             let r = Rect {
                 x: self.row2.x + row2_pitch * i as f32,
                 y: self.row2.y,
@@ -4562,16 +5343,195 @@ const fn row3_dummy() -> Rect {
     }
 }
 
-/// Row 1 key labels.
-pub const ROW1: [char; KB_ROW1] = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '0'];
-/// Row 2 key labels.
-pub const ROW2: [char; KB_ROW2] = ['q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o'];
-/// Row 3 middle key labels.
-pub const ROW3: [char; KB_ROW3_MID] = ['z', 'x', 'c', 'v', 'b', 'n', 'm'];
+/// Row 1 key labels. The digit row, shared by every page -- see [`KB_DIGITS`].
+pub const ROW1: [char; KB_ROW1] = KB_DIGITS;
+/// Row 2 key labels **on the alpha page**. See [`KB_ALPHA_ROW2`].
+pub const ROW2: [char; KB_ROW2] = KB_ALPHA_ROW2;
+/// Row 3 middle key labels **on the alpha page**. See [`KB_ALPHA_ROW3`].
+pub const ROW3: [char; KB_ROW3_MID] = KB_ALPHA_ROW3;
 
 // ===========================================================================
 // App surfaces
 // ===========================================================================
+
+/// What an app-info screen is for on a Linux device, and where the tap goes.
+///
+/// **This is not a transcription of the reference's app-info screen, because the
+/// reference does not have one.** `SystemShortcut.APP_INFO`
+/// (`SystemShortcut.java:188`) exists and `Launcher.getSystemShortcutStream`
+/// puts it first in the icon menu (`Launcher.java:2999-3001`), but tapping it
+/// resolves the target only *at* the tap:
+/// `PackageManagerHelper.startDetailsActivityForInfo` builds a `ComponentName`
+/// from the `ItemInfo` and calls `LauncherApps.startAppDetailsActivity`,
+/// falling back to a Toast when nothing handles it
+/// (`PackageManagerHelper.java:160-187`). The reference therefore has no
+/// screen to look at -- it hands off and is gone.
+///
+/// UTLC is the opposite: the handoff target is a *program* on this device
+/// (`gnome-software`, `discover`, ...), which either exists or does not, and a
+/// user who cannot see which one is about to be spawned has no way to know
+/// beforehand. So the panel is what the reference's one-line menu row resolves
+/// in a single step, made inspectable: it names the app, its component id, the
+/// `Exec=` line that will actually be run, the resolved software centre, and one
+/// button.
+///
+/// [`AppInfoTarget`] exists because the reference itself distinguishes the two
+/// destinations: an app with a live install session goes to the *market*
+/// activity rather than the details activity
+/// (`PackageManagerHelper.java:162-167`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AppInfoTarget {
+    /// The details handler for the component -- `LauncherApps.startAppDetailsActivity`
+    /// in the reference (`PackageManagerHelper.java:180-182`).
+    #[default]
+    Details,
+    /// The store handler, because the app has an install session in flight
+    /// (`PackageManagerHelper.java:162-167`).
+    Store,
+}
+
+/// Geometry of the app-info screen.
+///
+/// Every rect is produced here and read by **both** the renderer and
+/// [`Self::hit`], for the reason [`PopupMenuLayout::place`] exists: two
+/// derivations of one geometry is the bug class this module keeps naming.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AppInfoLayout {
+    /// The app-panel surface: top bar, back and close controls, content band.
+    ///
+    /// An [`AppLayout`] rather than eight loose rects, so the app-info screen is
+    /// literally the same window chrome as every other app surface and cannot
+    /// grow a bar of its own.
+    pub surface: AppLayout,
+    /// The app's icon.
+    pub icon: Rect,
+    /// The app's display name, under the icon.
+    pub name: Rect,
+    /// The component id line, e.g. `org.mozilla.firefox`.
+    pub id_line: Rect,
+    /// The `Exec=` line from the `.desktop` entry.
+    pub exec_line: Rect,
+    /// The line naming what the button will launch.
+    pub target_line: Rect,
+    /// The one-line explanation of what the button does.
+    pub hint: Rect,
+    /// The "Open in software centre" affordance.
+    pub open_button: Rect,
+}
+
+impl AppInfoLayout {
+    /// Build the app-info geometry for a panel.
+    pub fn new(w: f32, h: f32) -> Self {
+        let surface = AppLayout::new(w, h, AppPanel::Other, 0);
+        let p = DeviceProfile::for_panel(w);
+        let body_x = surface.bar.x + surface.bar.h * 0.25;
+        let body_w = surface.bar.w - surface.bar.h * 0.5;
+
+        // The icon is the largest square the content band can carry without
+        // pushing the four text lines off the panel, and is capped at a quarter
+        // of the width so a tablet does not get a poster.
+        let top = surface.scroll_top;
+        let icon_edge = (body_w * 0.32).min(h * 0.16).min(body_w * 0.5);
+        let icon = Rect {
+            x: body_x + (body_w - icon_edge) * 0.5,
+            y: top,
+            w: icon_edge,
+            h: icon_edge,
+            radius: icon_edge * ICON_RADIUS,
+        };
+        // Line pitch: a fixed multiple of the em the renderer draws body text
+        // at, so the panel's rhythm is the type scale's rhythm.
+        let em = font::em_px_at(1, w as usize);
+        let line_h = em * 1.55;
+        let gap = h * 0.006;
+        let first = icon.y + icon.h + gap;
+        let line = |i: usize| Rect {
+            x: body_x,
+            y: first + (line_h + gap) * i as f32,
+            w: body_w,
+            h: line_h,
+            radius: 0.0,
+        };
+        let name = line(0);
+        let id_line = line(1);
+        let exec_line = line(2);
+        let target_line = line(3);
+        let hint = line(4);
+        // The button is anchored to the *bottom* of the panel, not stacked under
+        // the text: the text block is short and the panel is tall, and a button
+        // that follows variable-length text moves as the id and exec strings
+        // change length. Anchoring it means its position is a function of the
+        // panel alone.
+        let btn_h = (h * 0.042).max(p.dp(p.touch_target_dp));
+        let open_button = Rect {
+            x: body_x,
+            y: (h - p.dp(18.0) - btn_h).max(0.0),
+            w: body_w,
+            h: btn_h,
+            radius: btn_h * 0.28,
+        };
+        Self {
+            surface,
+            icon,
+            name,
+            id_line,
+            exec_line,
+            target_line,
+            hint,
+            open_button,
+        }
+    }
+
+    /// The content rect, for the scrim behind the lines.
+    pub fn content(&self) -> Rect {
+        Rect {
+            x: self.surface.bar.x,
+            y: self.surface.scroll_top,
+            w: self.surface.bar.w,
+            h: (self.hint.y + self.hint.h - self.surface.scroll_top).max(0.0),
+            radius: self.surface.bar.radius,
+        }
+    }
+
+    /// Which control a touch at `(x, y)` landed on.
+    ///
+    /// Checks are **exclusive** on the trailing edge (`Rect::contains` is
+    /// inclusive on both, and this module has already been bitten by that: a
+    /// closed popup's zero-size rows matched a touch). The button is tested
+    /// before the body because it sits *inside* the body, and a body test first
+    /// would swallow it.
+    ///
+    /// [`Self::Body`] is returned for a miss on the panel so the shell can tell
+    /// "tapped the panel, do nothing" from "tapped outside it, dismiss"; `None`
+    /// means the touch was outside the app-info screen entirely.
+    pub fn hit(&self, x: f32, y: f32) -> Option<AppInfoHit> {
+        let bar = self.surface.bar;
+        let inside_bar = x >= bar.x && x < bar.x + bar.w && y >= bar.y && y < bar.y + bar.h;
+        if inside_bar {
+            return Some(AppInfoHit::Close);
+        }
+        let b = self.open_button;
+        if b.w > 0.0 && b.h > 0.0 && x >= b.x && x < b.x + b.w && y >= b.y && y < b.y + b.h {
+            return Some(AppInfoHit::Open);
+        }
+        let c = self.content();
+        if c.w > 0.0 && c.h > 0.0 && x >= c.x && x < c.x + c.w && y >= c.y && y < c.y + c.h {
+            return Some(AppInfoHit::Body);
+        }
+        None
+    }
+}
+
+/// What an app-info screen touch resolved to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppInfoHit {
+    /// Anywhere on the panel that is not a control: nothing to dispatch.
+    Body,
+    /// The top bar, which closes the screen.
+    Close,
+    /// The software-centre affordance.
+    Open,
+}
 
 /// Geometry of a single app window: top app bar, terminal tabs, message box.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -8225,6 +9185,124 @@ mod tests {
         assert_eq!(f.reorder_index(x, y, 0), None);
     }
 
+    /// The rename field sits inside the footer, inset on every side.
+    ///
+    /// The reference commits a rename from this band (`Folder.java:569`,
+    /// `:1851`); the field must be where the static title was, or the edit
+    /// affordance moves when editing starts.
+    #[test]
+    fn rename_field_is_the_footer_inset() {
+        let (_, f) = folder();
+        let footer = f.footer();
+        let field = f.rename_field();
+        assert!(field.w > 0.0 && field.h > 0.0);
+        assert!(field.x >= footer.x && field.x + field.w <= footer.x + footer.w + 0.01);
+        assert!(field.y >= footer.y && field.y + field.h <= footer.y + footer.h + 0.01);
+        assert!(field.x > footer.x && field.y > footer.y);
+    }
+
+    /// The caret sits after the text and never leaves the field.
+    #[test]
+    fn rename_caret_follows_the_text_and_clamps() {
+        let (_, f) = folder();
+        let field = f.rename_field();
+        let start = f.rename_caret(field, 0.0);
+        assert!(start.w > 0.0 && start.h > 0.0);
+        assert!(start.x >= field.x && start.x + start.w <= field.x + field.w + 0.01);
+        let after = f.rename_caret(field, 40.0);
+        assert!(after.x > start.x);
+        // A full buffer cannot push the caret off the sheet.
+        let full = f.rename_caret(field, 10_000.0);
+        assert!(full.x + full.w <= field.x + field.w + 0.01);
+        // Degenerate and non-finite inputs collapse to an empty rect, not NaN.
+        let empty = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 0.0,
+            h: 0.0,
+            radius: 0.0,
+        };
+        assert!(f.rename_caret(empty, 10.0).w == 0.0);
+        assert!(f.rename_caret(field, f32::NAN).x >= field.x);
+    }
+
+    /// The rename hit is exclusive on the far edges.
+    ///
+    /// `Rect::contains` is inclusive on both edges (`layout.rs:154`), so an
+    /// inclusive test here would let a touch on the field's right edge also hit
+    /// the sheet chrome.
+    #[test]
+    fn rename_hit_is_exclusive_on_the_far_edges() {
+        let (_, f) = folder();
+        let field = f.rename_field();
+        assert!(f.rename_hit(field.x + 1.0, field.y + 1.0));
+        assert!(!f.rename_hit(field.x + field.w, field.y + 1.0));
+        assert!(!f.rename_hit(field.x + 1.0, field.y + field.h));
+        assert!(!f.rename_hit(f32::NAN, field.y + 1.0));
+    }
+
+    /// The folder-to-workspace target maps the grid and guards every division.
+    ///
+    /// Inside the grid band it agrees with `home_grid_hit` at rest scroll;
+    /// outside, degenerate, or non-finite it is `None` rather than dividing by
+    /// a row count (`list_h / 0` is `inf`). The reference separates the exit by
+    /// an inflated rect (`Folder.java:1179-1184`) and an alarm
+    /// (`Folder.java:1293-1300`); the shell applies that first.
+    #[test]
+    fn folder_drag_to_workspace_target_maps_the_grid_and_guards() {
+        let l = Layout::new(1080.0, 2400.0, false);
+        let inside = l.grid_icon(3).center();
+        assert_eq!(
+            folder_drag_to_workspace_target(&l, inside),
+            l.home_grid_hit(inside.0, inside.1, 0.0)
+        );
+        assert!(folder_drag_to_workspace_target(&l, inside).is_some());
+        // Outside the band: above, below (exclusive), and off-panel.
+        assert_eq!(
+            folder_drag_to_workspace_target(&l, (540.0, l.grid_top - 1.0)),
+            None
+        );
+        assert_eq!(
+            folder_drag_to_workspace_target(&l, (540.0, l.grid_bottom)),
+            None
+        );
+        assert_eq!(
+            folder_drag_to_workspace_target(&l, (-1.0, l.grid_top + 10.0)),
+            None
+        );
+        assert_eq!(
+            folder_drag_to_workspace_target(&l, (f32::NAN, l.grid_top + 10.0)),
+            None
+        );
+        // Degenerate grids never divide: zero rows, zero cols, dead pitch.
+        let mut dead = l;
+        dead.max_rows = 0;
+        assert_eq!(folder_drag_to_workspace_target(&dead, inside), None);
+        let mut no_cols = l;
+        no_cols.grid_cols = 0;
+        assert_eq!(folder_drag_to_workspace_target(&no_cols, inside), None);
+        let mut flat = l;
+        flat.row_pitch = 0.0;
+        assert_eq!(folder_drag_to_workspace_target(&flat, inside), None);
+    }
+
+    /// The method form shares the free function's derivation.
+    #[test]
+    fn layout_folder_drag_slot_matches_the_free_function() {
+        let l = Layout::new(1080.0, 2400.0, false);
+        for pos in [
+            (100.0, 800.0),
+            (540.0, 1200.0),
+            (1000.0, 2000.0),
+            (540.0, 10.0),
+        ] {
+            assert_eq!(
+                l.folder_drag_slot(pos),
+                folder_drag_to_workspace_target(&l, pos)
+            );
+        }
+    }
+
     /// The reflow is the remove-and-insert permutation: every cell is occupied
     /// exactly once except the one the gap opened at.
     ///
@@ -8660,4 +9738,733 @@ mod tests {
     }
 
     fn assert_copy<T: Copy>() {}
+
+    // =======================================================================
+    // Keyboard: three pages
+    // =======================================================================
+
+    /// The three pages must not share a row. If two pages' tables were equal the
+    /// renderer would draw the same frame for two different `KeyboardLayout`s
+    /// and the whole layout field would be another correct-but-uncalled
+    /// implementation -- which is the failure this change exists to remove.
+    ///
+    /// Compared *row by row* rather than as whole arrays, so the assertion
+    /// says which row changed: row 1 is the shared digit row and must match.
+    #[test]
+    fn the_three_keyboard_pages_differ_where_they_are_meant_to() {
+        use crate::compositor::ime::KeyboardLayout as L;
+        let q = keyboard_rows(L::Qwerty);
+        let s = keyboard_rows(L::Symbols);
+        let n = keyboard_rows(L::Numeric);
+        assert_ne!(q.row2, s.row2, "symbols row 2 is the alpha row 2");
+        assert_ne!(q.row3, s.row3, "symbols row 3 is the alpha row 3");
+        assert_ne!(q.row2, n.row2, "numeric row 2 is the alpha row 2");
+        assert_ne!(q.row3, n.row3, "numeric row 3 is the alpha row 3");
+        assert_ne!(
+            s.row2, n.row2,
+            "symbols and numeric share row 2; one of the two pages draws no \
+             pixels the other does not"
+        );
+        assert_ne!(s.row3, n.row3, "symbols and numeric share row 3");
+    }
+
+    /// Every page's rows are exactly the length the draw loop reads.
+    ///
+    /// `keyboard_rows` returns slices, so a page whose table was typed at the
+    /// wrong length would silently hand the renderer a short row and
+    /// `keys.row3[i]` would panic *in production*, at whatever index the finger
+    /// happened to land on. The row counts are asserted here instead.
+    #[test]
+    fn every_page_row_is_the_length_the_draw_loop_reads() {
+        for layout in [
+            crate::compositor::ime::KeyboardLayout::Qwerty,
+            crate::compositor::ime::KeyboardLayout::Symbols,
+            crate::compositor::ime::KeyboardLayout::Numeric,
+        ] {
+            let r = keyboard_rows(layout);
+            assert_eq!(r.row2.len(), KB_ROW2, "{layout:?} row 2");
+            assert_eq!(r.row3.len(), KB_ROW3_MID, "{layout:?} row 3");
+        }
+        assert_eq!(KB_DIGITS.len(), KB_ROW1);
+    }
+
+    /// Every key cap is inside `font.rs`'s coverage.
+    ///
+    /// `font.rs` covers `0x20..=0x7F` and asserts that anything else draws *no
+    /// ink*, so a non-ASCII key is not a wrong-looking glyph, it is a blank
+    /// square. This is the test that stops a future `€` or `§` from being added
+    /// to a key table and looking like a font bug on the device.
+    #[test]
+    fn every_key_cap_is_in_font_coverage() {
+        for layout in [
+            crate::compositor::ime::KeyboardLayout::Qwerty,
+            crate::compositor::ime::KeyboardLayout::Symbols,
+            crate::compositor::ime::KeyboardLayout::Numeric,
+        ] {
+            let r = keyboard_rows(layout);
+            for ch in KB_DIGITS.iter().chain(r.row2).chain(r.row3) {
+                assert!(
+                    ('\u{20}'..='\u{7F}').contains(ch),
+                    "{layout:?}: {:?} is outside 0x20..=0x7F and would render as \
+                     a blank key cap",
+                    ch
+                );
+            }
+        }
+    }
+
+    /// The toggle key exists, is disjoint from its three neighbours, and is wide
+    /// enough for the label that gets painted on it.
+    ///
+    /// Disjointness is what makes [`Keyboard::hit`] well defined: `Rect::contains`
+    /// is inclusive on both edges, so two adjacent rects that share an edge have
+    /// a column that matches both, and `hit`'s scan order would silently decide
+    /// the tie.
+    #[test]
+    fn the_toggle_key_is_a_disjoint_key_that_fits_its_label() {
+        for (w, h) in [
+            (1080.0f32, 2400.0f32),
+            (720.0, 1280.0),
+            (1440.0, 3200.0),
+            (2000.0, 1000.0),
+        ] {
+            let kb = Keyboard::new(w, h);
+            let neighbours = [kb.row4_hide, kb.row4_space, kb.row4_enter];
+            for n in neighbours {
+                assert!(
+                    kb.row4_layout.x >= n.x + n.w || n.x >= kb.row4_layout.x + kb.row4_layout.w,
+                    "{w}x{h}: the toggle key overlaps a neighbour"
+                );
+            }
+            // The bottom row must exactly tile the inner width: a gap means a
+            // dead strip, an overlap means a tie in `hit`.
+            let total = kb.row4_hide.w + kb.row4_layout.w + kb.row4_space.w + kb.row4_enter.w;
+            let inner = kb.frame.w - (kb.row4_hide.x - kb.frame.x) * 2.0;
+            assert!(
+                (total - inner).abs() < 0.01,
+                "{w}x{h}: bottom row tiles {total} of {inner}"
+            );
+            for layout in [
+                crate::compositor::ime::KeyboardLayout::Qwerty,
+                crate::compositor::ime::KeyboardLayout::Symbols,
+                crate::compositor::ime::KeyboardLayout::Numeric,
+            ] {
+                let label = keyboard_toggle_label(layout);
+                let em = font::em_px_at(1, w as usize);
+                assert!(
+                    font::measure(label, em) < kb.row4_layout.w,
+                    "{w}x{h}: {label:?} measures {} in a {:.1} px key",
+                    font::measure(label, em),
+                    kb.row4_layout.w
+                );
+            }
+        }
+    }
+
+    /// The same touch resolves to the same *key* on every page, and to the page's
+    /// own character.
+    ///
+    /// The geometry is deliberately identical across pages, so this is really
+    /// two claims: the rects did not move, and the characters behind them did.
+    /// The second half is what makes the layout field observable -- a `Keyboard`
+    /// that hit-tested `w` on the symbols page would type `w` into a numeric
+    /// field.
+    #[test]
+    fn hit_reads_the_pages_own_characters_and_the_geometry_never_moves() {
+        use crate::compositor::ime::KeyboardLayout as L;
+        let alpha = Keyboard::new_for(1080.0, 2400.0, L::Qwerty);
+        for layout in [L::Qwerty, L::Symbols, L::Numeric] {
+            let kb = Keyboard::new_for(1080.0, 2400.0, layout);
+            assert_eq!(kb.frame, alpha.frame, "{layout:?}: the frame moved");
+            assert_eq!(kb.row2, alpha.row2, "{layout:?}: row 2 moved");
+            assert_eq!(kb.row3_mid, alpha.row3_mid, "{layout:?}: row 3 moved");
+            assert_eq!(
+                kb.row4_layout, alpha.row4_layout,
+                "{layout:?}: the toggle moved"
+            );
+        }
+
+        // Row 2, key 0: `q` on alpha, `^` on symbols, `-` on numeric.
+        let probe = alpha.row2_at(0).center();
+        assert_eq!(
+            Keyboard::new_for(1080.0, 2400.0, L::Qwerty).hit(probe.0, probe.1),
+            Some(Key::Char('q'))
+        );
+        assert_eq!(
+            Keyboard::new_for(1080.0, 2400.0, L::Symbols).hit(probe.0, probe.1),
+            Some(Key::Char('^'))
+        );
+        assert_eq!(
+            Keyboard::new_for(1080.0, 2400.0, L::Numeric).hit(probe.0, probe.1),
+            Some(Key::Char('-'))
+        );
+
+        // And the toggle is a key on every page.
+        for layout in [L::Qwerty, L::Symbols, L::Numeric] {
+            let kb = Keyboard::new_for(1080.0, 2400.0, layout);
+            let c = kb.row4_layout.center();
+            assert_eq!(
+                kb.hit(c.0, c.1),
+                Some(Key::Layout),
+                "{layout:?}: the toggle key is not tappable"
+            );
+        }
+    }
+
+    /// `Keyboard::new` is the alpha page, and says so.
+    ///
+    /// Pinned because the one-argument form exists for the existing call sites
+    /// and a silent change of its default would quietly relabel every keyboard
+    /// in every fixture.
+    #[test]
+    fn keyboard_new_is_the_alpha_page() {
+        assert_eq!(
+            Keyboard::new(1080.0, 2400.0),
+            Keyboard::new_for(
+                1080.0,
+                2400.0,
+                crate::compositor::ime::KeyboardLayout::Qwerty
+            )
+        );
+        assert_eq!(
+            Keyboard::new(1080.0, 2400.0).toggle_label(),
+            "?123",
+            "the alpha page's toggle must be the one that reaches the symbols page"
+        );
+    }
+
+    // =======================================================================
+    // App info
+    // =======================================================================
+
+    /// Every app-info control is on the panel, ordered, and reachable.
+    ///
+    /// The vertical order is the load-bearing part: the icon, then the five text
+    /// lines, then a button pinned to the bottom. A layout where the button
+    /// floats mid-panel would be a layout where the id and exec strings can
+    /// collide with it.
+    #[test]
+    fn app_info_controls_are_ordered_on_the_panel() {
+        for (w, h) in [(1080.0f32, 2400.0f32), (720.0, 1280.0), (1440.0, 3200.0)] {
+            let a = AppInfoLayout::new(w, h);
+            let bottom = h;
+            assert!(
+                a.icon.y >= a.surface.bar.y + a.surface.bar.h,
+                "{w}x{h}: icon under the bar"
+            );
+            let lines = [a.name, a.id_line, a.exec_line, a.target_line, a.hint];
+            for pair in lines.windows(2) {
+                assert!(
+                    pair[1].y >= pair[0].y + pair[0].h,
+                    "{w}x{h}: text lines overlap"
+                );
+            }
+            assert!(
+                a.open_button.y >= lines[4].y + lines[4].h,
+                "{w}x{h}: the button sits on the text"
+            );
+            assert!(
+                a.open_button.y + a.open_button.h <= bottom,
+                "{w}x{h}: the button runs off the panel"
+            );
+            // Every text line is inside the panel horizontally and long enough to
+            // carry the longest thing it has to show (an `Exec=` line).
+            for (i, line) in lines.iter().enumerate() {
+                assert!(
+                    line.x >= 0.0 && line.x + line.w <= w,
+                    "{w}x{h}: line {i} sideways"
+                );
+                assert!(line.w > 0.0 && line.h > 0.0, "{w}x{h}: line {i} is empty");
+            }
+            assert!(a.icon.w > 0.0 && a.icon.h > 0.0, "{w}x{h}: no icon box");
+        }
+    }
+
+    /// The app-info hit test resolves the controls it draws, and nothing else.
+    ///
+    /// **Exclusive** trailing edges throughout. `Rect::contains` is inclusive on
+    /// both, and an inclusive test here would report `Close` for a touch one
+    /// pixel below the bar and `Body` for one below the content, i.e. a hit
+    /// test that fires on the panel's neighbour.
+    #[test]
+    fn app_info_hit_resolves_the_drawn_controls() {
+        let a = AppInfoLayout::new(1080.0, 2400.0);
+        assert_eq!(
+            a.hit(a.open_button.center().0, a.open_button.center().1),
+            Some(AppInfoHit::Open)
+        );
+        assert_eq!(
+            a.hit(a.icon.center().0, a.icon.center().1),
+            Some(AppInfoHit::Body)
+        );
+        assert_eq!(
+            a.hit(a.surface.bar.center_x(), a.surface.bar.center_y()),
+            Some(AppInfoHit::Close),
+            "the top bar closes the screen"
+        );
+        // One pixel outside each control is not that control.
+        let b = a.open_button;
+        assert_ne!(
+            a.hit(b.center_x(), b.y + b.h + 0.5),
+            Some(AppInfoHit::Open),
+            "the button's exclusive bottom edge leaked"
+        );
+        let bar = a.surface.bar;
+        assert_ne!(
+            a.hit(bar.center_x(), bar.y + bar.h + 0.5),
+            Some(AppInfoHit::Close),
+            "the bar's exclusive bottom edge leaked"
+        );
+        // And above the bar is outside the screen entirely.
+        assert_eq!(a.hit(bar.center_x(), bar.y - 1.0), None);
+        // The button is inside the content band, so ordering in `hit` matters:
+        // a body test first would swallow it. Asserted through the public API.
+        assert!(
+            a.content().contains(b.center_x(), b.center_y())
+                || a.open_button.y >= a.content().y + a.content().h,
+            "the button and the content band are disjoint, so this test no longer \
+             pins the check order"
+        );
+    }
+
+    // =======================================================================
+    // Workspace drag geometry
+    // =======================================================================
+
+    fn drag_query() -> DragPageQuery {
+        DragPageQuery {
+            page: 1,
+            total_pages: 3,
+            x: 0.0,
+            down_x: 0.0,
+            velocity: 0.0,
+            hovered_ms: 0,
+        }
+    }
+
+    /// The edge band is a *width* and its panel-side boundary is exclusive.
+    ///
+    /// `Rect::contains` being inclusive on both edges is a documented hazard in
+    /// this project, and here it would make a drag exactly on the boundary of
+    /// the neighbouring page count as inside it -- the same class of bug as a
+    /// closed popup's zero-size rows matching a touch.
+    ///
+    /// Sign convention under test: negative velocity drags the content
+    /// leftwards, so the band it has to reach is the *right* one and the target
+    /// is `page + 1`.
+    #[test]
+    fn the_page_edge_band_is_exclusive_on_its_panel_side_boundary() {
+        let l = Layout::plain(1080.0, 2400.0);
+        let edge = l.profile().dp(DRAG_PAGE_EDGE_DP);
+
+        // Forward: the right band, whose near boundary is `edge`.
+        let mut fwd = drag_query();
+        fwd.page = 1;
+        fwd.velocity = -1.0;
+        fwd.hovered_ms = DRAG_PAGE_HOVER_MS;
+        fwd.x = edge + 0.5;
+        assert!(
+            l.drag_page_crossing(&fwd).cross,
+            "half a pixel inside the right band does not cross"
+        );
+        fwd.x = edge - 0.5;
+        assert!(
+            !l.drag_page_crossing(&fwd).cross,
+            "half a pixel short of the right band still crosses"
+        );
+
+        // Backward: the left band, whose far boundary is `edge` and must be
+        // exclusive for exactly the same reason.
+        let mut back = drag_query();
+        back.page = 1;
+        back.velocity = 1.0;
+        back.hovered_ms = DRAG_PAGE_HOVER_MS;
+        back.x = edge - 0.5;
+        assert!(
+            l.drag_page_crossing(&back).cross,
+            "half a pixel inside the left band does not cross"
+        );
+        back.x = edge;
+        assert!(
+            !l.drag_page_crossing(&back).cross,
+            "a drag exactly on the left band's boundary counts as inside it"
+        );
+    }
+
+    /// A drag turns the page in the direction the content is going, and only if
+    /// there is a page to go to.
+    ///
+    /// `isVelocityLeft` / `isDeltaLeft` in the reference
+    /// (`PagedView.java:1460-1461`): negative velocity advances the page in LTR,
+    /// and both the first and last page refuse a turn in the direction that does
+    /// not exist (`:1490, 1499`).
+    #[test]
+    fn a_drag_turns_the_page_in_the_direction_of_its_velocity() {
+        let l = Layout::plain(1080.0, 2400.0);
+        let edge = l.profile().dp(DRAG_PAGE_EDGE_DP);
+
+        // Forward from the middle page: 1 -> 2.
+        let mut fwd = drag_query();
+        fwd.page = 1;
+        fwd.x = l.w - edge + 1.0;
+        fwd.velocity = -2000.0;
+        let c = l.drag_page_crossing(&fwd);
+        assert!(c.cross, "a fast flick at the right edge turns the page");
+        assert_eq!(c.target, 2);
+
+        // Backward from the middle page: 1 -> 0.
+        let mut back = drag_query();
+        back.page = 1;
+        back.x = edge - 1.0;
+        back.velocity = 2000.0;
+        let c = l.drag_page_crossing(&back);
+        assert!(c.cross);
+        assert_eq!(c.target, 0);
+
+        // The last page cannot go forward...
+        let mut end = fwd;
+        end.page = 2;
+        let c = l.drag_page_crossing(&end);
+        assert!(!c.cross, "the last page turned past the end");
+        assert_eq!(c.target, 2);
+
+        // ...and the first cannot go back.
+        let mut start = back;
+        start.page = 0;
+        let c = l.drag_page_crossing(&start);
+        assert!(!c.cross, "the first page turned past the start");
+        assert_eq!(c.target, 0);
+
+        // A single-page pager never turns, whatever the velocity.
+        let mut one = fwd;
+        one.total_pages = 1;
+        let c = l.drag_page_crossing(&one);
+        assert!(!c.cross);
+        assert_eq!(c.target, 0);
+    }
+
+    /// Crossing an edge quickly does not turn the page; resting there does.
+    ///
+    /// The reference's rule is a *dwell*, not a proximity: an alarm armed on
+    /// entering a page (`SpringLoadedDragController.kt:33-44`) and a `snapToPage`
+    /// when it fires (`:47-57`). A proximity-only rule makes a fast flick across
+    /// the panel skip a page, which is what this test exists to prevent.
+    ///
+    /// `down_x` is pinned to `x` so the significant-move arm of
+    /// [`Layout::drag_page_crossing`] cannot satisfy the assertion by itself --
+    /// the test has to isolate the dwell.
+    #[test]
+    fn a_page_turn_needs_a_dwell_not_just_an_edge() {
+        let l = Layout::plain(1080.0, 2400.0);
+        let edge = l.profile().dp(DRAG_PAGE_EDGE_DP);
+        let mut q = drag_query();
+        q.page = 1;
+        q.x = l.w - edge + 1.0;
+        q.down_x = q.x;
+        q.velocity = -1.0;
+
+        q.hovered_ms = 0;
+        assert!(
+            !l.drag_page_crossing(&q).cross,
+            "a slow drag that has just entered the band must not turn yet"
+        );
+        q.hovered_ms = DRAG_PAGE_HOVER_MS;
+        let crossed = l.drag_page_crossing(&q);
+        assert!(crossed.cross, "the hover time has elapsed");
+        assert_eq!(crossed.reason, PageCrossReason::Hover);
+        assert_eq!(crossed.target, 2);
+    }
+
+    /// A fling turns the page wherever the finger is, and is reported as a
+    /// fling rather than a hover.
+    ///
+    /// `PagedView`'s release path takes the fling branch on velocity alone
+    /// (`:1499-1501`) and the threshold is
+    /// `easy_fling_threshold_velocity` once the drag has passed the page slop
+    /// (`res/values/dimens.xml:106`, `PagedView.java:1620`). Asserted **in the
+    /// middle of the panel**, far outside the edge band: a test whose fling
+    /// happened to sit in the band would pass with the fling arm removed, which
+    /// is the shape of this project's worst test failures.
+    #[test]
+    fn a_fling_turns_the_page_from_the_middle_of_the_panel() {
+        let l = Layout::plain(1080.0, 2400.0);
+        let threshold = l.profile().dp(PAGE_EASY_FLING_VELOCITY_DP);
+        let mut q = drag_query();
+        q.page = 1;
+        q.x = l.w * 0.5;
+        q.down_x = l.w * 0.5;
+        q.hovered_ms = 0;
+        // Outside the band, by a wide margin, so this is only ever about velocity.
+        assert!(
+            q.x > l.profile().dp(DRAG_PAGE_EDGE_DP)
+                && q.x < l.w - l.profile().dp(DRAG_PAGE_EDGE_DP),
+            "the probe must not be inside an edge band, or this test proves nothing"
+        );
+
+        // A slow drag parked in the middle turns nothing.
+        q.velocity = -threshold * 0.5;
+        assert!(!l.drag_page_crossing(&q).cross);
+
+        // Just over the threshold does, and says why.
+        q.velocity = -threshold - 1.0;
+        let c = l.drag_page_crossing(&q);
+        assert!(c.cross, "a fast fling in mid-panel must turn the page");
+        assert_eq!(c.reason, PageCrossReason::Fling);
+        assert_eq!(c.target, 2);
+
+        // And symmetrically the other way.
+        q.velocity = threshold + 1.0;
+        let c = l.drag_page_crossing(&q);
+        assert_eq!(
+            c.target, 0,
+            "a rightwards fling must go to the previous page"
+        );
+    }
+
+    /// A drag that covers more than 40% of a page turns it without a fling and
+    /// without a dwell.
+    ///
+    /// `SIGNIFICANT_MOVE_THRESHOLD` (`PagedView.java:88`) applied by
+    /// `isSignificantMove` (`:1306-1308`). Tested at the threshold from both
+    /// sides, because the comparison is strict: a `>=` would turn the page on a
+    /// drag that has moved exactly 40% of a page, which is the arbitrary line.
+    #[test]
+    fn a_significant_move_turns_the_page_on_its_own() {
+        let l = Layout::plain(1080.0, 2400.0);
+        let edge = l.profile().dp(DRAG_PAGE_EDGE_DP);
+        let mut q = drag_query();
+        q.page = 1;
+        q.x = l.w - edge + 1.0;
+        q.velocity = -1.0;
+        q.hovered_ms = 0;
+
+        q.down_x = q.x - l.w * PAGE_SIGNIFICANT_MOVE;
+        assert_eq!(
+            l.drag_page_crossing(&q).target,
+            1,
+            "exactly 40% of a page is not a significant move"
+        );
+
+        q.down_x = q.x - l.w * (PAGE_SIGNIFICANT_MOVE + 0.02);
+        let c = l.drag_page_crossing(&q);
+        assert!(c.cross, "just over 40% is");
+        assert_eq!(c.target, 2);
+    }
+
+    /// A still drag asks for nothing, and an out-of-range page cannot escape.
+    ///
+    /// `velocity == 0` has to be refused, not coerced: the shell reports 0 on the
+    /// first frame after a long press, before any velocity tracker has run, and
+    /// a `0.0` read as "rightwards" would flip the target page on the frame the
+    /// drag starts.
+    #[test]
+    fn a_still_drag_turns_no_page() {
+        let l = Layout::plain(1080.0, 2400.0);
+        for v in [0.0f32, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut q = drag_query();
+            q.x = 0.0;
+            q.hovered_ms = DRAG_CANCEL_HOVER_MS;
+            q.velocity = v;
+            let c = l.drag_page_crossing(&q);
+            assert!(!c.cross, "velocity {v} turned the page");
+            assert_eq!(c.reason, PageCrossReason::None);
+            assert_eq!(c.target, q.page);
+        }
+        // An out-of-range starting page cannot produce a target off the pager.
+        let mut q = drag_query();
+        q.page = 9;
+        q.velocity = -1.0;
+        q.x = l.w - 1.0;
+        q.hovered_ms = DRAG_PAGE_HOVER_MS;
+        let c = l.drag_page_crossing(&q);
+        assert!(c.target < 3, "target {} escaped the pager", c.target);
+        assert_eq!(c.target, 2);
+    }
+
+    /// The lift and the shadow are the folder's values, not a second derivation.
+    ///
+    /// The workspace drag was added by mirroring
+    /// [`FolderLayout::drag_lift`] / [`drag_shadow_offset`], and the only way
+    /// that stays true is if the two are the same computation. A copy here would
+    /// pass this test -- which is exactly why the test compares them rather than
+    /// re-deriving the value.
+    #[test]
+    fn the_workspace_lift_is_the_folders_lift() {
+        let l = Layout::plain(1080.0, 2400.0);
+        let f = FolderLayout::new(&l);
+        for edge in [40.0f32, 64.0, 120.0, 240.0] {
+            assert_eq!(
+                l.drag_lift_scale(edge),
+                f.drag_lift(edge, &l),
+                "the two lifts disagree at edge {edge}"
+            );
+        }
+        assert_eq!(l.drag_shadow_offset(), f.drag_shadow_offset(&l));
+        // And the degenerate case stays finite, because a 0-width cell is
+        // reachable from a clipped grid.
+        assert!(l.drag_lift_scale(0.0).is_finite());
+        assert!(l.drag_lift_scale(-1.0).is_finite());
+        assert!(l.drag_lift_scale(f32::NAN).is_finite());
+    }
+
+    /// A lifted cell grows from the finger, and only while it is lifting.
+    ///
+    /// `lift` is a progress, not a flag: at 0 the rect must be the resting icon
+    /// centred on the finger, and at 1 it must be the resting icon scaled by
+    /// [`Layout::drag_lift_scale`] and still centred on the finger. Anything else
+    /// means the drag drifts away from the user's finger, which is the specific
+    /// bug the reference's `d.getVisualCenter` handling exists to avoid
+    /// (`Workspace.java:2709`).
+    #[test]
+    fn a_lifted_cell_stays_centred_on_the_finger_and_grows() {
+        let l = Layout::plain(1080.0, 2400.0);
+        let at = (517.0f32, 903.0f32);
+        let resting = l.grid_icon(4);
+
+        let flat = l.drag_lifted_rect(4, at, 0.0);
+        assert!(
+            (flat.w - resting.w).abs() < 0.01,
+            "a lifted cell changed size at lift 0"
+        );
+        assert!((flat.center_x() - at.0).abs() < 0.01);
+        assert!((flat.center_y() - at.1).abs() < 0.01);
+
+        let full = l.drag_lifted_rect(4, at, 1.0);
+        let expected = resting.w * l.drag_lift_scale(resting.w);
+        assert!(
+            (full.w - expected).abs() < 0.01,
+            "the full lift is not the 6 dp lift"
+        );
+        assert!(full.w > flat.w, "the lift did not grow the cell");
+        assert!((full.center_x() - at.0).abs() < 0.01);
+
+        // Monotone, and out-of-range progress is clamped rather than extrapolated.
+        let mut prev = 0.0;
+        for i in 0..=10 {
+            let w = l.drag_lifted_rect(4, at, i as f32 / 10.0).w;
+            assert!(w >= prev, "the lift is not monotone at {i}");
+            prev = w;
+        }
+        assert_eq!(l.drag_lifted_rect(4, at, -3.0).w, flat.w);
+        assert_eq!(l.drag_lifted_rect(4, at, 9.0).w, full.w);
+        assert_eq!(l.drag_lifted_rect(4, at, f32::NAN).w, flat.w);
+    }
+
+    /// The drop indicator is the target cell, outdented into the slack, and the
+    /// merge plate is that same cell.
+    ///
+    /// The outdent is `CellLayout.getReorderRadius`'s
+    /// `-mBorderSpace / 2` (`CellLayout.java:980-981`): the indicator is drawn
+    /// from the geometry the radius is measured against, so an indicator drawn
+    /// from the bare icon would be visibly smaller than the drop zone.
+    #[test]
+    fn the_drop_indicator_is_the_target_cell_outdented() {
+        let l = Layout::plain(1080.0, 2400.0);
+        let icon = l.grid_icon(7);
+        let gap = l.drag_gap_rect(7);
+        assert!(
+            gap.w > icon.w,
+            "the indicator is not outdented past the icon"
+        );
+        assert!(gap.h > icon.h);
+        assert!(
+            (gap.center_x() - icon.center_x()).abs() < 0.01,
+            "the indicator moved off the cell centre"
+        );
+        // Symmetric: the slack on each side is the same, so an outdent that
+        // grew one axis only would show up here.
+        let slack_l = icon.x - gap.x;
+        let slack_r = gap.x + gap.w - icon.x - icon.w;
+        assert!(
+            (slack_l - slack_r).abs() < 0.01,
+            "the outdent is not symmetric"
+        );
+        // A different slot gives a different indicator.
+        assert_ne!(l.drag_gap_rect(7), l.drag_gap_rect(8));
+        // And the merge plate is the same cell, which is what makes
+        // "drop onto an icon" land exactly on "the icon's own box".
+        assert_eq!(l.drag_merge_rect(7), gap);
+    }
+
+    /// The merge radius wins the inner half of the reorder zone.
+    ///
+    /// `CellLayout.getFolderCreationRadius` (`:966-971`) is explicitly halfway
+    /// between the reorder radius and the icon's visible radius, and the reason
+    /// is that a drag *near* a neighbour reorders while a drag *on* it merges.
+    /// Tested at both radii, not just their ordering: a pair where the merge
+    /// radius were the larger one would satisfy "merge is reachable" and fail
+    /// exactly where the user can tell the two apart.
+    #[test]
+    fn the_merge_radius_is_halfway_inside_the_reorder_radius() {
+        let l = Layout::plain(1080.0, 2400.0);
+        for slot in [0usize, 3, 7, 11] {
+            let reorder = l.drag_reorder_radius(slot);
+            let merge = l.drag_merge_radius(slot);
+            let visible = ICON_VISIBLE_AREA_FACTOR * l.grid_icon(slot).w * 0.5;
+            assert!(
+                merge < reorder,
+                "slot {slot}: the merge radius {merge} is not inside the reorder \
+                 radius {reorder}"
+            );
+            assert!(
+                merge > 0.0,
+                "slot {slot}: the merge radius collapsed to {merge}"
+            );
+            // The documented identity, halfway.
+            assert!(
+                (merge - (reorder + visible) * 0.5).abs() < 0.01,
+                "slot {slot}: merge radius is not halfway between reorder and visible"
+            );
+
+            // The difference the halfway rule buys, exercised as a *distance*
+            // rather than as an inequality: a drag dropped `merge + 1 px` from
+            // the cell centre is out of the merge zone and still in the reorder
+            // zone. Without this, "merge < reorder" alone would still hold for a
+            // pair of radii that are both far outside the cell, and the two
+            // affordances would never actually be distinguishable to the shell.
+            let gap = l.drag_gap_rect(slot);
+            let c = gap.center();
+            let just_outside = (c.0 + merge + 1.0, c.1);
+            let d = ((just_outside.0 - c.0).powi(2) + (just_outside.1 - c.1).powi(2)).sqrt();
+            assert!(d > merge, "slot {slot}: the probe is inside the merge zone");
+            assert!(
+                d < reorder,
+                "slot {slot}: the probe is outside the reorder zone too, so the \
+                 merge/reorder distinction is untestable"
+            );
+        }
+    }
+
+    /// The reorder radius is the *smaller* half-distance, not the diagonal.
+    ///
+    /// `CellLayout.getReorderRadius`'s `canCreateFolder` branch takes
+    /// `min(left, top, right, bottom)` (`:983-991`) and the comment above it says
+    /// why: taking the circle in the smaller dimension ensures the reorder does
+    /// not start before the icon is over the target. A diagonal here would be
+    /// ~41% larger on a square cell and would start the reorder early.
+    #[test]
+    fn the_reorder_radius_is_the_inscribed_circle() {
+        let l = Layout::plain(1080.0, 2400.0);
+        let gap = l.drag_gap_rect(3);
+        let half_w = gap.w * 0.5;
+        let half_h = gap.h * 0.5;
+        assert!(
+            (l.drag_reorder_radius(3) - half_w.min(half_h)).abs() < 0.01,
+            "the reorder radius is not min(half-w, half-h)"
+        );
+        assert!(
+            l.drag_reorder_radius(3) < (half_w * half_h * 2.0).sqrt(),
+            "the reorder radius is the diagonal half"
+        );
+    }
+
+    /// Every new drag type is `Copy`, because the frame path carries one.
+    #[test]
+    fn the_drag_geometry_is_copy() {
+        assert_copy::<PageCrossing>();
+        assert_copy::<DragPageQuery>();
+        assert_copy::<WorkspaceDragGeometry>();
+        assert_copy::<AppInfoLayout>();
+        assert_copy::<KeyboardRows>();
+    }
 }

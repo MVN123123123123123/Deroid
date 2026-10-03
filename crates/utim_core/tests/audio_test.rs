@@ -97,7 +97,10 @@ fn test_milestone_4_1_dynamic_audio_routing() {
 
     // 4. Bluetooth A2DP audio connects
     router.on_bluetooth_a2dp_event(true, &mut hal);
-    assert_eq!(router.state.current_output, AudioOutputDevice::BluetoothA2dp);
+    assert_eq!(
+        router.state.current_output,
+        AudioOutputDevice::BluetoothA2dp
+    );
     assert_eq!(hal.get_parameter("routing"), Some("bt_a2dp"));
 
     // 5. Phone call begins: audio mode switches to IN_CALL, AEC and NS activate in DSP
@@ -119,7 +122,10 @@ fn test_milestone_4_1_dynamic_audio_routing() {
     assert_eq!(hal.mode, AudioMode::Normal);
     assert!(!hal.aec_enabled);
     assert!(!hal.ns_enabled);
-    assert_eq!(router.state.current_output, AudioOutputDevice::BluetoothA2dp);
+    assert_eq!(
+        router.state.current_output,
+        AudioOutputDevice::BluetoothA2dp
+    );
 }
 
 #[test]
@@ -172,11 +178,7 @@ fn test_milestone_4_1_mpg_power_synchronization() {
     std::fs::create_dir_all(&power).unwrap();
     std::fs::write(power.join("wake_lock"), "").unwrap();
     std::fs::write(power.join("wake_unlock"), "").unwrap();
-    let mut mpg = MobilePowerGovernor::with_paths(
-        power,
-        temp.join("cgroup"),
-        temp.join("battery"),
-    );
+    let mut mpg = MobilePowerGovernor::with_paths(power, temp.join("cgroup"), temp.join("battery"));
     let mut pwr_mgr = AudioPowerManager::new();
 
     let config = AudioConfig::standard_mobile_output();
@@ -269,9 +271,19 @@ fn test_milestone_4_1_hal_crash_during_active_call_restores_in_call_and_aec() {
     pwr_mgr.handle_hal_crash(&mut hal, &mut router, &mut nodes);
 
     // 4. Verify that HAL mode was preserved as InCall and DSP AEC/NS remain enabled
-    assert_eq!(hal.mode, AudioMode::InCall, "HAL mode must remain InCall after crash recovery");
-    assert!(hal.aec_enabled, "DSP AEC must remain enabled after crash recovery during call");
-    assert!(hal.ns_enabled, "DSP NS must remain enabled after crash recovery during call");
+    assert_eq!(
+        hal.mode,
+        AudioMode::InCall,
+        "HAL mode must remain InCall after crash recovery"
+    );
+    assert!(
+        hal.aec_enabled,
+        "DSP AEC must remain enabled after crash recovery during call"
+    );
+    assert!(
+        hal.ns_enabled,
+        "DSP NS must remain enabled after crash recovery during call"
+    );
     assert_eq!(router.state.current_output, AudioOutputDevice::Earpiece);
     assert_eq!(hal.get_parameter("routing"), Some("earpiece"));
     assert_eq!(nodes[0].state, SpaNodeState::Running);

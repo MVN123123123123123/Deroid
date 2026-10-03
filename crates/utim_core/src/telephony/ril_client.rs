@@ -10,7 +10,6 @@
 //! Adheres strictly to GEMINI.md: zero-copy packet parsing, bounded buffers,
 //! and minimal allocations.
 
-
 // --- Standard Android RIL Request Constants (telephony/ril.h) ---
 pub const RIL_REQUEST_GET_SIM_STATUS: u32 = 1;
 pub const RIL_REQUEST_ENTER_SIM_PIN: u32 = 2;

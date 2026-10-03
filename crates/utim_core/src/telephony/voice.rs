@@ -3,9 +3,7 @@
 //! and carrier IMS registration reporting.
 //! Conforms strictly to GEMINI.md: zero redundant dependencies, predictable state machine.
 
-use super::ril_client::{
-    RilClient, RIL_REQUEST_ANSWER, RIL_REQUEST_DIAL, RIL_REQUEST_HANGUP,
-};
+use super::ril_client::{RilClient, RIL_REQUEST_ANSWER, RIL_REQUEST_DIAL, RIL_REQUEST_HANGUP};
 
 /// Call State (3GPP TS 27.007 + Android RIL)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

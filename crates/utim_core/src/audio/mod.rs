@@ -10,8 +10,8 @@ pub mod spa_droid;
 
 pub use hal::{
     ActiveStream, AndroidAudioHal, AudioChannelMask, AudioConfig, AudioError, AudioFormat,
-    AudioHalVersion, AudioInputDevice, AudioMode, AudioOutputDevice, AudioOutputFlags,
-    AudioSource, AudioStreamType,
+    AudioHalVersion, AudioInputDevice, AudioMode, AudioOutputDevice, AudioOutputFlags, AudioSource,
+    AudioStreamType,
 };
 pub use power_integration::{AudioPowerManager, AUDIO_WAKELOCK_NAME};
 pub use routing::{AudioRouter, AudioRoutingState};

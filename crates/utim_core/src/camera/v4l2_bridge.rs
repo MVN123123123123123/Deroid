@@ -233,10 +233,7 @@ impl V4l2LoopbackBridge {
     }
 
     /// Push a frame from Camera HAL3 into the V4L2 buffer ring
-    pub fn feed_hal_frame(
-        &mut self,
-        frame: &CapturedFrame,
-    ) -> Result<u32, &'static str> {
+    pub fn feed_hal_frame(&mut self, frame: &CapturedFrame) -> Result<u32, &'static str> {
         if !self.is_streaming {
             return Err("V4L2 loopback is not streaming");
         }
@@ -248,8 +245,9 @@ impl V4l2LoopbackBridge {
         // bytesused is the length a consumer trusts, so an oversize frame
         // would advertise an out-of-bounds read.
         let expected_pix = match frame.format {
-            super::hal3::CameraPixelFormat::Nv12
-            | super::hal3::CameraPixelFormat::Yuv420Planar => V4L2_PIX_FMT_NV12,
+            super::hal3::CameraPixelFormat::Nv12 | super::hal3::CameraPixelFormat::Yuv420Planar => {
+                V4L2_PIX_FMT_NV12
+            }
             super::hal3::CameraPixelFormat::Yuyv => V4L2_PIX_FMT_YUYV,
             super::hal3::CameraPixelFormat::JpegBlob => V4L2_PIX_FMT_MJPEG,
             super::hal3::CameraPixelFormat::RawSensor => V4L2_PIX_FMT_YUYV,

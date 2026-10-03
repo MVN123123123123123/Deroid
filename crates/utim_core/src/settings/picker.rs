@@ -262,7 +262,8 @@ impl WallpaperPicker {
     /// and the second would be required before anything happened at all. That is
     /// a control that looks broken, which is the exact failure this module's
     /// `every_row_is_reachable_and_no_row_is_a_dead_tap` test exists to prevent --
-    /// the same reasoning that demoted the `auto-rotate` row.
+    /// the same reasoning that used to demote the `auto-rotate` row to `Text`
+    /// before its modeset path existed.
     ///
     /// The divergence is forced by the UI shape, not chosen for convenience. If
     /// the row ever gains a thumbnail preview, the two-tap model becomes the
@@ -302,6 +303,216 @@ impl WallpaperPicker {
     pub fn page_len(&self) -> usize {
         let on = self.cursor / SLOTS * SLOTS;
         (self.candidates.len() - on).min(SLOTS)
+    }
+}
+
+/// Ceiling on what the wallpaper probe may transiently allocate, bytes.
+///
+/// The seed is one `u32` that selects a palette. What it costs to produce one
+/// is a full inflate of the image, because PNG has no random access:
+/// `crate::graphics::png::decode_working_set_estimate` puts that at about
+/// 9 bytes per pixel. 8 MiB is the transient headroom between the shell's
+/// ~3.1 MiB steady RSS and the plan's 15 MiB ceiling
+/// (`crates/utlc/src/main.rs:9734`, `WALLPAPER_PROBE_BUDGET`). This is the
+/// same number, hoisted here so the shell's file picker and its probe agree
+/// about what "affordable" means without re-deriving it.
+pub const WALLPAPER_PROBE_BUDGET: u64 = 8 * 1024 * 1024;
+
+/// How many leading bytes the shell should read to validate a candidate
+/// without decoding it.
+///
+/// 33 covers PNG (`crate::graphics::png::header_size` needs signature +
+/// `IHDR`) and 30 covers WebP's `RIFF....WEBP` + chunk header; JPEG's `SOF`
+/// can sit several kilobytes in (after `APPn`/`DQT`/`DHT`), so 4 KiB is the
+/// bound that makes [`validate_image_prefix`] useful for all three without a
+/// full read. Off the frame path: the picker never reads, the shell does.
+pub const WALLPAPER_PREFIX_LEN: usize = 4096;
+
+/// Whether `path` names a file the picker can ever accept, by extension alone.
+///
+/// `png`/`jpg`/`jpeg`/`webp`, case-insensitive, matching the shell's
+/// `wallpaper_candidates` (`crates/utlc/src/main.rs:1306`) which today is
+/// png-only and the file picker which must not be. Pure string check, no
+/// filesystem access: the shell owns enumeration and hands candidates in,
+/// which is what keeps this module FS-agnostic.
+///
+/// A `true` here is not acceptance: the shell must still read
+/// [`WALLPAPER_PREFIX_LEN`] bytes and pass them to
+/// [`validate_image_prefix`], which checks the magic and the probe budget
+/// without decoding. Extension first (cheap reject), magic second (no
+/// spoofed suffix), decode never on the frame path.
+pub fn validate_image_path(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let Some(dot) = name.rfind('.') else {
+        return false;
+    };
+    let ext = &name[dot + 1..];
+    ext.eq_ignore_ascii_case("png")
+        || ext.eq_ignore_ascii_case("jpg")
+        || ext.eq_ignore_ascii_case("jpeg")
+        || ext.eq_ignore_ascii_case("webp")
+}
+
+/// Dimensions of a candidate from its leading bytes, if affordable.
+///
+/// Tries PNG (`crate::graphics::png::header_size`, which verifies the `IHDR`
+/// CRC), then JPEG `SOF`, then WebP `VP8`/`VP8L`/`VP8X`, in that order, and
+/// returns `None` when the prefix is not a supported image or when
+/// `crate::graphics::png::decode_working_set_estimate(w, h)` exceeds
+/// [`WALLPAPER_PROBE_BUDGET`]. No allocation, no decode: safe to call with
+/// the shell's prefix buffer.
+///
+/// `None` covers both "not an image" and "too big to probe": the shell skips
+/// the file either way (`crates/utlc/src/main.rs:9774-9780`), so
+/// distinguishing them would only add a branch the caller cannot act on.
+pub fn validate_image_prefix(prefix: &[u8]) -> Option<(u32, u32)> {
+    let (w, h) = image_dimensions(prefix)?;
+    if crate::graphics::png::decode_working_set_estimate(w, h) > WALLPAPER_PROBE_BUDGET {
+        return None;
+    }
+    Some((w, h))
+}
+
+/// Sort and dedupe a candidate list in place.
+///
+/// The shell's `wallpaper_candidates` (`crates/utlc/src/main.rs:1328-1329`)
+/// does `out.sort(); out.dedup();` after enumeration; this is that step as a
+/// pure helper so the file-picker import path and the boot enumeration share
+/// one ordering. No filesystem access: takes the `Vec<String>` the shell
+/// already owns.
+pub fn dedupe_candidates(candidates: &mut Vec<String>) {
+    candidates.sort();
+    candidates.dedup();
+}
+
+fn image_dimensions(prefix: &[u8]) -> Option<(u32, u32)> {
+    if let Some(wh) = crate::graphics::png::header_size(prefix) {
+        return Some(wh);
+    }
+    if let Some(wh) = jpeg_dimensions(prefix) {
+        return Some(wh);
+    }
+    webp_dimensions(prefix)
+}
+
+fn jpeg_dimensions(prefix: &[u8]) -> Option<(u32, u32)> {
+    if prefix.len() < 4 || prefix[0] != 0xFF || prefix[1] != 0xD8 {
+        return None;
+    }
+    let mut pos = 2usize;
+    while pos + 1 < prefix.len() {
+        if prefix[pos] != 0xFF {
+            return None;
+        }
+        let mut m = pos + 1;
+        while m < prefix.len() && prefix[m] == 0xFF {
+            m += 1;
+        }
+        if m >= prefix.len() {
+            return None;
+        }
+        let marker = prefix[m];
+        if marker == 0xD8 || marker == 0xD9 || (0xD0..=0xD7).contains(&marker) || marker == 0x01 {
+            pos = m + 1;
+            continue;
+        }
+        if marker == 0xDA {
+            return None;
+        }
+        if m + 2 >= prefix.len() {
+            return None;
+        }
+        let len = u16::from_be_bytes([prefix[m + 1], prefix[m + 2]]) as usize;
+        if len < 2 {
+            return None;
+        }
+        let is_sof = matches!(
+            marker,
+            0xC0 | 0xC1
+                | 0xC2
+                | 0xC3
+                | 0xC5
+                | 0xC6
+                | 0xC7
+                | 0xC9
+                | 0xCA
+                | 0xCB
+                | 0xCD
+                | 0xCE
+                | 0xCF
+        );
+        if is_sof {
+            if m + 7 >= prefix.len() {
+                return None;
+            }
+            let h = u16::from_be_bytes([prefix[m + 4], prefix[m + 5]]) as u32;
+            let w = u16::from_be_bytes([prefix[m + 6], prefix[m + 7]]) as u32;
+            if w == 0 || h == 0 {
+                return None;
+            }
+            return Some((w, h));
+        }
+        let next = m.checked_add(1)?.checked_add(len)?;
+        if next <= m || next > prefix.len() {
+            return None;
+        }
+        // A zero-length advance would spin; `len >= 2` plus the marker byte
+        // guarantees `next > pos`, but assert it structurally.
+        if next <= pos {
+            return None;
+        }
+        pos = next;
+    }
+    None
+}
+
+fn webp_dimensions(prefix: &[u8]) -> Option<(u32, u32)> {
+    if prefix.len() < 12 || &prefix[0..4] != b"RIFF" || &prefix[8..12] != b"WEBP" {
+        return None;
+    }
+    if prefix.len() < 20 {
+        return None;
+    }
+    let fourcc = &prefix[12..16];
+    if fourcc == b"VP8 " {
+        if prefix.len() < 30 {
+            return None;
+        }
+        if prefix[23] != 0x9D || prefix[24] != 0x01 || prefix[25] != 0x2A {
+            return None;
+        }
+        let w = u16::from_le_bytes([prefix[26], prefix[27]]) as u32 & 0x3FFF;
+        let h = u16::from_le_bytes([prefix[28], prefix[29]]) as u32 & 0x3FFF;
+        if w == 0 || h == 0 {
+            return None;
+        }
+        Some((w, h))
+    } else if fourcc == b"VP8L" {
+        if prefix.len() < 25 {
+            return None;
+        }
+        if prefix[20] != 0x2F {
+            return None;
+        }
+        let bits = u32::from_le_bytes([prefix[21], prefix[22], prefix[23], prefix[24]]);
+        let w = (bits & 0x3FFF) + 1;
+        let h = ((bits >> 14) & 0x3FFF) + 1;
+        if w == 0 || h == 0 || w > 16384 || h > 16384 {
+            return None;
+        }
+        Some((w, h))
+    } else if fourcc == b"VP8X" {
+        if prefix.len() < 30 {
+            return None;
+        }
+        let w = (prefix[24] as u32 | (prefix[25] as u32) << 8 | (prefix[26] as u32) << 16) + 1;
+        let h = (prefix[27] as u32 | (prefix[28] as u32) << 8 | (prefix[29] as u32) << 16) + 1;
+        if w == 0 || h == 0 {
+            return None;
+        }
+        Some((w, h))
+    } else {
+        None
     }
 }
 
@@ -596,5 +807,163 @@ mod tests {
             "a wildly out-of-range window must not overflow into a candidate"
         );
         assert_eq!(p.candidates_at(2), [None; SLOTS]);
+    }
+
+    /// The extension gate the shell's file picker needs: `png` today,
+    /// `jpg`/`jpeg`/`webp` once it imports, nothing else. Pure string check,
+    /// no filesystem, so the module stays FS-agnostic.
+    #[test]
+    fn validate_image_path_allows_only_image_extensions() {
+        for ok in [
+            "/data/wallpapers/00.png",
+            "/usr/share/backgrounds/a.JPG",
+            "b.jpeg",
+            "c.JPEG",
+            "/run/user/1000/d.webp",
+            "/run/user/1000/e.WEBP",
+            "relative/path/f.png",
+        ] {
+            assert!(validate_image_path(ok), "{ok} should be accepted");
+        }
+        for bad in [
+            "",
+            "noextension",
+            "/data/wallpapers/00.png.txt",
+            "/data/wallpapers/00.gif",
+            "/data/wallpapers/00.bmp",
+            "/data/wallpapers/.hidden",
+            "/data/wallpapers/png",
+            "foo.",
+            ".png",
+        ] {
+            // `.png` as a bare dotfile has an empty stem but a `png`
+            // extension by `rfind('.')`, so it is accepted by construction;
+            // assert the rest are rejected and pin `.png` as accepted.
+            if bad == ".png" {
+                assert!(validate_image_path(bad), ".png has a png extension");
+            } else {
+                assert!(!validate_image_path(bad), "{bad} should be rejected");
+            }
+        }
+        // The directory part never contributes an extension.
+        assert!(!validate_image_path("/data.png.dir/noext"));
+        assert!(validate_image_path("/data.png.dir/ok.jpg"));
+    }
+
+    /// Magic + dimensions + budget without decoding. PNG via
+    /// `header_size` (CRC-verified), JPEG via `SOF`, WebP via
+    /// `VP8/VP8L/VP8X`, all gated by `WALLPAPER_PROBE_BUDGET`.
+    #[test]
+    fn validate_image_prefix_checks_magic_and_budget() {
+        assert_eq!(WALLPAPER_PROBE_BUDGET, 8 * 1024 * 1024);
+        const _: () = assert!(WALLPAPER_PREFIX_LEN >= 33);
+        // PNG: build a real one with the crate's own encoder so the IHDR CRC
+        // is valid by construction rather than by a hardcoded blob.
+        let img = crate::graphics::png::RgbaImage {
+            width: 4,
+            height: 4,
+            pixels: vec![7u8; 4 * 4 * 4],
+        };
+        let png = crate::graphics::png::encode_png(&img).expect("encodes");
+        assert_eq!(validate_image_prefix(&png), Some((4, 4)));
+        // JPEG: SOI + SOF0 declaring 32x16. Length 11 = 2 + 9 payload.
+        let jpeg = [
+            0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x10, 0x00, 0x20, 0x01, 0x01, 0x11,
+            0x00, 0xFF, 0xD9,
+        ];
+        assert_eq!(validate_image_prefix(&jpeg), Some((32, 16)));
+        // JPEG with APP0 before SOF: the scan must skip it.
+        let mut jpeg_app: Vec<u8> =
+            vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x06, b'J', b'F', b'I', b'F'];
+        jpeg_app.extend_from_slice(&[0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x10, 0x00, 0x20]);
+        jpeg_app.extend_from_slice(&[0x01, 0x01, 0x11, 0x00, 0xFF, 0xD9]);
+        assert_eq!(validate_image_prefix(&jpeg_app), Some((32, 16)));
+        // WebP lossy: RIFF + VP8 with 9D 01 2A start code, 32x16.
+        let mut vp8 = vec![0u8; 30];
+        vp8[0..4].copy_from_slice(b"RIFF");
+        vp8[8..12].copy_from_slice(b"WEBP");
+        vp8[12..16].copy_from_slice(b"VP8 ");
+        vp8[23] = 0x9D;
+        vp8[24] = 0x01;
+        vp8[25] = 0x2A;
+        vp8[26..28].copy_from_slice(&32u16.to_le_bytes());
+        vp8[28..30].copy_from_slice(&16u16.to_le_bytes());
+        assert_eq!(validate_image_prefix(&vp8), Some((32, 16)));
+        // WebP lossless: 0x2F signature + 14+14 bit dims (31x15 stored as 30,14).
+        let mut vp8l = vec![0u8; 25];
+        vp8l[0..4].copy_from_slice(b"RIFF");
+        vp8l[8..12].copy_from_slice(b"WEBP");
+        vp8l[12..16].copy_from_slice(b"VP8L");
+        vp8l[20] = 0x2F;
+        let bits: u32 = 30 | (14 << 14);
+        vp8l[21..25].copy_from_slice(&bits.to_le_bytes());
+        assert_eq!(validate_image_prefix(&vp8l), Some((31, 15)));
+        // WebP extended: canvas 32x16 stored as 31,15 in 24-bit LE.
+        let mut vp8x = vec![0u8; 30];
+        vp8x[0..4].copy_from_slice(b"RIFF");
+        vp8x[8..12].copy_from_slice(b"WEBP");
+        vp8x[12..16].copy_from_slice(b"VP8X");
+        vp8x[24] = 31;
+        vp8x[27] = 15;
+        assert_eq!(validate_image_prefix(&vp8x), Some((32, 16)));
+        // Garbage, truncated, and wrong magic are all None.
+        assert_eq!(validate_image_prefix(&[]), None);
+        assert_eq!(validate_image_prefix(b"not an image"), None);
+        assert_eq!(validate_image_prefix(&[0xFF, 0xD8]), None);
+        assert_eq!(validate_image_prefix(&vp8[..20]), None);
+        // Over budget: a JPEG claiming 5000x5000 is ~225 MiB working set.
+        let mut huge = vec![0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x0B, 0x08];
+        huge.extend_from_slice(&5000u16.to_be_bytes());
+        huge.extend_from_slice(&5000u16.to_be_bytes());
+        huge.extend_from_slice(&[0x01, 0x01, 0x11, 0x00]);
+        assert_eq!(validate_image_prefix(&huge), None);
+        // PNG over budget via dimensions alone: 5000x5000 estimate exceeds it.
+        assert!(
+            crate::graphics::png::decode_working_set_estimate(5000, 5000) > WALLPAPER_PROBE_BUDGET
+        );
+        // Spoofed suffix: PNG extension but JPEG magic still resolves by magic.
+        assert!(validate_image_path("/tmp/evil.png"));
+        assert_eq!(validate_image_prefix(&jpeg), Some((32, 16)));
+    }
+
+    /// The probe budget boundary, from the shell's side: a 1280x720 claim
+    /// (~7.9 MiB working set) is affordable and resolves, while a 1440x900
+    /// claim (~11.1 MiB) is refused. Adjacent answers from the same gate, so
+    /// a budget that drifts in either direction fails one side or the other.
+    #[test]
+    fn validate_image_prefix_accepts_just_under_budget_and_refuses_just_over() {
+        fn jpeg_claim(w: u16, h: u16) -> Vec<u8> {
+            let mut v = vec![0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x0B, 0x08];
+            v.extend_from_slice(&h.to_be_bytes());
+            v.extend_from_slice(&w.to_be_bytes());
+            v.extend_from_slice(&[0x01, 0x01, 0x11, 0x00, 0xFF, 0xD9]);
+            v
+        }
+        assert_eq!(
+            validate_image_prefix(&jpeg_claim(1280, 720)),
+            Some((1280, 720))
+        );
+        assert_eq!(validate_image_prefix(&jpeg_claim(1440, 900)), None);
+    }
+
+    /// The sort+dedup the shell's `wallpaper_candidates` does after
+    /// enumeration, as the shared helper the import path also uses.
+    #[test]
+    fn dedupe_candidates_sorts_and_dedupes() {
+        let mut v = vec![
+            "/b.png".to_string(),
+            "/a.png".to_string(),
+            "/b.png".to_string(),
+            "/c.jpg".to_string(),
+            "/a.png".to_string(),
+        ];
+        dedupe_candidates(&mut v);
+        assert_eq!(v, vec!["/a.png", "/b.png", "/c.jpg"]);
+        let mut empty: Vec<String> = Vec::new();
+        dedupe_candidates(&mut empty);
+        assert!(empty.is_empty());
+        let mut single = vec!["/only.webp".to_string()];
+        dedupe_candidates(&mut single);
+        assert_eq!(single, vec!["/only.webp"]);
     }
 }

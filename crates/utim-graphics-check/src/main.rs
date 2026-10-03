@@ -162,7 +162,11 @@ fn check_elf_alignment(targets: &[String], json: bool) -> bool {
             Err(e) => {
                 all_ok = false;
                 if json {
-                    println!(r#"{{"file":"{}","error":"{}"}}"#, jesc(target), jesc(&e.to_string()));
+                    println!(
+                        r#"{{"file":"{}","error":"{}"}}"#,
+                        jesc(target),
+                        jesc(&e.to_string())
+                    );
                 } else {
                     eprintln!("[-] Error inspecting {}: {}", target, e);
                 }
@@ -318,9 +322,7 @@ fn run_full_diagnostics(json: bool) -> bool {
     if !elf_ok {
         passed = false;
     }
-    let elf_interp = elf_report
-        .as_ref()
-        .and_then(|r| r.interpreter.clone());
+    let elf_interp = elf_report.as_ref().and_then(|r| r.interpreter.clone());
 
     if json {
         println!(

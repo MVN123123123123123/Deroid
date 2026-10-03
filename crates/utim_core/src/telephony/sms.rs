@@ -92,11 +92,15 @@ impl SmsReassembler {
         let matching: Vec<&(u16, u8, u8, String, String, u32)> = self
             .pending_parts
             .iter()
-            .filter(|(r, t, _, s, _, _)| *r == concat_ref && *t == msg.concat_total && s == &msg.sender)
+            .filter(|(r, t, _, s, _, _)| {
+                *r == concat_ref && *t == msg.concat_total && s == &msg.sender
+            })
             .collect();
 
         let all_present = (1..=msg.concat_total).all(|needed_seq| {
-            matching.iter().any(|(_, _, seq, _, _, _)| *seq == needed_seq)
+            matching
+                .iter()
+                .any(|(_, _, seq, _, _, _)| *seq == needed_seq)
         });
 
         if all_present && matching.len() >= msg.concat_total as usize {
@@ -133,13 +137,12 @@ impl SmsReassembler {
 
 /// 3GPP TS 23.038 GSM 7-bit default alphabet table
 pub const GSM_7BIT_TO_CHAR: [char; 128] = [
-    '@', '£', '$', '¥', 'è', 'é', 'ù', 'ì', 'ò', 'Ç', '\n', 'Ø', 'ø', '\r', 'Å', 'å',
-    'Δ', '_', 'Φ', 'Γ', 'Λ', 'Ω', 'Π', 'Ψ', 'Σ', 'Θ', 'Ξ', '\u{1B}', 'Æ', 'æ', 'ß', 'É',
-    ' ', '!', '"', '#', '¤', '%', '&', '\'', '(', ')', '*', '+', ',', '-', '.', '/',
-    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', ':', ';', '<', '=', '>', '?',
-    '¡', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O',
-    'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', 'Ä', 'Ö', 'Ñ', 'Ü', '§',
-    '¿', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o',
+    '@', '£', '$', '¥', 'è', 'é', 'ù', 'ì', 'ò', 'Ç', '\n', 'Ø', 'ø', '\r', 'Å', 'å', 'Δ', '_',
+    'Φ', 'Γ', 'Λ', 'Ω', 'Π', 'Ψ', 'Σ', 'Θ', 'Ξ', '\u{1B}', 'Æ', 'æ', 'ß', 'É', ' ', '!', '"', '#',
+    '¤', '%', '&', '\'', '(', ')', '*', '+', ',', '-', '.', '/', '0', '1', '2', '3', '4', '5', '6',
+    '7', '8', '9', ':', ';', '<', '=', '>', '?', '¡', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I',
+    'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', 'Ä', 'Ö',
+    'Ñ', 'Ü', '§', '¿', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o',
     'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', 'ä', 'ö', 'ñ', 'ü', 'à',
 ];
 
@@ -177,7 +180,10 @@ pub fn char_to_gsm_extension(c: char) -> Option<u8> {
 }
 
 pub fn char_to_gsm_septet(c: char) -> Option<u8> {
-    GSM_7BIT_TO_CHAR.iter().position(|&ch| ch == c).map(|p| p as u8)
+    GSM_7BIT_TO_CHAR
+        .iter()
+        .position(|&ch| ch == c)
+        .map(|p| p as u8)
 }
 
 /// Decode 7-bit septets to String using 3GPP TS 23.038 alphabet and extension codes
@@ -254,7 +260,11 @@ pub fn pack_7bit(chars: &[u8]) -> Vec<u8> {
 }
 
 /// Unpack 7-bit septets starting at an arbitrary bit offset (handling UDH fill bits)
-pub fn unpack_7bit_from_bit_offset(packed: &[u8], start_bit: usize, septet_count: usize) -> Vec<u8> {
+pub fn unpack_7bit_from_bit_offset(
+    packed: &[u8],
+    start_bit: usize,
+    septet_count: usize,
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(septet_count);
 
     for i in 0..septet_count {
@@ -396,10 +406,7 @@ pub fn encode_sms_submit_pdu(recipient: &str, text: &str) -> Result<Vec<u8>, &'s
         // TP-DCS = 0x08 (UCS-2 16-bit)
         pdu.push(0x08);
         pdu.push(0xA7);
-        let ucs2_bytes: Vec<u8> = text
-            .encode_utf16()
-            .flat_map(|u| u.to_be_bytes())
-            .collect();
+        let ucs2_bytes: Vec<u8> = text.encode_utf16().flat_map(|u| u.to_be_bytes()).collect();
         if ucs2_bytes.len() > 140 {
             return Err("message exceeds one SMS; UDH segmentation required");
         }
@@ -502,10 +509,7 @@ pub fn encode_sms_deliver_pdu(
             pdu.extend_from_slice(&packed);
         }
     } else {
-        let ucs2_bytes: Vec<u8> = text
-            .encode_utf16()
-            .flat_map(|u| u.to_be_bytes())
-            .collect();
+        let ucs2_bytes: Vec<u8> = text.encode_utf16().flat_map(|u| u.to_be_bytes()).collect();
         if let Some((cref, total, seq)) = concat_info {
             if cref > 0xFF {
                 let udh = [
@@ -658,7 +662,11 @@ pub fn parse_sms_deliver_pdu(pdu: &[u8]) -> Result<SmsMessage, &'static str> {
             SmsEncoding::Gsm7Bit => {
                 // In 3GPP TS 23.040, when UDH is present in 7-bit GSM, fill bits align to the next septet
                 let header_bits = header_bytes * 8;
-                let fill_bits = if header_bits.is_multiple_of(7) { 0 } else { 7 - (header_bits % 7) };
+                let fill_bits = if header_bits.is_multiple_of(7) {
+                    0
+                } else {
+                    7 - (header_bits % 7)
+                };
                 let header_septets = (header_bits + fill_bits) / 7;
                 // H7: UDL is network-controlled; a UDL smaller than the header
                 // is a truncated PDU (error), and a UDL larger than the octets
@@ -672,7 +680,11 @@ pub fn parse_sms_deliver_pdu(pdu: &[u8]) -> Result<SmsMessage, &'static str> {
                     .saturating_sub(header_bits + fill_bits)
                     / 7;
                 let text_septets_count = (udl - header_septets).min(avail_septets);
-                let septets = unpack_7bit_from_bit_offset(user_data, header_bits + fill_bits, text_septets_count);
+                let septets = unpack_7bit_from_bit_offset(
+                    user_data,
+                    header_bits + fill_bits,
+                    text_septets_count,
+                );
                 decode_gsm7(&septets)
             }
             SmsEncoding::Ucs2 => {
@@ -712,9 +724,7 @@ pub fn parse_sms_deliver_pdu(pdu: &[u8]) -> Result<SmsMessage, &'static str> {
                     .collect();
                 String::from_utf16_lossy(&u16_words)
             }
-            SmsEncoding::EightBit => {
-                String::from_utf8_lossy(user_data).to_string()
-            }
+            SmsEncoding::EightBit => String::from_utf8_lossy(user_data).to_string(),
         }
     };
 

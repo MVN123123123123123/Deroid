@@ -35,11 +35,7 @@ impl AudioPowerManager {
     }
 
     /// Sync power state with UTIM MPG based on active SPA nodes
-    pub fn sync_power_state(
-        &mut self,
-        nodes: &[SpaDroidNode],
-        mpg: &mut MobilePowerGovernor,
-    ) {
+    pub fn sync_power_state(&mut self, nodes: &[SpaDroidNode], mpg: &mut MobilePowerGovernor) {
         let is_playing = nodes
             .iter()
             .any(|n| n.state == SpaNodeState::Running && n.config.buffer_size_bytes() > 0);

@@ -15,9 +15,11 @@ use std::path::Path;
 
 use super::layout::{
     AppLayout, AppPanel, FolderLayout, Keyboard, Layout, Rect, ShadeLayout, FOLDER_PREVIEW_MAX,
-    ICON_RADIUS, KB_ROW1, KB_ROW2, KB_ROW3_MID, LABEL_GAP, PANEL_PAD_FRACTION,
+    ICON_RADIUS, KB_ROW2, KB_ROW3_MID, LABEL_GAP, PANEL_PAD_FRACTION,
 };
 use super::png::RgbaImage;
+use crate::graphics::composer::Transform;
+use crate::sensors::sensor_proxy::DeviceOrientation;
 
 // --- DRM KMS IOCTL Definitions (Standard Linux ABI) ---
 const DRM_IOCTL_MODE_GETRESOURCES: libc::c_ulong = 0xc04064a0;
@@ -164,6 +166,32 @@ struct DrmModeFbDirtyCmd {
     clips_ptr: u64,
 }
 
+/// Whether a compositor transform transposes the scanout axes.
+///
+/// Only `Rotate90`/`Rotate270` swap `w` and `h`; `None`, `Rotate180` and the
+/// flips do not. Pure geometry, no I/O: the *decision* to rotate lives in
+/// `rotation::decide_modeset` (`rotation.rs:396-410`), this answers what size
+/// the re-modeset must allocate once that decision says `Rotate` (the
+/// reference actuates at `RotationHelper.java:226`).
+#[inline]
+pub const fn transform_swaps_xy(t: Transform) -> bool {
+    matches!(t, Transform::Rotate90 | Transform::Rotate270)
+}
+
+/// Framebuffer size after applying `t` to a `w` x `h` panel.
+///
+/// The pure counterpart of [`DrmKmsDevice::apply_transform`]'s size step, so
+/// the shell and tests can predict the modeset without issuing one. `Copy`
+/// in, `Copy` out, no heap, total over `Transform`.
+#[inline]
+pub const fn rotated_frame_size(w: u32, h: u32, t: Transform) -> (u32, u32) {
+    if transform_swaps_xy(t) {
+        (h, w)
+    } else {
+        (w, h)
+    }
+}
+
 /// Direct hardware DRM KMS display scanout device
 pub struct DrmKmsDevice {
     file: File,
@@ -177,6 +205,15 @@ pub struct DrmKmsDevice {
     pub size: usize,
     mmap_ptr: *mut u32,
     pub mode: DrmModeModeInfo,
+    /// Current scanout transform, `Transform::None` at rest.
+    ///
+    /// Set by `open_card` (native, unrotated) and advanced only by
+    /// [`DrmKmsDevice::apply_transform`]. It is what makes a redundant
+    /// re-modeset a no-op rather than a panel flicker: the reference
+    /// compares the flags it is about to set against the last ones and does
+    /// nothing when they match (`RotationHelper.java:232`), and
+    /// [`crate::rotation::RotationPolicy`] answers `Hold` for the same case.
+    pub transform: Transform,
     frame_cache_hash: u64,
     frame_cache_valid: bool,
     frame_dirty: bool,
@@ -501,6 +538,7 @@ impl DrmKmsDevice {
             size: create_dumb.size as usize,
             mmap_ptr,
             mode: selected_mode,
+            transform: Transform::None,
             frame_cache_hash: 0,
             frame_cache_valid: false,
             frame_dirty: false,
@@ -540,6 +578,188 @@ impl DrmKmsDevice {
     /// Call on any mode/display change or host-side resource reset.
     pub fn invalidate_frame_cache(&mut self) {
         self.frame_cache_valid = false;
+    }
+}
+
+impl DrmKmsDevice {
+    /// Re-modeset the panel for `transform`, re-creating the scanout buffer.
+    ///
+    /// Allocates a dumb buffer with [`rotated_frame_size`] dimensions of the
+    /// native mode (swapped `w`/`h` for 90/270), attaches a framebuffer,
+    /// maps it, and issues `SETCRTC` against the stored connector/CRTC/mode.
+    /// The mode timing itself is left native: rotation here is a transposed
+    /// framebuffer the compositor fills transposed (via `Transform`), not a
+    /// new panel timing, which is why the next rotation derives its size
+    /// from `mode` rather than from the current `width`/`height`.
+    ///
+    /// Returns `Ok(false)` without issuing any ioctl when already in
+    /// `transform` (the reference's compare-and-skip,
+    /// `RotationHelper.java:232`), `Ok(true)` after a modeset. Teardown of
+    /// the old buffer reuses `open_card`'s `SETCRTC`-failure order
+    /// (`drm_kms.rs:478-483`, mirrored by `Drop`): `munmap`, `RMFB`,
+    /// `DESTROY_DUMB`. Partial-creation failures unwind the same way
+    /// `open_card` does (ADDFB fail -> destroy; MAP fail -> remove FB +
+    /// destroy; mmap fail -> remove FB + destroy; SETCRTC fail -> unmap +
+    /// remove FB + destroy) and invalidate the frame cache, so a failed
+    /// modeset always repaints rather than rescanning a stale buffer.
+    pub fn apply_transform(&mut self, transform: Transform) -> io::Result<bool> {
+        if transform == self.transform {
+            return Ok(false);
+        }
+        let base_w = self.mode.hdisplay as u32;
+        let base_h = self.mode.vdisplay as u32;
+        if base_w == 0 || base_h == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "no native mode to rotate from",
+            ));
+        }
+        let (new_w, new_h) = rotated_frame_size(base_w, base_h, transform);
+        let fd = self.file.as_raw_fd();
+        if !self.mmap_ptr.is_null() && self.size > 0 {
+            unsafe {
+                libc::munmap(self.mmap_ptr as *mut libc::c_void, self.size);
+            }
+            self.mmap_ptr = std::ptr::null_mut();
+            self.size = 0;
+        }
+        if self.fb_id != 0 {
+            let mut fb = self.fb_id;
+            unsafe {
+                libc::ioctl(fd, DRM_IOCTL_MODE_RMFB, &mut fb);
+            }
+            self.fb_id = 0;
+        }
+        if self.dumb_handle != 0 {
+            let mut destroy = DrmModeDestroyDumb {
+                handle: self.dumb_handle,
+            };
+            unsafe {
+                libc::ioctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &mut destroy);
+            }
+            self.dumb_handle = 0;
+        }
+        let mut create_dumb = DrmModeCreateDumb {
+            width: new_w,
+            height: new_h,
+            bpp: 32,
+            flags: 0,
+            handle: 0,
+            pitch: 0,
+            size: 0,
+        };
+        if unsafe { libc::ioctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &mut create_dumb) } < 0 {
+            let err = io::Error::last_os_error();
+            self.invalidate_frame_cache();
+            return Err(err);
+        }
+        let mut fb_cmd = DrmModeFbCmd {
+            fb_id: 0,
+            width: new_w,
+            height: new_h,
+            pitch: create_dumb.pitch,
+            bpp: 32,
+            depth: 24,
+            handle: create_dumb.handle,
+        };
+        if unsafe { libc::ioctl(fd, DRM_IOCTL_MODE_ADDFB, &mut fb_cmd) } < 0 {
+            let err = io::Error::last_os_error();
+            let mut destroy = DrmModeDestroyDumb {
+                handle: create_dumb.handle,
+            };
+            unsafe { libc::ioctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &mut destroy) };
+            self.invalidate_frame_cache();
+            return Err(err);
+        }
+        let mut map_dumb = DrmModeMapDumb {
+            handle: create_dumb.handle,
+            pad: 0,
+            offset: 0,
+        };
+        if unsafe { libc::ioctl(fd, DRM_IOCTL_MODE_MAP_DUMB, &mut map_dumb) } < 0 {
+            let err = io::Error::last_os_error();
+            unsafe {
+                libc::ioctl(fd, DRM_IOCTL_MODE_RMFB, &mut fb_cmd.fb_id);
+                let mut destroy = DrmModeDestroyDumb {
+                    handle: create_dumb.handle,
+                };
+                libc::ioctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &mut destroy);
+            }
+            self.invalidate_frame_cache();
+            return Err(err);
+        }
+        let mmap_res = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                create_dumb.size as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                map_dumb.offset as libc::off_t,
+            )
+        };
+        if mmap_res == libc::MAP_FAILED {
+            let err = io::Error::last_os_error();
+            unsafe {
+                libc::ioctl(fd, DRM_IOCTL_MODE_RMFB, &mut fb_cmd.fb_id);
+                let mut destroy = DrmModeDestroyDumb {
+                    handle: create_dumb.handle,
+                };
+                libc::ioctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &mut destroy);
+            }
+            self.invalidate_frame_cache();
+            return Err(err);
+        }
+        let mmap_ptr = mmap_res as *mut u32;
+        let mut conn_ids = [self.connector_id];
+        let mut crtc = DrmModeCrtc {
+            set_connectors_ptr: conn_ids.as_mut_ptr() as u64,
+            count_connectors: 1,
+            crtc_id: self.crtc_id,
+            fb_id: fb_cmd.fb_id,
+            x: 0,
+            y: 0,
+            gamma_size: 0,
+            mode_valid: 1,
+            mode: self.mode,
+        };
+        if unsafe { libc::ioctl(fd, DRM_IOCTL_MODE_SETCRTC, &mut crtc) } < 0 {
+            let err = io::Error::last_os_error();
+            unsafe {
+                libc::munmap(mmap_ptr as *mut libc::c_void, create_dumb.size as usize);
+                libc::ioctl(fd, DRM_IOCTL_MODE_RMFB, &mut fb_cmd.fb_id);
+                let mut destroy = DrmModeDestroyDumb {
+                    handle: create_dumb.handle,
+                };
+                libc::ioctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &mut destroy);
+            }
+            self.invalidate_frame_cache();
+            return Err(err);
+        }
+        assert!(
+            create_dumb.pitch.is_multiple_of(4),
+            "pitch must be a multiple of 4 for XRGB8888"
+        );
+        self.fb_id = fb_cmd.fb_id;
+        self.dumb_handle = create_dumb.handle;
+        self.width = new_w;
+        self.height = new_h;
+        self.pitch = create_dumb.pitch;
+        self.size = create_dumb.size as usize;
+        self.mmap_ptr = mmap_ptr;
+        self.transform = transform;
+        self.invalidate_frame_cache();
+        Ok(true)
+    }
+
+    /// KMS actuation for a sensor orientation.
+    ///
+    /// Maps through [`DeviceOrientation::to_transform`]
+    /// (`sensor_proxy.rs:113-121`) and applies it. The *decision* of whether
+    /// to rotate is [`crate::rotation::decide_modeset`]'s (pure, no I/O); this
+    /// performs it and nothing else, so the policy stays I/O-free.
+    pub fn set_orientation(&mut self, orientation: DeviceOrientation) -> io::Result<bool> {
+        self.apply_transform(orientation.to_transform())
     }
 }
 
@@ -677,6 +897,79 @@ impl<'a> FolderPreviewRow<'a> {
     };
 }
 
+/// Fixed-capacity folder rename buffer, `Copy` so the frame path never allocates.
+///
+/// 64 bytes (`FOLDER_RENAME_MAX`, `layout.rs`), ASCII only: the renderer draws
+/// with the built-in vector font (`font.rs` covers `0x20..0x7F`), so a non-ASCII
+/// byte would render as a blank. `len` is the live prefix of `bytes`; the tail
+/// is zeroed and never read.
+///
+/// Pre-fill vs empty policy: the shell pre-fills this on edit start with the
+/// current title (truncated); an empty buffer while editing draws
+/// `FOLDER_RENAME_PLACEHOLDER` and never the stale `folder_title`, so clearing
+/// the field cannot read as "no change". `folder_rename_display` is the single
+/// function that implements that rule.
+///
+/// The reference commits through `FolderInfo.setTitle` on `dispatchBackKey`
+/// (`Folder.java:569`, `:1851`, announced via `DragLayer.java:190`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FolderRenameBuffer {
+    /// Live bytes, `bytes[..len]` are ASCII.
+    pub bytes: [u8; super::layout::FOLDER_RENAME_MAX],
+    /// How many of `bytes` are live, `0..=FOLDER_RENAME_MAX`.
+    pub len: u8,
+}
+
+impl FolderRenameBuffer {
+    /// The empty buffer: editing with no text, which draws the placeholder.
+    pub const EMPTY: Self = Self {
+        bytes: [0u8; super::layout::FOLDER_RENAME_MAX],
+        len: 0,
+    };
+
+    /// Copy `s` in, truncated to capacity. Non-ASCII bytes are replaced with
+    /// `?` so the renderer never receives a byte it cannot draw.
+    pub fn truncated(s: &str) -> Self {
+        let mut out = Self::EMPTY;
+        let mut n = 0usize;
+        for b in s.bytes() {
+            if n >= super::layout::FOLDER_RENAME_MAX {
+                break;
+            }
+            out.bytes[n] = if b.is_ascii() { b } else { b'?' };
+            n += 1;
+        }
+        out.len = n.min(255) as u8;
+        out
+    }
+
+    /// Live text, or `""` when empty. Borrowed, no allocation.
+    #[inline]
+    pub fn as_str(&self) -> &str {
+        let n = (self.len as usize).min(super::layout::FOLDER_RENAME_MAX);
+        core::str::from_utf8(&self.bytes[..n]).unwrap_or("")
+    }
+
+    /// Byte length of the live prefix.
+    #[inline]
+    pub fn len(&self) -> usize {
+        (self.len as usize).min(super::layout::FOLDER_RENAME_MAX)
+    }
+
+    /// True when no text is present, which selects the placeholder.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl Default for FolderRenameBuffer {
+    #[inline]
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
 /// Zero-allocation descriptor for an app icon displayed in the home screen grid
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AppGridItem<'a> {
@@ -728,6 +1021,95 @@ impl AppGridItem<'_> {
         folder_n: 0,
         folder_id: 0,
     };
+}
+
+/// What the app-info screen shows about one app, borrowed.
+///
+/// **A struct rather than five more `DrmInteractiveState` fields** because the
+/// five are not independent: they are one thing about one app, and a panel that
+/// is open has all five while a panel that is closed has none of them. Five
+/// `Option`s would make "the name is set but the exec line is not" a state the
+/// renderer has to decide what to do with, and this has none.
+///
+/// **The first four fields are the identity and the last five are
+/// presentation.** `Default` exists so a caller that knows what the app *is*
+/// -- the `id`, `name`, `Exec=` line and the resolved software centre -- does not
+/// also have to invent a tile colour and a glyph to get a panel on screen:
+/// `..Default::default()` (or `..Self::EMPTY`) leaves `icon` `None`, so the tile
+/// is drawn in `color == 0` and the panel shows no glyph. Fill them when the icon
+/// pipeline has them; the panel is correct, if plain, without them.
+///
+/// Every field is a borrow or a scalar, so it is `Copy` and costs nothing to
+/// carry on the frame path.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct AppInfoSpec<'a> {
+    /// The app's id, the same `&str` as [`AppGridItem::id`].
+    pub id: &'a str,
+    /// The app's display name, the same `&str` as [`AppGridItem::name`].
+    pub name: &'a str,
+    /// The `Exec=` line from the `.desktop` entry, or `""` when there is none.
+    ///
+    /// This is the line that decides whether the handoff works at all, which is
+    /// why it is on the panel rather than hidden behind the button: on a device
+    /// whose software centre is not installed, the *reason* nothing happens is
+    /// usually a `.desktop` whose `Exec` points at a path that does not exist.
+    pub exec: &'a str,
+    /// The command or program the button will spawn, already resolved.
+    ///
+    /// Resolved by the shell, because resolving it means looking for a binary on
+    /// this device -- `which`/`access(X_OK)` per candidate -- and `paint_frame`
+    /// may not do I/O. Empty selects the "no target found" state, which is a
+    /// real state and not an error: UTLC shows the panel and the button disabled
+    /// rather than pretending an app-info screen exists.
+    pub target: &'a str,
+    /// Decoded icon, or `None` for the glyph chip.
+    pub icon: Option<&'a RgbaImage>,
+    /// The glyph tile's fill, for when [`Self::icon`] is `None`.
+    pub color: u32,
+    /// The glyph drawn on the chip.
+    pub glyph: &'a str,
+    /// Which handler the button is aimed at.
+    ///
+    /// The reference makes the same distinction, at the tap rather than before
+    /// it: an app with a live install session goes to the market activity and
+    /// everything else to the details activity
+    /// (`PackageManagerHelper.java:162-167`). Showing which one *before* the tap
+    /// is the part UTLC adds.
+    pub target_kind: crate::graphics::layout::AppInfoTarget,
+    /// An install session is in flight, so the target is the store.
+    ///
+    /// A convenience over `target_kind == AppInfoTarget::Store` for the shell:
+    /// it is the fact, and `target_kind` is what it means for the button.
+    pub installing: bool,
+}
+
+impl<'a> AppInfoSpec<'a> {
+    /// The empty spec: every field at its default.
+    ///
+    /// A `const` alias for `Default::default()` rather than a second table of
+    /// values, so the two cannot disagree. `..Self::EMPTY` in a struct literal is
+    /// the shortest way to say "I know the app, I have no icon yet".
+    pub const EMPTY: Self = Self {
+        id: "",
+        name: "",
+        exec: "",
+        target: "",
+        icon: None,
+        color: 0,
+        glyph: "",
+        target_kind: crate::graphics::layout::AppInfoTarget::Details,
+        installing: false,
+    };
+
+    /// Whether the handoff button has anything to launch.
+    ///
+    /// A gate on the *drawn* button rather than on the tap, so the panel cannot
+    /// show an enabled affordance that does nothing -- the failure this project
+    /// keeps finding in the other direction.
+    #[inline]
+    pub fn can_open(&self) -> bool {
+        !self.target.is_empty()
+    }
 }
 
 /// The complete visible state for one frame.
@@ -1154,6 +1536,118 @@ pub struct DrmInteractiveState<'a> {
     /// ([`PopupMenuLayout::place`]), so a long press near a panel edge moves the
     /// menu to the other side of the anchor instead of off the panel.
     pub folder_menu_anchor: (f32, f32),
+
+    /// Folder rename buffer, fixed-capacity `Copy`.
+    ///
+    /// The text being edited while `folder_rename_editing` is true. Pre-filled
+    /// by the shell with the current title (truncated) on edit start; empty
+    /// draws `FOLDER_RENAME_PLACEHOLDER`, never `folder_title`. See
+    /// [`FolderRenameBuffer`] and `folder_rename_display` for the rule.
+    pub folder_rename_buffer: FolderRenameBuffer,
+
+    /// Whether the folder footer is an editable text field.
+    ///
+    /// False draws the static `folder_title`; true draws the field from
+    /// `FolderLayout::rename_field` with `folder_rename_display` and a caret
+    /// from `FolderLayout::rename_caret`. The reference commits on back
+    /// (`Folder.java:569`, `:1851`, `DragLayer.java:190`); what a commit does
+    /// is the shell's call.
+    pub folder_rename_editing: bool,
+
+    // ---------------------------------------------------------------------
+    // App info.
+    //
+    // `PopupItem::AppInfo` has been a variant since the popup rows were
+    // transcribed, `draw_popup` gives it the accent colour as the affirmative
+    // row (`drm_kms.rs:6982-6986`), and *nothing anywhere* turned the tap into a
+    // screen: there was no field for the app to be looked at and no draw path
+    // for it. `this_state_has_no_unread_field` (the field-audit scan in
+    // `screenshot.rs`) is what pins that this is now read.
+    // ---------------------------------------------------------------------
+    /// The app whose info panel is open, or `None` for "no panel".
+    ///
+    /// `None` is the whole mechanism: it selects the home screen, it is what the
+    /// shell clears on back, and it is what makes the panel unreachable from a
+    /// frame that did not ask for it. The panel is therefore a *surface* rather
+    /// than a state machine flag, which is why the shell does not need a
+    /// "which surface am I on" enum to keep in step with the renderer.
+    pub app_info: Option<AppInfoSpec<'a>>,
+
+    // ---------------------------------------------------------------------
+    // IME layout.
+    // ---------------------------------------------------------------------
+    /// Which page of the on-screen keyboard is up.
+    ///
+    /// The field that makes [`crate::compositor::ime::KeyboardLayout`] an
+    /// observable state rather than a piece of state nobody can see the effect
+    /// of. Before it, `VirtualKeyboard::handle_key_tap` had working `?123` /
+    /// `ABC` / `123` arms and the renderer built `Keyboard::new(w, h)` -- a fixed
+    /// QWERTY -- so a user could reach a symbols page and watch nothing happen.
+    /// That is the project's stated worst failure, reached from the opposite
+    /// direction: not a correct-but-uncalled implementation, but a called one
+    /// that changed no pixels.
+    pub keyboard_layout: crate::compositor::ime::KeyboardLayout,
+
+    // ---------------------------------------------------------------------
+    // Workspace icon drag.
+    //
+    // Seven scalars, no allocation, all `Copy`, mirroring the six folder-gesture
+    // fields above for the same reasons. UTLC has no drag layer: the shell owns
+    // the touch dispatch, the reorder commit and the page animation, and these
+    // are the numbers it draws from.
+    // ---------------------------------------------------------------------
+    /// Page-local slot of the workspace cell a drag has lifted, or `None`.
+    ///
+    /// Page-local for the same reason [`Self::folder_drag_slot`] is: the reorder
+    /// is a per-page reorder and a cross-page move is a page turn
+    /// (`SpringLoadedDragController.kt:47-57`), which the shell drives with
+    /// [`Self::home_page`].
+    pub drag_slot: Option<u8>,
+
+    /// Where the lifted cell's *visual centre* is, panel coordinates.
+    ///
+    /// The drag's own tracking, not the touch's: the reference resolves both the
+    /// drop cell and the page-turn edge from `d.getVisualCenter`
+    /// (`Workspace.java:2709, 2893-2895`), and a lift drawn at the finger with
+    /// the icon offset inside it is a different point.
+    pub drag_pos: (f32, f32),
+
+    /// The lifted cell's lift progress, `0.0`..=`1.0`.
+    ///
+    /// A progress and not a flag because the lift is an animation off the
+    /// long-press: `Layout::drag_lifted_rect` scales by it, so `0.0` draws the
+    /// resting cell centred on the finger and `1.0` the fully lifted one.
+    pub drag_lift: f32,
+
+    /// The slot the grid's gap has opened at, or `None`.
+    ///
+    /// The drop indicator. `None` means "drawn as-is", which is what an empty
+    /// grid and a released drag both want.
+    pub drag_drop_slot: Option<u8>,
+
+    /// The occupied cell the lifted icon would merge with, or `None`.
+    ///
+    /// "Two icons onto each other": the reference's `mFolderCreateBg`, a
+    /// `PreviewBackground` sized to the hovered icon with `isClipping = false`
+    /// so it shows behind it (`Workspace.java:2942-2956`), and the thing whose
+    /// release commits a folder. Resolved by the shell from
+    /// [`Self::drag_pos`] with [`crate::graphics::layout::Layout::drag_merge_radius`],
+    /// so the drawn plate and the dispatch decision cannot be two derivations.
+    pub drag_merge_slot: Option<u8>,
+}
+
+impl<'a> DrmInteractiveState<'a> {
+    /// Text the rename field shows while editing.
+    ///
+    /// The buffer when non-empty, `""` when empty (which draws
+    /// `FOLDER_RENAME_PLACEHOLDER`, never `folder_title`). Pre-fill is the
+    /// shell's job: it copies the title into `folder_rename_buffer` on edit
+    /// start, so this never reads `folder_title` itself and a cleared field
+    /// cannot resurrect the old name. Borrowed, no allocation.
+    #[inline]
+    pub fn folder_rename_display(&self) -> &str {
+        self.folder_rename_buffer.as_str()
+    }
 }
 
 /// One row of the recents strip, as the renderer sees it.
@@ -1268,6 +1762,15 @@ impl<'a> Default for DrmInteractiveState<'a> {
             folder_drag_out: false,
             folder_menu_progress: 0.0,
             folder_menu_anchor: (0.0, 0.0),
+            folder_rename_buffer: FolderRenameBuffer::EMPTY,
+            folder_rename_editing: false,
+            app_info: None,
+            keyboard_layout: crate::compositor::ime::KeyboardLayout::Qwerty,
+            drag_slot: None,
+            drag_pos: (0.0, 0.0),
+            drag_lift: 0.0,
+            drag_drop_slot: None,
+            drag_merge_slot: None,
         }
     }
 }
@@ -2917,7 +3420,9 @@ pub fn paint_frame(
         // App content container. The keyboard shortens it, so the drawn card
         // and the scrolled content band move together.
         let kb_h = if state.keyboard_active {
-            Keyboard::new(w as f32, h as f32).frame.h
+            Keyboard::new_for(w as f32, h as f32, state.keyboard_layout)
+                .frame
+                .h
         } else {
             0.0
         };
@@ -5512,7 +6017,13 @@ pub fn paint_frame(
     // Key rects come straight from `Keyboard`, the same struct the input path
     // hit-tests, so a key that is drawn is exactly a key that can be pressed.
     if state.keyboard_active && !state.is_locked && !state.shade_open {
-        let kb = Keyboard::new(w as f32, h as f32);
+        let kb = Keyboard::new_for(w as f32, h as f32, state.keyboard_layout);
+        // The page's row tables, resolved once. This is the whole of the
+        // layout-to-render path: everything below reads `page_rows` or
+        // `kb`, and nothing below reads a module-level constant, so there is no
+        // arrangement in which `state.keyboard_layout` changes the state and not
+        // the pixels.
+        let page_rows = kb.rows_for_layout();
         let f = kb.frame;
         let k_em = super::font::em_px_at(2, w);
         let k_text_h = k_em * 0.62;
@@ -5598,6 +6109,12 @@ pub fn paint_frame(
             shift_fg,
             1,
         );
+        // Row 1 is the shared digit row (`KB_DIGITS`) and is read from the same
+        // table `Keyboard::hit` reads, so the drawn digit and the typed digit
+        // are the same value. It used to be the module-level `ROW1`, which is
+        // now an alias of the same table -- but going through `Keyboard` means a
+        // fourth page cannot be added with a digit row the hit test misses.
+        let digits = super::layout::KB_DIGITS;
         key(
             buf,
             stride,
@@ -5638,10 +6155,9 @@ pub fn paint_frame(
             state.palette.on_surface_variant,
         );
 
-        for i in 0..KB_ROW1 {
+        for (i, &ch) in digits.iter().enumerate() {
             let r = kb.row1_at(i);
             key(buf, stride, w, h, &r, state.palette.surface_container_high);
-            let ch = super::layout::ROW1[i];
             let mut lb = [0u8; 4];
             let label: &str = if shift_on {
                 legend_label(&mut lb, ch)
@@ -5655,7 +6171,7 @@ pub fn paint_frame(
         for i in 0..KB_ROW2 {
             let r = kb.row2_at(i);
             key(buf, stride, w, h, &r, state.palette.surface_container_high);
-            let ch = super::layout::ROW2[i];
+            let ch = page_rows.row2[i];
             let mut lb = [0u8; 4];
             let label: &str = if shift_on {
                 legend_label(&mut lb, ch)
@@ -5669,7 +6185,7 @@ pub fn paint_frame(
         for i in 0..KB_ROW3_MID {
             let r = kb.row3_mid[i];
             key(buf, stride, w, h, &r, state.palette.surface_container_high);
-            let ch = super::layout::ROW3[i];
+            let ch = page_rows.row3[i];
             let mut lb = [0u8; 4];
             let label: &str = if shift_on {
                 legend_label(&mut lb, ch)
@@ -5726,6 +6242,29 @@ pub fn paint_frame(
             h,
             &kb.row4_enter,
             "Enter",
+            state.palette.on_primary,
+            1,
+        );
+        // The layout toggle, painted last so it sits over the space bar's left
+        // neighbour in the same row and reads as part of the bottom strip.
+        //
+        // `kb.toggle_label()` and the string `handle_key_tap` dispatches are one
+        // value (`layout::keyboard_toggle_label`), which is why this can be a
+        // function call rather than a match: a drawn label and a handled label
+        // that are separate tables is how `?123` ends up handled as `ABC`.
+        //
+        // It is drawn in the *accent* colour on purpose: it is the one key that
+        // changes the whole sheet, and it is the key the whole layout field
+        // exists to make reachable. An un-accented key that reconfigures the
+        // keyboard is the one thing a user will not think to press.
+        key(buf, stride, w, h, &kb.row4_layout, state.palette.primary);
+        legend(
+            buf,
+            stride,
+            w,
+            h,
+            &kb.row4_layout,
+            kb.toggle_label(),
             state.palette.on_primary,
             1,
         );
@@ -5914,6 +6453,13 @@ pub fn paint_frame(
         draw_workspace_morph(buf, stride, w, h, state);
         if state.folder_morph > 0.0 || state.folder_scrim > 0.0 {
             draw_folder(buf, stride, w, h, state);
+        } else {
+            // Closed folders paint nothing, so publish nothing: without this
+            // the previous frame's rename field and grid survive and a tap on
+            // the home screen hits a folder that is no longer on screen (the
+            // same trap `SETTINGS_GEOM` documents for its own pitch).
+            FOLDER_RENAME.with(|c| c.set(FolderRenameGeometry::EMPTY));
+            FOLDER_GRID.with(|c| c.set(FolderGridGeometry::EMPTY));
         }
         if state.overview_progress > 0.0 {
             draw_overview(buf, stride, w, h, state);
@@ -5924,6 +6470,413 @@ pub fn paint_frame(
         if state.popup_progress > 0.0 {
             draw_popup(buf, stride, w, h, state);
         }
+        // A lifted workspace cell, its gap and its merge plate. Above the popup:
+        // the reference's drag layer is above everything in the workspace
+        // (`DragLayer.java:190`), and a drag that the popup covered would be a
+        // drag the user could not see.
+        if state.drag_slot.is_some() {
+            draw_workspace_drag(buf, stride, w, h, state);
+        }
+        // The app-info panel is last of all: it is a whole surface, not a
+        // floating affordance, so nothing should draw over it.
+        if state.app_info.is_some() {
+            draw_app_info(buf, stride, w, h, state);
+        }
+    }
+}
+
+/// The lifted workspace cell, the drop gap and the "two icons onto each other"
+/// plate.
+///
+/// Drawn *after* the grid and the popup and *before* the app-info panel, so the
+/// layering is the same as the reference's: the drag floats above the workspace
+/// (`DragLayer.java:190`) and a panel above that.
+///
+/// Every rect comes from [`Layout`]'s drag methods -- the same ones the shell's
+/// dispatch reads -- so the plate under the finger is exactly the plate the
+/// release would commit against.
+fn draw_workspace_drag(
+    buf: &mut [u32],
+    stride: usize,
+    w: usize,
+    h: usize,
+    state: &DrmInteractiveState,
+) {
+    // No lifted cell means no drag visuals at all: an orphan gap or plate with
+    // `drag_slot == None` would be a drop target for a drag that does not
+    // exist. Checked first so all three paths (plate, gap, lift) share one
+    // gate -- the reference has no drag layer without a drag view
+    // (`DragLayer.java:190`).
+    if state.drag_slot.is_none() {
+        return;
+    }
+    let l = Layout::plain(w as f32, h as f32);
+
+    // --- 1. The merge plate. ----------------------------------------------------
+    // Drawn first so the lifted icon lands on top of it, which is the
+    // reference's arrangement: `mFolderCreateBg` is the hovered icon's own
+    // background and `isClipping = false` puts the whole plate behind it
+    // (`Workspace.java:2942-2956`).
+    if let Some(slot) = state.drag_merge_slot {
+        let m = l.drag_merge_rect(slot as usize);
+        // In the accent colour: this is the affirmative state, and the reference
+        // gives it the same treatment -- a `PreviewBackground` animated *to
+        // accept* (`Workspace.java:2948-2956`).
+        draw_rounded_rect_f(
+            buf,
+            stride,
+            w,
+            h,
+            m.x,
+            m.y,
+            m.w,
+            m.h,
+            m.radius,
+            state.palette.primary,
+        );
+    }
+
+    // --- 2. The drop gap. ------------------------------------------------------
+    //
+    // The reference clears the drag outlines the moment a merge arms
+    // (`Workspace.java:2955`) and otherwise draws one behind the target cell
+    // (`CellLayout.visualizeDropLocation:1196-1224`). So the two are mutually
+    // exclusive, and a shell that set both would otherwise see a plate with a
+    // gap drawn through it.
+    if let Some(slot) = state.drag_drop_slot {
+        if state.drag_merge_slot != Some(slot) {
+            let g = l.drag_gap_rect(slot as usize);
+            draw_rounded_rect_f(
+                buf,
+                stride,
+                w,
+                h,
+                g.x,
+                g.y,
+                g.w,
+                g.h,
+                g.radius,
+                state.palette.surface_container_high,
+            );
+        }
+    }
+
+    // --- 3. The lifted cell. ---------------------------------------------------
+    let Some(slot) = state.drag_slot else {
+        return;
+    };
+    let slot = slot as usize;
+    let lifted = l.drag_lifted_rect(slot, state.drag_pos, state.drag_lift);
+    // The resting cell is left as a hole rather than being erased: the reference
+    // removes the dragged view from the container
+    // (`Workspace.java:2235-2346` rearranges around it), so the slot's *gap* is
+    // the affordance and an outline over it would double-draw.
+    //
+    // The key shadow goes under the lift, offset by the reference's `.5dp`
+    // (`styles.xml:425-426`). It is drawn as a filled rect behind the tile rather
+    // than a blurred pass: the workspace icon shadow already exists as a
+    // pre-blurred mask (`icon_shadows`) and reusing it here would mean the drag
+    // depends on the shadow cache being enabled, which it is not in the dark
+    // theme (`res/values/styles.xml:111-113`) -- so a dark-themed drag would lose
+    // its lift entirely.
+    let shadow = l.drag_shadow_rect(lifted);
+    draw_rounded_rect_f(
+        buf,
+        stride,
+        w,
+        h,
+        shadow.x,
+        shadow.y,
+        shadow.w,
+        shadow.h,
+        shadow.radius,
+        (super::layout::FOLDER_DRAG_SHADOW_ALPHA as u32) << 24,
+    );
+
+    let app = state.grid_apps.get(slot);
+    let color = app
+        .map(|a| a.color)
+        .unwrap_or(state.palette.surface_container_high);
+    draw_rounded_rect_f(
+        buf,
+        stride,
+        w,
+        h,
+        lifted.x,
+        lifted.y,
+        lifted.w,
+        lifted.h,
+        lifted.radius,
+        color,
+    );
+    if let Some(app) = app {
+        if let Some(img) = app.icon {
+            draw_icon_bitmap_i32(
+                buf,
+                stride,
+                w,
+                h,
+                lifted.x.round() as i32,
+                lifted.y.round() as i32,
+                lifted.w.round() as usize,
+                lifted.h.round() as usize,
+                lifted.radius.round() as usize,
+                img,
+            );
+        } else if !app.glyph.is_empty() {
+            let em = super::font::em_px_at(2, w);
+            draw_text_centered(
+                buf,
+                stride,
+                w,
+                h,
+                lifted.center_x() as usize,
+                (lifted.center_y() - em * 0.30) as usize,
+                app.glyph,
+                0xFFFFFFFF,
+                2,
+            );
+        }
+    }
+}
+
+/// The app-info panel.
+///
+/// The surface the reference does not have. `SystemShortcut.APP_INFO`
+/// (`SystemShortcut.java:188`) resolves its target only at the tap and hands off
+/// (`PackageManagerHelper.java:160-187`); UTLC resolves it before, because on a
+/// Linux device the target is a *program* that may simply not be installed, and
+/// a user cannot tell from a menu row whether tapping it will do anything.
+///
+/// Gated on `state.app_info.is_some()` rather than on a progress field: there is
+/// no animation for it. A panel that slid in would need a spring, and the
+/// reference's own app-info -- a different activity -- does not slide in either
+/// (`SystemShortcut.java:240-249` starts it with a source-rect container
+/// transform, which UTLC has no equivalent for).
+fn draw_app_info(buf: &mut [u32], stride: usize, w: usize, h: usize, state: &DrmInteractiveState) {
+    let Some(info) = state.app_info else {
+        return;
+    };
+    let a = super::layout::AppInfoLayout::new(w as f32, h as f32);
+    let em = super::font::em_px_at(1, w);
+
+    // Opaque surface, full bleed: this is a screen, not a sheet. Same reasoning
+    // as the shade (`drm_kms.rs:2455-2460`): a translucent panel over a launcher
+    // costs a per-pixel blend over the whole display for a difference nobody can
+    // see under an opaque panel.
+    draw_rect_f(
+        buf,
+        stride,
+        w,
+        h,
+        0.0,
+        0.0,
+        w as f32,
+        h as f32,
+        state.palette.surface,
+    );
+
+    // Top bar, with the close control and the word the reference puts on the
+    // menu row: `R.string.app_info_drop_target_label` = "App info"
+    // (`res/values/strings.xml:226`).
+    draw_rounded_rect_f(
+        buf,
+        stride,
+        w,
+        h,
+        a.surface.bar.x,
+        a.surface.bar.y,
+        a.surface.bar.w,
+        a.surface.bar.h,
+        a.surface.bar.radius,
+        state.palette.surface_container,
+    );
+    let bar_c = a.surface.bar.center();
+    let title_x = a.surface.bar.x + a.surface.bar.h * 0.25;
+    let title_w = a.surface.close.x - title_x - a.surface.close.h * 0.3;
+    draw_text_centered_clipped(
+        buf,
+        stride,
+        w,
+        h,
+        (title_x + title_w * 0.5) as usize,
+        (bar_c.1 - em * 0.32) as usize,
+        title_w,
+        "App info",
+        state.palette.on_surface,
+        2,
+        FontWeight::Bold,
+    );
+    let c = a.surface.close;
+    draw_rounded_rect(
+        buf,
+        stride,
+        w,
+        h,
+        c.x as usize,
+        c.y as usize,
+        c.w as usize,
+        c.h as usize,
+        (c.h * 0.25) as usize,
+        0xFFEF4444,
+    );
+    let cc = c.center();
+    let r = c.h * 0.17;
+    draw_line(
+        buf,
+        stride,
+        w,
+        h,
+        cc.0 - r,
+        cc.1 - r,
+        cc.0 + r,
+        cc.1 + r,
+        0xFFFFFFFF,
+    );
+    draw_line(
+        buf,
+        stride,
+        w,
+        h,
+        cc.0 + r,
+        cc.1 - r,
+        cc.0 - r,
+        cc.1 + r,
+        0xFFFFFFFF,
+    );
+
+    // The icon.
+    draw_rounded_rect_f(
+        buf,
+        stride,
+        w,
+        h,
+        a.icon.x,
+        a.icon.y,
+        a.icon.w,
+        a.icon.h,
+        a.icon.radius,
+        info.color,
+    );
+    if let Some(img) = info.icon {
+        draw_icon_bitmap_i32(
+            buf,
+            stride,
+            w,
+            h,
+            a.icon.x.round() as i32,
+            a.icon.y.round() as i32,
+            a.icon.w.round() as usize,
+            a.icon.h.round() as usize,
+            a.icon.radius.round() as usize,
+            img,
+        );
+    } else if !info.glyph.is_empty() {
+        draw_text_centered(
+            buf,
+            stride,
+            w,
+            h,
+            a.icon.center_x() as usize,
+            (a.icon.center_y() - em * 0.30) as usize,
+            info.glyph,
+            0xFFFFFFFF,
+            2,
+        );
+    }
+
+    // The five text lines: name, id, exec, target, and what the button does.
+    //
+    // Each is drawn from its own rect and clipped to its own width, so a long
+    // `Exec=` line cannot run into the next one. An empty field draws nothing at
+    // all rather than a blank row -- the same rule the smartspace date line
+    // follows, and for the same reason: a drawn placeholder reads as data.
+    for (rect, text, weight) in [
+        (a.name, info.name, FontWeight::Bold),
+        (a.id_line, info.id, FontWeight::Regular),
+        (a.exec_line, info.exec, FontWeight::Regular),
+        (a.target_line, info.target, FontWeight::Regular),
+        (a.hint, app_info_hint(&info), FontWeight::Regular),
+    ] {
+        if text.is_empty() {
+            continue;
+        }
+        draw_text_clipped(
+            buf,
+            stride,
+            w,
+            h,
+            rect.x,
+            rect.center_y() - em * 0.31,
+            rect.w,
+            text,
+            if rect.y == a.name.y {
+                state.palette.on_surface
+            } else {
+                state.palette.on_surface_variant
+            },
+            1,
+            weight,
+        );
+    }
+
+    // The affordance. Disabled when there is nothing to spawn, and *drawn*
+    // disabled -- an enabled-looking button that does nothing is the exact
+    // failure this panel exists to avoid.
+    let enabled = info.can_open();
+    let b = a.open_button;
+    draw_rounded_rect_f(
+        buf,
+        stride,
+        w,
+        h,
+        b.x,
+        b.y,
+        b.w,
+        b.h,
+        b.radius,
+        if enabled {
+            state.palette.primary
+        } else {
+            state.palette.surface_container
+        },
+    );
+    draw_text_centered(
+        buf,
+        stride,
+        w,
+        h,
+        b.center_x() as usize,
+        (b.center_y() - em * 0.31) as usize,
+        APP_INFO_OPEN_LABEL,
+        if enabled {
+            state.palette.on_primary
+        } else {
+            state.palette.on_surface_variant
+        },
+        1,
+    );
+}
+
+/// The label on the app-info handoff button.
+///
+/// Not "App info": that is the *menu row* that opens this panel
+/// (`res/values/strings.xml:226`, `SystemShortcut.java:196`), and repeating it on
+/// the button would name the action the user just took rather than the one they
+/// are about to take.
+pub const APP_INFO_OPEN_LABEL: &str = "Open in software centre";
+
+/// One line under the app-info rows, saying what the button will actually do.
+///
+/// Two cases, because there are two: a resolved program, or nothing to run. The
+/// second is the case a launcher on Linux has and the reference never has -- the
+/// reference's `startAppDetailsActivity` either resolves or toasts, and it does
+/// not toasts until after the tap (`PackageManagerHelper.java:183-186`).
+fn app_info_hint(info: &AppInfoSpec<'_>) -> &'static str {
+    match (info.can_open(), info.installing) {
+        (true, true) => "Install session in progress; opens the store entry",
+        (true, false) => "Leaves the launcher",
+        (false, _) => "No software centre found for this app",
     }
 }
 
@@ -6379,6 +7332,11 @@ fn draw_folder(buf: &mut [u32], stride: usize, w: usize, h: usize, state: &DrmIn
     let sx = (wf * 0.5 - sw * 0.5).max(0.0);
     let sy = (hf * 0.5 - sh * 0.5).max(0.0);
     let a = ((m * 255.0) as u32) << 24;
+    // Clear before the early return, not after it: a morph that is open but
+    // still transparent (`a <= 4` on its first frame) paints nothing, and
+    // without this the previous edit's field survives into it.
+    FOLDER_RENAME.with(|c| c.set(FolderRenameGeometry::EMPTY));
+    FOLDER_GRID.with(|c| c.set(FolderGridGeometry::EMPTY));
     if a <= 4 {
         return;
     }
@@ -6399,27 +7357,134 @@ fn draw_folder(buf: &mut [u32], stride: usize, w: usize, h: usize, state: &DrmIn
         (a >> 8 << 8) | (state.palette.surface_container_high & 0x00FF_FFFF),
     );
 
-    // Title, on its own alpha so the reference's delay is expressible.
-    let ta = state.folder_title_alpha.clamp(0.0, 1.0);
-    if ta > 0.01 && !state.folder_title.is_empty() {
+    // The grid's own origin, once the container has finished growing.
+    // Computed here (not after the pager) because the rename field needs the
+    // same offset: `FolderLayout` rects are layout coordinates while the sheet
+    // is vertically centred, so `rename_field` must be shifted by
+    // `gx - cell.x, gy - cell.y` (see `folder_layout_offset`, `main.rs:645`).
+    // `FolderLayout::menu` is already panel-space and must not shift.
+    let gx = wf * 0.5 - grid_w * 0.5;
+    let gy = sy + fl.pad_top;
+    // Clear the published rename first, so a closed folder reports no field.
+    FOLDER_RENAME.with(|c| c.set(FolderRenameGeometry::EMPTY));
+    if state.folder_rename_editing {
+        // Visible text field when editing, replacing the static title.
+        //
+        // Pre-fill vs empty: `folder_rename_display` is the buffer when
+        // non-empty and `""` when empty; empty draws `FOLDER_RENAME_PLACEHOLDER`
+        // and never `folder_title`, so a cleared field cannot resurrect the old
+        // name. The shell pre-fills the buffer on edit start
+        // (`Folder.java:569`, `:1851`).
+        let layout_field = fl.rename_field();
+        let ox = gx - fl.cell.x;
+        let oy = gy - fl.cell.y;
         let em = super::font::em_px_at(1, w);
-        draw_text_centered(
+        let text = state.folder_rename_display();
+        let text_w = if text.is_empty() {
+            0.0
+        } else {
+            super::font::measure(text, em)
+        };
+        let layout_caret = fl.rename_caret(layout_field, text_w);
+        let panel_field = Rect {
+            x: layout_field.x + ox,
+            y: layout_field.y + oy,
+            w: layout_field.w,
+            h: layout_field.h,
+            radius: layout_field.radius,
+        };
+        let panel_caret = Rect {
+            x: layout_caret.x + ox,
+            y: layout_caret.y + oy,
+            w: layout_caret.w,
+            h: layout_caret.h,
+            radius: 0.0,
+        };
+        FOLDER_RENAME.with(|c| {
+            c.set(FolderRenameGeometry {
+                field: panel_field,
+                caret: panel_caret,
+                editing: true,
+                live: true,
+            })
+        });
+        draw_rounded_rect_f(
             buf,
             stride,
             w,
             h,
-            w / 2,
-            (sy + sh - fl.footer_h * 0.62 - em * 0.31) as usize,
-            state.folder_title,
-            state.palette.on_surface,
-            1,
+            panel_field.x,
+            panel_field.y,
+            panel_field.w,
+            panel_field.h,
+            panel_field.radius,
+            (a >> 8 << 8) | (state.palette.surface & 0x00FF_FFFF),
         );
+        if text.is_empty() {
+            draw_text_clipped(
+                buf,
+                stride,
+                w,
+                h,
+                panel_field.x + panel_field.h * 0.2,
+                panel_field.center_y() - em * 0.31,
+                (panel_field.w - panel_field.h * 0.4).max(0.0),
+                super::layout::FOLDER_RENAME_PLACEHOLDER,
+                state.palette.on_surface_variant,
+                1,
+                FontWeight::Regular,
+            );
+        } else {
+            draw_text_clipped(
+                buf,
+                stride,
+                w,
+                h,
+                panel_field.x + panel_field.h * 0.2,
+                panel_field.center_y() - em * 0.31,
+                (panel_field.w - panel_field.h * 0.4).max(0.0),
+                text,
+                state.palette.on_surface,
+                1,
+                FontWeight::Regular,
+            );
+        }
+        draw_rect_f(
+            buf,
+            stride,
+            w,
+            h,
+            panel_caret.x,
+            panel_caret.y,
+            panel_caret.w,
+            panel_caret.h,
+            state.palette.on_surface,
+        );
+    } else {
+        // Title, on its own alpha so the reference's delay is expressible.
+        let ta = state.folder_title_alpha.clamp(0.0, 1.0);
+        if ta > 0.01 && !state.folder_title.is_empty() {
+            let em = super::font::em_px_at(1, w);
+            draw_text_centered(
+                buf,
+                stride,
+                w,
+                h,
+                w / 2,
+                (sy + sh - fl.footer_h * 0.62 - em * 0.31) as usize,
+                state.folder_title,
+                state.palette.on_surface,
+                1,
+            );
+        }
     }
 
     // Contents on the `FolderLayout` grid. The cells fade and shrink with the
     // morph, so a folder opening does not pop its contents in at full size on
     // the frame the surface reaches its final geometry.
     if state.folder_apps.is_empty() {
+        FOLDER_GRID.with(|c| c.set(FolderGridGeometry::EMPTY));
+        draw_folder_menu(buf, stride, w, h, state, &l, &fl);
         return;
     }
 
@@ -6455,9 +7520,8 @@ fn draw_folder(buf: &mut [u32], stride: usize, w: usize, h: usize, state: &DrmIn
         }
     }
 
-    // The grid's own origin, once the container has finished growing.
-    let gx = wf * 0.5 - grid_w * 0.5;
-    let gy = sy + fl.pad_top;
+    // The grid was already located above for the rename offset; reuse `gx`
+    // and `gy` here so the grid and the field cannot drift into two origins.
     // Clear the published grid *first*, then republish below once it is known.
     //
     // This is the same trap `SETTINGS_GEOM` documents: without the clear, the
@@ -6474,6 +7538,7 @@ fn draw_folder(buf: &mut [u32], stride: usize, w: usize, h: usize, state: &DrmIn
     let per_page = fl.items_per_page();
     let first = (state.folder_page as usize).saturating_mul(per_page);
     if first >= state.folder_apps.len() {
+        draw_folder_menu(buf, stride, w, h, state, &l, &fl);
         return;
     }
     // Reorder, when one is in flight. Both halves come from the shell, and
@@ -6781,6 +7846,32 @@ fn draw_folder(buf: &mut [u32], stride: usize, w: usize, h: usize, state: &DrmIn
             state.palette.on_primary,
             1,
         );
+        // Cross-surface workspace slot, distinct from the Remove bar above.
+        //
+        // The bar is a top-band primary fill (`DeleteDropTarget.java:115`); this
+        // is a grid-cell outline in the tertiary role, so the two affordances
+        // cannot be confused. Resolved by `folder_drag_to_workspace_target` --
+        // the same function the shell's dispatch reads -- so the drawn slot is
+        // the slot a release would commit against. `None` draws nothing, which
+        // is what a drag over the scrim wants.
+        if let Some(slot) =
+            super::layout::folder_drag_to_workspace_target(&l, state.folder_drag_pos)
+        {
+            let g = l.drag_gap_rect(slot);
+            super::raster::draw_rounded_rect_outline_f(
+                buf,
+                stride,
+                w,
+                h,
+                g.x,
+                g.y,
+                g.w,
+                g.h,
+                g.radius,
+                (w as f32 / 420.0 * 0.5).max(1.0),
+                (0xFF << 24) | (state.palette.tertiary & 0x00FF_FFFF),
+            );
+        }
     }
 
     draw_folder_menu(buf, stride, w, h, state, &l, &fl);
@@ -7368,6 +8459,65 @@ fn interactive_state_hash(state: &DrmInteractiveState) -> u64 {
     mix!((state.folder_menu_progress * 1000.0) as u64);
     mix!((state.folder_menu_anchor.0 * 64.0) as i64 as u64);
     mix!((state.folder_menu_anchor.1 * 64.0) as i64 as u64);
+    for b in state
+        .folder_rename_buffer
+        .bytes
+        .iter()
+        .take(state.folder_rename_buffer.len())
+    {
+        mix!(*b as u64);
+    }
+    mix!(state.folder_rename_buffer.len() as u64);
+    mix!(state.folder_rename_editing as u64);
+
+    // App info. Hashed by *content*, not by presence: the panel shows the app's
+    // name, id and `Exec=` line, so a launcher rescan that changes an app's name
+    // -- "Firefox" becoming "Firefox ESR" -- draws different pixels with the
+    // panel open and identical structure. A presence-only hash would keep the
+    // stale panel. Same reasoning as `mix_app_row` for the catalogue, and the
+    // same trap that cost it there.
+    match &state.app_info {
+        Some(a) => {
+            mix!(1);
+            for b in a.id.bytes().take(48) {
+                mix!(b);
+            }
+            for b in a.name.bytes().take(32) {
+                mix!(b);
+            }
+            for b in a.exec.bytes().take(48) {
+                mix!(b);
+            }
+            for b in a.target.bytes().take(48) {
+                mix!(b);
+            }
+            mix!(a.icon.is_some() as u64);
+            mix!(a.color as u64);
+            for b in a.glyph.bytes().take(8) {
+                mix!(b);
+            }
+            // The button's *enabled* state is drawn, so the gate is part of the
+            // signature: a target that appears or disappears flips pixels.
+            mix!(a.can_open() as u64);
+            mix!(a.installing as u64);
+        }
+        None => mix!(0xA5),
+    }
+
+    // The IME page. A `u8` discriminant: the variant *is* the visible state, and
+    // every character on rows 2 and 3 is a function of it.
+    mix!(state.keyboard_layout as u64);
+
+    // The five workspace-drag fields. All five are per-frame during a drag --
+    // `drag_pos` and `drag_lift` are continuous and the three slots flip -- so
+    // unhashed they animate invisibly, which is the same failure as an unhashed
+    // folder drag and the same reason for the quantisation.
+    mix!(state.drag_slot.map(|v| v as u64).unwrap_or(u64::MAX));
+    mix!((state.drag_pos.0 * 64.0) as i64 as u64);
+    mix!((state.drag_pos.1 * 64.0) as i64 as u64);
+    mix!((state.drag_lift * 1000.0) as u64);
+    mix!(state.drag_drop_slot.map(|v| v as u64).unwrap_or(u64::MAX));
+    mix!(state.drag_merge_slot.map(|v| v as u64).unwrap_or(u64::MAX));
 
     if let Some(sex) = state.super_extreme_state {
         mix!(sex.active_screen as u8);
@@ -9669,6 +10819,84 @@ thread_local! {
     };
 }
 
+/// The folder rename field `draw_folder` last painted, published for the hit test.
+///
+/// Panel coordinates, already offset from `FolderLayout`'s layout space by the
+/// same `folder_grid_geometry` origin minus `cell` delta the grid uses (see
+/// `folder_layout_offset` in `main.rs:645`). `FolderLayout::menu` is
+/// panel-space and must not shift; this *must* shift, for the same reason the
+/// grid does: `rename_field` is in layout coordinates (`y = pad_top`) while
+/// the sheet is vertically centred.
+///
+/// `live` means "an open folder with editing on was painted". Cleared on every
+/// other frame, so a closed folder reports no tappable field.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FolderRenameGeometry {
+    /// Text-field rect as painted, panel pixels.
+    pub field: Rect,
+    /// Caret rect as painted, panel pixels. Zero-size when not editing.
+    pub caret: Rect,
+    /// Editing was on when this was published.
+    pub editing: bool,
+    /// A field was painted.
+    pub live: bool,
+}
+
+impl FolderRenameGeometry {
+    /// Nothing painted: every field zero and [`Self::live`] false.
+    pub const EMPTY: Self = Self {
+        field: Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 0.0,
+            h: 0.0,
+            radius: 0.0,
+        },
+        caret: Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 0.0,
+            h: 0.0,
+            radius: 0.0,
+        },
+        editing: false,
+        live: false,
+    };
+
+    /// Whether `(x, y)` hits the published field, exclusive on far edges.
+    ///
+    /// Exclusive (`x < x+w`) because `Rect::contains` is inclusive on both
+    /// edges (`layout.rs:154`); an inclusive test would let a touch on the
+    /// field's edge also hit the sheet chrome. Dead geometry hits nothing.
+    #[inline]
+    pub fn hit(&self, x: f32, y: f32) -> bool {
+        if !self.live || !self.editing {
+            return false;
+        }
+        if self.field.is_empty() {
+            return false;
+        }
+        if !x.is_finite() || !y.is_finite() {
+            return false;
+        }
+        x >= self.field.x
+            && x < self.field.x + self.field.w
+            && y >= self.field.y
+            && y < self.field.y + self.field.h
+    }
+}
+
+/// The rename field the last painted frame drew, or empty when no edit is open.
+pub fn folder_rename_geometry() -> FolderRenameGeometry {
+    FOLDER_RENAME.with(|c| c.get())
+}
+
+thread_local! {
+    static FOLDER_RENAME: std::cell::Cell<FolderRenameGeometry> = const {
+        std::cell::Cell::new(FolderRenameGeometry::EMPTY)
+    };
+}
+
 /// The Settings panel's painted geometry, published for the hit test.
 ///
 /// # Why this exists
@@ -11651,6 +12879,95 @@ mod tests {
         );
     }
 
+    /// The rename buffer is fixed-capacity, `Copy`, and truncates.
+    ///
+    /// `truncated`, `as_str`, `len` and `is_empty` are the four functions the
+    /// render path reads; `folder_rename_display` is the pre-fill rule on top
+    /// of them (buffer when non-empty, `""` when empty, never `folder_title`).
+    #[test]
+    fn folder_rename_buffer_is_copy_truncates_and_reports() {
+        fn is_copy<T: Copy>() {}
+        is_copy::<FolderRenameBuffer>();
+        is_copy::<FolderRenameGeometry>();
+        let empty = FolderRenameBuffer::EMPTY;
+        assert_eq!(empty.len(), 0);
+        assert!(empty.is_empty());
+        assert_eq!(empty.as_str(), "");
+        let hello = FolderRenameBuffer::truncated("Hi");
+        assert_eq!(hello.len(), 2);
+        assert!(!hello.is_empty());
+        assert_eq!(hello.as_str(), "Hi");
+        // Non-ASCII becomes `?` so the vector font can draw it.
+        let uni = FolderRenameBuffer::truncated("A\u{00B0}B");
+        assert_eq!(uni.as_str(), "A??B");
+        // Truncates to capacity, never panics.
+        let long = "x".repeat(crate::graphics::layout::FOLDER_RENAME_MAX + 20);
+        let cut = FolderRenameBuffer::truncated(&long);
+        assert_eq!(cut.len(), crate::graphics::layout::FOLDER_RENAME_MAX);
+        assert_eq!(
+            cut.as_str().len(),
+            crate::graphics::layout::FOLDER_RENAME_MAX
+        );
+        // Display follows the buffer, never the stale title.
+        let mut state = DrmInteractiveState {
+            folder_title: "Old",
+            ..DrmInteractiveState::default()
+        };
+        state.folder_rename_buffer = FolderRenameBuffer::EMPTY;
+        assert_eq!(state.folder_rename_display(), "");
+        state.folder_rename_buffer = FolderRenameBuffer::truncated("New");
+        assert_eq!(state.folder_rename_display(), "New");
+    }
+
+    /// The rename hash sees the buffer and the editing flag.
+    #[test]
+    fn folder_rename_fields_move_the_damage_hash() {
+        let base = DrmInteractiveState::default();
+        let h0 = interactive_state_hash(&base);
+        let mut edited = base.clone();
+        edited.folder_rename_editing = true;
+        assert_ne!(h0, interactive_state_hash(&edited));
+        edited.folder_rename_buffer = FolderRenameBuffer::truncated("Games2");
+        assert_ne!(h0, interactive_state_hash(&edited));
+    }
+
+    /// The published rename geometry hits exclusively and dies with the edit.
+    #[test]
+    fn folder_rename_geometry_hit_is_exclusive_and_gated() {
+        let field = Rect {
+            x: 10.0,
+            y: 20.0,
+            w: 100.0,
+            h: 40.0,
+            radius: 4.0,
+        };
+        let live = FolderRenameGeometry {
+            field,
+            caret: Rect {
+                x: 20.0,
+                y: 24.0,
+                w: 2.0,
+                h: 24.0,
+                radius: 0.0,
+            },
+            editing: true,
+            live: true,
+        };
+        assert!(live.hit(11.0, 21.0));
+        assert!(!live.hit(110.0, 21.0));
+        assert!(!live.hit(11.0, 60.0));
+        assert!(!live.hit(f32::NAN, 21.0));
+        let _ = folder_rename_geometry();
+        let dead = FolderRenameGeometry::EMPTY;
+        assert!(!dead.hit(11.0, 21.0));
+        let shut = FolderRenameGeometry {
+            editing: false,
+            live: true,
+            ..live
+        };
+        assert!(!shut.hit(11.0, 21.0));
+    }
+
     /// The press scale must be hashed even with nothing pressed.
     ///
     /// The icon-bounce spring keeps integrating after the shell clears
@@ -13092,5 +14409,231 @@ mod tests {
                 "{name}: one frame ({frame}) of motion rounded away to the same hash"
             );
         }
+    }
+
+    /// Only 90/270 transpose the scanout axes.
+    ///
+    /// Neutering (`matches!(t, Transform::Rotate90)` alone, or `false`) makes
+    /// `rotated_frame_size` return the identity for 270 and the size test
+    /// below fails with it.
+    #[test]
+    fn transform_swaps_xy_is_only_90_and_270() {
+        assert!(transform_swaps_xy(Transform::Rotate90));
+        assert!(transform_swaps_xy(Transform::Rotate270));
+        assert!(!transform_swaps_xy(Transform::None));
+        assert!(!transform_swaps_xy(Transform::Rotate180));
+        assert!(!transform_swaps_xy(Transform::FlipH));
+        assert!(!transform_swaps_xy(Transform::FlipV));
+    }
+
+    /// The re-modeset size swaps exactly for 90/270.
+    ///
+    /// Neutering (returning `(w, h)` unconditionally) keeps the 90/270
+    /// assertions red: a modeset that never swaps is a portrait buffer on a
+    /// landscape panel.
+    #[test]
+    fn rotated_frame_size_swaps_only_for_90_270() {
+        assert_eq!(
+            rotated_frame_size(1080, 2400, Transform::None),
+            (1080, 2400)
+        );
+        assert_eq!(
+            rotated_frame_size(1080, 2400, Transform::Rotate180),
+            (1080, 2400)
+        );
+        assert_eq!(
+            rotated_frame_size(1080, 2400, Transform::Rotate90),
+            (2400, 1080)
+        );
+        assert_eq!(
+            rotated_frame_size(1080, 2400, Transform::Rotate270),
+            (2400, 1080)
+        );
+    }
+
+    /// A re-modeset to the current transform issues no ioctl.
+    ///
+    /// Built on `/dev/null` rather than hardware: any ioctl attempted on it
+    /// fails, so `Ok(false)` proves nothing was issued. Neutering (dropping
+    /// the early-out) turns this into `Err` and fails the assertion.
+    #[test]
+    fn apply_transform_to_the_current_transform_is_a_noop_without_io() {
+        let file = std::fs::File::open("/dev/null").expect("/dev/null opens");
+        let mut dev = DrmKmsDevice {
+            file,
+            crtc_id: 1,
+            connector_id: 2,
+            fb_id: 0,
+            dumb_handle: 0,
+            width: 1080,
+            height: 2400,
+            pitch: 1080 * 4,
+            size: 0,
+            mmap_ptr: std::ptr::null_mut(),
+            mode: DrmModeModeInfo {
+                hdisplay: 1080,
+                vdisplay: 2400,
+                ..Default::default()
+            },
+            transform: Transform::None,
+            frame_cache_hash: 0,
+            frame_cache_valid: false,
+            frame_dirty: false,
+        };
+        assert!(
+            !dev.apply_transform(Transform::None).expect("noop modeset"),
+            "re-applying the current transform must be a silent no-op"
+        );
+    }
+
+    /// `set_orientation` maps through `to_transform`, not around it.
+    ///
+    /// `Normal`/`Undefined` are `Transform::None`
+    /// (`sensor_proxy.rs:113-121`), so both are no-ops on a native device;
+    /// `LeftUp` is `Rotate90` and must attempt a modeset, which on
+    /// `/dev/null` is `Err`. Neutering the mapping (always `None`) makes the
+    /// `LeftUp` arm return `Ok(false)` and fails.
+    #[test]
+    fn set_orientation_maps_through_to_transform() {
+        fn native() -> DrmKmsDevice {
+            let file = std::fs::File::open("/dev/null").expect("/dev/null opens");
+            DrmKmsDevice {
+                file,
+                crtc_id: 1,
+                connector_id: 2,
+                fb_id: 0,
+                dumb_handle: 0,
+                width: 1080,
+                height: 2400,
+                pitch: 1080 * 4,
+                size: 0,
+                mmap_ptr: std::ptr::null_mut(),
+                mode: DrmModeModeInfo {
+                    hdisplay: 1080,
+                    vdisplay: 2400,
+                    ..Default::default()
+                },
+                transform: Transform::None,
+                frame_cache_hash: 0,
+                frame_cache_valid: false,
+                frame_dirty: false,
+            }
+        }
+        use crate::sensors::sensor_proxy::DeviceOrientation;
+        assert!(
+            !native()
+                .set_orientation(DeviceOrientation::Normal)
+                .expect("noop modeset"),
+            "Normal maps to the native transform and must not modeset"
+        );
+        assert!(
+            !native()
+                .set_orientation(DeviceOrientation::Undefined)
+                .expect("noop modeset"),
+            "Undefined maps to the native transform and must not modeset"
+        );
+        assert!(
+            native().set_orientation(DeviceOrientation::LeftUp).is_err(),
+            "LeftUp is Rotate90 and must attempt a modeset, not no-op"
+        );
+    }
+
+    /// A closed folder publishes no rename field and no grid.
+    ///
+    /// `paint_frame` skips `draw_folder` entirely at rest, so without the
+    /// `else` clear the previous edit's field and grid survive and a tap on
+    /// the home screen hits a folder that is no longer on screen. Neutering
+    /// (removing the `else` clear) leaves both live and fails.
+    #[test]
+    fn closed_folder_clears_published_rename_and_grid() {
+        let _guard = crate::graphics::font::font_test_lock();
+        let member = AppGridItem {
+            id: "a",
+            name: "Alpha",
+            color: 0xFF445566,
+            glyph: "A",
+            icon: None,
+            folder_n: 0,
+            folder_id: 0,
+        };
+        let members = [member];
+        let open = DrmInteractiveState {
+            folder_morph: 1.0,
+            folder_scrim: 0.32,
+            folder_title_alpha: 1.0,
+            folder_title: "Games",
+            folder_apps: &members,
+            folder_item_count: 1,
+            folder_rename_editing: true,
+            folder_rename_buffer: FolderRenameBuffer::truncated("Hi"),
+            ..DrmInteractiveState::default()
+        };
+        let (w, h) = (1080usize, 2400usize);
+        let mut buf = vec![0xFF000000u32; w * h];
+        paint_frame(&mut buf, w, w, h, &open);
+        assert!(
+            folder_rename_geometry().live,
+            "the open edit published no rename field"
+        );
+        assert!(
+            folder_grid_geometry().live,
+            "the open folder published no grid"
+        );
+        let shut = DrmInteractiveState::default();
+        paint_frame(&mut buf, w, w, h, &shut);
+        assert_eq!(
+            folder_rename_geometry(),
+            FolderRenameGeometry::EMPTY,
+            "a closed folder still publishes a rename field"
+        );
+        assert!(
+            !folder_grid_geometry().live,
+            "a closed folder still publishes a live grid"
+        );
+    }
+
+    /// Each workspace-drag field moves the damage hash.
+    ///
+    /// `render_interactive_ui` short-circuits on a hash match, so an unhashed
+    /// drag field animates invisibly. Each arm perturbs one field against a
+    /// baseline that already holds the others, so the assertion isolates that
+    /// field: neutering (removing any one `mix!` in the five-field block)
+    /// leaves that arm equal and fails.
+    #[test]
+    fn workspace_drag_fields_move_the_damage_hash() {
+        let base = DrmInteractiveState::default();
+        let h0 = interactive_state_hash(&base);
+        let mut lifted = base.clone();
+        lifted.drag_slot = Some(2);
+        let h_lifted = interactive_state_hash(&lifted);
+        assert_ne!(h0, h_lifted, "drag_slot must repaint");
+        let mut moved = lifted.clone();
+        moved.drag_pos = (60.0, 120.0);
+        assert_ne!(
+            h_lifted,
+            interactive_state_hash(&moved),
+            "drag_pos must follow the finger"
+        );
+        let mut rising = lifted.clone();
+        rising.drag_lift = 1.0;
+        assert_ne!(
+            h_lifted,
+            interactive_state_hash(&rising),
+            "drag_lift must repaint"
+        );
+        let mut gap = lifted.clone();
+        gap.drag_drop_slot = Some(3);
+        assert_ne!(
+            h_lifted,
+            interactive_state_hash(&gap),
+            "drag_drop_slot must repaint"
+        );
+        let mut merging = lifted.clone();
+        merging.drag_merge_slot = Some(3);
+        assert_ne!(
+            h_lifted,
+            interactive_state_hash(&merging),
+            "drag_merge_slot must repaint"
+        );
     }
 }

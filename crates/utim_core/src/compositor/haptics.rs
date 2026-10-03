@@ -117,14 +117,20 @@ impl Haptics {
     ///
     /// Cheap and idempotent; the result is meant to be stored once.
     pub fn detect() -> Self {
-        Self { backend: Self::probe(), fired: 0 }
+        Self {
+            backend: Self::probe(),
+            fired: 0,
+        }
     }
 
     /// A haptics sink that discards everything. The default on a machine
     /// with no vibrator, and what the test suite uses so a unit test never
     /// touches `/sys`.
     pub fn disabled() -> Self {
-        Self { backend: Backend::None, fired: 0 }
+        Self {
+            backend: Backend::None,
+            fired: 0,
+        }
     }
 
     /// True when a real device was found.
@@ -144,9 +150,11 @@ impl Haptics {
     /// bound), and a haptic is not something worth failing a gesture over.
     pub fn trigger(&mut self, effect: HapticEffect) -> bool {
         let ok = match &self.backend {
-            Backend::Led { activate, amplitude, duration } => {
-                self.fire_led(activate, amplitude.as_deref(), duration.as_deref(), effect)
-            }
+            Backend::Led {
+                activate,
+                amplitude,
+                duration,
+            } => self.fire_led(activate, amplitude.as_deref(), duration.as_deref(), effect),
             Backend::Evdev(path) => self.fire_evdev(path, effect),
             Backend::None => false,
         };
@@ -234,9 +242,13 @@ impl Haptics {
         // SAFETY: `eff` is a live `FfEffect` whose size is pinned to 48 by a
         // `const` assert, which is the size `EVIOCSFF`'s size field encodes,
         // so the kernel reads exactly the bytes we initialised.
-        let mut ok =
-            unsafe { libc::ioctl(fd, EVIOCSFF, (&mut eff as *mut FfEffect).cast::<libc::c_void>()) }
-                >= 0;
+        let mut ok = unsafe {
+            libc::ioctl(
+                fd,
+                EVIOCSFF,
+                (&mut eff as *mut FfEffect).cast::<libc::c_void>(),
+            )
+        } >= 0;
         // A successful upload that left the request for "allocate me" in place
         // did not allocate. Playing an effect we do not own would be a no-op
         // at best, so report failure rather than counting the pulse.
@@ -247,7 +259,10 @@ impl Haptics {
                 // event from its own clock, so a zero `timeval` is correct and
                 // calling `gettimeofday` here would only add a syscall to the
                 // touch path.
-                time: libc::timeval { tv_sec: 0, tv_usec: 0 },
+                time: libc::timeval {
+                    tv_sec: 0,
+                    tv_usec: 0,
+                },
                 type_: EV_FF,
                 // The effect id the upload assigned: `input_ff_event` passes
                 // `code` straight to `ff->playback(dev, code, value)`.
@@ -259,7 +274,11 @@ impl Haptics {
             // returns the byte count it consumed, so a short write means the
             // event did not go through and must not count as a pulse.
             ok = unsafe {
-                libc::write(fd, (&ev as *const InputEvent).cast(), size_of::<InputEvent>())
+                libc::write(
+                    fd,
+                    (&ev as *const InputEvent).cast(),
+                    size_of::<InputEvent>(),
+                )
             } == size_of::<InputEvent>() as isize;
         }
         // SAFETY: `fd` is a descriptor this function opened and has not
@@ -305,7 +324,11 @@ impl Haptics {
         let (_, base) = best?;
         let opt = |n: &str| {
             let p = base.join(n);
-            if p.exists() { Some(p) } else { None }
+            if p.exists() {
+                Some(p)
+            } else {
+                None
+            }
         };
         Some(Backend::Led {
             activate: base.join("activate"),
@@ -328,7 +351,9 @@ impl Haptics {
             // EVIOCGBIT on the fd would need an open, and a probe must not
             // open.
             let dev = p.file_name().map(|s| s.to_owned())?;
-            let caps = PathBuf::from("/sys/class/input").join(&dev).join("capabilities");
+            let caps = PathBuf::from("/sys/class/input")
+                .join(&dev)
+                .join("capabilities");
             if std::fs::read_to_string(caps.join("ff"))
                 .map(|s| s.trim() != "0")
                 .unwrap_or(false)
@@ -524,7 +549,10 @@ impl FfEffectUnion {
     /// `ff_rumble_effect` is two `__u16` and nothing else. The `assert` is
     /// what makes the slice indices provably in bounds.
     fn rumble(&mut self, strong: u16, weak: u16) {
-        let r = FfRumbleEffect { strong_magnitude: strong, weak_magnitude: weak };
+        let r = FfRumbleEffect {
+            strong_magnitude: strong,
+            weak_magnitude: weak,
+        };
         let n = size_of::<FfRumbleEffect>();
         assert!(n <= self.0.len());
         for (i, b) in r.strong_magnitude.to_ne_bytes().iter().enumerate() {
@@ -704,8 +732,15 @@ mod tests {
         let raw = b"/dev/input/event3";
         let p = copy_c_path(Path::new("/dev/input/event3")).expect("a node path fits");
         assert_eq!(&p[..raw.len()], raw);
-        assert_eq!(p[raw.len()], 0, "no terminator means open() reads off the end");
-        assert!(p[raw.len() + 1..].iter().all(|&b| b == 0), "the tail stays zeroed");
+        assert_eq!(
+            p[raw.len()],
+            0,
+            "no terminator means open() reads off the end"
+        );
+        assert!(
+            p[raw.len() + 1..].iter().all(|&b| b == 0),
+            "the tail stays zeroed"
+        );
 
         // 255 bytes is the cap, and 255 bytes plus the terminator is exactly
         // the buffer: the boundary case must be accepted, not refused.
@@ -721,7 +756,10 @@ mod tests {
         // syscall, which is exactly what makes it safe to refuse rather than
         // truncate.
         let too_long = PathBuf::from(format!("/{}", "a".repeat(C_PATH_MAX)));
-        assert_eq!(too_long.as_os_str().as_encoded_bytes().len(), C_PATH_MAX + 1);
+        assert_eq!(
+            too_long.as_os_str().as_encoded_bytes().len(),
+            C_PATH_MAX + 1
+        );
         assert!(
             copy_c_path(&too_long).is_none(),
             "a path longer than the buffer must be refused, not truncated: \
@@ -751,7 +789,11 @@ mod tests {
     fn the_input_event_matches_the_kernel_layout() {
         assert_eq!(size_of::<InputEvent>(), 24, "timeval(16) + 2 + 2 + 4");
         assert_eq!(offset_of!(InputEvent, time), 0);
-        assert_eq!(offset_of!(InputEvent, type_), 16, "after the 16-byte timeval");
+        assert_eq!(
+            offset_of!(InputEvent, type_),
+            16,
+            "after the 16-byte timeval"
+        );
         assert_eq!(offset_of!(InputEvent, code), 18);
         assert_eq!(offset_of!(InputEvent, value), 20);
         assert_eq!(align_of::<InputEvent>(), 8, "timeval is 8-aligned");
@@ -760,7 +802,10 @@ mod tests {
         // the kernel reads them from. Endianness is native on both targets,
         // so this checks layout, not a byte order.
         let ev = InputEvent {
-            time: libc::timeval { tv_sec: 0, tv_usec: 0 },
+            time: libc::timeval {
+                tv_sec: 0,
+                tv_usec: 0,
+            },
             type_: EV_FF,
             code: 0,
             value: 1,
@@ -776,7 +821,10 @@ mod tests {
         assert_eq!(&bytes[16..18], &EV_FF.to_ne_bytes());
         assert_eq!(&bytes[18..20], &0u16.to_ne_bytes());
         assert_eq!(&bytes[20..24], &1i32.to_ne_bytes());
-        assert!(bytes[..16].iter().all(|&b| b == 0), "a zero timeval is fine");
+        assert!(
+            bytes[..16].iter().all(|&b| b == 0),
+            "a zero timeval is fine"
+        );
     }
 
     /// The ioctl number must decode to what `EVIOCSFF` is.
@@ -845,14 +893,15 @@ mod tests {
         // The bytes the kernel actually reads, at the offsets it reads them
         // from.
         let bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                &eff as *const FfEffect as *const u8,
-                size_of::<FfEffect>(),
-            )
+            std::slice::from_raw_parts(&eff as *const FfEffect as *const u8, size_of::<FfEffect>())
         };
         assert_eq!(&bytes[16..18], &255u16.to_ne_bytes());
         assert_eq!(&bytes[18..20], &0u16.to_ne_bytes());
-        assert_eq!(&bytes[10..12], &30u16.to_ne_bytes(), "replay_length at 5th __u16");
+        assert_eq!(
+            &bytes[10..12],
+            &30u16.to_ne_bytes(),
+            "replay_length at 5th __u16"
+        );
         assert_eq!(&bytes[2..4], &(-1i16).to_ne_bytes(), "id = -1");
         assert_eq!(&bytes[..2], &FF_RUMBLE.to_ne_bytes(), "type");
     }
@@ -892,7 +941,10 @@ mod tests {
         ] {
             let mut a = [0u8; 4];
             let mut d = [0u8; 4];
-            assert_eq!(fmt_u8(&mut a, e.amplitude()), e.amplitude().to_string().as_bytes());
+            assert_eq!(
+                fmt_u8(&mut a, e.amplitude()),
+                e.amplitude().to_string().as_bytes()
+            );
             assert_eq!(fmt_u8(&mut d, e.on_ms()), e.on_ms().to_string().as_bytes());
             assert!(e.amplitude() <= 255, "the u8 domain is the whole premise");
         }
@@ -913,11 +965,19 @@ mod tests {
         // `OpenOptions` unconditionally ORs in `O_CLOEXEC`; the observable
         // consequence is that `FD_CLOEXEC` is set on the descriptor, which is
         // what a test can check without strace.
-        let f = OpenOptions::new().write(true).truncate(false).open(&attr).expect("open");
+        let f = OpenOptions::new()
+            .write(true)
+            .truncate(false)
+            .open(&attr)
+            .expect("open");
         use std::os::unix::io::AsRawFd;
         let flags = unsafe { libc::fcntl(f.as_raw_fd(), libc::F_GETFD) };
         assert!(flags >= 0, "F_GETFD failed");
-        assert_ne!(flags & libc::FD_CLOEXEC, 0, "the descriptor would leak across exec");
+        assert_ne!(
+            flags & libc::FD_CLOEXEC,
+            0,
+            "the descriptor would leak across exec"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -966,7 +1026,10 @@ mod tests {
             HapticEffect::Open,
         ] {
             assert!(e.on_ms() > 0, "{e:?} would be inaudible");
-            assert!(e.on_ms() <= u16::MAX as u32, "{e:?} overflows replay_length");
+            assert!(
+                e.on_ms() <= u16::MAX as u32,
+                "{e:?} overflows replay_length"
+            );
             assert!(e.amplitude() <= 255, "{e:?} overflows the u8 amplitude");
         }
     }
@@ -1008,10 +1071,7 @@ mod tests {
             std::fs::read_to_string(dir.join("amplitude")).unwrap(),
             "255"
         );
-        assert_eq!(
-            std::fs::read_to_string(dir.join("duration")).unwrap(),
-            "30"
-        );
+        assert_eq!(std::fs::read_to_string(dir.join("duration")).unwrap(), "30");
         assert_eq!(std::fs::read_to_string(dir.join("activate")).unwrap(), "1");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1028,7 +1088,11 @@ mod tests {
             fired: 0,
         };
         assert!(!h.trigger(HapticEffect::Tick));
-        assert_eq!(h.fired(), 0, "a pulse that reached no device is not a pulse");
+        assert_eq!(
+            h.fired(),
+            0,
+            "a pulse that reached no device is not a pulse"
+        );
     }
 
     #[test]

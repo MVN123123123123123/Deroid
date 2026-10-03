@@ -153,8 +153,6 @@ impl ModemManagerBridge {
     }
 
     pub fn is_mobile_data_connected(&self) -> bool {
-        self.slots
-            .iter()
-            .any(|s| s.data.is_data_active())
+        self.slots.iter().any(|s| s.data.is_data_active())
     }
 }

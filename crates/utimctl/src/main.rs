@@ -119,9 +119,7 @@ fn main() {
         "analyze" => {
             // `analyze` alone == `analyze time`; anything else is rejected
             // rather than silently ignored.
-            if operands.len() > 1
-                || (operands.len() == 1 && operands[0] != "time")
-            {
+            if operands.len() > 1 || (operands.len() == 1 && operands[0] != "time") {
                 eprintln!("Usage: systemctl analyze [time]");
                 process::exit(1);
             }
@@ -173,8 +171,8 @@ fn strip_options(args: &[String]) -> Result<Vec<String>, String> {
             "--no-pager" | "--no-legend" | "--full" | "-l" | "--plain" | "--no-block"
             | "--system" | "--user" | "--quiet" | "-q" | "--now" | "--force" | "--all"
             | "--reverse" | "--show-types" | "--value" | "--failed" => {}
-            "--state" | "--type" | "-t" | "--job-mode" | "--no-ask-password" | "-H"
-            | "--host" | "-M" | "--machine" | "--lines" | "-n" => {
+            "--state" | "--type" | "-t" | "--job-mode" | "--no-ask-password" | "-H" | "--host"
+            | "-M" | "--machine" | "--lines" | "-n" => {
                 if inline_value.is_none() {
                     // Consume the value token; it must not look like a flag.
                     match args.get(i + 1) {
@@ -382,9 +380,7 @@ fn run_enable_cmd(unit: &str) {
     };
     let parsed = utim_core::unit::parse_unit(unit, &path, &content);
     if parsed.install.wanted_by.is_empty() && parsed.install.required_by.is_empty() {
-        eprintln!(
-            "Failed to enable unit: {unit} is static (no [Install] WantedBy=/RequiredBy=)"
-        );
+        eprintln!("Failed to enable unit: {unit} is static (no [Install] WantedBy=/RequiredBy=)");
         process::exit(1);
     }
     for target in &parsed.install.wanted_by {
@@ -417,10 +413,7 @@ fn run_enable_cmd(unit: &str) {
         };
         let target_req = format!("/etc/systemd/system/{}.requires", target_name);
         if let Err(e) = std::fs::create_dir_all(&target_req) {
-            eprintln!(
-                "Failed to enable unit: cannot create {}: {}",
-                target_req, e
-            );
+            eprintln!("Failed to enable unit: cannot create {}: {}", target_req, e);
             process::exit(1);
         }
         let symlink_path = format!("{}/{}", target_req, unit);
@@ -439,9 +432,7 @@ fn run_disable_cmd(unit: &str) {
     let entries = match std::fs::read_dir(etc_systemd) {
         Ok(e) => e,
         Err(e) => {
-            eprintln!(
-                "Failed to disable unit {unit}: cannot read /etc/systemd/system: {e}"
-            );
+            eprintln!("Failed to disable unit {unit}: cannot read /etc/systemd/system: {e}");
             process::exit(1);
         }
     };
@@ -638,8 +629,7 @@ mod tests {
 
     #[test]
     fn valued_options_consume_their_value() {
-        let cleaned =
-            strip_options(&argv(&["systemctl", "list-units", "--state=failed"])).unwrap();
+        let cleaned = strip_options(&argv(&["systemctl", "list-units", "--state=failed"])).unwrap();
         assert_eq!(cleaned, argv(&["systemctl", "list-units"]));
 
         let cleaned =

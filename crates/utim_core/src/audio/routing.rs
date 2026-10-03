@@ -3,9 +3,7 @@
 //! 3.5mm Wired Headset, and Bluetooth (A2DP / SCO).
 //! Follows GEMINI.md: zero redundant dependencies, predictable deterministic state transitions.
 
-use super::hal::{
-    AndroidAudioHal, AudioInputDevice, AudioMode, AudioOutputDevice,
-};
+use super::hal::{AndroidAudioHal, AudioInputDevice, AudioMode, AudioOutputDevice};
 
 /// Dynamic audio routing state
 #[derive(Debug, Clone, PartialEq)]

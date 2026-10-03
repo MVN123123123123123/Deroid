@@ -17,9 +17,8 @@ use utim_core::input::{
     ABS_TILT_X, BTN_STYLUS, BTN_TOOL_PEN,
 };
 use utim_core::sensors::{
-    calculate_nmea_checksum, AndroidSensorsHal, DeviceOrientation, GnssConstellation,
-    GnssLocation, GnssService, SatelliteInfo, SensorData, SensorProxyService, SensorType,
-    SensorsBringupStatus,
+    calculate_nmea_checksum, AndroidSensorsHal, DeviceOrientation, GnssConstellation, GnssLocation,
+    GnssService, SatelliteInfo, SensorData, SensorProxyService, SensorType, SensorsBringupStatus,
 };
 
 #[test]
@@ -42,7 +41,10 @@ fn test_milestone_5_2_idc_parser_and_touch_calibration() {
     assert_eq!(config.device_type, TouchDeviceType::TouchScreen);
     assert!(config.orientation_aware);
     assert_eq!(config.size_calibration, TouchSizeCalibration::Geometric);
-    assert_eq!(config.pressure_calibration, TouchPressureCalibration::Physical);
+    assert_eq!(
+        config.pressure_calibration,
+        TouchPressureCalibration::Physical
+    );
     assert!(config.is_internal);
 
     // Calibrate pressure (raw 2048 / 4096 = 0.5)
@@ -159,7 +161,10 @@ fn test_milestone_5_2_active_stylus_evdev_to_wayland_tablet() {
         code: BTN_TOOL_PEN,
         value: 0,
     };
-    assert_eq!(stylus.process_event(&ev_prox_out), Some(TabletEvent::ProximityOut));
+    assert_eq!(
+        stylus.process_event(&ev_prox_out),
+        Some(TabletEvent::ProximityOut)
+    );
     assert!(!stylus.in_proximity);
 }
 
@@ -282,7 +287,10 @@ fn test_milestone_5_3_sensor_proxy_orientation_and_hysteresis() {
     assert_eq!(s3, Some(DeviceOrientation::LeftUp));
     assert_eq!(proxy.current_orientation, DeviceOrientation::LeftUp);
     assert_eq!(proxy.current_orientation.as_dbus_str(), "left-up");
-    assert_eq!(proxy.current_orientation.to_transform(), Transform::Rotate90);
+    assert_eq!(
+        proxy.current_orientation.to_transform(),
+        Transform::Rotate90
+    );
 
     // 3. Single transient vibration/bump should NOT trigger rotation
     proxy.process_accelerometer(0.0, 9.8, 0.0); // 1 sample
@@ -311,7 +319,8 @@ fn test_milestone_5_3_gnss_hal_and_nmea_generation() {
         vertical_accuracy_m: 5.0,
         timestamp_ms: 1711200000000,
     };
-    gnss.update_location(loc).expect("valid fix must be accepted");
+    gnss.update_location(loc)
+        .expect("valid fix must be accepted");
     assert!(gnss.has_fix);
 
     // 3. Add Satellites in View

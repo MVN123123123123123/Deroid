@@ -266,12 +266,8 @@ fn main() {
                                 supervisor.load_systemd_units(&default_paths);
                                 // Prune activation sockets of removed units
                                 // and stop tracking them in epoll.
-                                let live: std::collections::HashSet<String> = supervisor
-                                    .dag
-                                    .all_nodes()
-                                    .keys()
-                                    .cloned()
-                                    .collect();
+                                let live: std::collections::HashSet<String> =
+                                    supervisor.dag.all_nodes().keys().cloned().collect();
                                 for fd in supervisor.sockets.prune_removed_units(&live) {
                                     registered_sockets.remove(&fd);
                                     // P8/B8: DEL before close so a recycled fd
@@ -314,10 +310,7 @@ fn main() {
                         Err(e) => {
                             let kind = e.kind();
                             if kind != std::io::ErrorKind::WouldBlock {
-                                supervisor.log_msg(&format!(
-                                    "Control accept error: {}",
-                                    e
-                                ));
+                                supervisor.log_msg(&format!("Control accept error: {}", e));
                             }
                         }
                     }
@@ -419,7 +412,8 @@ fn handle_client_connection(
             | IpcRequest::IsEnabled(_)
             | IpcRequest::AnalyzeTime => {}
             _ => {
-                let resp = IpcResponse::Err("Permission denied: root privileges required".to_string());
+                let resp =
+                    IpcResponse::Err("Permission denied: root privileges required".to_string());
                 let _ = write_response(&stream, &resp);
                 return;
             }
@@ -481,20 +475,31 @@ fn handle_client_connection(
                 let unit_path = &node.unit.path;
                 let install = &node.unit.install;
                 let mut targets = install.wanted_by.clone();
-                if targets.is_empty() && install.required_by.is_empty() && install.alias.is_empty() {
+                if targets.is_empty() && install.required_by.is_empty() && install.alias.is_empty()
+                {
                     targets.push("multi-user.target".to_string());
                 }
                 for target in targets {
-                    let target_name = if target.contains('.') { target } else { format!("{}.target", target) };
-                    let wants_dir = PathBuf::from(format!("/etc/systemd/system/{}.wants", target_name));
+                    let target_name = if target.contains('.') {
+                        target
+                    } else {
+                        format!("{}.target", target)
+                    };
+                    let wants_dir =
+                        PathBuf::from(format!("/etc/systemd/system/{}.wants", target_name));
                     let _ = fs::create_dir_all(&wants_dir);
                     let symlink_path = wants_dir.join(&unit);
                     let _ = fs::remove_file(&symlink_path);
                     let _ = std::os::unix::fs::symlink(unit_path, &symlink_path);
                 }
                 for req in &install.required_by {
-                    let req_name = if req.contains('.') { req.clone() } else { format!("{}.target", req) };
-                    let req_dir = PathBuf::from(format!("/etc/systemd/system/{}.requires", req_name));
+                    let req_name = if req.contains('.') {
+                        req.clone()
+                    } else {
+                        format!("{}.target", req)
+                    };
+                    let req_dir =
+                        PathBuf::from(format!("/etc/systemd/system/{}.requires", req_name));
                     let _ = fs::create_dir_all(&req_dir);
                     let symlink_path = req_dir.join(&unit);
                     let _ = fs::remove_file(&symlink_path);

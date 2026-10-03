@@ -4,9 +4,7 @@
 //! Conforms strictly to GEMINI.md: zero-copy PCM slice passing, bounded buffers,
 //! and sub-15ms roundtrip latency.
 
-use super::hal::{
-    AndroidAudioHal, AudioConfig, AudioError, AudioStreamType,
-};
+use super::hal::{AndroidAudioHal, AudioConfig, AudioError, AudioStreamType};
 
 /// SPA Node States (PipeWire spa/node/node.h)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,19 +82,11 @@ impl SpaDroidNode {
             let stream_id = if self.direction == SpaDirection::Capture {
                 let devs = hal.active_input_devices;
                 let n = hal.num_active_inputs.min(devs.len());
-                hal.open_input_stream(
-                    super::hal::AudioSource::Mic,
-                    self.config,
-                    &devs[..n],
-                )?
+                hal.open_input_stream(super::hal::AudioSource::Mic, self.config, &devs[..n])?
             } else {
                 let devs = hal.active_output_devices;
                 let n = hal.num_active_outputs.min(devs.len());
-                hal.open_output_stream(
-                    stream_type,
-                    self.config,
-                    &devs[..n],
-                )?
+                hal.open_output_stream(stream_type, self.config, &devs[..n])?
             };
             self.hal_stream_id = Some(stream_id);
         }

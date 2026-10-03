@@ -151,7 +151,11 @@ impl AndroidSensorsHal {
     }
 
     /// Set sampling period in microseconds
-    pub fn set_sampling_period(&mut self, sensor_type: SensorType, period_us: i32) -> Result<(), &'static str> {
+    pub fn set_sampling_period(
+        &mut self,
+        sensor_type: SensorType,
+        period_us: i32,
+    ) -> Result<(), &'static str> {
         let sensor = self
             .sensors
             .iter_mut()
@@ -173,7 +177,12 @@ impl AndroidSensorsHal {
     }
 
     /// Produce an accelerometer reading
-    pub fn produce_accelerometer_event(&mut self, x: f32, y: f32, z: f32) -> Result<SensorEvent, &'static str> {
+    pub fn produce_accelerometer_event(
+        &mut self,
+        x: f32,
+        y: f32,
+        z: f32,
+    ) -> Result<SensorEvent, &'static str> {
         self.gate(SensorType::Accelerometer)?;
         self.accel_ts += 20_000_000; // 20 ms
         Ok(SensorEvent {
@@ -195,7 +204,12 @@ impl AndroidSensorsHal {
     }
 
     /// Produce a gyroscope angular velocity reading
-    pub fn produce_gyroscope_event(&mut self, x: f32, y: f32, z: f32) -> Result<SensorEvent, &'static str> {
+    pub fn produce_gyroscope_event(
+        &mut self,
+        x: f32,
+        y: f32,
+        z: f32,
+    ) -> Result<SensorEvent, &'static str> {
         self.gate(SensorType::Gyroscope)?;
         self.gyro_ts += 20_000_000; // 20 ms (50 Hz)
         Ok(SensorEvent {
@@ -206,7 +220,10 @@ impl AndroidSensorsHal {
     }
 
     /// Produce a proximity distance reading
-    pub fn produce_proximity_event(&mut self, distance_cm: f32) -> Result<SensorEvent, &'static str> {
+    pub fn produce_proximity_event(
+        &mut self,
+        distance_cm: f32,
+    ) -> Result<SensorEvent, &'static str> {
         self.gate(SensorType::Proximity)?;
         self.prox_ts += 100_000_000; // 100 ms (10 Hz)
         Ok(SensorEvent {

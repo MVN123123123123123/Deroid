@@ -34,11 +34,11 @@ pub struct SatelliteInfo {
 /// Geographic Position Fix
 #[derive(Debug, Clone, PartialEq)]
 pub struct GnssLocation {
-    pub latitude: f64,          // degrees (-90.0 .. +90.0)
-    pub longitude: f64,         // degrees (-180.0 .. +180.0)
-    pub altitude_m: f64,        // meters above WGS84 ellipsoid
-    pub speed_mps: f32,         // meters per second
-    pub bearing_deg: f32,       // degrees (0.0 .. 360.0)
+    pub latitude: f64,    // degrees (-90.0 .. +90.0)
+    pub longitude: f64,   // degrees (-180.0 .. +180.0)
+    pub altitude_m: f64,  // meters above WGS84 ellipsoid
+    pub speed_mps: f32,   // meters per second
+    pub bearing_deg: f32, // degrees (0.0 .. 360.0)
     pub horizontal_accuracy_m: f32,
     pub vertical_accuracy_m: f32,
     pub timestamp_ms: u64,
@@ -219,7 +219,11 @@ impl GnssService {
             .map(|s| s.svid)
             .take(12)
             .collect();
-        let fix = if self.has_fix && used.len() >= 3 { 3 } else { 1 };
+        let fix = if self.has_fix && used.len() >= 3 {
+            3
+        } else {
+            1
+        };
         let mut body = format!("GPGSA,A,{}", fix);
         for i in 0..12 {
             if i < used.len() {
@@ -251,10 +255,7 @@ impl GnssService {
             for sat in chunk {
                 body.push_str(&format!(
                     ",{:02},{:02},{:03},{:02}",
-                    sat.svid,
-                    sat.elevation_deg as u32,
-                    sat.azimuth_deg as u32,
-                    sat.snr_dbhz as u32
+                    sat.svid, sat.elevation_deg as u32, sat.azimuth_deg as u32, sat.snr_dbhz as u32
                 ));
             }
             let csum = calculate_nmea_checksum(&body);

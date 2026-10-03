@@ -6,12 +6,10 @@
 pub mod idc;
 pub mod stylus;
 
-pub use idc::{
-    InputDeviceConfig, TouchDeviceType, TouchPressureCalibration, TouchSizeCalibration,
-};
+pub use idc::{InputDeviceConfig, TouchDeviceType, TouchPressureCalibration, TouchSizeCalibration};
 pub use stylus::{
-    StylusHandler, TabletEvent, TabletToolType, ABS_DISTANCE, ABS_PRESSURE, ABS_TILT_X,
-    ABS_TILT_Y, BTN_STYLUS, BTN_STYLUS2, BTN_TOOL_PEN, BTN_TOOL_RUBBER,
+    StylusHandler, TabletEvent, TabletToolType, ABS_DISTANCE, ABS_PRESSURE, ABS_TILT_X, ABS_TILT_Y,
+    BTN_STYLUS, BTN_STYLUS2, BTN_TOOL_PEN, BTN_TOOL_RUBBER,
 };
 
 /// Full Phase 5 Input Subsystem Bring-Up Status

@@ -38,8 +38,8 @@ pub use protocols::{
     WlMessage, WlrLayer,
 };
 pub use recents::{
-    dismiss_recents_scale, DismissOutcome, FolderOpen, KillAction, KillQueue, KillState,
-    PopupItem, PopupItems, Recents, TaskCard, MAX_DEEP_SHORTCUTS, MAX_TASKS, NO_THUMB,
+    dismiss_recents_scale, DismissOutcome, FolderOpen, KillAction, KillQueue, KillState, PopupItem,
+    PopupItems, Recents, TaskCard, MAX_DEEP_SHORTCUTS, MAX_TASKS, NO_THUMB,
 };
 pub use scene::{plane_z_order, MobileScene, ShellMode};
 pub use server::{CompositorMetrics, WaylandServer};

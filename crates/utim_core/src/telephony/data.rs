@@ -3,9 +3,7 @@
 //! and network interface configuration (rmnet_data0 / ccmni0).
 //! Conforms strictly to GEMINI.md systems discipline.
 
-use super::ril_client::{
-    RilClient, RIL_REQUEST_DEACTIVATE_DATA_CALL, RIL_REQUEST_SETUP_DATA_CALL,
-};
+use super::ril_client::{RilClient, RIL_REQUEST_DEACTIVATE_DATA_CALL, RIL_REQUEST_SETUP_DATA_CALL};
 
 /// APN Authentication Protocol
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,13 +130,7 @@ impl MobileDataManager {
     }
 
     /// Complete data call setup after RIL response
-    pub fn on_data_call_connected(
-        &mut self,
-        ip: &str,
-        gateway: &str,
-        dns: &[&str],
-        mtu: u32,
-    ) {
+    pub fn on_data_call_connected(&mut self, ip: &str, gateway: &str, dns: &[&str], mtu: u32) {
         if let Some(ref mut session) = self.active_session {
             session.state = DataCallState::Connected;
             session.ipv4_addr = ip.to_string();

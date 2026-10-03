@@ -393,28 +393,19 @@ fn build_rows(s: &LauncherState) -> Vec<SettingRow> {
         row(
             "auto-rotate",
             "Auto-rotate",
-            // Not a `Toggle`. `LauncherState::auto_rotate` is persisted and read
-            // by nothing: honouring it means a D-Bus subscription to
-            // `net.hadess.SensorProxy` plus an output-mode change on the KMS
-            // device, which is a feature rather than a wiring pass.
-            //
-            // Presenting it as a switch is the failure this module's own
-            // `every_row_is_reachable_and_no_row_is_a_dead_tap` test exists to
-            // catch: a control a user can move with no result, and no way to tell
-            // that apart from a broken one. Demoted to `Text` so the row admits
-            // it is not editable, which is at least the same information the user
-            // would get from a toggle that does nothing -- except honest.
-            if s.auto_rotate {
-                "On (not applied)"
-            } else {
-                // Qualified like the true branch. A bare "Off" is byte-for-byte
-                // what a `Toggle` renders, so the row would be indistinguishable
-                // from a switch -- which is the exact failure
-                // `every_row_is_reachable_and_no_row_is_a_dead_tap` exists to
-                // catch, and it rejects it below.
-                "Off (not applied)"
-            },
-            SettingKind::Text,
+            // A real switch now. All three halves exist: the sensor
+            // subscription (`SensorProxyConnection::connect` +
+            // `claim_accelerometer`, polled at ~2 Hz into
+            // `RotationPolicy::update`), the policy itself (`rotation.rs`,
+            // fed by `set_auto_rotate(state.auto_rotate)` and re-synced
+            // after every settings tap), and the actuation (the shell
+            // forwards `Rotate` through `decide_modeset` to
+            // `DrmKmsDevice::set_orientation`, which re-modesets with
+            // swapped w/h for 90/270). The reference's `allowRotation`
+            // (`RotationHelper.java:51`, default false in
+            // `PreferenceManager.kt:75`).
+            on_off(s.auto_rotate),
+            SettingKind::Toggle,
             None,
         ),
         row(
@@ -469,16 +460,11 @@ pub fn apply(s: &mut LauncherState, key: &str, delta: i32) -> bool {
         "show-search-bar" => flip(&mut s.show_search_bar),
         "home-locked" => flip(&mut s.home_locked),
         "haptics" => flip(&mut s.haptics),
-        // No `auto-rotate` arm. The row was demoted to `Text` because
-        // `LauncherState::auto_rotate` is read by nothing, and a `Text` row that
-        // still had a mutating arm is the exact contradiction this module exists
-        // to prevent: the row says "not editable" while the key silently changes
-        // persisted state. Either the row is a control or the key is inert, and
-        // here the key is inert.
-        //
-        // Removing the arm also means `apply` returns `false` for it, so the
-        // shell skips the `touch()`/`save()` and does not mark the state dirty for
-        // a change that never happened.
+        // Actuated: the shell feeds this to `RotationPolicy::set_auto_rotate`
+        // on boot and re-syncs it after every settings tap, polls the sensor
+        // into `update`, and forwards `Rotate` through `decide_modeset` to
+        // `DrmKmsDevice::set_orientation`.
+        "auto-rotate" => flip(&mut s.auto_rotate),
         "accent-source" => {
             let next = match s.accent_source {
                 AccentSource::Wallpaper => AccentSource::Custom,
@@ -744,15 +730,10 @@ mod tests {
     /// that read it reject `"On"`/`"Off"` on a `Text` row before consulting it,
     /// because a `Text` row showing one of those is drawing a switch that cannot
     /// be moved.
-    const TEXT_VALUES: [&str; 3] = [
+    const TEXT_VALUES: [&str; 1] = [
         // `default-page`: cycleable, but the shell has no "go to a different
         // page on launch" path for the value to reach.
         "Page 1",
-        // `auto-rotate`: persisted and read by nothing, so the row says so
-        // rather than offering a switch that changes nothing. *Both* branches
-        // have to be qualified, or the false branch draws a bare "Off".
-        "On (not applied)",
-        "Off (not applied)",
     ];
 
     /// A tap must activate the row it landed on, and the gaps must hit nothing.
@@ -1088,10 +1069,7 @@ mod tests {
         }
 
         // And the list is not vacuous: every entry is something a row actually
-        // shows, so it cannot quietly become a place to hide a new value. Both
-        // auto-rotate branches have to be reachable, which is what pins the
-        // qualifier on the *false* one -- the bare "Off" this test exists to
-        // reject.
+        // shows, so it cannot quietly become a place to hide a new value.
         let mut on = LauncherState::default();
         on.auto_rotate = true;
         let shown: Vec<&str> = build(&s)
@@ -1198,6 +1176,30 @@ mod tests {
         let mut s = LauncherState::default();
         assert!(!apply(&mut s, "no-such-setting", 1));
         assert!(!apply(&mut s, "", 1));
+    }
+
+    /// `auto-rotate` is a live switch: the row is a `Toggle` and the key flips
+    /// persisted state, because the full path exists (sensor subscription +
+    /// policy + `decide_modeset` + KMS `set_orientation`, re-synced by the
+    /// shell after every tap). This is the inverse pin of the inert version:
+    /// demoting the row to `Text` while keeping the arm, or removing the arm
+    /// while keeping the `Toggle`, fails here -- the two must change together.
+    #[test]
+    fn auto_rotate_is_a_live_switch_now_that_the_modeset_path_exists() {
+        let mut s = LauncherState::default();
+        let before = s.auto_rotate;
+        assert!(apply(&mut s, "auto-rotate", 1));
+        assert_ne!(s.auto_rotate, before);
+        assert!(apply(&mut s, "auto-rotate", 1));
+        assert_eq!(s.auto_rotate, before, "a second tap restores the value");
+        // And the row really is the `Toggle` it claims to be, on both branches.
+        for v in [false, true] {
+            s.auto_rotate = v;
+            let rows = build(&s);
+            let r = find_row(&rows, "auto-rotate");
+            assert_eq!(r.kind, SettingKind::Toggle);
+            assert_eq!(r.value, if v { "On" } else { "Off" });
+        }
     }
 
     /// The accent colour follows its source.

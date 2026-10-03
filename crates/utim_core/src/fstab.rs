@@ -33,9 +33,8 @@ impl FstabEntry {
                 "remount" => flags |= libc::MS_REMOUNT,
                 "bind" => flags |= libc::MS_BIND,
                 "rbind" => flags |= libc::MS_BIND | libc::MS_REC,
-                "rw" | "suid" | "dev" | "exec" | "atime" | "diratime" | "async"
-                | "defaults" | "auto" | "noauto" | "user" | "users"
-                | "nostrictatime" => {}
+                "rw" | "suid" | "dev" | "exec" | "atime" | "diratime" | "async" | "defaults"
+                | "auto" | "noauto" | "user" | "users" | "nostrictatime" => {}
                 _ => {}
             }
         }

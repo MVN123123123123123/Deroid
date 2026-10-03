@@ -27,14 +27,8 @@ impl AudioHalVersion {
         // H21: resolve from the version fields so HIDL_2_0 does not report
         // itself as @7.0. AIDL instance names carry no version by design.
         match *self {
-            Self::Hidl {
-                major: 2,
-                minor: 0,
-            } => "android.hardware.audio@2.0::IDevicesFactory",
-            Self::Hidl {
-                major: 7,
-                minor: 1,
-            } => "android.hardware.audio@7.1::IDevicesFactory",
+            Self::Hidl { major: 2, minor: 0 } => "android.hardware.audio@2.0::IDevicesFactory",
+            Self::Hidl { major: 7, minor: 1 } => "android.hardware.audio@7.1::IDevicesFactory",
             Self::Hidl { .. } => "android.hardware.audio@7.0::IDevicesFactory",
             Self::Aidl { .. } => "android.hardware.audio.core.IModule/default",
         }

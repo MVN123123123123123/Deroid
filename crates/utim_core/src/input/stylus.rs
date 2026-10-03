@@ -6,15 +6,15 @@
 use crate::compositor::input::LinuxInputEvent;
 
 // --- Linux Stylus / Digitizer Evdev Constants ---
-pub const BTN_TOOL_PEN: u16 = 0x140;    // 320
+pub const BTN_TOOL_PEN: u16 = 0x140; // 320
 pub const BTN_TOOL_RUBBER: u16 = 0x141; // 321
-pub const BTN_STYLUS: u16 = 0x14b;     // 331 (Primary barrel button)
-pub const BTN_STYLUS2: u16 = 0x14c;    // 332 (Secondary barrel button)
+pub const BTN_STYLUS: u16 = 0x14b; // 331 (Primary barrel button)
+pub const BTN_STYLUS2: u16 = 0x14c; // 332 (Secondary barrel button)
 
-pub const ABS_PRESSURE: u16 = 0x18;    // 24
-pub const ABS_DISTANCE: u16 = 0x19;    // 25
-pub const ABS_TILT_X: u16 = 0x1a;      // 26
-pub const ABS_TILT_Y: u16 = 0x1b;      // 27
+pub const ABS_PRESSURE: u16 = 0x18; // 24
+pub const ABS_DISTANCE: u16 = 0x19; // 25
+pub const ABS_TILT_X: u16 = 0x1a; // 26
+pub const ABS_TILT_Y: u16 = 0x1b; // 27
 
 /// Wayland Tablet Tool Types (zwp_tablet_tool_v2.type)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,14 +115,16 @@ impl StylusHandler {
         match ev.type_ {
             crate::compositor::input::EV_ABS => match ev.code {
                 crate::compositor::input::ABS_X => {
-                    self.cursor_x = (ev.value as f32 / self.digitizer_max_x.max(1.0)) * self.screen_width;
+                    self.cursor_x =
+                        (ev.value as f32 / self.digitizer_max_x.max(1.0)) * self.screen_width;
                     Some(TabletEvent::Motion {
                         x: self.cursor_x,
                         y: self.cursor_y,
                     })
                 }
                 crate::compositor::input::ABS_Y => {
-                    self.cursor_y = (ev.value as f32 / self.digitizer_max_y.max(1.0)) * self.screen_height;
+                    self.cursor_y =
+                        (ev.value as f32 / self.digitizer_max_y.max(1.0)) * self.screen_height;
                     Some(TabletEvent::Motion {
                         x: self.cursor_x,
                         y: self.cursor_y,

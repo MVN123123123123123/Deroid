@@ -377,4 +377,3 @@ fn test_wayland_read_string_overflow_and_bounds() {
     assert_eq!(s, "hello");
     assert_eq!(next, 4 + 8);
 }
-

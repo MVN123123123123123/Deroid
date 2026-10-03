@@ -16,8 +16,7 @@ use utim_core::telephony::{
     encode_sms_deliver_pdu, encode_sms_submit_pdu, pack_7bit, parse_sms_deliver_pdu, unpack_7bit,
     CallState, DataCallState, ModemManagerBridge, RilClient, RilPacket, SmsEncoding, SmsMessage,
     SmsReassembler, TelephonyBringupStatus, TelephonyWakeManager, VoiceCallManager, WakeReason,
-    RIL_E_SUCCESS,
-    RIL_REQUEST_SETUP_DATA_CALL, RIL_UNSOL_RESPONSE_CALL_STATE_CHANGED,
+    RIL_E_SUCCESS, RIL_REQUEST_SETUP_DATA_CALL, RIL_UNSOL_RESPONSE_CALL_STATE_CHANGED,
     TELEPHONY_CGROUP_PATH, TELEPHONY_OOM_SCORE_ADJ, TELEPHONY_WAKE_LOCK,
 };
 
@@ -33,11 +32,13 @@ fn test_milestone_4_2_ril_packet_serialization_and_unsol() {
     assert!(wire_bytes.len() >= 12);
 
     // Verify big-endian length prefix
-    let total_len = u32::from_be_bytes([wire_bytes[0], wire_bytes[1], wire_bytes[2], wire_bytes[3]]);
+    let total_len =
+        u32::from_be_bytes([wire_bytes[0], wire_bytes[1], wire_bytes[2], wire_bytes[3]]);
     assert_eq!(total_len as usize, wire_bytes.len() - 4);
 
     // 2. Standard AOSP RILD Unsolicited Packet (RESPONSE_UNSOLICITED = 1)
-    let unsol_wire = RilPacket::serialize_unsolicited(RIL_UNSOL_RESPONSE_CALL_STATE_CHANGED, &[0x42]);
+    let unsol_wire =
+        RilPacket::serialize_unsolicited(RIL_UNSOL_RESPONSE_CALL_STATE_CHANGED, &[0x42]);
     let (parsed_unsol, read_len) = RilPacket::parse(&unsol_wire).unwrap().unwrap();
     assert_eq!(read_len, unsol_wire.len());
     match parsed_unsol {
@@ -53,7 +54,11 @@ fn test_milestone_4_2_ril_packet_serialization_and_unsol() {
     let (parsed_resp, resp_len) = RilPacket::parse(&resp_wire).unwrap().unwrap();
     assert_eq!(resp_len, resp_wire.len());
     match parsed_resp {
-        RilPacket::Response { serial: s, error_code, payload } => {
+        RilPacket::Response {
+            serial: s,
+            error_code,
+            payload,
+        } => {
             assert_eq!(s, serial);
             assert_eq!(error_code, RIL_E_SUCCESS);
             assert_eq!(payload, b"OK\0");
@@ -107,15 +112,33 @@ fn test_milestone_4_2_voice_call_lifecycle_and_volte() {
     let hangup_pkt1 = voice.hangup(call_id, &mut ril).unwrap();
     assert!(!hangup_pkt1.is_empty());
     // Hangup payload is call index (4 bytes LE) at body offset 8
-    let _body_len = u32::from_be_bytes([hangup_pkt1[0], hangup_pkt1[1], hangup_pkt1[2], hangup_pkt1[3]]) as usize;
-    let index1 = u32::from_le_bytes([hangup_pkt1[12], hangup_pkt1[13], hangup_pkt1[14], hangup_pkt1[15]]);
+    let _body_len = u32::from_be_bytes([
+        hangup_pkt1[0],
+        hangup_pkt1[1],
+        hangup_pkt1[2],
+        hangup_pkt1[3],
+    ]) as usize;
+    let index1 = u32::from_le_bytes([
+        hangup_pkt1[12],
+        hangup_pkt1[13],
+        hangup_pkt1[14],
+        hangup_pkt1[15],
+    ]);
     assert_eq!(index1, 1);
 
     // 6. Now hang up Call 2 -> RIL packet must preserve call index 2, NOT 1!
     let hangup_pkt2 = voice.hangup(call_id2, &mut ril).unwrap();
     assert!(!hangup_pkt2.is_empty());
-    let index2 = u32::from_le_bytes([hangup_pkt2[12], hangup_pkt2[13], hangup_pkt2[14], hangup_pkt2[15]]);
-    assert_eq!(index2, 2, "Call index 2 must be preserved when hanging up remaining call");
+    let index2 = u32::from_le_bytes([
+        hangup_pkt2[12],
+        hangup_pkt2[13],
+        hangup_pkt2[14],
+        hangup_pkt2[15],
+    ]);
+    assert_eq!(
+        index2, 2,
+        "Call index 2 must be preserved when hanging up remaining call"
+    );
     assert!(!voice.has_active_call());
 }
 
@@ -148,7 +171,8 @@ fn test_milestone_4_2_sms_pdu_encoding_and_concatenation() {
     assert_eq!(decoded_alpha, alpha_text);
 
     // 4. SMS-SUBMIT PDU encoding
-    let pdu_submit = encode_sms_submit_pdu("+1234567890", "Test message from UTIM GSI: €100").unwrap();
+    let pdu_submit =
+        encode_sms_submit_pdu("+1234567890", "Test message from UTIM GSI: €100").unwrap();
     assert!(!pdu_submit.is_empty());
 
     // 5. SMS-DELIVER PDU single-part roundtrip
@@ -163,8 +187,10 @@ fn test_milestone_4_2_sms_pdu_encoding_and_concatenation() {
 
     // 6. Multipart SMS with UDH Concatenation Roundtrip & Reassembly
     let mut reassembler = SmsReassembler::new();
-    let pdu_part1 = encode_sms_deliver_pdu(orig_sender, "First segment. ", Some((0x42, 2, 1))).unwrap();
-    let pdu_part2 = encode_sms_deliver_pdu(orig_sender, "Second segment.", Some((0x42, 2, 2))).unwrap();
+    let pdu_part1 =
+        encode_sms_deliver_pdu(orig_sender, "First segment. ", Some((0x42, 2, 1))).unwrap();
+    let pdu_part2 =
+        encode_sms_deliver_pdu(orig_sender, "Second segment.", Some((0x42, 2, 2))).unwrap();
 
     let msg1 = parse_sms_deliver_pdu(&pdu_part1).unwrap();
     let msg2 = parse_sms_deliver_pdu(&pdu_part2).unwrap();
@@ -181,7 +207,10 @@ fn test_milestone_4_2_sms_pdu_encoding_and_concatenation() {
 
     // Retransmission deduplication check: simulate network re-sending part 1
     assert!(reassembler.add_segment(msg1.clone()).is_none());
-    assert!(reassembler.add_segment(msg1.clone()).is_none(), "Duplicate segment must not complete early");
+    assert!(
+        reassembler.add_segment(msg1.clone()).is_none(),
+        "Duplicate segment must not complete early"
+    );
 
     // Add part 2: completes and yields exact combined body
     let full = reassembler.add_segment(msg2).expect("Reassembly failed");
@@ -229,11 +258,15 @@ fn test_milestone_4_2_sms_pdu_encoding_and_concatenation() {
     assert!(reassembler2.add_segment(alice_p1).is_none());
     assert!(reassembler2.add_segment(bob_p1).is_none());
 
-    let alice_full = reassembler2.add_segment(alice_p2).expect("Alice reassembly failed");
+    let alice_full = reassembler2
+        .add_segment(alice_p2)
+        .expect("Alice reassembly failed");
     assert_eq!(alice_full.sender, "+1111111111");
     assert_eq!(alice_full.body, "Alice Part 1; Alice Part 2");
 
-    let bob_full = reassembler2.add_segment(bob_p2).expect("Bob reassembly failed");
+    let bob_full = reassembler2
+        .add_segment(bob_p2)
+        .expect("Bob reassembly failed");
     assert_eq!(bob_full.sender, "+2222222222");
     assert_eq!(bob_full.body, "Bob Part 1; Bob Part 2");
 }
@@ -257,12 +290,8 @@ fn test_milestone_4_2_mobile_data_setup_and_network_interface() {
     );
 
     // 3. Simulated RIL data call response with cellular network configuration
-    slot.data.on_data_call_connected(
-        "10.142.68.21",
-        "10.142.68.1",
-        &["8.8.8.8", "8.8.4.4"],
-        1500,
-    );
+    slot.data
+        .on_data_call_connected("10.142.68.21", "10.142.68.1", &["8.8.8.8", "8.8.4.4"], 1500);
 
     assert!(slot.data.is_data_active());
     let session = slot.data.active_session.as_ref().unwrap();
@@ -316,11 +345,7 @@ fn test_milestone_4_2_wake_from_deep_suspend() {
     std::fs::create_dir_all(&power).unwrap();
     std::fs::write(power.join("wake_lock"), "").unwrap();
     std::fs::write(power.join("wake_unlock"), "").unwrap();
-    let mut mpg = MobilePowerGovernor::with_paths(
-        power,
-        temp.join("cgroup"),
-        temp.join("battery"),
-    );
+    let mut mpg = MobilePowerGovernor::with_paths(power, temp.join("cgroup"), temp.join("battery"));
     let mut wake_mgr = TelephonyWakeManager::new();
 
     assert!(!wake_mgr.wake_lock_active);
@@ -374,7 +399,9 @@ fn test_milestone_4_2_sms_pdu_truncated_and_edge_cases() {
     assert!(parse_sms_deliver_pdu(&[0x00, 0x04, 0x02, 0x91, 0x21, 0x00]).is_err());
 
     // 6. Truncated timestamp (SCTS) / UDL
-    assert!(parse_sms_deliver_pdu(&[0x00, 0x04, 0x02, 0x91, 0x21, 0x00, 0x00, 0x01, 0x02]).is_err());
+    assert!(
+        parse_sms_deliver_pdu(&[0x00, 0x04, 0x02, 0x91, 0x21, 0x00, 0x00, 0x01, 0x02]).is_err()
+    );
 
     // 7. Truncated UDH header
     let truncated_udh_pdu = [
@@ -413,7 +440,10 @@ fn test_milestone_4_2_call_index_allocation_and_collision_prevention() {
     let (c3, _) = voice.dial("+333", &mut ril);
     assert_eq!(voice.calls.len(), 2);
     let call3 = voice.calls.iter().find(|c| c.call_id == c3).unwrap();
-    assert_eq!(call3.index, 1, "Call 3 must take lowest available index (1) avoiding collision with 2");
+    assert_eq!(
+        call3.index, 1,
+        "Call 3 must take lowest available index (1) avoiding collision with 2"
+    );
 
     // Cleanly hang up both remaining calls
     let pkt2 = voice.hangup(c2, &mut ril).unwrap();
@@ -434,7 +464,7 @@ fn test_milestone_4_2_ril_truncated_solicited_response() {
     wire.extend_from_slice(&8u32.to_be_bytes()); // body len = 8
     wire.extend_from_slice(&0u32.to_le_bytes()); // RESPONSE_SOLICITED
     wire.extend_from_slice(&42u32.to_le_bytes()); // serial
-    // body len is 8 (< 12) -> must return error
+                                                  // body len is 8 (< 12) -> must return error
     let res = RilPacket::parse(&wire);
     assert!(res.is_err());
 }

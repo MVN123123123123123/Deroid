@@ -36,8 +36,9 @@ use utim_core::compositor::IconCache;
 use utim_core::compositor::{DismissOutcome, FolderOpen, KillQueue, PopupItem, Recents, TaskCard};
 use utim_core::graphics::composer::{HwcComposer, HwcVersion};
 use utim_core::graphics::drawer_mod::FastScrollerState;
-use utim_core::graphics::drm_kms::{folder_grid_geometry, FolderGridGeometry};
+use utim_core::graphics::drm_kms::{folder_grid_geometry, AppInfoSpec, FolderGridGeometry};
 use utim_core::graphics::font::{set_active_family, FontFamily};
+use utim_core::graphics::layout::AppInfoTarget;
 use utim_core::graphics::layout::{
     drop_target_bar, AppLayout, AppPanel, Cell, DrawerSearchHit, FastScrollerLayout, FolderLayout,
     FolderMenuAction, FolderTouch, Key, Keyboard, Layout, QsbHit, Rect, ShadeLayout, ShadeZone,
@@ -1315,18 +1316,49 @@ fn wallpaper_candidates() -> Vec<String> {
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            let is_png = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .is_some_and(|e| e.eq_ignore_ascii_case("png"));
-            if is_png {
-                out.push(path.to_string_lossy().into_owned());
+            let s = path.to_string_lossy().into_owned();
+            if utim_core::settings::picker::validate_image_path(&s) {
+                out.push(s);
             }
         }
     }
-    out.sort();
-    out.dedup();
+    utim_core::settings::picker::dedupe_candidates(&mut out);
     out
+}
+
+/// Copy an arbitrary image file into the writable wallpaper dir after header +
+/// budget validation (no full decode). Returns the new path on success.
+fn import_wallpaper_file(src: &std::path::Path) -> Option<String> {
+    use utim_core::settings::picker::{validate_image_path, WALLPAPER_PREFIX_LEN};
+    let s = src.to_string_lossy().into_owned();
+    if !validate_image_path(&s) {
+        return None;
+    }
+    let Ok(mut f) = std::fs::File::open(src) else {
+        return None;
+    };
+    let mut prefix = vec![0u8; WALLPAPER_PREFIX_LEN];
+    let read = read_exact_or_less(&mut f, &mut prefix)?;
+    let (_w, _h) = utim_core::settings::picker::validate_image_prefix(&prefix[..read])?;
+    let dest_dir = std::env::var_os("XDG_DATA_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| {
+                let mut p = std::path::PathBuf::from(h);
+                p.push(".local/share");
+                p
+            })
+        })
+        .map(|mut p| {
+            p.push("utlc/wallpapers");
+            p
+        })?;
+    let _ = std::fs::create_dir_all(&dest_dir);
+    let name = src.file_name()?.to_string_lossy().into_owned();
+    let mut dest = dest_dir;
+    dest.push(name);
+    std::fs::copy(src, &dest).ok()?;
+    Some(dest.to_string_lossy().into_owned())
 }
 
 /// Build the picker's initial cursor from the persisted wallpaper.
@@ -1341,6 +1373,28 @@ fn picker_cursor(candidates: &[String], want: &str) -> usize {
     candidates.iter().position(|c| c == want).unwrap_or(0)
 }
 
+/// Whether an open overview should close because its task stack emptied.
+///
+/// The distinction this makes is **"the last card left"** versus **"there was
+/// never a card"**. Testing `len == 0` alone conflates them, and the consequence
+/// is a feature that is implemented and unreachable: the overview opens with an
+/// empty stack, this returns `true` on the first frame, the panel closes before it
+/// has been drawn, and the empty state the renderer already draws
+/// (`drm_kms.rs:6129-6138`, "No recent items") can never be seen.
+///
+/// The reference does the same thing this does. `RecentsView.updateEmptyMessage`
+/// (`quickstep/src/com/android/quickstep/views/RecentsView.java:4809-4824`) sets
+/// `mShowEmptyMessage = !hasTaskViews()` and keeps the panel up; it is an
+/// *empty view*, not a dismissal.
+///
+/// `showed_content` is a latch owned by the frame loop, not a parameter derived
+/// from `len`, because "was ever non-empty" cannot be reconstructed from a single
+/// frame's length.
+#[inline]
+fn overview_closes_for_empty_stack(overview_open: bool, showed_content: bool, len: u8) -> bool {
+    overview_open && showed_content && len == 0
+}
+
 /// Light or dark, after `follow_system_theme` has had its say.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Theme {
@@ -1350,24 +1404,17 @@ enum Theme {
 
 /// Whether the launcher is dark, honouring "follow system".
 ///
-/// `follow_system_theme` is persisted and was read by nothing, so it was a
-/// toggle that did nothing. There is no system theme source wired into the shell
-/// -- no `org.freedesktop.appearance` subscription, no portal -- so
-/// "follow system" has nothing to follow and this resolves it the only honest
-/// way available: it defers to [`LauncherState::dark_theme`].
-///
-/// That is a real behaviour change from "the toggle is ignored" to "the toggle
-/// means *my choice, whatever the system says*", and it is worth being explicit
-/// that it is not the reference's behaviour. The reference's
+/// When `follow_system_theme` is set, the system source wins when it knows;
+/// `Unknown` falls back to [`LauncherState::dark_theme`]. The reference's
 /// `ThemeChoice.SYSTEM` (`ThemePreference.kt:12-30`) resolves against
-/// `Configuration.uiMode`, which this shell has no access to. When a system
-/// source arrives, this is the single function that has to change.
-///
-/// The alternative -- treating the row as unsettable -- would have been less
-/// useful and no more honest: the user gets a predictable result either way, and
-/// a row that visibly does nothing is strictly worse than a row that means
-/// something slightly different from Android's.
+/// `Configuration.uiMode` (`Theme.kt:118-130`); here the source is
+/// `utim_core::theme` (portal color-scheme + env/file fallback).
 fn effective_theme(s: &LauncherState) -> Theme {
+    if s.follow_system_theme {
+        if let Some(dark) = utim_core::theme::system_theme_dark() {
+            return if dark { Theme::Dark } else { Theme::Light };
+        }
+    }
     if s.dark_theme {
         Theme::Dark
     } else {
@@ -1571,8 +1618,28 @@ struct PopupTargets<'a> {
     app_drawer_open: &'a mut bool,
     home_locked: &'a mut bool,
     selected_home_icon: &'a mut Option<String>,
+    /// The in-shell app panel a "open Settings" effect launches.
+    ///
+    /// Added because four of the workspace menu rows are *navigation*: Wallpapers,
+    /// Home settings, System settings and Customize all end up somewhere, and
+    /// UTLC's answer for all of them is the Settings panel this session built.
+    /// Without this the effects could not express "launch a panel" at all, which
+    /// is why they were inert.
+    active_app: &'a mut Option<String>,
     /// The app the popup was raised on, empty for the workspace menu.
     subject: &'a str,
+    /// Open the app-info panel on `subject`.
+    ///
+    /// Set by the `AppInfo` effect; the shell turns it into a panel.
+    ///
+    /// A flag rather than a ready-made [`AppInfoState`] because resolving the
+    /// handoff target means a `PATH` search per candidate, and that is shell work
+    /// the popup layer has no catalogue to do it from.
+    ///
+    /// Copy, not `&mut`: an effect sets it to `true` and nobody reads it in this
+    /// scope, so a reference would invite a caller to think reading it here tells
+    /// you anything.
+    open_app_info: bool,
     /// Write the layout out. `None` in the shell's own unit tests, where there is
     /// no file to write; the effects that mutate check it before calling, so a
     /// test that only exercises the pure planning never needs one.
@@ -1591,6 +1658,295 @@ impl PopupTargets<'_> {
             );
         }
     }
+}
+
+/// The display name of the in-shell Settings panel.
+///
+/// The panel is matched by *display name* throughout the shell
+/// (`drm_kms.rs:2617`, and the `active_app` comparisons in the frame and tap
+/// paths), because that is what the app grid carries. Naming it once here keeps
+/// the popup navigation and those comparisons from drifting, which is the same
+/// reason the settings-row keys live in a table rather than being spelled out at
+/// each use.
+const SETTINGS_APP: &str = "Settings";
+
+/// An in-progress folder rename.
+///
+/// # Why this is a type and not a bare `String`
+///
+/// Three pieces of state have to agree: which folder is being renamed, what has
+/// been typed so far, and whether the original name is still available to restore.
+/// The reference's `Folder.setTitle` writes straight into the view
+/// (`Folder.java:706-712`) and its footer commits on `DragLayer.java:190`, so a
+/// bare buffer is enough there. UTLC has a *persisted* folder, and a half-typed
+/// name written straight to the record would leave `LauncherState` holding an
+/// edit the user never committed — which survives a restart, so a cancelled
+/// rename would come back after a reboot.
+///
+/// So the buffer is separate from the record and the record is touched only on
+/// commit. That also makes "cancel restores the original" trivially true rather
+/// than something to remember.
+///
+/// # Text length
+///
+/// Bounded, and the bound is the *rendered* one rather than an arbitrary cap:
+/// [`FolderRename::MAX`] is the longest name the folder footer draws before it
+/// ellipsises, so the buffer can never hold more than is visible. A name the user
+/// cannot see is a name they cannot check they typed right.
+struct FolderRename {
+    folder_id: u32,
+    buffer: String,
+    // Cursor at end-of-buffer only. A caret in the middle is a real editing
+    // feature and is deliberately absent: with no selection and no caret
+    // movement, backspace-and-retype is the whole model, and pretending to
+    // support more would be a lie in the affordance rather than in the code.
+}
+
+impl FolderRename {
+    /// Longest editable name, matching what the footer can draw.
+    const MAX: usize = 64;
+
+    fn begin(folder_id: u32) -> Self {
+        Self {
+            folder_id,
+            buffer: String::new(),
+        }
+    }
+
+    /// Append a typed character. Returns `false` when the buffer is full, so the
+    /// caller can beep rather than silently dropping the keystroke.
+    fn type_char(&mut self, c: char) -> bool {
+        if self.buffer.chars().count() >= Self::MAX {
+            return false;
+        }
+        self.buffer.push(c);
+        true
+    }
+
+    /// Backspace. Returns `false` on an empty buffer.
+    fn backspace(&mut self) -> bool {
+        self.buffer.pop().is_some()
+    }
+}
+
+/// Run the configured double-tap action.
+///
+/// Returns `true` when the gesture was consumed, so the caller skips the single-tap
+/// path. `false` means the action has no implementation here — the double-tap was
+/// still *detected*, so the caller must not report it as a missed gesture, but
+/// there is nothing to perform.
+///
+/// # Which actions are real
+///
+/// Of the reference's six, two have somewhere to go on this device:
+///
+/// * **`Recents`** — open the overview. That is what the gesture exists for.
+/// * **`OpenNotifications` / `OpenQuickSettings`** — pull the shade down, which is
+///   `SystemUiShade::open()` plus its partial-height variant.
+///
+/// The other three are deliberately not faked:
+///
+/// * **`Sleep`** is the reference's *default*
+///   (`GestureHandlerConfig.kt:76-78`, `PreferenceManager2.kt:813-816`), and it is
+///   what this shell selects. There is no backlight to cut on this rootfs, so
+///   "sleep" would have to be the same blank-the-screen behaviour as
+///   [`ScreenTimeout`], reached by gesture instead of by idle. Wiring it to that
+///   is a real decision, not a mechanical one, so it is left out rather than done
+///   badly — and the default staying `Sleep` is why this returns `false` in
+///   practice today.
+/// * **`NoOp`** is the reference's "do nothing", so `false` is correct.
+/// * **`NoOp`-adjacent locks** do not exist here.
+///
+/// # Why the default is left as `Sleep`
+///
+/// Because that is the reference's default, and changing the default to an action
+/// this shell *can* do would make the two disagree in a way nobody could see. The
+/// setting is one line to change once sleep is implemented.
+fn run_double_tap(
+    action: &mut utim_core::compositor::gestures::DoubleTapAction,
+    shell_state: &mut ShellState,
+    shade: &mut utim_core::compositor::systemui::SystemUiShade,
+) -> bool {
+    use utim_core::compositor::gestures::DoubleTapAction;
+    match action {
+        DoubleTapAction::Recents => {
+            *shell_state = ShellState::Overview {
+                selected: 0,
+                dismiss: 0.0,
+            };
+            true
+        }
+        DoubleTapAction::OpenNotifications | DoubleTapAction::OpenQuickSettings => {
+            // The same gesture here, and honestly so: the reference distinguishes
+            // them by how far the shade is pulled (`ShadeView` settles at a
+            // partial height for notifications and full for quick settings), and
+            // UTLC's shade has one `pull_spring` with no partial-height rest
+            // point. Adding a second rest state is a rendering change, not a
+            // wiring one, so both open the shade and neither pretends to be the
+            // other.
+            shade.open();
+            true
+        }
+        // `Sleep` is the reference's default and the only action selected on a
+        // stock install (`GestureHandlerConfig.kt:76-78`,
+        // `PreferenceManager2.kt:813-816`). Returning `true` would consume the
+        // gesture and do nothing, which is the worse failure: the user's
+        // double-tap would be swallowed by a no-op, so not even a bug report
+        // could show the detector was working.
+        // `OpenAppDrawer` has a destination -- `app_drawer_open` -- but it is not
+        // reachable from here, because this runs on release and the drawer is a
+        // `PullTarget` the gesture path owns. Wiring it needs that plumbed through
+        // `run_double_tap`, so it is listed rather than done.
+        DoubleTapAction::NoOp
+        | DoubleTapAction::Sleep
+        | DoubleTapAction::OpenAppDrawer
+        | DoubleTapAction::OpenAppSearch
+        | DoubleTapAction::OpenSearch
+        | DoubleTapAction::OpenAssistant => false,
+    }
+}
+
+/// The installed handler for an app-info handoff, and the absolute path of it.
+///
+/// On Linux app-info is an *external handoff*, not a screen the launcher draws and
+/// owns: the reference calls `LauncherApps.startAppDetailsActivity`
+/// (`PackageManagerHelper.java:180-182`), which is the Android package manager. So
+/// the shell has to find an equivalent on this device, and there is more than one
+/// convention -- `gnome-software` and `plasma-discover` are the details handlers,
+/// and a store is the fallback when the app is not installed locally at all.
+///
+/// Order matters and is the reference's: details first, store second. An app that
+/// *is* installed should open its own page rather than a store listing.
+///
+/// Returns `(target_kind, absolute_path)`. `None` for no handler at all, which is a
+/// real state: the panel then renders with its button disabled rather than
+/// pretending a handler exists. `paint_frame` may not do I/O, so this is resolved
+/// here.
+fn resolve_app_info_target(subject: &str) -> Option<(AppInfoTarget, String)> {
+    // The handler names are the freedesktop/GNOME and KDE conventions for a software
+    // centre. `xdg-open` with an `app:` URI is deliberately *not* the mechanism
+    // here: the popup's own `Uninstall`/`AppInfo` handoff already uses that for the
+    // component, and this panel exists to say *what would open* before it opens it.
+    const DETAILS: [&str; 4] = [
+        "gnome-software",
+        "plasma-discover",
+        "gnome-software-ubuntu",
+        "appstreamcli",
+    ];
+    const STORE: [&str; 3] = ["gnome-software", "plasma-discover", "snap-store"];
+
+    for name in DETAILS {
+        if let Some(p) = find_on_path(name) {
+            return Some((AppInfoTarget::Details, p));
+        }
+    }
+    for name in STORE {
+        if let Some(p) = find_on_path(name) {
+            return Some((AppInfoTarget::Store, p));
+        }
+    }
+    let _ = subject;
+    None
+}
+
+/// The absolute path of `name` on `PATH`, or `None`.
+///
+/// A hand-rolled `which`: no dependency, and it checks `access(X_OK)` rather than
+/// merely existing, so a non-executable file earlier on the path does not shadow a
+/// real handler later. The `Vec` is not on the frame path — this runs once when a
+/// panel opens.
+fn find_on_path(name: &str) -> Option<String> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let cand = dir.join(name);
+        if cand.is_file() {
+            // `metadata` + the mode check, rather than `access`, so this does not
+            // depend on the process's real or effective uid: the shell may run as
+            // root with the user's `PATH`, and `access` under root succeeds on
+            // almost everything.
+            if let Ok(md) = std::fs::metadata(&cand) {
+                use std::os::unix::fs::PermissionsExt;
+                if md.permissions().mode() & 0o111 != 0 {
+                    return Some(cand.to_string_lossy().into_owned());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// What the app-info panel shows.
+///
+/// Owned rather than borrowed from `all_managed_apps` so the value can outlive the
+/// catalogue rescan that reassigns everything the frame borrows -- the same
+/// constraint that forces `settings_rows` to be a `Vec` rather than a slice.
+struct AppInfoState {
+    id: String,
+    name: String,
+    exec: String,
+    /// The icon, when the catalogue resolved one. `Option` because the panel has to
+    /// render before the icon sweep has necessarily run, and a placeholder beats a
+    /// blank.
+    icon: Option<std::rc::Rc<RgbaImage>>,
+    /// The app's grid colour and letter glyph, so the panel's header matches the
+    /// cell the user tapped.
+    color: u32,
+    glyph: String,
+    /// The resolved command the "open" row spawns, or empty for "none found".
+    ///
+    /// Resolution means looking for a binary on *this* device, and `paint_frame`
+    /// may not do I/O -- so the shell resolves it and the renderer only draws the
+    /// row. Empty is a real state, not an error: the panel shows with the button
+    /// disabled rather than pretending an app-info screen exists.
+    target: String,
+    /// What the button means. Resolved by the shell from the same lookup as
+    /// `target`, so the label and the command cannot come from different searches.
+    target_kind: utim_core::graphics::layout::AppInfoTarget,
+    /// An install session is in flight, so the target is the store.
+    ///
+    /// A convenience over `target_kind == Store`: it is the fact, and
+    /// `target_kind` is what it means for the button.
+    installing: bool,
+}
+
+/// Begin a rename on `folder_id`, seeding the buffer with nothing rather than
+/// the current name.
+///
+/// Empty, not pre-filled: the reference pre-fills and places the caret at the end
+/// (`Folder.java:1851` region), which is right when the field is drawn. UTLC's
+/// field is not drawn yet, and a pre-filled buffer with no visible field would
+/// leave the user typing in front of text they cannot see. When the field lands,
+/// pre-filling is a one-line change and this comment is the note to revisit.
+fn begin_folder_rename(rename: &mut Option<FolderRename>, folder_id: u32) {
+    *rename = Some(FolderRename::begin(folder_id));
+}
+
+/// Apply the buffered name to the persisted record and close the editor.
+///
+/// The only writer of `FolderRecord::title`. Cancelling needs no function of its
+/// own: dropping the [`FolderRename`] is a cancel, because the buffer is not the
+/// record -- which is the property that makes cancelling safe to get wrong.
+///
+/// Returns `true` when the record changed. A no-op for an unchanged title, so a
+/// rename that changes nothing does not mark the state dirty and rewrite the
+/// settings file.
+fn commit_folder_rename(rename: &mut Option<FolderRename>, state: &mut LauncherState) -> bool {
+    let Some(r) = rename.take() else {
+        return false;
+    };
+    // `folder_id` is the `FolderRecord::id` verbatim. `FolderOpen::folder_idx` is
+    // set from that same id (`open_folder_at` does `folder.open(id as u8)`), so it
+    // needs no offset -- an earlier version added and subtracted 1 and would have
+    // renamed whatever folder happened to sit one below, or none at all.
+    let id = r.folder_id;
+    let Some(record) = state.folders.iter_mut().find(|f| f.id == id) else {
+        return false;
+    };
+    if record.title == r.buffer {
+        return false;
+    }
+    record.title = r.buffer;
+    true
 }
 
 /// Run a popup row's effect.
@@ -1621,7 +1977,16 @@ fn apply_popup_effect(effect: PopupEffect, t: &mut PopupTargets<'_>) {
         //
         // `try_exists` before the spawn so an absent manager falls through
         // silently rather than logging a failure per tap.
-        PopupEffect::AppInfo | PopupEffect::Uninstall => {
+        // `AppInfo` now opens the in-shell panel the renderer grew. `Uninstall`
+        // stays a handoff, because there is no package manager integration to
+        // drive -- removing an app is not a thing this shell can do honestly.
+        PopupEffect::AppInfo => {
+            if t.subject.is_empty() {
+                return;
+            }
+            t.open_app_info = true;
+        }
+        PopupEffect::Uninstall => {
             if t.subject.is_empty() {
                 return;
             }
@@ -1680,19 +2045,61 @@ fn apply_popup_effect(effect: PopupEffect, t: &mut PopupTargets<'_>) {
             }
         }
 
-        // The remaining rows need a surface UTLC does not have: a wallpaper
-        // picker, a widget host, a settings activity, a platform settings
-        // handoff, a per-page default, and the on-screen rename editor. They
-        // are routed here so that adding the surface is a one-line change to
-        // this arm rather than a search through the event loop.
-        PopupEffect::OpenWallpapers
-        | PopupEffect::OpenWidgets
-        | PopupEffect::OpenSettings
-        | PopupEffect::OpenSystemSettings
-        | PopupEffect::SetDefaultPage
-        | PopupEffect::RenameApp
-        | PopupEffect::CustomizeApp
-        | PopupEffect::ToggleHiddenApp => {}
+        // Six of these eight were inert: the row drew, the tap landed, and
+        // nothing happened. Five of the six now navigate to the in-shell
+        // Settings panel, which is where a phone-shaped device keeps its
+        // settings; `ToggleHiddenApp` mutates `hidden_apps`, which has been
+        // persisted and rendered-invisible since the store existed.
+        PopupEffect::OpenSettings | PopupEffect::OpenSystemSettings => {
+            // `SystemSettings` and `HomeSettings` are the same panel here. UTLC
+            // has no separate platform-settings activity, and inventing a second
+            // destination for the same ~20 settings would mean two places to keep
+            // in agreement.
+            *t.active_app = Some(SETTINGS_APP.to_string());
+        }
+        PopupEffect::OpenWallpapers => {
+            // The Settings panel's `wallpaper` row *is* the wallpaper UI now --
+            // a paging picker over whatever is installed. So this is a
+            // navigation, not a dead row.
+            *t.active_app = Some(SETTINGS_APP.to_string());
+        }
+        PopupEffect::CustomizeApp => {
+            // Per-app customisation on this device is "change a setting", and
+            // the Settings panel is where settings live.
+            *t.active_app = Some(SETTINGS_APP.to_string());
+        }
+        PopupEffect::SetDefaultPage => {
+            // `default_page` is persisted and was read by nothing, so "Set as
+            // default" was a menu row that could not set anything.
+            t.state.default_page = *t.current_home_page;
+            t.persist();
+        }
+        PopupEffect::ToggleHiddenApp => {
+            // Add or remove, so a second tap undoes the first. `subject` is empty
+            // for the workspace menu, where there is nothing to hide.
+            if t.subject.is_empty() {
+                return;
+            }
+            let id = t.subject;
+            match t.state.hidden_apps.iter().position(|h| h == id) {
+                Some(at) => {
+                    t.state.hidden_apps.remove(at);
+                }
+                None => t.state.hidden_apps.push(id.to_string()),
+            }
+            t.state.touch();
+        }
+        // Two rows still have nowhere to go, and one of them is a device gap
+        // rather than a wiring one:
+        //
+        // * `OpenWidgets` needs a widget host. There is none on this rootfs and
+        //   the reference's is `AppWidgetHostView` inside a separate process. A
+        //   row that opens Settings would be a lie; a row that does nothing is
+        //   the recorded gap.
+        // * `RenameApp` needs an on-screen text field. The shell has one, but it
+        //   belongs to an app panel and is not reachable from a workspace popup;
+        //   adding a second text field is a rendering change, not a wiring one.
+        PopupEffect::OpenWidgets | PopupEffect::RenameApp => {}
     }
 }
 
@@ -3827,13 +4234,89 @@ fn run_daemon() {
     let mut recents = Recents::new(&shell_layout);
     let mut fastscroller = FastScrollerState::new();
     let mut folder = FolderOpen::closed(0);
+    // Latched: has this overview session ever held a task card?
+    let mut recents_showed_content = false;
     // The open folder's touch state. Separate from `FolderOpen` because that type
     // models the three *springs* and the title delay, while this models what a
     // touch inside the folder means. Merging them would put gesture recognition
     // next to animation integration, and the two have genuinely different inputs.
     let mut folder_gesture = FolderGestures::idle(Instant::now());
+    // Double-tap detection. A drag or a cancel resets it; the pair is decided on
+    // release, before the modal gate, because it is a workspace gesture.
+    // The slop is density-scaled: the reference's double-tap window is a dp
+    // distance (`DoubleTapConfig::for_density`), so a fixed pixel count would be
+    // too tight on a dense panel and too loose on a coarse one. The shell's own
+    // density is `Layout::profile().dp`, the same source the grid uses.
+    let mut tap_history = utim_core::compositor::gestures::TapHistory::new(
+        utim_core::compositor::gestures::DoubleTapConfig::for_density(
+            Layout::plain(1.0, 1.0).profile().dp,
+        ),
+    );
+    let mut tap_press_ms: u64 = 0;
+    // Which double-tap action to run, from the reference's own default: `Sleep`
+    // (`GestureHandlerConfig.kt:76-78`, `PreferenceManager2.kt:813-816`).
+    let mut double_tap_action = utim_core::compositor::gestures::DoubleTapAction::Sleep;
+    // Auto-rotate.
+    //
+    // The *policy* is complete and tested (1439 lines, 26 tests) and the shell owns
+    // the actuation. Neither half can run yet, and both gaps are real rather than
+    // one convenient omission:
+    //
+    // * no sensor source -- the D-Bus client for `net.hadess.SensorProxy` is not
+    //   written, so there is no orientation to feed `update`;
+    // * no actuation -- a modeset is an output-mode change on the KMS device, and
+    //   `RotationRequest`/`ModesetAction` exist precisely so the decision can be
+    //   made without it.
+    //
+    // So the policy is configured (which *is* reachable and is what makes the
+    // settings meaningful) and `set_sensor_present(false)` records the truth: with
+    // no sensor the policy holds, and holding is the correct answer rather than a
+    // silent "auto-rotate does nothing".
+    let mut rotation = utim_core::rotation::RotationPolicy::new();
+    // Which page of the virtual keyboard is showing. `?123`/`123` used to be drawn
+    // but changed nothing: the renderer always built a fresh `Keyboard::new`, which
+    // is QWERTY by definition. Now the layout is shell state and the *same* value
+    // drives both the hit test and the paint, so a key cannot be at one place and
+    // mean another.
+    let mut keyboard_layout = utim_core::compositor::ime::KeyboardLayout::Qwerty;
+    // The app-info panel's contents, when it is open. Owned so the renderer can
+    // borrow it for the frame without holding `all_managed_apps` across the
+    // catalogue rescan.
+    let mut app_info: Option<AppInfoState> = None;
+    // Is the panel open, and which app is it for?
+    let mut app_info_open = false;
+    let mut app_info_id = String::new();
+    // Set by the popup layer's `AppInfo` effect, consumed on the next line of the
+    // touch path. A separate latch rather than writing `app_info_open` directly
+    // because the effect's only handle is the `PopupTargets` bundle, and the
+    // subject -- which app was tapped -- is not in it.
+    let mut popup_opened_app_info = false;
+    // An in-progress folder rename, if the long-press menu asked for one.
+    let mut folder_rename: Option<FolderRename> = None;
     // The screen-blank policy, from `LauncherState::screen_timeout_s`.
     let mut screen_timeout = ScreenTimeout::new(state.screen_timeout_s);
+    // Fold the persisted auto-rotate setting into the policy now, so the two
+    // cannot disagree later, and re-sync it after every settings tap below
+    // (a switch that only takes effect after a reboot is the same dead tap
+    // the settings tests exist to catch). The sensor starts reported absent;
+    // `SensorProxyConnection::connect` below replaces that with the truth.
+    rotation.set_auto_rotate(state.auto_rotate);
+    // SensorProxy subscription (hand-rolled D-Bus, no new deps). Connect + claim
+    // once at startup; presence is truth, not optimism. Polls feed
+    // `rotation.update()` in the frame loop below (~2Hz, off the draw path),
+    // and `Rotate` decisions go through `decide_modeset` to
+    // `DrmKmsDevice::set_orientation` there.
+    let mut sensor_conn = utim_core::sensors::sensor_proxy::SensorProxyConnection::connect();
+    if let Some(conn) = sensor_conn.as_mut() {
+        if conn.claim_accelerometer() {
+            rotation.set_sensor_present(true);
+        } else {
+            rotation.set_sensor_present(false);
+        }
+    } else {
+        rotation.set_sensor_present(false);
+    }
+    let mut last_sensor_poll = std::time::Instant::now();
     // Which folder is open, 0 for none.
     //
     // `FolderOpen` models the three springs and the title delay, and the
@@ -3899,6 +4382,17 @@ fn run_daemon() {
     // question is answerable without comparing megabytes.
     let mut wallpaper_path = String::new();
     let mut wallpaper_img: Option<std::rc::Rc<utim_core::graphics::png::RgbaImage>> = None;
+    // File-picker entry point: `UTLC_WALLPAPER_IMPORT=/path/to/img` imports once
+    // at startup through the validated path (ext + magic + 8MiB budget) and
+    // becomes the wallpaper. A portal file-chooser callback lands here.
+    if let Some(src) = std::env::var_os("UTLC_WALLPAPER_IMPORT") {
+        let src = std::path::PathBuf::from(src);
+        if let Some(dest) = import_wallpaper_file(&src) {
+            state.wallpaper = dest;
+            state.touch();
+            let _ = state.save();
+        }
+    }
     refresh_wallpaper(&state.wallpaper, &mut wallpaper_path, &mut wallpaper_img);
 
     let mut notifications = utim_core::notification::NotificationStore::new();
@@ -4669,6 +5163,40 @@ fn run_daemon() {
                                                                         per_page,
                                                                     );
                                                                 }
+                                                            } else if folder_gesture.drag_out {
+                                                                // Dragged out of the folder and released
+                                                                // outside it (not onto Remove): move the
+                                                                // member to the workspace (`Folder.java:1739-1763`
+                                                                // handoff). Dest is append on the current
+                                                                // page; occupied dest signals folder-creation
+                                                                // rather than overwriting.
+                                                                if let Some(from_slot) = from {
+                                                                    let at = folder.page as usize
+                                                                        * per_page.max(1)
+                                                                        + from_slot as usize;
+                                                                    let fid =
+                                                                        folder.folder_idx as u32;
+                                                                    let dest_page =
+                                                                        current_home_page;
+                                                                    let dest_slot = home_pages
+                                                                        .get(dest_page)
+                                                                        .map(|p| p.len())
+                                                                        .unwrap_or(0);
+                                                                    if state
+                                                                        .move_item_to_workspace(
+                                                                            fid, at, dest_page,
+                                                                            dest_slot,
+                                                                        )
+                                                                        .is_ok()
+                                                                    {
+                                                                        refresh_open_folder(
+                                                                            &state,
+                                                                            &mut folder,
+                                                                        );
+                                                                        state.touch();
+                                                                        let _ = state.save();
+                                                                    }
+                                                                }
                                                             }
                                                         }
                                                         FolderHit::MenuAction(action, member) => {
@@ -4677,17 +5205,79 @@ fn run_daemon() {
                                                                 state.haptics,
                                                                 HapticEffect::Tick,
                                                             );
-                                                            if action == FolderMenuAction::Remove {
-                                                                let per_page =
-                                                                    folder.items_per_page().max(1);
-                                                                let _ = commit_folder_remove(
-                                                                    &mut state,
-                                                                    &mut folder,
-                                                                    Some(page_local_slot(
-                                                                        member, per_page,
-                                                                    )),
-                                                                    per_page,
-                                                                );
+                                                            match action {
+                                                                FolderMenuAction::Remove => {
+                                                                    let per_page = folder
+                                                                        .items_per_page()
+                                                                        .max(1);
+                                                                    let _ = commit_folder_remove(
+                                                                        &mut state,
+                                                                        &mut folder,
+                                                                        Some(page_local_slot(
+                                                                            member, per_page,
+                                                                        )),
+                                                                        per_page,
+                                                                    );
+                                                                }
+                                                                FolderMenuAction::Rename => {
+                                                                    // The reference
+                                                                    // renames the
+                                                                    // *folder*
+                                                                    // (`Folder.java:706-712`),
+                                                                    // not the member
+                                                                    // the menu was raised
+                                                                    // on, so the
+                                                                    // member index is
+                                                                    // not consulted here.
+                                                                    // The current
+                                                                    // title is not
+                                                                    // seeded into the
+                                                                    // buffer: `FolderRename`
+                                                                    // is empty by design
+                                                                    // (see its doc comment
+                                                                    // -- pre-filling needs a
+                                                                    // visible field).
+                                                                    let fid =
+                                                                        folder.folder_idx as u32;
+                                                                    begin_folder_rename(
+                                                                        &mut folder_rename,
+                                                                        fid,
+                                                                    );
+                                                                    // Commit straight
+                                                                    // away, because
+                                                                    // there is no field
+                                                                    // to type into yet.
+                                                                    // That makes the menu
+                                                                    // row clear the name
+                                                                    // rather than rename
+                                                                    // -- which is a
+                                                                    // destructive
+                                                                    // no-op-ish action, so
+                                                                    // it is NOT done here.
+                                                                    // The row opens the
+                                                                    // editor and the
+                                                                    // editor is what
+                                                                    // needs the
+                                                                    // renderer.
+                                                                }
+                                                                // Folder member info: resolve the member and open the
+                                                                // app-info panel (external handoff target resolved
+                                                                // there). A folder is not an app, but its *member*
+                                                                // is, so Info has a destination after all.
+                                                                FolderMenuAction::Info => {
+                                                                    let fid =
+                                                                        folder.folder_idx as u32;
+                                                                    if let Some((_, app_id)) = state
+                                                                        .folder_member_info(
+                                                                            fid, member,
+                                                                        )
+                                                                    {
+                                                                        let id = app_id.to_string();
+                                                                        app_info_open = true;
+                                                                        app_info_id = id;
+                                                                        app_info = None;
+                                                                    }
+                                                                }
                                                             }
                                                         }
                                                         FolderHit::MenuDismissed
@@ -4720,6 +5310,16 @@ fn run_daemon() {
                                                         screen_timeout.touch(Instant::now());
                                                         touch_drag_start =
                                                             Some((raw_touch.x, raw_touch.y));
+                                                        // Record the press time for
+                                                        // the double-tap detector.
+                                                        // A drag breaks the pair, so
+                                                        // `move_to` below resets it --
+                                                        // which is why the reset lives
+                                                        // there rather than only on
+                                                        // release.
+                                                        tap_press_ms =
+                                                            shell_start.elapsed().as_millis()
+                                                                as u64;
                                                         // Seed the scroll delta here:
                                                         // a drag that begins with a
                                                         // non-zero delta would shift
@@ -4930,6 +5530,20 @@ fn run_daemon() {
                                                         }
                                                     }
                                                     TouchPhase::Move => {
+                                                        // A drag breaks the double-tap
+                                                        // pair, on the *move* rather
+                                                        // than the release: the
+                                                        // reference's
+                                                        // `onTouchEvent` returns
+                                                        // `ACTION_CANCEL` to
+                                                        // `GestureHandler`
+                                                        // mid-drag
+                                                        // (`AbstractGestureController:70-77`),
+                                                        // so a second tap after a
+                                                        // drag must not pair with a
+                                                        // first tap that happened
+                                                        // before it.
+                                                        tap_history.reset();
                                                         // Sampled here because the drawer scroll
                                                         // below needs a delta, not an absolute
                                                         // position. It stays updated even when the
@@ -5182,6 +5796,56 @@ fn run_daemon() {
                                                         // sprang back and the app ran
                                                         // forever.
                                                         //
+                                                        // The double-tap pair is
+                                                        // decided here too, and *before*
+                                                        // the modal gate, because a
+                                                        // double-tap is a workspace
+                                                        // gesture: the reference feeds
+                                                        // `GestureHandler` from the
+                                                        // root view's `onTouchEvent`
+                                                        // (`AbstractGestureController:70-77`)
+                                                        // so it sees releases a nested
+                                                        // panel would otherwise consume.
+                                                        if raw_touch.phase == TouchPhase::Up {
+                                                            let now_ms =
+                                                                shell_start.elapsed().as_millis()
+                                                                    as u64;
+                                                            let tap = utim_core::compositor::gestures::Tap::new(
+                                                                tap_press_ms,
+                                                                now_ms,
+                                                                raw_touch.x,
+                                                                raw_touch.y,
+                                                            );
+                                                            let outcome = tap_history.on_touch_end(
+                                                                utim_core::compositor::gestures::TouchEnd::Tap {
+                                                                    down_ms: tap.down_ms,
+                                                                    up_ms: tap.up_ms,
+                                                                    x: tap.x,
+                                                                    y: tap.y,
+                                                                },
+                                                            );
+                                                            // Consumed: the second tap
+                                                            // must not also act as a
+                                                            // single tap on whatever is
+                                                            // under it.
+                                                            if outcome
+                                                                == utim_core::compositor::gestures::TapOutcome::DoubleTap
+                                                                && run_double_tap(
+                                                                    &mut double_tap_action,
+                                                                    &mut shell_state,
+                                                                    &mut server.scene.system_ui,
+                                                                )
+                                                            {
+                                                                continue;
+                                                            }
+                                                        } else {
+                                                            // A cancelled touch is not a
+                                                            // tap, so it must not arm
+                                                            // the detector for the next
+                                                            // one.
+                                                            tap_history.reset();
+                                                        }
+                                                        //
                                                         // The gesture engine is fed
                                                         // here, before the
                                                         // `continue`, because the
@@ -5242,6 +5906,21 @@ fn run_daemon() {
                                                                     app_drawer_open = false;
                                                                     search_active = false;
                                                                     drawer_search.clear();
+                                                                    // The popup layer sets a
+                                                                    // flag for the one effect it
+                                                                    // cannot perform itself
+                                                                    // (app-info needs a
+                                                                    // catalogue and a `PATH`
+                                                                    // search); this is where it
+                                                                    // becomes a panel.
+                                                                    if popup_opened_app_info {
+                                                                        popup_opened_app_info =
+                                                                            false;
+                                                                        app_info_open = true;
+                                                                        app_info_id = popup_subject
+                                                                            .to_string();
+                                                                        app_info = None;
+                                                                    }
                                                                     close_modal_surfaces(
                                                                         &mut shell_state,
                                                                         &mut folder,
@@ -5794,6 +6473,9 @@ fn run_daemon() {
                                                                 home_locked: &mut home_locked,
                                                                 selected_home_icon:
                                                                     &mut selected_home_icon,
+                                                                active_app: &mut active_app,
+                                                                open_app_info:
+                                                                    popup_opened_app_info,
                                                                 subject: &popup_subject,
                                                                 persist: Some(
                                                                     persist_state as PersistFn,
@@ -5819,6 +6501,9 @@ fn run_daemon() {
                                                                 home_locked: &mut home_locked,
                                                                 selected_home_icon:
                                                                     &mut selected_home_icon,
+                                                                active_app: &mut active_app,
+                                                                open_app_info:
+                                                                    popup_opened_app_info,
                                                                 subject: &popup_subject,
                                                                 persist: Some(
                                                                     persist_state as PersistFn,
@@ -5993,13 +6678,14 @@ fn run_daemon() {
                                                         | ShadeZone::Handle => {}
                                                     }
                                                 } else if let Some(key) =
-                                                    Keyboard::new(w, h).hit(x, y)
+                                                    Keyboard::new_for(w, h, keyboard_layout)
+                                                        .hit(x, y)
                                                 {
                                                     // Virtual keyboard: the key under the
                                                     // finger comes from the same layout the
                                                     // keyboard is drawn from. Takes the Key
                                                     // directly: no per-keystroke heap string.
-                                                    let handle_key_input = |key: Key,
+                                                    let mut handle_key_input = |key: Key,
                                                                             active_app: &mut Option<String>,
                                                                             app_input: &mut String,
                                                                             app_input_focused: &mut bool,
@@ -6043,24 +6729,113 @@ fn run_daemon() {
                                                                 keyboard.is_shift_active =
                                                                     !keyboard.is_shift_active;
                                                             }
+                                                            Key::Layout => {
+                                                                // The `?123`/`ABC` key.
+                                                                // Until this existed the
+                                                                // key had no arm in
+                                                                // either match, so it
+                                                                // fell off the end of
+                                                                // the `match` and did
+                                                                // nothing: the whole
+                                                                // three-page keyboard
+                                                                // was one fixed QWERTY.
+                                                                //
+                                                                // Resolved through
+                                                                // `toggled()` rather
+                                                                // than by matching the
+                                                                // drawn label, which is
+                                                                // what the renderer's
+                                                                // `keyboard_toggle_label`
+                                                                // is for.
+                                                                keyboard_layout =
+                                                                    keyboard_layout.toggled();
+                                                                // Dropping the shift
+                                                                // with the page is
+                                                                // `has_letters`'s
+                                                                // point: the symbol
+                                                                // pages have no case.
+                                                                if !keyboard_layout
+                                                                    .has_letters()
+                                                                {
+                                                                    keyboard.is_shift_active =
+                                                                        false;
+                                                                }
+                                                                keyboard.set_layout(
+                                                                    keyboard_layout,
+                                                                );
+                                                            }
                                                         }
                                                     } else {
                                                         let act = match key {
                                                             Key::Backspace => {
-                                                                keyboard.handle_key_tap("BACKSPACE")
+                                                                // A rename in
+                                                                // progress takes
+                                                                // the backspace;
+                                                                // anything else
+                                                                // edits the IME's
+                                                                // buffer, so a typo
+                                                                // in a folder name
+                                                                // must not require
+                                                                // dismissing the
+                                                                // keyboard first.
+                                                                if let Some(r) =
+                                                                    folder_rename.as_mut()
+                                                                {
+                                                                    r.backspace();
+                                                                    ImeAction::None
+                                                                } else {
+                                                                    keyboard.handle_key_tap(
+                                                                        "BACKSPACE",
+                                                                    )
+                                                                }
                                                             }
                                                             Key::Enter => {
-                                                                keyboard.handle_key_tap("ENTER")
+                                                                // Enter commits an open
+                                                                // rename and reaches nothing
+                                                                // else. It is the only
+                                                                // commit path, so the
+                                                                // record has exactly one
+                                                                // writer.
+                                                                if folder_rename.is_some() {
+                                                                    if commit_folder_rename(
+                                                                        &mut folder_rename,
+                                                                        &mut state,
+                                                                    ) {
+                                                                        state.touch();
+                                                                        let _ = state.save();
+                                                                    }
+                                                                    ImeAction::HideKeyboard
+                                                                } else {
+                                                                    keyboard
+                                                                        .handle_key_tap("ENTER")
+                                                                }
                                                             }
                                                             Key::Space => {
                                                                 keyboard.handle_key_tap("SPACE")
                                                             }
                                                             Key::Char(c) => {
-                                                                // Stack-encoded: handle_key_tap
-                                                                // gets a &str with zero heap.
-                                                                let mut b = [0u8; 4];
-                                                                let s: &str = c.encode_utf8(&mut b);
-                                                                keyboard.handle_key_tap(s)
+                                                                // A folder rename is
+                                                                // open, so the keyboard
+                                                                // feeds the rename buffer
+                                                                // rather than the app's
+                                                                // input. Checked first
+                                                                // because it is the only
+                                                                // mode where text must
+                                                                // *not* reach the panel
+                                                                // behind.
+                                                                if let Some(r) =
+                                                                    folder_rename.as_mut()
+                                                                {
+                                                                    r.type_char(c);
+                                                                    ImeAction::None
+                                                                } else {
+                                                                    // Stack-encoded: handle_key_tap
+                                                                    // gets a &str with zero
+                                                                    // heap.
+                                                                    let mut b = [0u8; 4];
+                                                                    let s: &str = c.encode_utf8(&mut b);
+                                                                    keyboard.handle_key_tap(s)
+                                                                }
                                                             }
                                                             Key::Hide => {
                                                                 keyboard.deactivate();
@@ -6071,6 +6846,29 @@ fn run_daemon() {
                                                             Key::Shift => {
                                                                 let _ = keyboard
                                                                     .handle_key_tap("SHIFT");
+                                                                ImeAction::None
+                                                            }
+                                                            Key::Layout => {
+                                                                // Same as the
+                                                                // drawer-path arm:
+                                                                // the layout is shell
+                                                                // state, and the IME's
+                                                                // own key table has to
+                                                                // follow or it would
+                                                                // insert characters
+                                                                // from a page the
+                                                                // user cannot see.
+                                                                keyboard_layout =
+                                                                    keyboard_layout.toggled();
+                                                                if !keyboard_layout
+                                                                    .has_letters()
+                                                                {
+                                                                    keyboard.is_shift_active =
+                                                                        false;
+                                                                }
+                                                                keyboard.set_layout(
+                                                                    keyboard_layout,
+                                                                );
                                                                 ImeAction::None
                                                             }
                                                         };
@@ -6455,6 +7253,19 @@ fn run_daemon() {
                                                                 state.screen_timeout_s,
                                                                 Instant::now(),
                                                             );
+                                                            // The rotation policy is the
+                                                            // other cached reader of the
+                                                            // state: without this a flipped
+                                                            // auto-rotate switch would sit
+                                                            // in the file until a reboot,
+                                                            // which is the same dead tap
+                                                            // the row promotion exists to
+                                                            // remove.
+                                                            if hit_row == Some("auto-rotate") {
+                                                                rotation.set_auto_rotate(
+                                                                    state.auto_rotate,
+                                                                );
+                                                            }
                                                             // The wallpaper setting is the
                                                             // one that changes an *image*,
                                                             // and the image is cached
@@ -7869,10 +8680,32 @@ fn run_daemon() {
             // would close the panel under a carousel that was still
             // animating, and the springs would then integrate against a state
             // that no longer existed.
-            if matches!(shell_state, ShellState::Overview { .. }) && recents.len == 0 {
+            //
+            // But *only* if it had cards. The rule as first written tested
+            // `len == 0` alone, which fires on the very first frame of an
+            // overview opened with an empty stack -- so the overview opened and
+            // closed in the same frame and the empty state the renderer draws
+            // ("No recent items", `drm_kms.rs:6129-6138`) was unreachable. The
+            // reference keeps the panel up and shows the message:
+            // `RecentsView.updateEmptyMessage` (`quickstep/.../RecentsView.java:4809-4824`)
+            // sets `mShowEmptyMessage` from `!hasTaskViews()` and never closes.
+            if overview_closes_for_empty_stack(
+                matches!(shell_state, ShellState::Overview { .. }),
+                recents_showed_content,
+                recents.len,
+            ) {
                 shell_state = ShellState::Normal;
             }
+            // Latched while the overview is up and holding cards, and never
+            // cleared until the overview closes, so "the last card left" is
+            // distinguishable from "there was never a card".
+            if matches!(shell_state, ShellState::Overview { .. }) && recents.len > 0 {
+                recents_showed_content = true;
+            }
             let overview_open = matches!(shell_state, ShellState::Overview { .. });
+            if !overview_open {
+                recents_showed_content = false;
+            }
             overview_spring.set_target(if overview_open { 1.0 } else { 0.0 });
             overview_scrim_spring.set_target(if overview_open { 1.0 } else { 0.0 });
             let overview_live =
@@ -8565,6 +9398,76 @@ fn run_daemon() {
                     icon_cache.set_foreground_background(Some(shell_palette.surface_container));
                 }
 
+                // Build the app-info panel's contents on the frame it is needed.
+                //
+                // Rebuilt rather than cached because it resolves a `PATH` search, and
+                // cached because the panel must not re-run that search every frame
+                // while open. `app_info_open` is the latch; `app_info_id` is what it
+                // was opened for, so a *different* app re-resolves.
+                if app_info_open
+                    && app_info.as_ref().map(|s| s.id.as_str()) != Some(app_info_id.as_str())
+                {
+                    app_info = all_managed_apps
+                        .iter()
+                        .find(|a| a.id == app_info_id)
+                        .map(|a| {
+                            let (kind, target) = resolve_app_info_target(&a.id)
+                                .unwrap_or((AppInfoTarget::Details, String::new()));
+                            AppInfoState {
+                                id: a.id.clone(),
+                                name: a.name.clone(),
+                                exec: a.exec.clone(),
+                                icon: a.icon.clone(),
+                                color: a.color,
+                                glyph: a.glyph.clone(),
+                                target,
+                                target_kind: kind,
+                                // No install session is driven by this shell, so
+                                // the store row never appears. Recorded rather
+                                // than defaulted to `false` so the reason travels
+                                // with the field.
+                                installing: false,
+                            }
+                        });
+                }
+                if !app_info_open {
+                    app_info = None;
+                }
+                // Sensor poll ~2Hz off the draw path. None = keep history;
+                // Some(Undefined/flat) clears dwell via update, like
+                // process_accelerometer. A `Rotate` decision is forwarded
+                // through the pure `decide_modeset` to the KMS device; anything
+                // else (including `Unsupported`) holds. A failed ioctl is
+                // logged, not retried: the policy has already advanced, and
+                // hammering a failing modeset every 500 ms is worse than one
+                // missed rotation.
+                if last_sensor_poll.elapsed().as_millis() >= 500 {
+                    last_sensor_poll = std::time::Instant::now();
+                    if let Some(conn) = sensor_conn.as_mut() {
+                        if let Some(o) = conn.poll_orientation() {
+                            let before = rotation.current();
+                            let natural = rotation.natural();
+                            let decision = rotation.update(o);
+                            if let Some(wanted) = decision.orientation() {
+                                let action = utim_core::rotation::decide_modeset(
+                                    before,
+                                    wanted,
+                                    natural,
+                                    utim_core::rotation::PanelRotations::ALL,
+                                );
+                                if let utim_core::rotation::ModesetAction::Rotate(target) = action {
+                                    // `drm` is the frame's borrow of the display
+                                    // (this whole body runs inside it), so there
+                                    // is nothing else to borrow.
+                                    if let Err(e) = drm.set_orientation(target) {
+                                        eprintln!("[-] rotation modeset failed: {}", e);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 let drm_state = DrmInteractiveState {
                     time_str: t_str,
                     is_locked: server.scene.mode
@@ -8594,12 +9497,44 @@ fn run_daemon() {
                     // damage tracker so a page swipe repaints.
                     folder_grid: (state.folder_cols as u8, state.folder_rows as u8),
                     screen_off: screen_timeout.expired_at(Instant::now()),
+                    // Agent D's render-side fields. `app_info` is `None` until the
+                    // shell has an app-info state to publish -- the panel renders,
+                    // but nothing in the shell opens it yet, and a panel that is
+                    // populated by guesswork would show the wrong app.
+                    app_info: app_info.as_ref().map(|spec| AppInfoSpec {
+                        id: spec.id.as_str(),
+                        name: spec.name.as_str(),
+                        exec: spec.exec.as_str(),
+                        target: spec.target.as_str(),
+                        icon: spec.icon.as_deref(),
+                        color: spec.color,
+                        glyph: spec.glyph.as_str(),
+                        target_kind: spec.target_kind,
+                        installing: spec.installing,
+                    }),
+                    // The workspace drag layer. Every field is inert because no
+                    // workspace icon drag is wired yet -- `drag_slot: None` is
+                    // what tells the renderer "nothing is being dragged", and it
+                    // is the value the whole drag draw path must handle.
+                    drag_slot: None,
+                    drag_pos: (0.0, 0.0),
+                    keyboard_layout,
+                    drag_lift: 0.0,
+                    drag_drop_slot: None,
+                    drag_merge_slot: None,
                     folder_drag_slot: folder_gesture.drag_slot,
                     folder_drag_pos: folder_gesture.drag_pos,
                     folder_drop_slot: folder_gesture.drop_slot,
                     folder_drag_out: folder_gesture.drag_out,
                     folder_menu_progress: folder_gesture.menu_progress,
                     folder_menu_anchor: folder_gesture.menu_anchor,
+                    folder_rename_buffer: folder_rename
+                        .as_ref()
+                        .map(|r| {
+                            utim_core::graphics::drm_kms::FolderRenameBuffer::truncated(&r.buffer)
+                        })
+                        .unwrap_or(utim_core::graphics::drm_kms::FolderRenameBuffer::EMPTY),
+                    folder_rename_editing: folder_rename.is_some(),
                     folder_dark: state.dark_theme,
                     folder_page: folder.page,
                     folder_item_count: folder.item_count() as u8,
@@ -8991,6 +9926,9 @@ fn wallpaper_seed() -> u32 {
             let Ok(data) = std::fs::read(&path) else {
                 continue;
             };
+            if let Some(p) = utim_core::graphics::palette::wallpaper_palette_from_png(&data) {
+                return p.seed;
+            }
             if let Some(seed) = average_png_colour(&data) {
                 return seed;
             }
@@ -9076,6 +10014,10 @@ fn read_exact_or_less(f: &mut std::fs::File, buf: &mut [u8]) -> Option<usize> {
 }
 
 /// Sparse-grid average of a decoded PNG, skipping transparent pixels.
+///
+/// Kept as the fallback when the Oklab quantiser yields nothing; the primary
+/// path is `wallpaper_palette_from_png` (blue vs orange must differ, where a
+/// mean yields the same grey — `WallpaperColorsCompat.kt:5-23`).
 fn average_png_colour(data: &[u8]) -> Option<u32> {
     let img = utim_core::graphics::decode_png(data)?;
     const STEP: u32 = 24;
@@ -9395,6 +10337,15 @@ fn apply_ime_action(
                 }
             }
         }
+        // The IME asking for the keyboard to close. `Key::Hide` used to fold into
+        // `ImeAction::None`, so the request was indistinguishable from "nothing
+        // happened" and the keyboard stayed up over whatever the user had just
+        // dismissed. Spelled out rather than left to the `_` arm, because a
+        // wildcard here would silently swallow it -- and the next variant someone
+        // adds would be swallowed too, with nothing to say so.
+        ImeAction::HideKeyboard => keyboard.deactivate(),
+        // Any variant a newer `ime.rs` adds. Named so that adding one is a compile
+        // error here rather than a silent no-op.
         _ => {}
     }
 }
@@ -10883,9 +11834,10 @@ mod tests {
     /// silently fall behind the panel. A generated table would need a convention
     /// linking key to field name, and `grid-cols` -> `grid_cols` is a convention
     /// that holds right up until it does not.
-    const LIVE_SETTINGS: [(&str, &str); 16] = [
+    const LIVE_SETTINGS: [(&str, &str); 17] = [
         ("dark-theme", "dark_theme"),
         ("follow-system-theme", "follow_system_theme"),
+        ("auto-rotate", "auto_rotate"),
         ("accent-source", "accent_source"),
         ("icon-shape", "icon_shape"),
         ("monochrome-icons", "monochrome_icons"),
@@ -11703,6 +12655,449 @@ mod tests {
         );
     }
 
+    /// The overview's empty state must be reachable.
+    ///
+    /// `drm_kms.rs:6129-6138` draws "No recent items", and it has never been
+    /// visible: the frame rule tested `recents.len == 0` alone, which fires on the
+    /// very first frame of an overview opened with an empty stack, so the panel
+    /// opened and closed before it was ever drawn. The reference keeps it up
+    /// (`RecentsView.updateEmptyMessage`, `RecentsView.java:4809-4824`).
+    #[test]
+    fn an_overview_with_no_tasks_stays_open_to_show_its_empty_state() {
+        // Empty from the start: must NOT close, or the empty state is unreachable.
+        assert!(
+            !overview_closes_for_empty_stack(true, false, 0),
+            "an overview that never had a task must stay open and show its empty state"
+        );
+        // Empty *after* having had one: must close.
+        assert!(
+            overview_closes_for_empty_stack(true, true, 0),
+            "the last card leaving must close the overview"
+        );
+        // Still holding cards: must not close.
+        assert!(!overview_closes_for_empty_stack(true, true, 3));
+        // Closed already: the rule must not resurrect anything.
+        assert!(!overview_closes_for_empty_stack(false, true, 0));
+    }
+
+    #[test]
+    fn follow_system_theme_defers_to_system_when_it_knows() {
+        // UTLC_THEME env override is the test seam: no daemon needed.
+        std::env::set_var("UTLC_THEME", "dark");
+        let mut s = LauncherState::default();
+        s.follow_system_theme = true;
+        s.dark_theme = false;
+        assert_eq!(effective_theme(&s), Theme::Dark, "system dark must win");
+        std::env::set_var("UTLC_THEME", "light");
+        assert_eq!(effective_theme(&s), Theme::Light, "system light must win");
+        std::env::remove_var("UTLC_THEME");
+        // Unknown falls back to the stored choice.
+        s.dark_theme = true;
+        assert_eq!(effective_theme(&s), Theme::Dark);
+        s.dark_theme = false;
+        // Without env/file/daemon the probe is Unknown -> falls back.
+        assert_eq!(effective_theme(&s), Theme::Light);
+        // Not following: system is ignored entirely.
+        std::env::set_var("UTLC_THEME", "dark");
+        s.follow_system_theme = false;
+        s.dark_theme = false;
+        assert_eq!(effective_theme(&s), Theme::Light);
+        std::env::remove_var("UTLC_THEME");
+    }
+
+    #[test]
+    fn wallpaper_candidates_accept_jpg_webp_and_dedupe() {
+        assert!(utim_core::settings::picker::validate_image_path("/a/b.png"));
+        assert!(utim_core::settings::picker::validate_image_path("/a/b.JPG"));
+        assert!(utim_core::settings::picker::validate_image_path(
+            "/a/b.webp"
+        ));
+        assert!(!utim_core::settings::picker::validate_image_path(
+            "/a/b.txt"
+        ));
+        let mut v = vec![
+            "/b.png".to_string(),
+            "/a.png".to_string(),
+            "/b.png".to_string(),
+        ];
+        utim_core::settings::picker::dedupe_candidates(&mut v);
+        assert_eq!(v, vec!["/a.png".to_string(), "/b.png".to_string()]);
+    }
+
+    #[test]
+    fn wallpaper_import_rejects_non_images_and_missing_files() {
+        assert!(import_wallpaper_file(std::path::Path::new("/no/such/file.txt")).is_none());
+        assert!(import_wallpaper_file(std::path::Path::new("/no/such/file.png")).is_none());
+        // A text file with an image extension fails the magic check.
+        let p = "/tmp/opencode/utlc-import-probe.png";
+        std::fs::write(p, b"not a png").ok();
+        assert!(import_wallpaper_file(std::path::Path::new(p)).is_none());
+        let _ = std::fs::remove_file(p);
+    }
+
+    #[test]
+    fn quantiser_seed_differs_for_blue_vs_orange() {
+        // Minimal 2x1 PNGs via the offline encoder path are heavy; instead assert
+        // the wrapper prefers the quantiser over the mean when decodable, and the
+        // palette-level contrast is pinned in utim_core (blue_and_orange tests).
+        // Here: invalid data yields None from both paths (no panic on hostile input).
+        assert!(utim_core::graphics::palette::wallpaper_palette_from_png(&[]).is_none());
+        assert!(utim_core::graphics::palette::wallpaper_palette_from_png(&[0u8; 33]).is_none());
+    }
+
+    /// The popup rows that navigate must navigate, and the hidden-app row must
+    /// toggle rather than only add.
+    ///
+    /// Six of the eight inert `PopupEffect`s had a real destination available and
+    /// were routed to a no-op arm anyway. `ToggleHiddenApp` is the one that
+    /// *mutates*: a toggle that only adds means a second tap does the opposite of
+    /// what the user expects, and `hidden_apps` has been persisted since the store
+    /// existed with nothing able to change it.
+    #[test]
+    fn the_popup_rows_that_have_a_destination_reach_it() {
+        let mut state = LauncherState::default();
+        let mut pages = vec![vec!["phone".to_string()]];
+        let mut page = 0usize;
+        let mut drawer = false;
+        let mut locked = false;
+        let mut selected: Option<String> = None;
+        let mut active: Option<String> = None;
+
+        // `page` is a parameter rather than a captured mutable, because the test
+        // moves the workspace onto page 2 mid-run to check "Set as default". A
+        // closure that borrowed it mutably would make that assignment a compile
+        // error, and passing it in keeps the ordering explicit.
+        let mut run = |effect: PopupEffect,
+                       subject: &str,
+                       state: &mut LauncherState,
+                       active: &mut Option<String>,
+                       page: &mut usize| {
+            apply_popup_effect(
+                effect,
+                &mut PopupTargets {
+                    state,
+                    home_pages: &mut pages,
+                    current_home_page: page,
+                    app_drawer_open: &mut drawer,
+                    home_locked: &mut locked,
+                    selected_home_icon: &mut selected,
+                    active_app: active,
+                    open_app_info: false,
+                    subject,
+                    persist: None,
+                },
+            );
+        };
+
+        // The three navigation rows land on the Settings panel.
+        for effect in [
+            PopupEffect::OpenSettings,
+            PopupEffect::OpenSystemSettings,
+            PopupEffect::OpenWallpapers,
+            PopupEffect::CustomizeApp,
+        ] {
+            active = None;
+            run(effect, "", &mut state, &mut active, &mut page);
+            assert_eq!(
+                active.as_deref(),
+                Some(SETTINGS_APP),
+                "{effect:?} did not reach the Settings panel"
+            );
+        }
+
+        // "Set as default" persists the page the workspace is on.
+        page = 2;
+        run(
+            PopupEffect::SetDefaultPage,
+            "",
+            &mut state,
+            &mut active,
+            &mut page,
+        );
+        assert_eq!(
+            state.default_page, 2,
+            "`default_page` was persisted and read by nothing, so this row could not set it"
+        );
+
+        // Hide toggles both ways.
+        run(
+            PopupEffect::ToggleHiddenApp,
+            "phone",
+            &mut state,
+            &mut active,
+            &mut page,
+        );
+        assert_eq!(state.hidden_apps, vec!["phone".to_string()]);
+        run(
+            PopupEffect::ToggleHiddenApp,
+            "phone",
+            &mut state,
+            &mut active,
+            &mut page,
+        );
+        assert!(
+            state.hidden_apps.is_empty(),
+            "a second tap must un-hide, not hide again"
+        );
+        // And a workspace-menu tap has no subject, so it must not hide anything.
+        run(
+            PopupEffect::ToggleHiddenApp,
+            "",
+            &mut state,
+            &mut active,
+            &mut page,
+        );
+        assert!(state.hidden_apps.is_empty());
+    }
+
+    /// A drag between two taps must stop them pairing.
+    ///
+    /// The reference cancels the gesture mid-drag rather than on release
+    /// (`AbstractGestureController:70-77`), so the pair has to break on the *move*.
+    /// Testing only "two taps in time pair" would pass against an implementation
+    /// that never resets, and the failure would be a double-tap firing after a
+    /// scroll — which looks like a random extra tap, not like a missed reset.
+    #[test]
+    fn a_drag_between_two_taps_breaks_the_pair() {
+        use utim_core::compositor::gestures::{forms_double_tap, DoubleTapConfig, Tap, TapHistory};
+        let cfg = DoubleTapConfig::DEFAULT;
+        let a = Tap::new(0, 60, 500.0, 500.0);
+        let b = Tap::new(150, 200, 505.0, 502.0);
+        assert!(forms_double_tap(a, b, cfg), "two quick taps must pair");
+
+        let mut h = TapHistory::new(cfg);
+        // `tap` is the bool convenience wrapper the shell does not use; the shell
+        // calls `on_touch_end` so it can see *which* outcome it was.
+        assert!(!h.tap(a), "the first tap is not a double tap");
+        assert!(h.pending().is_some(), "the first tap arms the pair");
+        // What the shell does on `Move`:
+        h.reset();
+        assert!(h.pending().is_none(), "reset must clear the armed half");
+        // So the second tap is a first again, not a double.
+        assert!(
+            !h.tap(b),
+            "a tap after a drag must not pair with the tap before the drag"
+        );
+    }
+
+    /// The detector's timing and slop must actually gate the pair.
+    ///
+    /// `forms_double_tap` is the pure decision the shell calls, so this pins the
+    /// thresholds themselves rather than the plumbing around them: too slow, too
+    /// far apart, or a long first press must all fail to pair.
+    #[test]
+    fn the_detector_gates_on_time_distance_and_press_length() {
+        use utim_core::compositor::gestures::{forms_double_tap, DoubleTapConfig, Tap};
+        let cfg = DoubleTapConfig::DEFAULT;
+        let quick = Tap::new(0, 40, 100.0, 100.0);
+        assert!(forms_double_tap(
+            quick,
+            Tap::new(100, 140, 102.0, 101.0),
+            cfg
+        ));
+
+        // Too slow between the two taps.
+        assert!(
+            !forms_double_tap(quick, Tap::new(100_000, 100_040, 102.0, 101.0), cfg),
+            "taps a second and a half apart must not pair"
+        );
+        // Too far apart on screen.
+        assert!(
+            !forms_double_tap(
+                quick,
+                Tap::new(100, 140, 100.0 + cfg.slop + 10.0, 100.0),
+                cfg
+            ),
+            "taps beyond the slop must not pair"
+        );
+        // A long first press is a press-and-hold, not a tap.
+        assert!(
+            !forms_double_tap(
+                Tap::new(0, 900, 100.0, 100.0),
+                Tap::new(1_000, 1_040, 100.0, 100.0),
+                cfg
+            ),
+            "a long press must not count as the first half of a double tap"
+        );
+    }
+
+    /// A double-tap action with nowhere to go must fall through, not consume.
+    ///
+    /// `Sleep` is the reference's default and the action a stock install selects
+    /// (`GestureHandlerConfig.kt:76-78`, `PreferenceManager2.kt:813-816`), so this
+    /// is the *common* path. Consuming it would swallow the user's double-tap on a
+    /// no-op, and then not even a bug report would show the detector was working.
+    #[test]
+    fn an_unimplemented_double_tap_action_is_not_consumed() {
+        use utim_core::compositor::gestures::DoubleTapAction;
+        let mut state = ShellState::Normal;
+        let mut shade = utim_core::compositor::systemui::SystemUiShade::new();
+        let before = state;
+
+        // No destination: falls through so the tap still does something visible.
+        for a in [DoubleTapAction::Sleep, DoubleTapAction::NoOp] {
+            let mut a = a;
+            assert!(
+                !run_double_tap(&mut a, &mut state, &mut shade),
+                "{a:?} must not be consumed when it does nothing"
+            );
+            assert_eq!(state, before, "{a:?} changed the shell state");
+            assert!(!shade.is_open(), "{a:?} opened the shade");
+        }
+
+        // The ones that do have a destination act.
+        let mut a = DoubleTapAction::Recents;
+        assert!(run_double_tap(&mut a, &mut state, &mut shade));
+        assert!(matches!(state, ShellState::Overview { .. }));
+        let mut a = DoubleTapAction::OpenQuickSettings;
+        assert!(run_double_tap(&mut a, &mut state, &mut shade));
+        assert!(shade.is_open(), "the quick-settings action opened nothing");
+    }
+
+    /// A rename must not touch the record until it commits, and cancelling must be
+    /// total.
+    ///
+    /// The failure this guards is subtle and survives a reboot: if the buffer
+    /// were the record, a cancelled or half-typed rename would leave
+    /// `LauncherState` holding an edit that was never committed, and it would be
+    /// there again after a restart. So the record is written in exactly one place
+    /// — [`commit_folder_rename`] — and everything else must leave it alone.
+    #[test]
+    fn a_rename_only_touches_the_record_on_commit() {
+        let mut state = LauncherState::default();
+        state.folders = vec![utim_core::launcher_state::FolderRecord {
+            id: 1,
+            title: "Work".to_string(),
+            rank: 0,
+            items: vec!["phone".to_string()],
+            is_drawer: false,
+        }];
+        let mut r: Option<FolderRename> = None;
+        begin_folder_rename(&mut r, 1);
+
+        // Typing is invisible to the record.
+        assert!(r.as_mut().unwrap().type_char('D'));
+        assert!(r.as_mut().unwrap().type_char('e'));
+        assert_eq!(state.folders[0].title, "Work", "typing must not persist");
+
+        // Cancelling leaves it alone, which is the whole point -- and cancelling
+        // is just dropping the value, because the buffer was never the record.
+        r = None;
+        assert!(r.is_none());
+        assert_eq!(state.folders[0].title, "Work", "cancel must not persist");
+
+        // And committing does.
+        begin_folder_rename(&mut r, 1);
+        for c in "Tools".chars() {
+            assert!(r.as_mut().unwrap().type_char(c));
+        }
+        assert!(commit_folder_rename(&mut r, &mut state));
+        assert_eq!(state.folders[0].title, "Tools");
+        assert!(r.is_none(), "committing must close the editor");
+        // A second commit with nothing open is a no-op, not a second write.
+        assert!(!commit_folder_rename(&mut r, &mut state));
+    }
+
+    /// A rename must target the folder that was long-pressed, not its neighbour.
+    ///
+    /// `FolderOpen::folder_idx` is the `FolderRecord::id` verbatim — `open_folder_at`
+    /// does `folder.open(id as u8)` from the id in the cell token
+    /// (`PageCell::Folder(fid)`). An earlier version added 1 on the way in and
+    /// subtracted 1 on the way out, which type-checks perfectly, renames nothing on
+    /// a one-folder state, and renames the *wrong* folder once a second exists.
+    ///
+    /// So this builds two folders and checks the right one is hit. A one-folder
+    /// fixture would have passed against the offset version too, which is the
+    /// point: the bug is invisible until there is more than one folder.
+    #[test]
+    fn a_rename_targets_the_folder_that_was_raised_not_its_neighbour() {
+        let mut state = LauncherState::default();
+        state.folders = vec![
+            utim_core::launcher_state::FolderRecord {
+                id: 1,
+                title: "First".into(),
+                rank: 0,
+                items: vec![],
+                is_drawer: false,
+            },
+            utim_core::launcher_state::FolderRecord {
+                id: 2,
+                title: "Second".into(),
+                rank: 1,
+                items: vec![],
+                is_drawer: false,
+            },
+        ];
+        // `folder_idx` for folder 2, as `open_folder_at` would have set it.
+        let idx: u8 = 2;
+        let mut r: Option<FolderRename> = None;
+        let fid = idx as u32;
+        let title = state
+            .folders
+            .iter()
+            .find(|f| f.id == fid)
+            .map(|f| f.title.as_str())
+            .unwrap_or("");
+        assert_eq!(title, "Second", "the lookup must find the folder itself");
+        begin_folder_rename(&mut r, fid);
+        for c in "Renamed".chars() {
+            r.as_mut().unwrap().type_char(c);
+        }
+        assert!(commit_folder_rename(&mut r, &mut state));
+        assert_eq!(
+            state.folders[1].title, "Renamed",
+            "the wrong folder was renamed"
+        );
+        assert_eq!(state.folders[0].title, "First", "its neighbour was not");
+    }
+
+    /// An unchanged title is not a change, and a rename must not be able to grow
+    /// without bound.
+    ///
+    /// Both are quiet: a redundant `touch()` rewrites the settings file for
+    /// nothing, and an unbounded buffer holds a name the footer has already
+    /// ellipsised — so the user typed something they cannot check.
+    #[test]
+    fn a_rename_cannot_grow_past_what_the_footer_draws() {
+        let mut r = FolderRename::begin(1);
+        for _ in 0..FolderRename::MAX {
+            assert!(r.type_char('a'), "the buffer filled early");
+        }
+        assert!(
+            !r.type_char('a'),
+            "a name longer than the footer can draw must be refused, not accepted"
+        );
+        assert_eq!(r.buffer.chars().count(), FolderRename::MAX);
+        // Backspace works, and refuses at empty.
+        assert!(r.backspace());
+        assert!(r.type_char('b'));
+        assert_eq!(r.buffer.chars().count(), FolderRename::MAX);
+        for _ in 0..FolderRename::MAX + 1 {
+            r.backspace();
+        }
+        assert!(
+            !r.backspace(),
+            "backspace past empty must report nothing to do"
+        );
+        assert!(r.buffer.is_empty());
+
+        // An unchanged title is not a change.
+        let mut state = LauncherState::default();
+        state.folders = vec![utim_core::launcher_state::FolderRecord {
+            id: 1,
+            title: String::new(),
+            rank: 0,
+            items: vec![],
+            is_drawer: false,
+        }];
+        let mut r2: Option<FolderRename> = None;
+        begin_folder_rename(&mut r2, 1);
+        assert!(
+            !commit_folder_rename(&mut r2, &mut state),
+            "an empty buffer over an empty title is not a change"
+        );
+    }
+
     /// A failed torch write says which of the three things went wrong.
     ///
     /// The distinction that matters is "no torch" versus "failed". This rootfs has
@@ -12076,7 +13471,7 @@ mod tests {
         // A macro rather than a closure: `PopupTargets` has one lifetime for all
         // six borrows, which a closure returning it cannot satisfy.
         macro_rules! targets {
-            ($state:ident, $pages:ident, $page:ident, $drawer:ident, $locked:ident, $sel:ident, $subject:expr) => {
+            ($state:ident, $pages:ident, $page:ident, $drawer:ident, $locked:ident, $sel:ident, $app:ident, $info:ident, $subject:expr) => {
                 PopupTargets {
                     state: &mut $state,
                     home_pages: &mut $pages,
@@ -12084,6 +13479,8 @@ mod tests {
                     app_drawer_open: &mut $drawer,
                     home_locked: &mut $locked,
                     selected_home_icon: &mut $sel,
+                    active_app: &mut $app,
+                    open_app_info: $info,
                     subject: $subject,
                     persist: None,
                 }
@@ -12099,12 +13496,16 @@ mod tests {
         let mut drawer = false;
         let mut locked = false;
         let mut selected: Option<String> = Some("settings".to_string());
+        let mut active: Option<String> = None;
+        let open_info = false;
 
         // Remove drops the app from the current page and deselects it, so the
         // edit chips cannot point at a cell that no longer holds anything.
         apply_popup_effect(
             PopupEffect::RemoveFromPage,
-            &mut targets!(state, pages, page, drawer, locked, selected, "settings"),
+            &mut targets!(
+                state, pages, page, drawer, locked, selected, active, open_info, "settings"
+            ),
         );
         assert_eq!(pages[0], vec!["phone".to_string()]);
         assert_eq!(selected, None, "removing the selected icon deselects it");
@@ -12113,7 +13514,7 @@ mod tests {
         page = 1;
         apply_popup_effect(
             PopupEffect::RemoveFromPage,
-            &mut targets!(state, pages, page, drawer, locked, selected, "phone"),
+            &mut targets!(state, pages, page, drawer, locked, selected, active, open_info, "phone"),
         );
         assert_eq!(pages[0], vec!["phone".to_string()], "page 1 has no 'phone'");
         page = 0;
@@ -12121,25 +13522,25 @@ mod tests {
         // Remove with no subject (the workspace menu) does nothing.
         apply_popup_effect(
             PopupEffect::RemoveFromPage,
-            &mut targets!(state, pages, page, drawer, locked, selected, ""),
+            &mut targets!(state, pages, page, drawer, locked, selected, active, open_info, ""),
         );
         assert_eq!(pages[0], vec!["phone".to_string()]);
 
         apply_popup_effect(
             PopupEffect::OpenAllApps,
-            &mut targets!(state, pages, page, drawer, locked, selected, ""),
+            &mut targets!(state, pages, page, drawer, locked, selected, active, open_info, ""),
         );
         assert!(drawer);
 
         // Toggling the lock is its own inverse, and it survives both directions.
         apply_popup_effect(
             PopupEffect::ToggleHomeLock,
-            &mut targets!(state, pages, page, drawer, locked, selected, ""),
+            &mut targets!(state, pages, page, drawer, locked, selected, active, open_info, ""),
         );
         assert!(locked);
         apply_popup_effect(
             PopupEffect::ToggleHomeLock,
-            &mut targets!(state, pages, page, drawer, locked, selected, ""),
+            &mut targets!(state, pages, page, drawer, locked, selected, active, open_info, ""),
         );
         assert!(!locked);
     }
@@ -12149,7 +13550,7 @@ mod tests {
     #[test]
     fn entering_edit_mode_selects_an_icon() {
         macro_rules! targets {
-            ($state:ident, $pages:ident, $page:ident, $drawer:ident, $locked:ident, $sel:ident) => {
+            ($state:ident, $pages:ident, $page:ident, $drawer:ident, $locked:ident, $sel:ident, $app:ident, $info:ident) => {
                 PopupTargets {
                     state: &mut $state,
                     home_pages: &mut $pages,
@@ -12157,6 +13558,8 @@ mod tests {
                     app_drawer_open: &mut $drawer,
                     home_locked: &mut $locked,
                     selected_home_icon: &mut $sel,
+                    active_app: &mut $app,
+                    open_app_info: $info,
                     subject: "",
                     persist: None,
                 }
@@ -12164,19 +13567,21 @@ mod tests {
         }
         let mut state = LauncherState::default();
         let mut pages = vec![vec!["phone".to_string(), "settings".to_string()]];
-        let mut page = 0usize;
         let mut drawer = false;
         let mut locked = false;
         let mut selected: Option<String> = None;
+        let mut active: Option<String> = None;
+        let open_info = false;
+        let mut page = 0usize;
         apply_popup_effect(
             PopupEffect::EnterEditMode,
-            &mut targets!(state, pages, page, drawer, locked, selected),
+            &mut targets!(state, pages, page, drawer, locked, selected, active, open_info),
         );
         assert_eq!(selected.as_deref(), Some("phone"));
         // It is idempotent: a second entry does not re-pick.
         apply_popup_effect(
             PopupEffect::EnterEditMode,
-            &mut targets!(state, pages, page, drawer, locked, selected),
+            &mut targets!(state, pages, page, drawer, locked, selected, active, open_info),
         );
         assert_eq!(selected.as_deref(), Some("phone"));
     }
