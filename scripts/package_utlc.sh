@@ -18,9 +18,25 @@ trap cleanup EXIT
 
 echo "[*] Constructing UTLC (Universal Treble Launcher & Compositor) Debian package..."
 
-AARCH64_BIN="${WORKSPACE_ROOT}/target/aarch64-unknown-linux-gnu/release/utlc"
-echo "[*] Building release aarch64 binary for utlc..."
-cargo build --release -p utlc --target aarch64-unknown-linux-gnu
+TARGET_ARCH="${TARGET_ARCH:-amd64}"
+case "${TARGET_ARCH}" in
+    amd64|x86_64)
+        TARGET_ARCH="amd64"
+        RUST_TARGET="x86_64-unknown-linux-gnu"
+        ;;
+    arm64|aarch64)
+        TARGET_ARCH="arm64"
+        RUST_TARGET="aarch64-unknown-linux-gnu"
+        ;;
+    *)
+        echo "Unsupported TARGET_ARCH: ${TARGET_ARCH}" >&2
+        exit 1
+        ;;
+esac
+
+RELEASE_BIN="${WORKSPACE_ROOT}/target/${RUST_TARGET}/release/utlc"
+echo "[*] Building release ${TARGET_ARCH} binary for utlc..."
+cargo build --release -p utlc --target "${RUST_TARGET}"
 
 mkdir -p "${BUILD_DIR}/DEBIAN"
 mkdir -p "${BUILD_DIR}/usr/bin"
@@ -29,7 +45,7 @@ mkdir -p "${BUILD_DIR}/usr/share/applications"
 mkdir -p "${BUILD_DIR}/usr/share/doc/utlc"
 
 # 2. Copy binary and services
-cp "${AARCH64_BIN}" "${BUILD_DIR}/usr/bin/utlc"
+cp "${RELEASE_BIN}" "${BUILD_DIR}/usr/bin/utlc"
 chmod 755 "${BUILD_DIR}/usr/bin/utlc"
 
 if [[ -f "${WORKSPACE_ROOT}/utlc.service" ]]; then
@@ -57,12 +73,12 @@ Categories=System;Core;
 EOF
 
 # 4. Control metadata
-cat << 'EOF' > "${BUILD_DIR}/DEBIAN/control"
+cat << EOF > "${BUILD_DIR}/DEBIAN/control"
 Package: utlc
 Version: 1.0.0
 Section: x11
 Priority: standard
-Architecture: arm64
+Architecture: ${TARGET_ARCH}
 Maintainer: Universal Treble Linux <developer@treble-linux.org>
 Depends: libc6 (>= 2.34), libhybris-hwcomposer (>= 1.0.0) | android-framework
 Recommends: seatd
@@ -87,7 +103,7 @@ Copyright: 2026 Universal Treble Linux Contributors
 License: Apache-2.0 or MIT
 EOF
 
-DEB_FILE="${OUTPUT_DIR}/utlc_1.0.0_arm64.deb"
+DEB_FILE="${OUTPUT_DIR}/utlc_1.0.0_${TARGET_ARCH}.deb"
 dpkg-deb --build --root-owner-group "${BUILD_DIR}" "${DEB_FILE}"
 
 echo "[+] Successfully created Debian package: ${DEB_FILE}"

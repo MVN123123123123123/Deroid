@@ -3606,6 +3606,15 @@ pub fn paint_frame(
             );
 
             let mut line_y = strip_bottom + h as f32 * 0.010;
+            let s = crate::session::session();
+            let mut os_buf = [0u8; 96];
+            let os_str = {
+                use std::io::Write;
+                let mut cur = std::io::Cursor::new(&mut os_buf[..]);
+                let _ = write!(cur, "Universal Treble Linux 1.0 (Debian Sid {})", s.machine());
+                let n = cur.position() as usize;
+                core::str::from_utf8(&os_buf[..n]).unwrap_or("Universal Treble Linux 1.0")
+            };
             draw_text(
                 buf,
                 stride,
@@ -3613,11 +3622,19 @@ pub fn paint_frame(
                 h,
                 36,
                 line_y as usize,
-                "Universal Treble Linux 1.0 (Debian Sid ARM64)",
+                os_str,
                 0xFF38BDF8,
                 3,
             );
             line_y += h as f32 * 0.016;
+            let mut krel_buf = [0u8; 96];
+            let krel_str = {
+                use std::io::Write;
+                let mut cur = std::io::Cursor::new(&mut krel_buf[..]);
+                let _ = write!(cur, "Linux {} (Android GKI)", s.kernel_release());
+                let n = cur.position() as usize;
+                core::str::from_utf8(&krel_buf[..n]).unwrap_or("Linux (Android GKI)")
+            };
             draw_text(
                 buf,
                 stride,
@@ -3625,7 +3642,7 @@ pub fn paint_frame(
                 h,
                 36,
                 line_y as usize,
-                "Linux 6.1.23-android14-4-00257 (Android GKI)",
+                krel_str,
                 0xFF94A3B8,
                 2,
             );

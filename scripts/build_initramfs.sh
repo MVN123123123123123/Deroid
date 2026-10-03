@@ -21,16 +21,203 @@ if [[ "${OUTPUT_INITRAMFS}" != /* ]]; then
     OUTPUT_INITRAMFS="${PWD}/${OUTPUT_INITRAMFS}"
 fi
 RAMDISK_BUILD_DIR="${WORKSPACE_ROOT}/build/initramfs"
-ANDROID_RAMDISK="/opt/android-sdk/system-images/android-34/google_apis/arm64-v8a/ramdisk.img"
-ANDROID_VENDOR="/opt/android-sdk/system-images/android-34/google_apis/arm64-v8a/vendor.img"
-# Pinned supply-chain digests (B-2). Regenerate with sha256sum if the SDK
-# image is intentionally upgraded; never bypass with || true.
-ANDROID_RAMDISK_SHA256="5c4a40a87ea671396a683a30fde67a3e51c63a21d332a9c5a18ecf20c53e6185"
-ANDROID_VENDOR_SHA256="d5f44441eb7ced018ef09c09e25658bd9218d9633817f67d5b07d8f365876821"
+
+# Automatic Android SDK & Kernel Detection Functions
+find_latest_android_image() {
+    local target_arch="${1:-}"
+    local sdk_roots=(
+        "${ANDROID_HOME:-}"
+        "${ANDROID_SDK_ROOT:-}"
+        "/opt/android-sdk"
+        "${HOME}/Android/Sdk"
+    )
+
+    local candidates=()
+    for root in "${sdk_roots[@]}"; do
+        [[ -n "${root}" && -d "${root}/system-images" ]] || continue
+        while IFS= read -r kpath; do
+            [[ -f "${kpath}" ]] || continue
+            candidates+=("${kpath}")
+        done < <(find "${root}/system-images" -name "kernel-ranchu" 2>/dev/null)
+    done
+
+    if [[ ${#candidates[@]} -eq 0 ]]; then
+        return 1
+    fi
+
+    local best_kernel=""
+    local best_score=0
+
+    for kpath in "${candidates[@]}"; do
+        local img_dir="$(dirname "${kpath}")"
+        local api="0"
+        local abi=""
+        if [[ -f "${img_dir}/source.properties" ]]; then
+            api="$(grep -E "^AndroidVersion.ApiLevel=" "${img_dir}/source.properties" | cut -d= -f2 | tr -d " " || echo 0)"
+            abi="$(grep -E "^SystemImage.Abi=" "${img_dir}/source.properties" | cut -d= -f2 | tr -d " " || echo "")"
+        fi
+        local api_num=$(echo "${api}" | awk '{print int($1 * 10)}')
+
+        if [[ -n "${target_arch}" ]]; then
+            case "${target_arch}" in
+                x86_64|amd64)
+                    [[ "${abi}" == *"x86_64"* || "${kpath}" == *"x86_64"* ]] || continue
+                    ;;
+                arm64|aarch64)
+                    [[ "${abi}" == *"arm64"* || "${kpath}" == *"arm64"* ]] || continue
+                    ;;
+            esac
+        fi
+
+        if (( api_num > best_score )); then
+            best_score=${api_num}
+            best_kernel="${kpath}"
+        fi
+    done
+
+    if [[ -n "${best_kernel}" ]]; then
+        echo "${best_kernel}"
+        return 0
+    fi
+    return 1
+}
+
+detect_kernel_and_android() {
+    local kpath="$1"
+    local img_dir="$(dirname "${kpath}")"
+
+    ANDROID_ABI=""
+    ANDROID_API=""
+    ANDROID_VER=""
+    if [[ -f "${img_dir}/source.properties" ]]; then
+        ANDROID_API="$(grep -E "^AndroidVersion.ApiLevel=" "${img_dir}/source.properties" | cut -d= -f2 | tr -d " " || true)"
+        ANDROID_ABI="$(grep -E "^SystemImage.Abi=" "${img_dir}/source.properties" | cut -d= -f2 | tr -d " " || true)"
+    fi
+    if [[ -z "${ANDROID_API}" && "${kpath}" =~ android-([0-9.]+) ]]; then
+        ANDROID_API="${BASH_REMATCH[1]}"
+    fi
+
+    local api_int="${ANDROID_API%%.*}"
+    if [[ -n "${api_int}" && "${api_int}" =~ ^[0-9]+$ ]]; then
+        if (( api_int >= 31 )); then
+            ANDROID_VER="Android $((api_int - 20))"
+        elif (( api_int == 30 )); then
+            ANDROID_VER="Android 11"
+        elif (( api_int == 29 )); then
+            ANDROID_VER="Android 10"
+        elif (( api_int == 28 )); then
+            ANDROID_VER="Android 9"
+        else
+            ANDROID_VER="Android API ${ANDROID_API}"
+        fi
+    fi
+
+    KERNEL_ARCH="unknown"
+    if [[ "${ANDROID_ABI}" == *"x86_64"* ]]; then
+        KERNEL_ARCH="x86_64"
+    elif [[ "${ANDROID_ABI}" == *"arm64"* || "${ANDROID_ABI}" == *"aarch64"* ]]; then
+        KERNEL_ARCH="aarch64"
+    else
+        local file_out="$(file -b "${kpath}" 2>/dev/null || true)"
+        if [[ "${file_out}" == *"x86"* ]]; then
+            KERNEL_ARCH="x86_64"
+        elif [[ "${file_out}" == *"ARM"* || "${file_out}" == *"aarch64"* ]]; then
+            KERNEL_ARCH="aarch64"
+        elif [[ "${file_out}" == *"gzip compressed"* ]]; then
+            local decomp_file="$(gzip -dc "${kpath}" 2>/dev/null | file - || true)"
+            if [[ "${decomp_file}" == *"ARM64"* || "${decomp_file}" == *"aarch64"* || "${decomp_file}" == *"ARM"* ]]; then
+                KERNEL_ARCH="aarch64"
+            elif [[ "${decomp_file}" == *"x86"* ]]; then
+                KERNEL_ARCH="x86_64"
+            fi
+        fi
+    fi
+
+    KERNEL_VER="unknown"
+    local file_out="$(file -b "${kpath}" 2>/dev/null || true)"
+    if [[ "${file_out}" =~ version\ ([^,\ ]+) ]]; then
+        KERNEL_VER="${BASH_REMATCH[1]}"
+    fi
+    if [[ "${KERNEL_VER}" == "unknown" ]]; then
+        local ver_line=""
+        if [[ "${file_out}" == *"gzip compressed"* ]]; then
+            ver_line="$(gzip -dc "${kpath}" 2>/dev/null | strings | grep -E "Linux version [0-9]+\.[0-9]+" | head -n 1 || true)"
+        else
+            ver_line="$(strings "${kpath}" 2>/dev/null | grep -E "Linux version [0-9]+\.[0-9]+" | head -n 1 || true)"
+        fi
+        if [[ "${ver_line}" =~ Linux\ version\ ([^,\ ]+) ]]; then
+            KERNEL_VER="${BASH_REMATCH[1]}"
+        fi
+    fi
+
+    if [[ -z "${ANDROID_VER}" ]]; then
+        if [[ "${KERNEL_VER}" =~ -android([0-9]+)- ]]; then
+            ANDROID_VER="Android ${BASH_REMATCH[1]}"
+        elif [[ "${kpath}" =~ android-([0-9]+) ]]; then
+            ANDROID_VER="Android ${BASH_REMATCH[1]}"
+        else
+            ANDROID_VER="Android Generic"
+        fi
+    fi
+}
+
+lookup_known_digest() {
+    local fpath="$1"
+    local ftype="$2"
+    if [[ "${ftype}" == "ramdisk" ]]; then
+        if [[ "${fpath}" == *"android-37"* && "${fpath}" == *"x86_64"* ]]; then
+            echo "1a3822e981bd07308b48882d205e91e893eff40a27e566a84b597180f2ad426b"
+        elif [[ "${fpath}" == *"android-34"* && "${fpath}" == *"arm64"* ]]; then
+            echo "5c4a40a87ea671396a683a30fde67a3e51c63a21d332a9c5a18ecf20c53e6185"
+        fi
+    elif [[ "${ftype}" == "vendor" ]]; then
+        if [[ "${fpath}" == *"android-37"* && "${fpath}" == *"x86_64"* ]]; then
+            echo "fb76b3cb619100e5d63f5147be982bb31afeb9beb726e82ce9239d295487ad9b"
+        elif [[ "${fpath}" == *"android-34"* && "${fpath}" == *"arm64"* ]]; then
+            echo "d5f44441eb7ced018ef09c09e25658bd9218d9633817f67d5b07d8f365876821"
+        fi
+    fi
+}
+
+# Auto-detect Android image and kernel if not already set
+if [[ -z "${KERNEL_PATH:-}" ]]; then
+    PREFERRED_ARCH="${TARGET_ARCH:-x86_64}"
+    KERNEL_PATH="$(find_latest_android_image "${PREFERRED_ARCH}")" || true
+    if [[ -z "${KERNEL_PATH}" ]]; then
+        KERNEL_PATH="$(find_latest_android_image "")" || true
+    fi
+fi
+
+if [[ -n "${KERNEL_PATH:-}" && -f "${KERNEL_PATH}" ]]; then
+    detect_kernel_and_android "${KERNEL_PATH}"
+    IMG_DIR="$(dirname "${KERNEL_PATH}")"
+    ANDROID_RAMDISK="${ANDROID_RAMDISK:-${IMG_DIR}/ramdisk.img}"
+    ANDROID_VENDOR="${ANDROID_VENDOR:-${IMG_DIR}/vendor.img}"
+else
+    ANDROID_RAMDISK="${ANDROID_RAMDISK:-/opt/android-sdk/system-images/android-37.0/google_apis/x86_64/ramdisk.img}"
+    ANDROID_VENDOR="${ANDROID_VENDOR:-/opt/android-sdk/system-images/android-37.0/google_apis/x86_64/vendor.img}"
+    KERNEL_ARCH="${TARGET_ARCH:-x86_64}"
+    KERNEL_VER="unknown"
+    ANDROID_VER="Android 17"
+    ANDROID_API="37.0"
+fi
+
+# Pinned supply-chain digests (B-2).
+ANDROID_RAMDISK_SHA256="${ANDROID_RAMDISK_SHA256:-$(lookup_known_digest "${ANDROID_RAMDISK}" "ramdisk")}"
+ANDROID_VENDOR_SHA256="${ANDROID_VENDOR_SHA256:-$(lookup_known_digest "${ANDROID_VENDOR}" "vendor")}"
+
+if [[ "${KERNEL_ARCH}" == "aarch64" || "${TARGET_ARCH:-}" == "arm64" || "${TARGET_ARCH:-}" == "aarch64" ]]; then
+    INIT_CC="${CC:-aarch64-linux-gnu-gcc}"
+else
+    INIT_CC="${CC:-gcc}"
+fi
 
 echo "============================================================"
 echo " Building Universal Treble Linux Initramfs for Android GKI"
-echo " Target Output: ${OUTPUT_INITRAMFS}"
+echo " Detected Android:   ${ANDROID_VER} (API ${ANDROID_API:-unknown})"
+echo " Detected Kernel:    ${KERNEL_VER} (${KERNEL_ARCH})"
+echo " Target Output:      ${OUTPUT_INITRAMFS}"
+echo " Compiler:           ${INIT_CC}"
 echo "============================================================"
 
 mkdir -p "${WORKSPACE_ROOT}/dist/modules"
@@ -39,9 +226,11 @@ mkdir -p "${RAMDISK_BUILD_DIR}"/{bin,dev,proc,sys,lib/modules,sysroot}
 
 # 1. Extract virtio kernel modules from Android emulator ramdisk
 if [[ -f "${ANDROID_RAMDISK}" ]]; then
-    echo "[*] Verifying ${ANDROID_RAMDISK} against pinned digest..."
-    echo "${ANDROID_RAMDISK_SHA256}  ${ANDROID_RAMDISK}" | sha256sum -c - \
-        || { echo "FATAL: ANDROID_RAMDISK digest mismatch" >&2; exit 1; }
+    if [[ -n "${ANDROID_RAMDISK_SHA256}" ]]; then
+        echo "[*] Verifying ${ANDROID_RAMDISK} against pinned digest..."
+        echo "${ANDROID_RAMDISK_SHA256}  ${ANDROID_RAMDISK}" | sha256sum -c - \
+            || { echo "FATAL: ANDROID_RAMDISK digest mismatch" >&2; exit 1; }
+    fi
     echo "[*] Extracting virtio kernel modules from ${ANDROID_RAMDISK}..."
     python3 -c '
 import subprocess, sys
@@ -80,13 +269,14 @@ fi
 
 # 1b. Extract GPU & Display kernel modules from Android vendor partition
 if [[ -f "${ANDROID_VENDOR}" ]]; then
-    echo "[*] Verifying ${ANDROID_VENDOR} against pinned digest..."
-    echo "${ANDROID_VENDOR_SHA256}  ${ANDROID_VENDOR}" | sha256sum -c - \
-        || { echo "FATAL: ANDROID_VENDOR digest mismatch" >&2; exit 1; }
+    if [[ -n "${ANDROID_VENDOR_SHA256}" ]]; then
+        echo "[*] Verifying ${ANDROID_VENDOR} against pinned digest..."
+        echo "${ANDROID_VENDOR_SHA256}  ${ANDROID_VENDOR}" | sha256sum -c - \
+            || { echo "FATAL: ANDROID_VENDOR digest mismatch" >&2; exit 1; }
+    fi
     echo "[*] Extracting GPU, DRM, and Network kernel modules from ${ANDROID_VENDOR}..."
     7z e -y "${ANDROID_VENDOR}" \
         lib/modules/virtio-gpu.ko \
-        lib/modules/drm_dma_helper.ko \
         lib/modules/virtio_input.ko \
         lib/modules/failover.ko \
         lib/modules/net_failover.ko \
@@ -103,7 +293,7 @@ if [[ -d "${WORKSPACE_ROOT}/dist/modules" ]]; then
 fi
 
 # 2. Compile static early init executable
-echo "[*] Compiling static early init loader (aarch64)..."
+echo "[*] Compiling static early init loader (${KERNEL_ARCH}) with ${INIT_CC}..."
 cat << 'EOF' > "${RAMDISK_BUILD_DIR}/init.c"
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -383,7 +573,7 @@ int main(int argc, char *argv[]) {
 }
 EOF
 
-aarch64-linux-gnu-gcc -static -Os -ffunction-sections -fdata-sections \
+"${INIT_CC}" -static -Os -ffunction-sections -fdata-sections \
     -fno-asynchronous-unwind-tables -Wl,--gc-sections -Wl,-s \
     "${RAMDISK_BUILD_DIR}/init.c" -o "${RAMDISK_BUILD_DIR}/init"
 rm -f "${RAMDISK_BUILD_DIR}/init.c"

@@ -10,7 +10,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-KERNEL_PATH="/opt/android-sdk/system-images/android-34/google_apis/arm64-v8a/kernel-ranchu"
+KERNEL_PATH="${KERNEL_PATH:-}"
+TARGET_ARCH="${TARGET_ARCH:-}"
 INITRD_PATH="${WORKSPACE_ROOT}/dist/initramfs.cpio.gz"
 DRIVE_PATH="${WORKSPACE_ROOT}/dist/system.raw.img"
 ROOTFS_DIR="${WORKSPACE_ROOT}/build/rootfs"
@@ -39,11 +40,12 @@ Usage: $0 [options]
 All-in-One Packaging & Testing Options:
   -b, --build           Pack and build all components (Rust binaries, rootfs, disk image, initramfs) before boot
   --rebuild             Clean old artifacts and rebuild everything fresh from scratch
-  --full-debian         Bootstrap full Debian Sid ARM64 rootfs (requires sudo debootstrap for real apt/dpkg)
+  --full-debian         Bootstrap full Debian Sid rootfs (requires asroot debootstrap for real apt/dpkg)
   --no-net              Disable virtual network interface (virtio-net-pci)
 
 QEMU & Runtime Options:
-  --kernel <path>       Kernel binary (default: ${KERNEL_PATH})
+  --kernel <path>       Kernel binary (default: auto-detected from installed Android SDK system-images)
+  --arch <arch>         Target architecture: x86_64/amd64 or aarch64/arm64 (default: auto-detected from kernel)
   --initrd <path>       Initramfs archive (default: ${INITRD_PATH})
   --drive <path>        Raw rootfs disk image (default: ${DRIVE_PATH})
   --test                Run in automated test mode (verifies UTIM boot and exits)
@@ -88,6 +90,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --kernel)
             KERNEL_PATH="$2"
+            shift 2
+            ;;
+        --arch)
+            TARGET_ARCH="$2"
             shift 2
             ;;
         --initrd)
@@ -198,7 +204,7 @@ if [[ "${PULL_LOG_MODE}" == "1" ]]; then
         fi
     fi
     if [[ "${QEMU_RUNNING}" == "0" ]]; then
-        PID_VAL=$(pgrep -f "qemu-system-aarch64.*kernel-ranchu" 2>/dev/null | head -n 1 || true)
+        PID_VAL=$(pgrep -f "qemu-system-.*kernel-ranchu" 2>/dev/null | head -n 1 || true)
         if [[ -n "${PID_VAL}" ]]; then
             QEMU_RUNNING=1
             RUNNING_PID="${PID_VAL}"
@@ -239,30 +245,216 @@ if [[ "${PULL_LOG_MODE}" == "1" ]]; then
     exit 0
 fi
 
+# Automatic Android SDK & Kernel Detection Functions
+find_latest_android_image() {
+    local target_arch="${1:-}"
+    local sdk_roots=(
+        "${ANDROID_HOME:-}"
+        "${ANDROID_SDK_ROOT:-}"
+        "/opt/android-sdk"
+        "${HOME}/Android/Sdk"
+    )
+
+    local candidates=()
+    for root in "${sdk_roots[@]}"; do
+        [[ -n "${root}" && -d "${root}/system-images" ]] || continue
+        while IFS= read -r kpath; do
+            [[ -f "${kpath}" ]] || continue
+            candidates+=("${kpath}")
+        done < <(find "${root}/system-images" -name "kernel-ranchu" 2>/dev/null)
+    done
+
+    if [[ ${#candidates[@]} -eq 0 ]]; then
+        return 1
+    fi
+
+    local best_kernel=""
+    local best_score=0
+
+    for kpath in "${candidates[@]}"; do
+        local img_dir="$(dirname "${kpath}")"
+        local api="0"
+        local abi=""
+        if [[ -f "${img_dir}/source.properties" ]]; then
+            api="$(grep -E "^AndroidVersion.ApiLevel=" "${img_dir}/source.properties" | cut -d= -f2 | tr -d " " || echo 0)"
+            abi="$(grep -E "^SystemImage.Abi=" "${img_dir}/source.properties" | cut -d= -f2 | tr -d " " || echo "")"
+        fi
+        local api_num=$(echo "${api}" | awk '{print int($1 * 10)}')
+
+        if [[ -n "${target_arch}" ]]; then
+            case "${target_arch}" in
+                x86_64|amd64)
+                    [[ "${abi}" == *"x86_64"* || "${kpath}" == *"x86_64"* ]] || continue
+                    ;;
+                arm64|aarch64)
+                    [[ "${abi}" == *"arm64"* || "${kpath}" == *"arm64"* ]] || continue
+                    ;;
+            esac
+        fi
+
+        if (( api_num > best_score )); then
+            best_score=${api_num}
+            best_kernel="${kpath}"
+        fi
+    done
+
+    if [[ -n "${best_kernel}" ]]; then
+        echo "${best_kernel}"
+        return 0
+    fi
+    return 1
+}
+
+detect_kernel_and_android() {
+    local kpath="$1"
+    local img_dir="$(dirname "${kpath}")"
+
+    ANDROID_ABI=""
+    ANDROID_API=""
+    ANDROID_VER=""
+    if [[ -f "${img_dir}/source.properties" ]]; then
+        ANDROID_API="$(grep -E "^AndroidVersion.ApiLevel=" "${img_dir}/source.properties" | cut -d= -f2 | tr -d " " || true)"
+        ANDROID_ABI="$(grep -E "^SystemImage.Abi=" "${img_dir}/source.properties" | cut -d= -f2 | tr -d " " || true)"
+    fi
+    if [[ -z "${ANDROID_API}" && "${kpath}" =~ android-([0-9.]+) ]]; then
+        ANDROID_API="${BASH_REMATCH[1]}"
+    fi
+
+    local api_int="${ANDROID_API%%.*}"
+    if [[ -n "${api_int}" && "${api_int}" =~ ^[0-9]+$ ]]; then
+        if (( api_int >= 31 )); then
+            ANDROID_VER="Android $((api_int - 20))"
+        elif (( api_int == 30 )); then
+            ANDROID_VER="Android 11"
+        elif (( api_int == 29 )); then
+            ANDROID_VER="Android 10"
+        elif (( api_int == 28 )); then
+            ANDROID_VER="Android 9"
+        else
+            ANDROID_VER="Android API ${ANDROID_API}"
+        fi
+    fi
+
+    KERNEL_ARCH="unknown"
+    if [[ "${ANDROID_ABI}" == *"x86_64"* ]]; then
+        KERNEL_ARCH="x86_64"
+    elif [[ "${ANDROID_ABI}" == *"arm64"* || "${ANDROID_ABI}" == *"aarch64"* ]]; then
+        KERNEL_ARCH="aarch64"
+    else
+        local file_out="$(file -b "${kpath}" 2>/dev/null || true)"
+        if [[ "${file_out}" == *"x86"* ]]; then
+            KERNEL_ARCH="x86_64"
+        elif [[ "${file_out}" == *"ARM"* || "${file_out}" == *"aarch64"* ]]; then
+            KERNEL_ARCH="aarch64"
+        elif [[ "${file_out}" == *"gzip compressed"* ]]; then
+            local decomp_file="$(gzip -dc "${kpath}" 2>/dev/null | file - || true)"
+            if [[ "${decomp_file}" == *"ARM64"* || "${decomp_file}" == *"aarch64"* || "${decomp_file}" == *"ARM"* ]]; then
+                KERNEL_ARCH="aarch64"
+            elif [[ "${decomp_file}" == *"x86"* ]]; then
+                KERNEL_ARCH="x86_64"
+            fi
+        fi
+    fi
+
+    KERNEL_VER="unknown"
+    local file_out="$(file -b "${kpath}" 2>/dev/null || true)"
+    if [[ "${file_out}" =~ version\ ([^,\ ]+) ]]; then
+        KERNEL_VER="${BASH_REMATCH[1]}"
+    fi
+    if [[ "${KERNEL_VER}" == "unknown" ]]; then
+        local ver_line=""
+        if [[ "${file_out}" == *"gzip compressed"* ]]; then
+            ver_line="$(gzip -dc "${kpath}" 2>/dev/null | strings | grep -E "Linux version [0-9]+\.[0-9]+" | head -n 1 || true)"
+        else
+            ver_line="$(strings "${kpath}" 2>/dev/null | grep -E "Linux version [0-9]+\.[0-9]+" | head -n 1 || true)"
+        fi
+        if [[ "${ver_line}" =~ Linux\ version\ ([^,\ ]+) ]]; then
+            KERNEL_VER="${BASH_REMATCH[1]}"
+        fi
+    fi
+
+    if [[ -z "${ANDROID_VER}" ]]; then
+        if [[ "${KERNEL_VER}" =~ -android([0-9]+)- ]]; then
+            ANDROID_VER="Android ${BASH_REMATCH[1]}"
+        elif [[ "${kpath}" =~ android-([0-9]+) ]]; then
+            ANDROID_VER="Android ${BASH_REMATCH[1]}"
+        else
+            ANDROID_VER="Android Generic"
+        fi
+    fi
+}
+
+# Auto-detect kernel image if not specified
+if [[ -z "${KERNEL_PATH}" ]]; then
+    PREFERRED_ARCH="${TARGET_ARCH:-x86_64}"
+    echo "[*] Auto-detecting Android SDK kernel image (preferred: ${PREFERRED_ARCH})..."
+    KERNEL_PATH="$(find_latest_android_image "${PREFERRED_ARCH}")" || true
+    if [[ -z "${KERNEL_PATH}" ]]; then
+        KERNEL_PATH="$(find_latest_android_image "")" || true
+    fi
+    if [[ -z "${KERNEL_PATH}" ]]; then
+        echo "Error: No Android SDK kernel-ranchu found in system-images directories." >&2
+        exit 1
+    fi
+fi
+
 if [[ ! -f "${KERNEL_PATH}" ]]; then
-    echo "Error: Kernel not found at ${KERNEL_PATH}"
+    echo "Error: Kernel not found at ${KERNEL_PATH}" >&2
     exit 1
 fi
+
+detect_kernel_and_android "${KERNEL_PATH}"
+
+# Configure architecture and emulator parameters from detected kernel
+if [[ "${KERNEL_ARCH}" == "x86_64" ]]; then
+    TARGET_ARCH="amd64"
+    QEMU_BIN="qemu-system-x86_64"
+    MACHINE_OPTS=("-M" "pc")
+    SMP_OPTS=("-smp" "2")
+    ACCEL_OPTS=()
+    if [[ -w /dev/kvm ]]; then
+        ACCEL_OPTS=("-enable-kvm" "-cpu" "host")
+    else
+        ACCEL_OPTS=("-cpu" "max")
+    fi
+    KERNEL_APPEND="earlyprintk=ttyS0 console=ttyS0 8250.nr_uarts=1 clocksource=pit root=/dev/vda rw init=/init loglevel=4 printk.devkmsg=on panic=-1"
+else
+    TARGET_ARCH="arm64"
+    QEMU_BIN="qemu-system-aarch64"
+    MACHINE_OPTS=("-M" "virt,gic-version=3")
+    SMP_OPTS=("-smp" "1")
+    ACCEL_OPTS=("-cpu" "cortex-a76")
+    KERNEL_APPEND="console=ttyAMA0 root=/dev/vda rw init=/init loglevel=4 printk.devkmsg=on panic=-1"
+fi
+
+echo "============================================================"
+echo " Universal Treble Linux - Environment Auto-Detected"
+echo " Detected Android:   ${ANDROID_VER} (API ${ANDROID_API:-unknown})"
+echo " Detected Kernel:    Linux ${KERNEL_VER} (${KERNEL_ARCH})"
+echo " Kernel Image:       ${KERNEL_PATH}"
+echo " Emulator Engine:    ${QEMU_BIN} (${MACHINE_OPTS[*]})"
+echo " Rootfs Target:      Debian Sid ${TARGET_ARCH}"
+echo "============================================================"
 
 pack_components() {
     local is_full="${1:-0}"
     echo "============================================================"
-    echo " [PACK] Packaging Universal Treble Linux for QEMU"
+    echo " [PACK] Packaging Universal Treble Linux for QEMU (${TARGET_ARCH})"
     echo "============================================================"
 
     echo "[*] Step 1/3: Assembling Rootfs and packaging deb/binaries..."
     if [[ "${is_full}" == "1" ]]; then
-        echo "[*] Executing privileged debootstrap build (sudo)..."
-        sudo "${SCRIPT_DIR}/build_rootfs.sh" "${ROOTFS_DIR}"
+        echo "[*] Executing privileged debootstrap build (asroot)..."
+        TARGET_ARCH="${TARGET_ARCH}" asroot "${SCRIPT_DIR}/build_rootfs.sh" "${ROOTFS_DIR}"
     else
-        "${SCRIPT_DIR}/build_rootfs.sh" "${ROOTFS_DIR}"
+        TARGET_ARCH="${TARGET_ARCH}" "${SCRIPT_DIR}/build_rootfs.sh" "${ROOTFS_DIR}"
     fi
 
     echo "[*] Step 2/3: Packaging ext4 rootfs disk image (system.raw.img)..."
     "${SCRIPT_DIR}/build_image.sh" "${ROOTFS_DIR}" "${WORKSPACE_ROOT}/dist/system.img"
 
     echo "[*] Step 3/3: Packaging early boot initramfs (initramfs.cpio.gz)..."
-    "${SCRIPT_DIR}/build_initramfs.sh" "${INITRD_PATH}"
+    KERNEL_PATH="${KERNEL_PATH}" TARGET_ARCH="${TARGET_ARCH}" "${SCRIPT_DIR}/build_initramfs.sh" "${INITRD_PATH}"
 
     echo "[+] All components packaged successfully!"
     echo "============================================================"
@@ -280,6 +472,17 @@ else
     if [[ ! -d "${ROOTFS_DIR}" || ! -f "${ROOTFS_DIR}/usr/bin/utim" ]]; then
         echo "[*] Rootfs not assembled at ${ROOTFS_DIR}."
         NEED_PACK=1
+    else
+        elf_type="$(file -b "${ROOTFS_DIR}/usr/bin/utim" 2>/dev/null || true)"
+        if [[ "${TARGET_ARCH}" == "amd64" && "${elf_type}" != *"x86-64"* ]]; then
+            echo "[*] Stale non-x86_64 rootfs detected at ${ROOTFS_DIR}. Repackaging for x86_64..."
+            rm -rf "${ROOTFS_DIR}"
+            NEED_PACK=1
+        elif [[ "${TARGET_ARCH}" == "arm64" && "${elf_type}" != *"aarch64"* && "${elf_type}" != *"ARM aarch64"* ]]; then
+            echo "[*] Stale non-arm64 rootfs detected at ${ROOTFS_DIR}. Repackaging for arm64..."
+            rm -rf "${ROOTFS_DIR}"
+            NEED_PACK=1
+        fi
     fi
 
     if [[ ! -f "${DRIVE_PATH}" ]]; then
@@ -294,7 +497,7 @@ else
 
     if [[ ! -f "${INITRD_PATH}" ]]; then
         echo "[*] Initramfs not found at ${INITRD_PATH}. Building..."
-        "${SCRIPT_DIR}/build_initramfs.sh" "${INITRD_PATH}"
+        KERNEL_PATH="${KERNEL_PATH}" TARGET_ARCH="${TARGET_ARCH}" "${SCRIPT_DIR}/build_initramfs.sh" "${INITRD_PATH}"
     fi
 fi
 
@@ -321,16 +524,17 @@ fi
 
 # 4. Assemble QEMU execution command
 mkdir -p "${WORKSPACE_ROOT}/dist"
+
 QEMU_CMD=(
-    qemu-system-aarch64
-    -M virt,gic-version=3
-    -cpu cortex-a76
-    -smp 1
+    "${QEMU_BIN}"
+    "${MACHINE_OPTS[@]}"
+    "${ACCEL_OPTS[@]}"
+    "${SMP_OPTS[@]}"
     -m 4096
     -kernel "${KERNEL_PATH}"
     -initrd "${INITRD_PATH}"
     -drive "file=${DRIVE_PATH},if=virtio,format=raw"
-    -append "console=ttyAMA0 root=/dev/vda rw init=/init loglevel=4 printk.devkmsg=on panic=-1"
+    -append "${KERNEL_APPEND}"
     -pidfile "${PID_FILE}"
     "${DISPLAY_OPTS[@]}"
     "${NET_OPTS[@]}"

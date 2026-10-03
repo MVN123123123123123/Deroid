@@ -17,6 +17,7 @@ use std::ffi::CString;
 use std::fs;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
+use std::io::Write;
 use std::sync::OnceLock;
 
 /// UID the session commands run as once root privileges are dropped.
@@ -39,6 +40,9 @@ const HOME_CAP: usize = 128;
 const PROMPT_CAP: usize = 160;
 /// Working buffer for the reentrant passwd lookup, grown on `ERANGE`.
 const PW_BUF_CAP: usize = 4096;
+const KERNEL_RELEASE_CAP: usize = 128;
+const MACHINE_CAP: usize = 32;
+const ANDROID_VER_CAP: usize = 16;
 
 /// Identity of the account that shell commands actually run under.
 ///
@@ -53,6 +57,12 @@ pub struct Session {
     host_len: usize,
     prompt: [u8; PROMPT_CAP],
     prompt_len: usize,
+    kernel_release: [u8; KERNEL_RELEASE_CAP],
+    kernel_release_len: usize,
+    machine: [u8; MACHINE_CAP],
+    machine_len: usize,
+    android_ver: [u8; ANDROID_VER_CAP],
+    android_ver_len: usize,
     uid: libc::uid_t,
     gid: libc::gid_t,
 }
@@ -76,16 +86,42 @@ impl Session {
             ),
         };
 
+        let mut uts: libc::utsname = unsafe { std::mem::zeroed() };
         let mut host = [0u8; HOST_CAP];
-        let host_len = {
-            let n = read_hostname(&mut host);
-            if n == 0 {
-                host[..7].copy_from_slice(b"localhost");
-                7
-            } else {
-                n
-            }
-        };
+        let mut host_len = 0;
+        let mut kernel_release = [0u8; KERNEL_RELEASE_CAP];
+        let mut kernel_release_len = 0;
+        let mut machine = [0u8; MACHINE_CAP];
+        let mut machine_len = 0;
+
+        if unsafe { libc::uname(&mut uts) } == 0 {
+            host_len = unsafe { copy_cstr(&mut host, uts.nodename.as_ptr()) };
+            kernel_release_len = unsafe { copy_cstr(&mut kernel_release, uts.release.as_ptr()) };
+            machine_len = unsafe { copy_cstr(&mut machine, uts.machine.as_ptr()) };
+        }
+
+        if host_len == 0 {
+            host[..7].copy_from_slice(b"localhost");
+            host_len = 7;
+        }
+        if kernel_release_len == 0 {
+            let def = b"6.12.58-android17";
+            kernel_release[..def.len()].copy_from_slice(def);
+            kernel_release_len = def.len();
+        }
+        if machine_len == 0 {
+            #[cfg(target_arch = "x86_64")]
+            let def = b"x86_64";
+            #[cfg(target_arch = "aarch64")]
+            let def = b"aarch64";
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+            let def = b"unknown";
+            machine[..def.len()].copy_from_slice(def);
+            machine_len = def.len();
+        }
+
+        let mut android_ver = [0u8; ANDROID_VER_CAP];
+        let android_ver_len = probe_android_version(&mut android_ver, &kernel_release[..kernel_release_len]);
 
         // Commands always start in the session home, so `~` is truthful, and
         // the `#`/`$` marker reflects the uid the child will run as.
@@ -101,6 +137,12 @@ impl Session {
             host_len,
             prompt,
             prompt_len,
+            kernel_release,
+            kernel_release_len,
+            machine,
+            machine_len,
+            android_ver,
+            android_ver_len,
             uid,
             gid,
         }
@@ -124,6 +166,21 @@ impl Session {
     /// Full prompt prefix including the trailing space, e.g. `user@phone:~$ `.
     pub fn prompt(&self) -> &str {
         text(&self.prompt[..self.prompt_len], "user@localhost:~$ ")
+    }
+
+    /// Running kernel release string (`uname().release`), e.g. `6.12.58-android16-6-...`.
+    pub fn kernel_release(&self) -> &str {
+        text(&self.kernel_release[..self.kernel_release_len], "6.12.58")
+    }
+
+    /// Machine hardware architecture (`uname().machine`), e.g. `x86_64` or `aarch64`.
+    pub fn machine(&self) -> &str {
+        text(&self.machine[..self.machine_len], "x86_64")
+    }
+
+    /// Detected Android release version number (e.g. `17`, `16`, `14`).
+    pub fn android_version(&self) -> &str {
+        text(&self.android_ver[..self.android_ver_len], "17")
     }
 
     /// UID that shell commands run as (root is dropped to [`SESSION_UID`]).
@@ -329,13 +386,103 @@ fn copy_fallback_home(uid: libc::uid_t, dst: &mut [u8]) -> usize {
     copy_sanitized(dst, fallback.as_bytes())
 }
 
-/// Read `uname().nodename`: one syscall, no truncation guessing, no allocation.
-fn read_hostname(dst: &mut [u8]) -> usize {
-    let mut uts: libc::utsname = unsafe { std::mem::zeroed() };
-    if unsafe { libc::uname(&mut uts) } != 0 {
-        return 0;
+/// Automatically probe Android release version from property files or kernel release string.
+fn probe_android_version(dst: &mut [u8], krel: &[u8]) -> usize {
+    let prop_files = [
+        "/vendor/build.prop",
+        "/system/build.prop",
+        "/system/etc/build.prop",
+        "/default.prop",
+        "/vendor/default.prop",
+    ];
+
+    for path in prop_files {
+        let fd = unsafe {
+            let mut cpath = [0u8; 64];
+            let plen = path.len().min(cpath.len() - 1);
+            cpath[..plen].copy_from_slice(&path.as_bytes()[..plen]);
+            cpath[plen] = 0;
+            libc::open(cpath.as_ptr() as *const libc::c_char, libc::O_RDONLY | libc::O_CLOEXEC)
+        };
+        if fd >= 0 {
+            let mut buf = [0u8; 4096];
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len() - 1) };
+            unsafe { libc::close(fd) };
+            if n > 0 {
+                let slice = &buf[..n as usize];
+                if let Some(ver) = extract_prop(slice, b"ro.build.version.release=") {
+                    let len = ver.len().min(dst.len());
+                    dst[..len].copy_from_slice(&ver[..len]);
+                    return len;
+                }
+                if let Some(sdk) = extract_prop(slice, b"ro.build.version.sdk=") {
+                    if let Ok(sdk_str) = core::str::from_utf8(sdk) {
+                        if let Ok(num) = sdk_str.trim().parse::<u32>() {
+                            let ver_num = if num >= 31 { num - 20 } else { num };
+                            let mut tmp = [0u8; 16];
+                            let mut cur = std::io::Cursor::new(&mut tmp[..]);
+                            let _ = write!(cur, "{}", ver_num);
+                            let tlen = (cur.position() as usize).min(dst.len());
+                            dst[..tlen].copy_from_slice(&tmp[..tlen]);
+                            return tlen;
+                        }
+                    }
+                }
+            }
+        }
     }
-    unsafe { copy_cstr(dst, uts.nodename.as_ptr()) }
+
+    if let Ok(kstr) = core::str::from_utf8(krel) {
+        if let Some(idx) = kstr.find("-android") {
+            let rem = &kstr[idx + 8..];
+            let num_bytes: &[u8] = rem.as_bytes();
+            let mut end = 0;
+            while end < num_bytes.len() && num_bytes[end].is_ascii_digit() {
+                end += 1;
+            }
+            if end > 0 {
+                let num_str = &rem[..end];
+                let ver_str = if num_str == "16" && kstr.contains("6.12") {
+                    "17"
+                } else {
+                    num_str
+                };
+                let bytes = ver_str.as_bytes();
+                let len = bytes.len().min(dst.len());
+                dst[..len].copy_from_slice(&bytes[..len]);
+                return len;
+            }
+        }
+    }
+
+    let def = b"17";
+    dst[..def.len()].copy_from_slice(def);
+    def.len()
+}
+
+/// Zero-copy property parser for Android build.prop content.
+fn extract_prop<'a>(data: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
+    let mut pos = 0;
+    while pos + key.len() <= data.len() {
+        if &data[pos..pos + key.len()] == key {
+            let val_start = pos + key.len();
+            let mut val_end = val_start;
+            while val_end < data.len() && data[val_end] != b'\n' && data[val_end] != b'\r' {
+                val_end += 1;
+            }
+            let val = &data[val_start..val_end];
+            if !val.is_empty() {
+                return Some(val);
+            }
+        }
+        while pos < data.len() && data[pos] != b'\n' {
+            pos += 1;
+        }
+        if pos < data.len() {
+            pos += 1;
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -420,5 +567,32 @@ mod tests {
         if !is_root_process() {
             ensure_session_dirs();
         }
+    }
+
+    #[test]
+    fn test_kernel_and_android_detection() {
+        let s = session();
+        assert!(!s.kernel_release().is_empty());
+        assert!(!s.machine().is_empty());
+        assert!(!s.android_version().is_empty());
+
+        // Probe on simulated kernel releases
+        let mut dst = [0u8; 16];
+        let n = probe_android_version(&mut dst, b"6.12.58-android16-6-gccafb60de224-ab14828483");
+        assert_eq!(&dst[..n], b"17");
+
+        let n = probe_android_version(&mut dst, b"6.1.23-android14-4-00257");
+        assert_eq!(&dst[..n], b"14");
+
+        let n = probe_android_version(&mut dst, b"5.15.41-android12-9-00001");
+        assert_eq!(&dst[..n], b"12");
+    }
+
+    #[test]
+    fn test_extract_prop() {
+        let sample = b"ro.product.model=Pixel 8\nro.build.version.release=15\nro.build.version.sdk=35\n";
+        assert_eq!(extract_prop(sample, b"ro.build.version.release="), Some(&b"15"[..]));
+        assert_eq!(extract_prop(sample, b"ro.build.version.sdk="), Some(&b"35"[..]));
+        assert_eq!(extract_prop(sample, b"ro.missing="), None);
     }
 }

@@ -4142,7 +4142,10 @@ fn run_daemon() {
     let mut app_input_focused = false;
     let mut messages_list: Vec<String> = vec![
         "Treble Carrier: LTE connection active.".to_string(),
-        "System: All Android 14 GKI HAL bridges ready.".to_string(),
+        format!(
+            "System: All Android {} GKI HAL bridges ready.",
+            utim_core::session::session().android_version()
+        ),
     ];
     let mut terminal_tabs: Vec<TerminalTab> = vec![TerminalTab::new(1)];
     let mut active_tab_idx: usize = 0;
@@ -10354,8 +10357,10 @@ fn log_terminal_output(line: &str) {
     use std::fs::OpenOptions;
     use std::io::Write;
 
-    // 1. Mirror to serial console /dev/ttyAMA0 so QEMU captures it into dist/qemu_terminal.log
-    if let Ok(mut tty) = OpenOptions::new().write(true).open("/dev/ttyAMA0") {
+    // 1. Mirror to serial console (/dev/ttyS0 for x86_64, /dev/ttyAMA0 for aarch64, or /dev/console)
+    if let Ok(mut tty) = OpenOptions::new().write(true).open("/dev/ttyS0") {
+        let _ = writeln!(tty, "[UTLC-TERM] {}", line);
+    } else if let Ok(mut tty) = OpenOptions::new().write(true).open("/dev/ttyAMA0") {
         let _ = writeln!(tty, "[UTLC-TERM] {}", line);
     } else if let Ok(mut console) = OpenOptions::new().write(true).open("/dev/console") {
         let _ = writeln!(console, "[UTLC-TERM] {}", line);
@@ -10717,9 +10722,12 @@ fn run_command_process(
         if !executed_real {
             match bin_name {
                 "uname" => {
+                    let s = utim_core::session::session();
                     let _ = tx.send(format!(
-                        "Linux {} 6.1.23-android14-4-00257 aarch64 GNU/Linux",
-                        utim_core::session::session().host()
+                        "Linux {} {} {} GNU/Linux",
+                        s.host(),
+                        s.kernel_release(),
+                        s.machine()
                     ));
                 }
                 "uptime" => {

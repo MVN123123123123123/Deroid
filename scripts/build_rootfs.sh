@@ -7,7 +7,21 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-TARGET_ARCH="arm64"
+TARGET_ARCH="${TARGET_ARCH:-amd64}"
+case "${TARGET_ARCH}" in
+    amd64|x86_64)
+        TARGET_ARCH="amd64"
+        RUST_TARGET="x86_64-unknown-linux-gnu"
+        ;;
+    arm64|aarch64)
+        TARGET_ARCH="arm64"
+        RUST_TARGET="aarch64-unknown-linux-gnu"
+        ;;
+    *)
+        echo "Unsupported TARGET_ARCH: ${TARGET_ARCH}" >&2
+        exit 1
+        ;;
+esac
 DEBIAN_MIRROR="http://deb.debian.org/debian/"
 DEBIAN_SUITE="sid"
 ROOTFS_DIR="${1:-${WORKSPACE_ROOT}/build/rootfs}"
@@ -104,13 +118,13 @@ EOF
 }
 
 echo "============================================================"
-echo " Building Debian Sid ARM64 Rootfs for Universal Treble Linux"
+echo " Building Debian Sid ${TARGET_ARCH} Rootfs for Universal Treble Linux"
 echo " Target Rootfs Directory: ${ROOTFS_DIR}"
 echo "============================================================"
 
-# Ensure UTIM binaries are built for aarch64
-echo "[*] Verifying UTIM aarch64 release binaries..."
-cargo build --release --workspace --target aarch64-unknown-linux-gnu
+# Ensure UTIM binaries are built for target architecture
+echo "[*] Verifying UTIM ${TARGET_ARCH} release binaries (${RUST_TARGET})..."
+cargo build --release --workspace --target "${RUST_TARGET}"
 
 # Ensure dummy deb package and graphics packages are built
 echo "[*] Building utim-init-dummy package..."
@@ -120,25 +134,46 @@ echo "[*] Building Phase 2 Graphics HAL packages (libhybris, Mesa Turnip/Zink, l
 "${SCRIPT_DIR}/package_graphics.sh" "${WORKSPACE_ROOT}/dist"
 
 echo "[*] Building Phase 3 UTLC Mobile Wayland Compositor & Shell package..."
-"${SCRIPT_DIR}/package_utlc.sh" "${WORKSPACE_ROOT}/dist"
+TARGET_ARCH="${TARGET_ARCH}" "${SCRIPT_DIR}/package_utlc.sh" "${WORKSPACE_ROOT}/dist"
 
 if [[ "${DRY_RUN}" == "1" || "$(id -u)" != "0" ]]; then
     echo "[!] Non-root execution detected or DRY_RUN=1."
-    echo "[*] Assembling Debian Sid ARM64 rootfs (with APT, dpkg, bash, and UTIM init)..."
+    echo "[*] Assembling Debian Sid ${TARGET_ARCH} rootfs (with APT, dpkg, bash, and UTIM init)..."
 
-    # Ensure Debian Sid ARM64 packages (apt, dpkg, bash, coreutils) are populated
+    # Ensure Debian Sid packages (apt, dpkg, bash, coreutils) are populated
+    if [[ -f "${ROOTFS_DIR}/usr/bin/apt" ]]; then
+        current_elf="$(file -b "${ROOTFS_DIR}/usr/bin/apt" 2>/dev/null || true)"
+        if [[ "${TARGET_ARCH}" == "amd64" && "${current_elf}" != *"x86-64"* ]]; then
+            echo "[*] Stale non-amd64 rootfs detected at ${ROOTFS_DIR}. Removing..."
+            rm -rf "${ROOTFS_DIR}"
+        elif [[ "${TARGET_ARCH}" == "arm64" && "${current_elf}" != *"aarch64"* && "${current_elf}" != *"ARM aarch64"* ]]; then
+            echo "[*] Stale non-arm64 rootfs detected at ${ROOTFS_DIR}. Removing..."
+            rm -rf "${ROOTFS_DIR}"
+        fi
+    fi
+
     if [[ ! -f "${ROOTFS_DIR}/usr/bin/apt" ]]; then
-        if [[ -d "${WORKSPACE_ROOT}/build/test_debootstrap" && -f "${WORKSPACE_ROOT}/build/test_debootstrap/usr/bin/apt" ]]; then
-            echo "[*] Populating Debian Sid base from cached debootstrap..."
+        if [[ -d "${WORKSPACE_ROOT}/build/test_debootstrap_${TARGET_ARCH}" && -f "${WORKSPACE_ROOT}/build/test_debootstrap_${TARGET_ARCH}/usr/bin/apt" ]]; then
+            echo "[*] Populating Debian Sid base from cached debootstrap (${TARGET_ARCH})..."
+            rm -rf "${ROOTFS_DIR}"
+            mkdir -p "${ROOTFS_DIR}"
+            cp -a "${WORKSPACE_ROOT}/build/test_debootstrap_${TARGET_ARCH}/." "${ROOTFS_DIR}/"
+        elif [[ "${TARGET_ARCH}" == "arm64" && -d "${WORKSPACE_ROOT}/build/test_debootstrap" && -f "${WORKSPACE_ROOT}/build/test_debootstrap/usr/bin/apt" ]]; then
+            echo "[*] Populating Debian Sid base from cached debootstrap (arm64)..."
             rm -rf "${ROOTFS_DIR}"
             mkdir -p "${ROOTFS_DIR}"
             cp -a "${WORKSPACE_ROOT}/build/test_debootstrap/." "${ROOTFS_DIR}/"
         else
-            echo "[*] Bootstrapping Debian Sid ARM64 base packages via fakeroot..."
+            echo "[*] Bootstrapping Debian Sid ${TARGET_ARCH} base packages via fakeroot..."
             rm -rf "${ROOTFS_DIR}"
             mkdir -p "${ROOTFS_DIR}"
-            fakeroot debootstrap --foreign --variant=minbase --arch="${TARGET_ARCH}" "${DEBIAN_SUITE}" "${ROOTFS_DIR}" "${DEBIAN_MIRROR}" \
-                || { echo "FATAL: debootstrap ${DEBIAN_SUITE}/${TARGET_ARCH} failed" >&2; exit 1; }
+            if [[ "${TARGET_ARCH}" == "amd64" && "$(uname -m)" == "x86_64" ]]; then
+                fakeroot debootstrap --variant=minbase --arch="${TARGET_ARCH}" "${DEBIAN_SUITE}" "${ROOTFS_DIR}" "${DEBIAN_MIRROR}" \
+                    || { echo "FATAL: debootstrap ${DEBIAN_SUITE}/${TARGET_ARCH} failed" >&2; exit 1; }
+            else
+                fakeroot debootstrap --foreign --variant=minbase --arch="${TARGET_ARCH}" "${DEBIAN_SUITE}" "${ROOTFS_DIR}" "${DEBIAN_MIRROR}" \
+                    || { echo "FATAL: debootstrap ${DEBIAN_SUITE}/${TARGET_ARCH} failed" >&2; exit 1; }
+            fi
         fi
         [[ -x "${ROOTFS_DIR}/usr/bin/apt" ]] || { echo "FATAL: base system incomplete (no ${ROOTFS_DIR}/usr/bin/apt)" >&2; exit 1; }
     fi
@@ -157,8 +192,18 @@ if [[ "${DRY_RUN}" == "1" || "$(id -u)" != "0" ]]; then
     mkdir -p "${ROOTFS_DIR}/var/lib/systemd/deb-systemd-helper-enabled"
     mkdir -p "${ROOTFS_DIR}/proc" "${ROOTFS_DIR}/sys" "${ROOTFS_DIR}/dev"
     mkdir -p "${ROOTFS_DIR}/root" "${ROOTFS_DIR}/home" "${ROOTFS_DIR}/mnt"
-    rm -rf "${ROOTFS_DIR}/lib64"
-    ln -sfn "lib" "${ROOTFS_DIR}/lib64"
+    if [[ "${TARGET_ARCH}" == "arm64" ]]; then
+        rm -rf "${ROOTFS_DIR}/lib64"
+        ln -sfn "lib" "${ROOTFS_DIR}/lib64"
+    elif [[ "${TARGET_ARCH}" == "amd64" ]]; then
+        mkdir -p "${ROOTFS_DIR}/usr/lib64"
+        if [[ ! -e "${ROOTFS_DIR}/lib64" ]]; then
+            ln -sfn "usr/lib64" "${ROOTFS_DIR}/lib64"
+        fi
+        if [[ -f "${ROOTFS_DIR}/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2" && ! -e "${ROOTFS_DIR}/usr/lib64/ld-linux-x86-64.so.2" ]]; then
+            ln -sfn "../lib/x86_64-linux-gnu/ld-linux-x86-64.so.2" "${ROOTFS_DIR}/usr/lib64/ld-linux-x86-64.so.2"
+        fi
+    fi
 
     # Canonical systemd target definitions
     cat << 'EOF' > "${ROOTFS_DIR}/usr/lib/systemd/system/basic.target"
@@ -234,17 +279,17 @@ EOF
 
     # Install UTIM binaries, systemd shims, graphics check tool, and UTLC compositor
     echo "[*] Installing UTIM binaries, systemd shims, graphics check tool, and UTLC compositor..."
-    cp "${WORKSPACE_ROOT}/target/aarch64-unknown-linux-gnu/release/utim" "${ROOTFS_DIR}/usr/bin/utim"
+    cp "${WORKSPACE_ROOT}/target/${RUST_TARGET}/release/utim" "${ROOTFS_DIR}/usr/bin/utim"
     ln -sf "/usr/bin/utim" "${ROOTFS_DIR}/sbin/init"
     ln -sf "/usr/bin/utim" "${ROOTFS_DIR}/init"
 
-    cp "${WORKSPACE_ROOT}/target/aarch64-unknown-linux-gnu/release/utimctl" "${ROOTFS_DIR}/usr/bin/utimctl"
+    cp "${WORKSPACE_ROOT}/target/${RUST_TARGET}/release/utimctl" "${ROOTFS_DIR}/usr/bin/utimctl"
     ln -sf "/usr/bin/utimctl" "${ROOTFS_DIR}/usr/bin/systemctl"
 
-    cp "${WORKSPACE_ROOT}/target/aarch64-unknown-linux-gnu/release/deb-systemd-helper" "${ROOTFS_DIR}/usr/bin/deb-systemd-helper"
-    cp "${WORKSPACE_ROOT}/target/aarch64-unknown-linux-gnu/release/deb-systemd-invoke" "${ROOTFS_DIR}/usr/bin/deb-systemd-invoke"
-    cp "${WORKSPACE_ROOT}/target/aarch64-unknown-linux-gnu/release/utim-graphics-check" "${ROOTFS_DIR}/usr/bin/utim-graphics-check"
-    cp "${WORKSPACE_ROOT}/target/aarch64-unknown-linux-gnu/release/utlc" "${ROOTFS_DIR}/usr/bin/utlc"
+    cp "${WORKSPACE_ROOT}/target/${RUST_TARGET}/release/deb-systemd-helper" "${ROOTFS_DIR}/usr/bin/deb-systemd-helper"
+    cp "${WORKSPACE_ROOT}/target/${RUST_TARGET}/release/deb-systemd-invoke" "${ROOTFS_DIR}/usr/bin/deb-systemd-invoke"
+    cp "${WORKSPACE_ROOT}/target/${RUST_TARGET}/release/utim-graphics-check" "${ROOTFS_DIR}/usr/bin/utim-graphics-check"
+    cp "${WORKSPACE_ROOT}/target/${RUST_TARGET}/release/utlc" "${ROOTFS_DIR}/usr/bin/utlc"
 
     # Install systemd helper shims (tmpfiles, sysusers, notify, escape)
     if [[ -d "${SCRIPT_DIR}/shims" ]]; then
@@ -284,7 +329,16 @@ EOF
 
     # Copy deb packages and kernel modules
     mkdir -p "${ROOTFS_DIR}/tmp/debs"
-    cp "${WORKSPACE_ROOT}/dist/"*.deb "${ROOTFS_DIR}/tmp/debs/"
+    for deb in "${WORKSPACE_ROOT}/dist/"*.deb; do
+        [[ -f "${deb}" ]] || continue
+        case "${deb}" in
+            *_"${TARGET_ARCH}".deb|*_all.deb|*utim-init-dummy.deb)
+                cp "${deb}" "${ROOTFS_DIR}/tmp/debs/"
+                ;;
+            *)
+                ;;
+        esac
+    done
     mkdir -p "${ROOTFS_DIR}/lib/modules"
     cp -a "${WORKSPACE_ROOT}/dist/modules/"*.ko "${ROOTFS_DIR}/lib/modules/" 2>/dev/null || true
 
@@ -303,6 +357,11 @@ EOF
             ! -name 'ISO8859-1.so' ! -name 'UTF-16.so' ! -name 'UTF-32.so' \
             ! -name 'ANSI_X3.4-1968.so' -delete
     fi
+    if [[ -d "${ROOTFS_DIR}/usr/lib/x86_64-linux-gnu/gconv" ]]; then
+        find "${ROOTFS_DIR}/usr/lib/x86_64-linux-gnu/gconv" -name '*.so' \
+            ! -name 'ISO8859-1.so' ! -name 'UTF-16.so' ! -name 'UTF-32.so' \
+            ! -name 'ANSI_X3.4-1968.so' -delete
+    fi
 
     # Neutral graphics environment (B-6): the target GPU is probed at runtime
     # by utim. Never bake the build host's pipeline into the image.
@@ -314,31 +373,40 @@ EOF
     ln -sf "/etc/environment.d/10-graphics.conf" "${ROOTFS_DIR}/run/utim/graphics.env"
 
     # Generate ld.so.cache for dynamic library resolution
-    if [[ -f "${ROOTFS_DIR}/sbin/ldconfig" ]] && command -v qemu-aarch64-static >/dev/null 2>&1; then
-        echo "[*] Generating ld.so.cache using qemu-aarch64-static ldconfig..."
-        qemu-aarch64-static -L "${ROOTFS_DIR}" "${ROOTFS_DIR}/sbin/ldconfig" -C "${ROOTFS_DIR}/etc/ld.so.cache" -f "${ROOTFS_DIR}/etc/ld.so.conf" 2>/dev/null || true
+    if [[ -f "${ROOTFS_DIR}/sbin/ldconfig" ]]; then
+        if [[ "${TARGET_ARCH}" == "amd64" && "$(uname -m)" == "x86_64" ]]; then
+            echo "[*] Generating ld.so.cache using native ldconfig..."
+            "${ROOTFS_DIR}/sbin/ldconfig" -r "${ROOTFS_DIR}" -C "/etc/ld.so.cache" -f "/etc/ld.so.conf" 2>/dev/null || true
+        elif command -v qemu-aarch64-static >/dev/null 2>&1; then
+            echo "[*] Generating ld.so.cache using qemu-aarch64-static ldconfig..."
+            qemu-aarch64-static -L "${ROOTFS_DIR}" "${ROOTFS_DIR}/sbin/ldconfig" -C "${ROOTFS_DIR}/etc/ld.so.cache" -f "${ROOTFS_DIR}/etc/ld.so.conf" 2>/dev/null || true
+        fi
     fi
 
-    echo "[+] Debian Sid ARM64 rootfs assembled successfully at ${ROOTFS_DIR}."
+    echo "[+] Debian Sid ${TARGET_ARCH} rootfs assembled successfully at ${ROOTFS_DIR}."
     exit 0
 fi
 
 # Privileged full bootstrap path
 mkdir -p "${ROOTFS_DIR}"
 
-echo "[*] Running debootstrap for Debian Sid ARM64..."
-debootstrap --arch="${TARGET_ARCH}" --foreign "${DEBIAN_SUITE}" "${ROOTFS_DIR}" "${DEBIAN_MIRROR}"
+echo "[*] Running debootstrap for Debian Sid ${TARGET_ARCH}..."
+if [[ "${TARGET_ARCH}" == "amd64" && "$(uname -m)" == "x86_64" ]]; then
+    debootstrap --arch="${TARGET_ARCH}" "${DEBIAN_SUITE}" "${ROOTFS_DIR}" "${DEBIAN_MIRROR}"
+else
+    debootstrap --arch="${TARGET_ARCH}" --foreign "${DEBIAN_SUITE}" "${ROOTFS_DIR}" "${DEBIAN_MIRROR}"
 
-if [[ -f "${ROOTFS_DIR}/debootstrap/debootstrap" ]]; then
-    echo "[*] Completing foreign debootstrap second-stage via qemu-aarch64-static..."
-    cp "$(command -v qemu-aarch64-static 2>/dev/null || echo /usr/bin/qemu-aarch64-static)" "${ROOTFS_DIR}/usr/bin/" 2>/dev/null || true
-    mount -t proc proc "${ROOTFS_DIR}/proc" || true
-    mount -t sysfs sysfs "${ROOTFS_DIR}/sys" || true
-    mount --bind /dev "${ROOTFS_DIR}/dev" || true
-    chroot "${ROOTFS_DIR}" /debootstrap/debootstrap --second-stage || true
-    umount -l "${ROOTFS_DIR}/dev" 2>/dev/null || true
-    umount -l "${ROOTFS_DIR}/sys" 2>/dev/null || true
-    umount -l "${ROOTFS_DIR}/proc" 2>/dev/null || true
+    if [[ -f "${ROOTFS_DIR}/debootstrap/debootstrap" ]]; then
+        echo "[*] Completing foreign debootstrap second-stage via qemu-aarch64-static..."
+        cp "$(command -v qemu-aarch64-static 2>/dev/null || echo /usr/bin/qemu-aarch64-static)" "${ROOTFS_DIR}/usr/bin/" 2>/dev/null || true
+        mount -t proc proc "${ROOTFS_DIR}/proc" || true
+        mount -t sysfs sysfs "${ROOTFS_DIR}/sys" || true
+        mount --bind /dev "${ROOTFS_DIR}/dev" || true
+        chroot "${ROOTFS_DIR}" /debootstrap/debootstrap --second-stage || true
+        umount -l "${ROOTFS_DIR}/dev" 2>/dev/null || true
+        umount -l "${ROOTFS_DIR}/sys" 2>/dev/null || true
+        umount -l "${ROOTFS_DIR}/proc" 2>/dev/null || true
+    fi
 fi
 
 echo "[*] Configuring APT repositories..."
@@ -375,20 +443,20 @@ EOF
 configure_identity_and_network "${ROOTFS_DIR}"
 
 echo "[*] Installing UTIM binaries, systemd shims, and graphics check tool..."
-cp "${WORKSPACE_ROOT}/target/aarch64-unknown-linux-gnu/release/utim" "${ROOTFS_DIR}/usr/bin/utim"
+cp "${WORKSPACE_ROOT}/target/${RUST_TARGET}/release/utim" "${ROOTFS_DIR}/usr/bin/utim"
 ln -sf "/usr/bin/utim" "${ROOTFS_DIR}/sbin/init"
 ln -sf "/usr/bin/utim" "${ROOTFS_DIR}/init"
 
-    cp "${WORKSPACE_ROOT}/target/aarch64-unknown-linux-gnu/release/utimctl" "${ROOTFS_DIR}/usr/bin/utimctl"
+    cp "${WORKSPACE_ROOT}/target/${RUST_TARGET}/release/utimctl" "${ROOTFS_DIR}/usr/bin/utimctl"
     ln -sf "/usr/bin/utimctl" "${ROOTFS_DIR}/usr/bin/systemctl"
     if [[ ! -L "${ROOTFS_DIR}/bin" ]] || [[ "$(readlink "${ROOTFS_DIR}/bin")" != *"usr/bin"* && "$(readlink "${ROOTFS_DIR}/bin")" != "usr/bin" ]]; then
         ln -sf "/usr/bin/utimctl" "${ROOTFS_DIR}/bin/systemctl"
     fi
 
-    cp "${WORKSPACE_ROOT}/target/aarch64-unknown-linux-gnu/release/deb-systemd-helper" "${ROOTFS_DIR}/usr/bin/deb-systemd-helper"
-    cp "${WORKSPACE_ROOT}/target/aarch64-unknown-linux-gnu/release/deb-systemd-invoke" "${ROOTFS_DIR}/usr/bin/deb-systemd-invoke"
-    cp "${WORKSPACE_ROOT}/target/aarch64-unknown-linux-gnu/release/utim-graphics-check" "${ROOTFS_DIR}/usr/bin/utim-graphics-check"
-    cp "${WORKSPACE_ROOT}/target/aarch64-unknown-linux-gnu/release/utlc" "${ROOTFS_DIR}/usr/bin/utlc"
+    cp "${WORKSPACE_ROOT}/target/${RUST_TARGET}/release/deb-systemd-helper" "${ROOTFS_DIR}/usr/bin/deb-systemd-helper"
+    cp "${WORKSPACE_ROOT}/target/${RUST_TARGET}/release/deb-systemd-invoke" "${ROOTFS_DIR}/usr/bin/deb-systemd-invoke"
+    cp "${WORKSPACE_ROOT}/target/${RUST_TARGET}/release/utim-graphics-check" "${ROOTFS_DIR}/usr/bin/utim-graphics-check"
+    cp "${WORKSPACE_ROOT}/target/${RUST_TARGET}/release/utlc" "${ROOTFS_DIR}/usr/bin/utlc"
 
     # Install systemd helper shims (tmpfiles, sysusers, notify, escape)
     if [[ -d "${SCRIPT_DIR}/shims" ]]; then
@@ -489,5 +557,5 @@ chroot "${ROOTFS_DIR}" apt-get install -y --no-install-recommends \
 cleanup_chroot_mounts
 trap - EXIT
 
-echo "[+] Debian Sid ARM64 Rootfs successfully created!"
+echo "[+] Debian Sid ${TARGET_ARCH} Rootfs successfully created!"
 
